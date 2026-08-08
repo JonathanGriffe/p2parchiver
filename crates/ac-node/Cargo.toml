@@ -1,0 +1,25 @@
+[package]
+name = "ac-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ac"
+path = "src/main.rs"
+
+[dependencies]
+ac-net.workspace = true
+libp2p.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = ["crates/ac-net", "crates/ac-node", "crates/ac-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ac-net = { path = "crates/ac-net" }
+
+libp2p = { version = "0.56", features = [
+    "ed25519", "serde", "macros", "tokio",
+    # QUIC is the primary transport: it carries its own TLS, and its single UDP
+    # flow is what makes hole punching viable later. TCP+noise+yamux is the
+    # fallback for networks that block or mangle UDP.
+    "quic", "tcp", "noise", "yamux", "dns",
+    "identify", "ping",
+    # `/ac/enroll/1.0.0`. CBOR because the types are ours and change with
+    # the protocol version, so a self-describing binary format costs
+    # nothing and reads better in a packet capture than raw protobuf.
+    "request-response", "cbor",
+    # Stage 6 server services. The relay stays at libp2p's default 128 KiB
+    # per circuit: enough for DCUtR to coordinate a hole punch, far too
+    # little to move media. Raising that cap in milestone 2 is what will
+    # make stronger gating necessary.
+    "relay", "rendezvous", "autonat",
+    # Stage 7 client reachability. UPnP is the cheapest possible outcome:
+    # a mapped port means no relay and no hole punch at all.
+    "upnp",
+    # Stage 9: upgrade a relayed connection to a direct one. Needs the relay
+    # to exist first — the punch is coordinated over it.
+    "dcutr",
+    # Stage 10: the one discovery path needing no infrastructure, and the
+    # one that keeps two devices on the same wifi off a distant relay.
+    "mdns",
+    # Resource caps: what protects a node from an unknown peer, since clients
+    # authorize data rather than connections. `connection_limits` needs no
+    # feature — it ships unconditionally.
+    "memory-connection-limits",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+directories = "6"
+# Bundled SQLite so a node never depends on a system library being present or
+# recent enough; this ships to desktops we do not control.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Invite codes: OS randomness, and a hash so a leaked database backup does
+# not hand over live invites.
+getrandom = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# The node will run unattended for long stretches; a panic in the event loop
+# takes the whole daemon down, so surface the usual suspects at compile time.
+unwrap_used = "warn"
+expect_used = "warn"

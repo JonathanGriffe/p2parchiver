@@ -1,0 +1,6 @@
+/target
+
+# A node's data directory when running from the repo, and anything `--home` points at.
+# It holds an Ed25519 private key.
+/.ac
+/.ac-server

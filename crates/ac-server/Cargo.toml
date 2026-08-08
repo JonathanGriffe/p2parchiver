@@ -1,0 +1,30 @@
+[package]
+name = "ac-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ac-server"
+path = "src/main.rs"
+
+[dependencies]
+ac-net.workspace = true
+libp2p.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+toml.workspace = true
+
+[lints]
+workspace = true
