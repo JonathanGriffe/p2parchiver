@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# A second push to the same branch makes the first one's result irrelevant. Tags are
+# excluded from cancellation: a release build that loses a race is a missing artefact.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads rust-toolchain.toml, so the CI toolchain is the pinned one by construction
+      # rather than by a version repeated here and left to drift.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` covers tests and examples, not just the library and binaries.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  image:
+    name: image
+    needs: test
+    # Never on pull_request: secrets are not available to forked PRs, so the job could only
+    # fail. Publishing is also not something a PR should be able to do.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/ac-server
+          # `latest` tracks main; a v* tag also publishes its semver forms. Every build
+          # additionally gets an immutable sha tag, so a deployment can name an exact
+          # commit rather than a label that moves under it.
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Without a cache every push recompiles the whole dependency tree, which for a
+          # libp2p build is the dominant cost of this workflow.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,11 @@
+# The build context is the repository root, and `target/` is tens of gigabytes. Without
+# this it is all uploaded to the daemon before the first instruction runs — slow locally,
+# and a hard timeout risk on a CI runner.
+target/
+.git/
+
+# Nothing outside the crates and their manifests is used by deploy/Dockerfile.
+scripts/
+deploy/
+.github/
+.env

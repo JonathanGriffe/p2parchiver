@@ -4,6 +4,38 @@ The server never stores media. It handles enrolment, peer discovery, reachabilit
 and relaying when hole punching fails. A small VPS is ample — it is idle most of the time
 and its cost is bandwidth, not CPU.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs fmt, clippy (`-D warnings`) and the test suite on every
+push and pull request. On a push to `main` or a `v*` tag it then builds `deploy/Dockerfile`
+and publishes to Docker Hub as `<user>/ac-server`.
+
+Two repository secrets are required:
+
+| Secret | Value |
+| --- | --- |
+| `DOCKERHUB_USERNAME` | your Docker Hub account name |
+| `DOCKERHUB_TOKEN` | an access token — *not* your password |
+
+Create the token at Docker Hub → Account Settings → Personal access tokens, with
+**Read & Write** scope. If you keep them in a local `.env` (git-ignored), push them with:
+
+```bash
+set -a; . ./.env; set +a
+gh secret set DOCKERHUB_USERNAME --body "$DOCKERHUB_USERNAME"
+gh secret set DOCKERHUB_TOKEN   --body "$DOCKERHUB_TOKEN"
+```
+
+GitHub Actions cannot read a `.env` file from the repository — and committing one would
+publish the credentials — so secrets are the mechanism regardless of where you keep the
+originals.
+
+Images are tagged `latest` (main), the semver forms of any `v*` tag, and always an
+immutable `sha-<commit>`. Prefer the sha tag when deploying: `latest` moves underneath a
+running server, so a `docker compose pull` can change versions without you choosing to.
+
+To run a published image, set `image:` in `compose.yaml` instead of `build:`.
+
 ## Quick start
 
 ```bash

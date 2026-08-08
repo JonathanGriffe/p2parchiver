@@ -154,9 +154,7 @@ async fn probe(
                 connectivity.disconnected(*peer_id, swarm.is_connected(peer_id));
             }
 
-            SwarmEvent::OutgoingConnectionError { peer_id, error, .. }
-                if *peer_id == target =>
-            {
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } if *peer_id == target => {
                 findings.dial_error = Some(error.to_string());
             }
 
