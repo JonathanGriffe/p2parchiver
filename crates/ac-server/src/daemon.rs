@@ -4,11 +4,13 @@
 //! The differences are the role (which behaviours are enabled) and the policy handed to
 //! the authorizer — here, the enrollment database.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use libp2p::futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response;
-use libp2p::swarm::{Swarm, SwarmEvent};
+use libp2p::swarm::{ConnectionId, Swarm, SwarmEvent};
 use libp2p::{PeerId, identify, ping, relay, rendezvous};
 
 use ac_net::config::Config;
@@ -98,9 +100,34 @@ pub async fn run(
     // with whatever is known at the time rather than a fixed list.
     let mut service_addrs: Vec<libp2p::Multiaddr> = Vec::new();
 
+    // Which connection each client is currently reachable on, so a reconnection can
+    // displace the connection it replaced rather than waiting for a timeout to notice.
+    let mut links = ServiceLinks::default();
+
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
+                // Inspected before dispatch: closing a superseded connection needs the
+                // swarm, which the reporting path deliberately does not get.
+                match &event {
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id, connection_id, endpoint, ..
+                    } if endpoint.is_listener() => {
+                        if let Some(stale) = links.supersede(*peer_id, *connection_id) {
+                            tracing::info!(
+                                peer = %peer_id,
+                                "reconnected; dropping the previous connection so circuits \
+                                 reach the live one"
+                            );
+                            swarm.close_connection(stale);
+                        }
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, connection_id, .. } => {
+                        links.closed(*peer_id, *connection_id);
+                    }
+                    _ => {}
+                }
+
                 match event {
                     // Enrolment cannot arrive here — the service listener does not speak
                     // it — so the only events needing the swarm are relay grants.
@@ -143,6 +170,50 @@ pub async fn run(
                 tracing::info!("interrupted, shutting down");
                 return Ok(());
             }
+        }
+    }
+}
+
+/// The one connection each client is currently reachable on.
+///
+/// A node that dies without closing its connection — a crash, a laptop suspending, a
+/// network dropping — leaves the server believing it is still there for as long as the
+/// ping timeout takes to notice, around fifteen seconds. When the node comes back it gets
+/// a *new* connection and a fresh relay reservation, and both are granted, so everything
+/// looks healthy from every side. But circuits keep being delivered into the dead
+/// connection, so the restarted node never sees them and dialers get "Relay failed to
+/// connect to destination" — indistinguishable from the peer simply being offline.
+///
+/// A client needs exactly one service connection, so a second inbound one is near proof
+/// the first is gone. Closing the older one immediately makes the relay route to the live
+/// connection instead of waiting to discover the corpse.
+///
+/// Inbound only. AutoNAT's dial-back is the server connecting *out* to a client to test
+/// its reachability, and that legitimately coexists with the client's own connection —
+/// evicting on it would break the very probe it comes from. Circuits add no connections
+/// of their own; they ride as streams on the connection a peer already has.
+#[derive(Default)]
+struct ServiceLinks {
+    current: HashMap<PeerId, ConnectionId>,
+}
+
+impl ServiceLinks {
+    /// Record a new inbound connection, returning the one it displaces.
+    fn supersede(&mut self, peer: PeerId, id: ConnectionId) -> Option<ConnectionId> {
+        match self.current.insert(peer, id) {
+            Some(previous) if previous != id => Some(previous),
+            _ => None,
+        }
+    }
+
+    /// Forget a connection, unless it was already replaced by a newer one.
+    ///
+    /// The check matters: evicting a stale connection makes it close, and that close
+    /// arrives *after* the replacement was recorded. Removing blindly would erase the
+    /// live entry and let the next reconnection skip the eviction entirely.
+    fn closed(&mut self, peer: PeerId, id: ConnectionId) {
+        if self.current.get(&peer) == Some(&id) {
+            self.current.remove(&peer);
         }
     }
 }
@@ -422,6 +493,199 @@ mod tests {
         assert!(!is_announceable(&"/ip6/febf::1/tcp/4001".parse().unwrap()));
     }
 
+    // ---------------------------------------------------------------- the gate
+    //
+    // The two tests below are the ones that prove the architecture, and they are
+    // deliberately a matched pair. The first says the service listener admits only
+    // enrolled peers. The second says that once admitted, peers do *not* apply the same
+    // rule to each other.
+    //
+    // Weakening either one breaks the design in a way that is invisible until much later.
+    // Losing the first turns the relay into an open one for anybody who learns the port.
+    // Losing the second — by giving clients an identity filter that "matches the server's"
+    // — deadlocks membership: a member returning after an absence has to be handed a
+    // membership proof by peers it does not yet recognise, and a client that refuses
+    // strangers can never receive one.
+
+    use std::time::Duration;
+
+    use ac_net::authz::AcceptAnyPeer;
+    use libp2p::Multiaddr;
+
+    /// Long enough for a loaded CI machine, short enough that a hang fails rather than
+    /// blocking forever.
+    const GATE_TIMEOUT: Duration = Duration::from_secs(20);
+
+    fn test_identity() -> Identity {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Identity::load_or_generate(&dir.path().join("identity.key"))
+            .expect("identity")
+            .0
+    }
+
+    /// Loopback only: binding every interface drags in Docker bridges and link-local IPv6.
+    fn loopback_config() -> Config {
+        Config {
+            listen: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr")],
+            listen_enroll: Vec::new(),
+            external: Vec::new(),
+            mdns: false,
+            server: None,
+        }
+    }
+
+    async fn first_listen_addr<A: ac_net::authz::PeerAuthorizer>(
+        swarm: &mut Swarm<AcBehaviour<A>>,
+    ) -> Multiaddr {
+        loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                return address;
+            }
+        }
+    }
+
+    /// Dial `addr` from `client`, driving `server` so it can answer, and report whether
+    /// the *server* admitted `who`.
+    ///
+    /// The verdict is read from the listening side on purpose. A denial happens in the
+    /// behaviour, after the transport handshake has already succeeded, so the dialer sees
+    /// `ConnectionEstablished` followed by a close — asking the dialer whether it got in
+    /// reports "yes" for a peer that was in fact refused. The server is the only side that
+    /// knows, and it says so as `IncomingConnectionError`.
+    ///
+    /// Both swarms must still be polled: a connection needs the listening side to make
+    /// progress, so driving only the dialer would time out whatever the policy.
+    async fn admits<S, C>(
+        server: &mut Swarm<AcBehaviour<S>>,
+        client: &mut Swarm<AcBehaviour<C>>,
+        addr: Multiaddr,
+        who: PeerId,
+    ) -> bool
+    where
+        S: ac_net::authz::PeerAuthorizer,
+        C: ac_net::authz::PeerAuthorizer,
+    {
+        client.dial(addr).expect("dial starts");
+
+        let settled = async {
+            loop {
+                tokio::select! {
+                    event = server.select_next_some() => match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == who => {
+                            return true;
+                        }
+                        SwarmEvent::IncomingConnectionError { .. } => return false,
+                        _ => {}
+                    },
+                    _ = client.select_next_some() => {}
+                }
+            }
+        };
+
+        // A timeout counts as refusal: "nothing ever arrived" is a shape a rejection can
+        // legitimately take.
+        tokio::time::timeout(GATE_TIMEOUT, settled)
+            .await
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn the_service_listener_admits_the_enrolled_and_refuses_everyone_else() {
+        let member = test_identity();
+        let stranger = test_identity();
+
+        let (store, code) = store_with_invite();
+        assert!(
+            matches!(
+                decide(&store, &code.to_string(), &member.peer_id(), &[]),
+                EnrollResponse::Enrolled { .. }
+            ),
+            "the member must start out enrolled"
+        );
+        assert!(!store.is_enrolled(&stranger.peer_id()));
+
+        let mut server = build(
+            &test_identity(),
+            &loopback_config(),
+            Role::Server,
+            Enrolled(store),
+        )
+        .expect("server swarm");
+        let addr = first_listen_addr(&mut server).await;
+
+        let member_peer = member.peer_id();
+        let mut member_swarm =
+            build(&member, &loopback_config(), Role::Client, AcceptAnyPeer).expect("member swarm");
+        assert!(
+            admits(&mut server, &mut member_swarm, addr.clone(), member_peer).await,
+            "an enrolled peer must reach the service listener"
+        );
+
+        let stranger_peer = stranger.peer_id();
+        let mut stranger_swarm = build(&stranger, &loopback_config(), Role::Client, AcceptAnyPeer)
+            .expect("stranger swarm");
+        assert!(
+            !admits(&mut server, &mut stranger_swarm, addr, stranger_peer).await,
+            "an unenrolled peer must be refused before it can negotiate a single protocol \
+             — otherwise the relay is open to anyone who learns the port"
+        );
+    }
+
+    /// A control for the test above.
+    ///
+    /// The same unenrolled peer, dialling the same kind of listener, gets in when the
+    /// policy is open. Without this, a refusal caused by something incidental — a bind
+    /// that failed, a dial that never started — would read exactly like the gate working,
+    /// and the test would keep passing after the gate was gone.
+    #[tokio::test]
+    async fn the_policy_is_what_refuses_and_not_something_incidental() {
+        let stranger = test_identity();
+        let stranger_peer = stranger.peer_id();
+
+        let mut open = build(
+            &test_identity(),
+            &loopback_config(),
+            Role::Server,
+            AcceptAnyPeer,
+        )
+        .expect("open server swarm");
+        let addr = first_listen_addr(&mut open).await;
+
+        let mut stranger_swarm = build(&stranger, &loopback_config(), Role::Client, AcceptAnyPeer)
+            .expect("stranger swarm");
+
+        assert!(
+            admits(&mut open, &mut stranger_swarm, addr, stranger_peer).await,
+            "with an open policy the very peer refused above must be admitted, or the \
+             refusal proves nothing about the policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn peers_that_have_never_met_still_connect_to_each_other() {
+        let dialer = test_identity();
+        let dialer_peer = dialer.peer_id();
+
+        let mut a =
+            build(&dialer, &loopback_config(), Role::Client, AcceptAnyPeer).expect("swarm a");
+        let mut b = build(
+            &test_identity(),
+            &loopback_config(),
+            Role::Client,
+            AcceptAnyPeer,
+        )
+        .expect("swarm b");
+
+        let addr = first_listen_addr(&mut b).await;
+
+        assert!(
+            admits(&mut b, &mut a, addr, dialer_peer).await,
+            "clients must not filter by identity: a peer with no prior knowledge of the \
+             dialer has to accept it, or a returning member can never be handed proof of \
+             its own membership"
+        );
+    }
+
     const HOUR: i64 = 3600;
 
     fn peer() -> PeerId {
@@ -520,5 +784,86 @@ mod tests {
 
         assert!(store.is_enrolled(&asker));
         assert!(!store.is_enrolled(&bystander));
+    }
+
+    #[test]
+    fn a_first_connection_displaces_nothing() {
+        let mut links = ServiceLinks::default();
+        assert_eq!(
+            links.supersede(peer(), ConnectionId::new_unchecked(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn reconnecting_displaces_the_previous_connection() {
+        let mut links = ServiceLinks::default();
+        let p = peer();
+        let first = ConnectionId::new_unchecked(1);
+
+        links.supersede(p, first);
+
+        assert_eq!(
+            links.supersede(p, ConnectionId::new_unchecked(2)),
+            Some(first),
+            "the stale connection must be handed back so it can be closed"
+        );
+    }
+
+    #[test]
+    fn one_peer_reconnecting_leaves_another_alone() {
+        let mut links = ServiceLinks::default();
+        let (a, b) = (peer(), peer());
+
+        links.supersede(a, ConnectionId::new_unchecked(1));
+        links.supersede(b, ConnectionId::new_unchecked(2));
+
+        assert_eq!(
+            links.supersede(a, ConnectionId::new_unchecked(3)),
+            Some(ConnectionId::new_unchecked(1))
+        );
+        assert_eq!(
+            links.supersede(b, ConnectionId::new_unchecked(4)),
+            Some(ConnectionId::new_unchecked(2))
+        );
+    }
+
+    /// Evicting makes the old connection close, and that close arrives *after* the
+    /// replacement was recorded. If it removed the entry, the next reconnection would find
+    /// nothing to displace and the stale-routing bug would come straight back.
+    #[test]
+    fn the_evicted_connection_closing_does_not_forget_its_replacement() {
+        let mut links = ServiceLinks::default();
+        let p = peer();
+        let (first, second) = (
+            ConnectionId::new_unchecked(1),
+            ConnectionId::new_unchecked(2),
+        );
+
+        links.supersede(p, first);
+        links.supersede(p, second);
+        links.closed(p, first); // the eviction landing, out of order
+
+        assert_eq!(
+            links.supersede(p, ConnectionId::new_unchecked(3)),
+            Some(second),
+            "the live connection must still be tracked after the evicted one closes"
+        );
+    }
+
+    #[test]
+    fn a_clean_disconnect_is_forgotten() {
+        let mut links = ServiceLinks::default();
+        let p = peer();
+        let only = ConnectionId::new_unchecked(1);
+
+        links.supersede(p, only);
+        links.closed(p, only);
+
+        assert_eq!(
+            links.supersede(p, ConnectionId::new_unchecked(2)),
+            None,
+            "a peer that left properly has nothing to displace when it returns"
+        );
     }
 }
