@@ -299,6 +299,13 @@ struct Handshake {
     username: Option<String>,
     /// Whether they accepted ours.
     we_passed: bool,
+    /// Whether completion has already been reported.
+    ///
+    /// [`Handshake::complete`] stays true for the life of the entry, so it cannot on its own
+    /// tell "just completed" from "completed a while ago". Nothing stops a peer sending a
+    /// second attestation on the same connection, and each one re-runs the verification path
+    /// — so without this latch the announcement would repeat as often as the *peer* chose.
+    announced: bool,
     /// When to give up and close.
     deadline: Instant,
 }
@@ -309,6 +316,7 @@ impl Handshake {
             sent: false,
             username: None,
             we_passed: false,
+            announced: false,
             deadline: Instant::now() + HANDSHAKE_TIMEOUT,
         }
     }
@@ -504,21 +512,31 @@ impl Attest {
         }
     }
 
-    /// Announce a peer once both halves have passed.
+    /// Announce a peer once both halves have passed. Returns whether this call announced it.
     ///
-    /// Called from both completion paths, and prints exactly once: whichever half lands
-    /// second is the only call that finds the handshake complete.
-    fn settle(&mut self, peer: PeerId) {
-        let Some(handshake) = self.peers.get(&peer) else {
-            return;
+    /// Called from both completion paths, and latches on [`Handshake::announced`] so it fires
+    /// exactly once per handshake. Completion alone is not enough to decide that: it stays
+    /// true afterwards, and a peer may send a second attestation on the same connection,
+    /// which re-runs the verification path and calls back in here. Guarding on `complete()`
+    /// alone let a peer choose how often it was announced.
+    ///
+    /// The latch lives on the handshake rather than on the peer, so a genuine reconnection —
+    /// where [`Attest::on_disconnected`] has dropped the entry — is announced again.
+    fn settle(&mut self, peer: PeerId) -> bool {
+        let Some(handshake) = self.peers.get_mut(&peer) else {
+            return false;
         };
-        if !handshake.complete() {
-            return;
+        if !handshake.complete() || handshake.announced {
+            return false;
         }
-        if let Some(username) = &handshake.username {
-            println!("verified {username} {peer}");
-            tracing::info!(%peer, %username, "attestation exchange complete");
-        }
+        handshake.announced = true;
+
+        let Some(username) = handshake.username.clone() else {
+            return false;
+        };
+        println!("verified {username} {peer}");
+        tracing::info!(%peer, %username, "attestation exchange complete");
+        true
     }
 
     /// Close a peer that failed the check.
@@ -1057,5 +1075,98 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
         }
 
         other => tracing::trace!(?other, "swarm event"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer() -> PeerId {
+        libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    /// An [`Attest`] with no attestation and no swarm — enough to drive [`Attest::settle`],
+    /// which touches neither.
+    fn attest() -> Attest {
+        Attest {
+            path: PathBuf::from("attestation.cbor"),
+            me: peer(),
+            server: Some(peer()),
+            mine: None,
+            renewing: false,
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Both halves passed, ready to be announced.
+    fn complete_handshake() -> Handshake {
+        Handshake {
+            username: Some("alice".to_owned()),
+            we_passed: true,
+            ..Handshake::new()
+        }
+    }
+
+    #[test]
+    fn a_peer_is_announced_once_however_often_it_attests() {
+        // Nothing stops a peer sending a second attestation on the same connection, and
+        // each one re-runs the verification path. `complete()` stays true afterwards, so
+        // guarding on it alone let the *peer* choose how often it was announced.
+        let mut attest = attest();
+        let p = peer();
+        attest.peers.insert(p, complete_handshake());
+
+        assert!(attest.settle(p), "the completing call announces");
+        assert!(
+            !attest.settle(p),
+            "a second attestation must not announce again"
+        );
+        assert!(!attest.settle(p));
+    }
+
+    #[test]
+    fn an_incomplete_handshake_is_not_announced() {
+        // They verified us, we have not verified them. Announcing here would report a peer
+        // as verified on one side's say-so.
+        let mut attest = attest();
+        let p = peer();
+        attest.peers.insert(
+            p,
+            Handshake {
+                we_passed: true,
+                ..Handshake::new()
+            },
+        );
+
+        assert!(!attest.settle(p));
+    }
+
+    #[test]
+    fn a_reconnecting_peer_is_announced_again() {
+        // The latch belongs to the handshake, not to the peer. `on_disconnected` drops the
+        // entry, so the next connection is a fresh exchange and genuinely worth reporting —
+        // a per-peer latch would silence it forever.
+        let mut attest = attest();
+        let p = peer();
+        attest.peers.insert(p, complete_handshake());
+        assert!(attest.settle(p));
+
+        attest.on_disconnected(p, false);
+        attest.peers.insert(p, complete_handshake());
+
+        assert!(
+            attest.settle(p),
+            "a fresh handshake announces on its own terms"
+        );
+    }
+
+    #[test]
+    fn an_unknown_peer_settles_to_nothing() {
+        // Ordering is not guaranteed; a result can arrive for a peer whose entry has already
+        // been dropped by a close.
+        assert!(!attest().settle(peer()));
     }
 }
