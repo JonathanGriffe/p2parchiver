@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 libp2p.workspace = true
 serde.workspace = true
+ciborium.workspace = true
 toml.workspace = true
 directories.workspace = true
 tracing.workspace = true
@@ -14,7 +15,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-ciborium = "0.2"
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [lints]

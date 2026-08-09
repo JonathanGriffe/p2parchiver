@@ -44,6 +44,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
+# Attestations are signed over their CBOR encoding, carried verbatim. libp2p's
+# `cbor` codec does not expose an encoder, so this is the one we control.
+ciborium = "0.2"
 toml = "1"
 directories = "6"
 # Bundled SQLite so a node never depends on a system library being present or

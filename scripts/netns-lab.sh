@@ -188,8 +188,10 @@ EOF
         local code
         code=$(ip netns exec srv env AC_SERVER_HOME="$LAB/srv" \
             "$ACS" invite new --label "$ns" | awk '/^invite/{print $2}')
+        # The username doubles as the namespace name, so `verified <name>` lines in a
+        # node's output say which lab node vouched for which.
         ip netns exec "$ns" env AC_HOME="$LAB/$ns" \
-            "$AC" join "/ip4/$SRV_IP/udp/4002/quic-v1/p2p/$speer" "$code" \
+            "$AC" join "/ip4/$SRV_IP/udp/4002/quic-v1/p2p/$speer" "$code" --username "$ns" \
             >"$LAB/$ns.join" 2>&1 || { echo "$ns failed to enrol" >&2; cat "$LAB/$ns.join" >&2; exit 1; }
     done
 

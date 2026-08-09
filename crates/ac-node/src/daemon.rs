@@ -8,30 +8,64 @@
 //! in milestone 2 — and the app layer will make it. Dialling itself is already available
 //! (`Swarm::dial`), and who is currently connected is already answerable
 //! (`Swarm::connected_peers`), so no interface is invented here ahead of a real caller.
+//!
+//! # Admission
+//!
+//! What it *does* decide is who may stay. Every peer connection runs a mutual attestation
+//! exchange — see [`Attest`] — and one that does not complete is closed. That is an
+//! authorization check on a live connection, not on the act of connecting, and the
+//! distinction is the one `ac_net::authz` spends its module docs on: the credential is
+//! signed by the server, so verifying it needs no prior knowledge of the peer and cannot
+//! deadlock the way a locally-held trust list does.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use libp2p::futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, rendezvous, upnp};
+use libp2p::{
+    Multiaddr, PeerId, autonat, identify, mdns, ping, relay, rendezvous, request_response, upnp,
+};
 
+use ac_net::attest::{self, Attestation};
 use ac_net::authz::AcceptAnyPeer;
-use ac_net::config::Config;
+use ac_net::config::{Config, Paths};
 use ac_net::connectivity::Connectivity;
 use ac_net::identity::Identity;
-use ac_net::proto::RENDEZVOUS_NAMESPACE;
+use ac_net::proto::{
+    AttestRequest, AttestResponse, PeerAttestRequest, PeerAttestResponse, RENDEZVOUS_NAMESPACE,
+};
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
+
+/// This node's application layer.
+///
+/// Empty for now. Milestone 2 replaces it with the group protocol from `ac-groups`, which is
+/// the whole reason `AcBehaviour` carries an app slot: a protocol living in another crate
+/// cannot be added as a field here, so the binary supplies it instead.
+type App = libp2p::swarm::dummy::Behaviour;
+
+/// The value form of [`App`]; a type alias cannot be used as a constructor.
+const APP: App = libp2p::swarm::dummy::Behaviour;
+
+/// A convenient alias for the concrete swarm this module drives.
+type ClientSwarm = libp2p::Swarm<ac_net::swarm::AcBehaviour<AcceptAnyPeer, App>>;
 
 /// Listen, optionally dial, and run until interrupted.
 ///
 /// The authorizer is [`AcceptAnyPeer`]: a client accepts connections from anyone, because
 /// refusing by identity would prevent a peer from ever delivering the group membership
 /// proof that authorizes it. Resource limits, not identity, bound what a stranger costs.
-pub async fn run(identity: &Identity, config: &Config, dial: &[Multiaddr]) -> Result<()> {
+pub async fn run(
+    identity: &Identity,
+    config: &Config,
+    paths: &Paths,
+    dial: &[Multiaddr],
+) -> Result<()> {
     let mut swarm =
-        build(identity, config, Role::Client, AcceptAnyPeer).context("building the swarm")?;
+        build(identity, config, Role::Client, AcceptAnyPeer, APP).context("building the swarm")?;
 
     println!("peer {}", identity.peer_id());
 
@@ -54,6 +88,11 @@ pub async fn run(identity: &Identity, config: &Config, dial: &[Multiaddr]) -> Re
         None => None,
     };
 
+    // Admission. Always present, including on a node that has never enrolled: such a node
+    // has nothing to verify anyone against, so it closes every peer connection rather than
+    // leaving one open and unchecked.
+    let mut attest = Attest::load(paths, identity.peer_id(), link.as_ref().map(|l| l.server));
+
     // How each peer is reachable, and why. The only record of whether milestone 1's
     // headline claim — relayed connections upgrade to direct — actually held.
     let mut connectivity = Connectivity::default();
@@ -70,10 +109,24 @@ pub async fn run(identity: &Identity, config: &Config, dial: &[Multiaddr]) -> Re
                 if let Some(link) = &mut link {
                     link.housekeeping(&mut swarm);
                 }
+                attest.housekeeping(&mut swarm);
             }
 
             event = swarm.select_next_some() => {
                 track(&mut connectivity, &swarm, &event);
+
+                // Admission runs before the `ServerLink` arm so that a peer which fails
+                // the check is closed in the same turn it was seen, rather than lingering
+                // for a tick. The server itself is exempt and skipped inside.
+                match &event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        attest.on_connected(&mut swarm, *peer_id);
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        attest.on_disconnected(*peer_id, swarm.is_connected(peer_id));
+                    }
+                    _ => {}
+                }
 
                 if let Some(link) = &mut link {
                     match &event {
@@ -97,7 +150,18 @@ pub async fn run(identity: &Identity, config: &Config, dial: &[Multiaddr]) -> Re
                         _ => {}
                     }
                 }
-                on_event(event);
+
+                // Dispatched by value rather than by reference, because answering an
+                // inbound request means taking ownership of its `ResponseChannel`.
+                match event {
+                    SwarmEvent::Behaviour(AcBehaviourEvent::PeerAttest(event)) => {
+                        attest.on_peer_event(&mut swarm, event);
+                    }
+                    SwarmEvent::Behaviour(AcBehaviourEvent::Attest(event)) => {
+                        attest.on_renewal(event);
+                    }
+                    other => on_event(other),
+                }
             }
 
             _ = tokio::signal::ctrl_c() => {
@@ -112,10 +176,10 @@ pub async fn run(identity: &Identity, config: &Config, dial: &[Multiaddr]) -> Re
 ///
 /// This is the only place the two halves meet: [`Connectivity`] takes plain values so it
 /// can be tested without a network, and this turns libp2p's events into those values.
-fn track<A: ac_net::authz::PeerAuthorizer>(
+fn track<A: ac_net::authz::PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
     connectivity: &mut Connectivity,
-    swarm: &libp2p::Swarm<ac_net::swarm::AcBehaviour<A>>,
-    event: &SwarmEvent<AcBehaviourEvent<A>>,
+    swarm: &libp2p::Swarm<ac_net::swarm::AcBehaviour<A, X>>,
+    event: &SwarmEvent<AcBehaviourEvent<A, X>>,
 ) {
     match event {
         SwarmEvent::ConnectionEstablished {
@@ -180,6 +244,404 @@ fn report_discovered(registrations: &[rendezvous::Registration], me: libp2p::Pee
             addresses = ?registration.record.addresses(),
             "discovered a peer"
         );
+    }
+}
+
+/// How long a peer has to complete the mutual attestation exchange.
+///
+/// Swept on the housekeeping tick, so the real deadline is this plus up to one tick. Sized
+/// for a relayed round trip on a slow link, not for a hole punch — nothing here waits on
+/// DCUtR, because the exchange runs over whatever connection already exists.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The mutual attestation check, and the credential it is built on.
+///
+/// # Why both directions
+///
+/// Verifying only the peer that dialled would leave the dialer talking to anyone. Both
+/// sides send their own attestation and answer the other's, and a peer counts as admitted
+/// only when *both* halves have passed — [`Handshake::complete`]. The two halves are
+/// tracked separately because they are two independent request-response exchanges that can
+/// land in either order.
+///
+/// # Why the server is exempt
+///
+/// The server does not speak `/ac/peer-attest/1.0.0` — it has no attestation of its own to
+/// present, and needs none, since a client pinned its peer id at enrolment and the
+/// connection handshake already proved it. Demanding one would close the very connection
+/// renewal depends on, and with it the relay reservation and the registry.
+struct Attest {
+    /// Where our attestation is cached between runs.
+    path: PathBuf,
+    /// This node, for verifying that a renewal really is about us.
+    me: PeerId,
+    /// The only signer whose attestations mean anything here.
+    ///
+    /// `None` on a node that has never enrolled. Nothing can be checked without it — not
+    /// a peer's attestation and not our own — so every peer connection is closed on sight.
+    /// That is the honest reading of "verify before talking": a node that cannot verify
+    /// does not get to talk.
+    server: Option<PeerId>,
+    /// `None` until the server issues one. A node in that state is admitted by nobody.
+    mine: Option<Attestation>,
+    /// Set while a renewal is in flight, so the tick does not queue a second one.
+    renewing: bool,
+    /// Per-peer exchange state. An absent entry means the exchange has not started.
+    peers: HashMap<PeerId, Handshake>,
+}
+
+/// One peer's progress through the exchange.
+struct Handshake {
+    /// Whether our attestation has been put on the wire yet. False when the peer connected
+    /// before this node had one.
+    sent: bool,
+    /// Their username, set once *their* attestation verified. `Some` is "they passed".
+    username: Option<String>,
+    /// Whether they accepted ours.
+    we_passed: bool,
+    /// When to give up and close.
+    deadline: Instant,
+}
+
+impl Handshake {
+    fn new() -> Self {
+        Self {
+            sent: false,
+            username: None,
+            we_passed: false,
+            deadline: Instant::now() + HANDSHAKE_TIMEOUT,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.username.is_some() && self.we_passed
+    }
+}
+
+impl Attest {
+    /// Load the cached attestation, discarding one that is no longer usable.
+    ///
+    /// Verified against this node's own peer id and its server, not merely decoded: a file
+    /// copied from another node, or left over from a different server, has to be thrown
+    /// away rather than presented and rejected by every peer in turn.
+    fn load(paths: &Paths, me: PeerId, server: Option<PeerId>) -> Self {
+        let path = paths.attestation_file();
+
+        let Some(server) = server else {
+            tracing::warn!(
+                "this node has not enrolled, so it can verify nobody and can prove nothing \
+                 about itself. Every peer connection will be closed. Run `ac join` first."
+            );
+            return Self {
+                path,
+                me,
+                server: None,
+                mine: None,
+                renewing: false,
+                peers: HashMap::new(),
+            };
+        };
+
+        let mine = attest::load(&path)
+            .unwrap_or_else(|e| {
+                tracing::warn!(path = %path.display(), error = %e, "could not read the attestation");
+                None
+            })
+            .filter(|a| match a.verify(&me, &server, attest::now()) {
+                Ok(statement) => {
+                    tracing::info!(
+                        username = %statement.username,
+                        expires_in_h = (statement.expires_at - attest::now()).max(0) / 3600,
+                        "loaded this node's attestation"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "the stored attestation is unusable; will renew");
+                    false
+                }
+            });
+
+        Self {
+            path,
+            me,
+            server: Some(server),
+            mine,
+            renewing: false,
+            peers: HashMap::new(),
+        }
+    }
+
+    /// A peer connected: begin the exchange, unless it is the server.
+    fn on_connected(&mut self, swarm: &mut ClientSwarm, peer: PeerId) {
+        let Some(server) = self.server else {
+            // Nothing to check against, and nothing to offer. Closed immediately rather
+            // than left to time out, so the peer gets a reason instead of a dead socket.
+            self.reject(swarm, peer, "this node has not enrolled with a server");
+            return;
+        };
+        if peer == server {
+            return;
+        }
+        // A peer legitimately holds a relayed *and* a direct connection while an upgrade
+        // settles. It was vouched for on the first; the second proves nothing new, and
+        // re-running the exchange would race the entry that already exists.
+        if self.peers.get(&peer).is_some_and(Handshake::complete) {
+            return;
+        }
+
+        self.peers.entry(peer).or_insert_with(Handshake::new);
+        self.send_ours(swarm, peer);
+    }
+
+    /// Put our attestation on the wire, if we have one and have not already sent it.
+    ///
+    /// Silently does nothing when this node has no attestation yet. That is not a failure
+    /// path: the peer's deadline is already running, so the exchange either completes when
+    /// a renewal lands or the connection is closed for not completing.
+    fn send_ours(&mut self, swarm: &mut ClientSwarm, peer: PeerId) {
+        let Some(mine) = self.mine.clone() else {
+            return;
+        };
+        let Some(handshake) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        if handshake.sent {
+            return;
+        }
+
+        let Some(behaviour) = swarm.behaviour_mut().peer_attest.as_mut() else {
+            return;
+        };
+        behaviour.send_request(&peer, PeerAttestRequest { attestation: mine });
+        handshake.sent = true;
+    }
+
+    /// Handle one `/ac/peer-attest/1.0.0` event.
+    fn on_peer_event(
+        &mut self,
+        swarm: &mut ClientSwarm,
+        event: request_response::Event<PeerAttestRequest, PeerAttestResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => self.on_their_attestation(swarm, peer, request, channel),
+
+                request_response::Message::Response { response, .. } => match response {
+                    PeerAttestResponse::Accepted => {
+                        if let Some(handshake) = self.peers.get_mut(&peer) {
+                            handshake.we_passed = true;
+                        }
+                        self.settle(peer);
+                    }
+                    PeerAttestResponse::Rejected(why) => {
+                        self.reject(swarm, peer, &format!("they rejected ours: {why}"));
+                    }
+                },
+            },
+
+            // They never answered, or do not speak the protocol at all. Either way this
+            // peer cannot be admitted, and waiting for the deadline would only delay it.
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                self.reject(swarm, peer, &format!("no usable answer: {error}"));
+            }
+
+            // Their request to us failed mid-flight. Not fatal on its own — their side
+            // will retry or time out — so this only stops *us* from having verified them,
+            // which the deadline already covers.
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                tracing::debug!(%peer, %error, "inbound attestation failed");
+            }
+
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    /// Verify what a peer sent, answer it, and close if it did not check out.
+    fn on_their_attestation(
+        &mut self,
+        swarm: &mut ClientSwarm,
+        peer: PeerId,
+        request: PeerAttestRequest,
+        channel: request_response::ResponseChannel<PeerAttestResponse>,
+    ) {
+        let verdict = match self.server {
+            Some(server) => request
+                .attestation
+                .verify(&peer, &server, attest::now())
+                .map(|statement| statement.username)
+                .map_err(|e| e.to_string()),
+            // Answered rather than ignored: the peer learns why in one round trip instead
+            // of waiting out its own deadline on a connection that will never work.
+            None => Err("this node has not enrolled, so it cannot verify anyone".to_owned()),
+        };
+
+        let response = match &verdict {
+            Ok(_) => PeerAttestResponse::Accepted,
+            Err(why) => PeerAttestResponse::Rejected(why.clone()),
+        };
+        if let Some(behaviour) = swarm.behaviour_mut().peer_attest.as_mut() {
+            // Best effort. A rejected peer is disconnected immediately below, which can
+            // truncate this — the closed connection is the message that matters, and the
+            // reason string is a courtesy to whoever reads both sides' logs.
+            let _ = behaviour.send_response(channel, response);
+        }
+
+        match verdict {
+            Ok(username) => {
+                self.peers
+                    .entry(peer)
+                    .or_insert_with(Handshake::new)
+                    .username = Some(username);
+                // They may have reached us before we had a credential, or before we saw
+                // the connection at all; either way this is the moment to send ours.
+                self.send_ours(swarm, peer);
+                self.settle(peer);
+            }
+            Err(why) => self.reject(swarm, peer, &why),
+        }
+    }
+
+    /// Announce a peer once both halves have passed.
+    ///
+    /// Called from both completion paths, and prints exactly once: whichever half lands
+    /// second is the only call that finds the handshake complete.
+    fn settle(&mut self, peer: PeerId) {
+        let Some(handshake) = self.peers.get(&peer) else {
+            return;
+        };
+        if !handshake.complete() {
+            return;
+        }
+        if let Some(username) = &handshake.username {
+            println!("verified {username} {peer}");
+            tracing::info!(%peer, %username, "attestation exchange complete");
+        }
+    }
+
+    /// Close a peer that failed the check.
+    fn reject(&mut self, swarm: &mut ClientSwarm, peer: PeerId, why: &str) {
+        // The server is never subject to this. Closing it would take down renewal, the
+        // relay reservation and the registry in one go — and it has already proven itself
+        // by holding the key for the peer id pinned at enrolment.
+        if Some(peer) == self.server {
+            return;
+        }
+        self.peers.remove(&peer);
+        tracing::warn!(%peer, why, "closing the connection: attestation refused");
+        println!("refused {peer} ({why})");
+        let _ = swarm.disconnect_peer_id(peer);
+    }
+
+    fn on_disconnected(&mut self, peer: PeerId, still_connected: bool) {
+        if still_connected {
+            return;
+        }
+        self.peers.remove(&peer);
+    }
+
+    /// Renew when due, send to anyone still waiting, and close whatever has timed out.
+    fn housekeeping(&mut self, swarm: &mut ClientSwarm) {
+        let due = self
+            .mine
+            .as_ref()
+            .is_none_or(|a| a.needs_renewal(attest::now()));
+
+        if let Some(server) = self.server
+            && due
+            && !self.renewing
+            && swarm.is_connected(&server)
+            && let Some(behaviour) = swarm.behaviour_mut().attest.as_mut()
+        {
+            behaviour.send_request(&server, AttestRequest);
+            self.renewing = true;
+            tracing::info!(%server, "asking for a fresh attestation");
+        }
+
+        // Peers that connected before this node had a credential.
+        let waiting: Vec<PeerId> = self
+            .peers
+            .iter()
+            .filter(|(_, h)| !h.sent)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in waiting {
+            self.send_ours(swarm, peer);
+        }
+
+        let now = Instant::now();
+        let expired: Vec<PeerId> = self
+            .peers
+            .iter()
+            .filter(|(_, h)| !h.complete() && now >= h.deadline)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in expired {
+            self.reject(
+                swarm,
+                peer,
+                "the attestation exchange did not complete in time",
+            );
+        }
+    }
+
+    /// Handle the server's answer to a renewal request.
+    fn on_renewal(&mut self, event: request_response::Event<AttestRequest, AttestResponse>) {
+        match event {
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                ..
+            } => {
+                self.renewing = false;
+                let Some(server) = self.server else {
+                    // Unreachable: a request is only ever sent to a known server.
+                    return;
+                };
+                match response {
+                    AttestResponse::Issued(attestation) => {
+                        // Checked before it is stored or presented, so a server that hands
+                        // out something unusable is caught here rather than as an
+                        // unexplained refusal from every peer.
+                        match attestation.verify(&self.me, &server, attest::now()) {
+                            Ok(statement) => {
+                                if let Err(e) = attest::save(&self.path, &attestation) {
+                                    // Not fatal: the attestation works for this run, and
+                                    // the next start simply renews again.
+                                    tracing::warn!(
+                                        path = %self.path.display(),
+                                        error = %e,
+                                        "could not cache the attestation"
+                                    );
+                                }
+                                let hours = (statement.expires_at - attest::now()).max(0) / 3600;
+                                println!("attested as {} for {hours}h", statement.username);
+                                self.mine = Some(attestation);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "the server issued an attestation this node cannot use"
+                                );
+                            }
+                        }
+                    }
+                    AttestResponse::Refused(reason) => {
+                        tracing::warn!(reason = reason.explain(), "attestation refused");
+                    }
+                }
+            }
+
+            request_response::Event::OutboundFailure { error, .. } => {
+                // Cleared so the next tick tries again; the server link has its own
+                // reconnect schedule, and this rides on whatever it recovers.
+                self.renewing = false;
+                tracing::warn!(%error, "could not renew the attestation");
+            }
+
+            other => tracing::trace!(?other, "attest event"),
+        }
     }
 }
 
@@ -282,9 +744,9 @@ impl ServerLink {
     /// Driven by a periodic tick rather than by per-event timers: there are two schedules
     /// and neither needs sub-second precision, so one clock is easier to reason about than
     /// two futures being polled in a `select!`.
-    fn housekeeping<A: ac_net::authz::PeerAuthorizer>(
+    fn housekeeping<A: ac_net::authz::PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
-        swarm: &mut libp2p::Swarm<ac_net::swarm::AcBehaviour<A>>,
+        swarm: &mut libp2p::Swarm<ac_net::swarm::AcBehaviour<A, X>>,
     ) {
         let now = Instant::now();
 
@@ -313,9 +775,9 @@ impl ServerLink {
     /// A **full** query, deliberately: the discovery cookie returns only registrations
     /// added since it was issued, so it can find a peer that arrived and never report one
     /// that left. A list built from deltas accumulates ghosts.
-    fn discover<A: ac_net::authz::PeerAuthorizer>(
+    fn discover<A: ac_net::authz::PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &self,
-        swarm: &mut libp2p::Swarm<ac_net::swarm::AcBehaviour<A>>,
+        swarm: &mut libp2p::Swarm<ac_net::swarm::AcBehaviour<A, X>>,
     ) {
         if !self.published {
             // Not registered yet, so there is nothing to refresh and the server may not
@@ -338,9 +800,9 @@ impl ServerLink {
     }
 
     /// Ask for the reservation, if this is the connection we were waiting for.
-    fn reserve<A: ac_net::authz::PeerAuthorizer>(
+    fn reserve<A: ac_net::authz::PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
-        swarm: &mut libp2p::Swarm<ac_net::swarm::AcBehaviour<A>>,
+        swarm: &mut libp2p::Swarm<ac_net::swarm::AcBehaviour<A, X>>,
         connected: libp2p::PeerId,
     ) {
         if self.reserved || connected != self.server {
@@ -376,9 +838,9 @@ impl ServerLink {
     /// listeners on an interface change, AutoNAT re-confirms, and [`Self::housekeeping`]
     /// re-registers on its next tick. The cost is that a moved node is stale in the
     /// registry for up to one refresh interval.
-    fn publish<A: ac_net::authz::PeerAuthorizer>(
+    fn publish<A: ac_net::authz::PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
-        swarm: &mut libp2p::Swarm<ac_net::swarm::AcBehaviour<A>>,
+        swarm: &mut libp2p::Swarm<ac_net::swarm::AcBehaviour<A, X>>,
     ) {
         if self.published {
             return;
@@ -410,7 +872,7 @@ impl ServerLink {
     }
 }
 
-fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer>>) {
+fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             // Printed rather than logged, and with the peer id appended, so the output

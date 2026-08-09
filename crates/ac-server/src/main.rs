@@ -30,7 +30,7 @@ use ac_net::config::Paths;
 /// firewall rule cannot name a port the OS picks at random.
 pub const SERVICE_PORT: u16 = 4001;
 
-/// The enrolment listener's port: `/ac/enroll/1.0.0` only, open to anyone.
+/// The enrolment listener's port: `/ac/enroll/2.0.0` only, open to anyone.
 ///
 /// Fixed for the step-earlier version of the same reason: this is the address that goes
 /// into an invite the admin hands out.

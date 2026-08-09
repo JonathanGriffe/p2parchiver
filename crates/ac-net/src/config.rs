@@ -93,6 +93,15 @@ impl Paths {
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join(DB_FILENAME)
     }
+
+    /// The server-signed attestation this node presents to peers.
+    ///
+    /// Lives beside the identity key because the two are useless apart: the attestation
+    /// names the peer id the key produces, so it is worthless to anyone who copies it
+    /// without the key.
+    pub fn attestation_file(&self) -> PathBuf {
+        self.data_dir.join(super::attest::ATTESTATION_FILENAME)
+    }
 }
 
 /// A node's on-disk settings.

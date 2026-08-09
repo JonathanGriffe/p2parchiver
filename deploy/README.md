@@ -55,7 +55,7 @@ docker compose -f deploy/compose.yaml exec ac-server ac-server invite new --labe
 On the client:
 
 ```bash
-ac join /ip4/<your-server-ip>/udp/4002/quic-v1/p2p/<peer-id> <invite-code>
+ac join /ip4/<your-server-ip>/udp/4002/quic-v1/p2p/<peer-id> <invite-code> --username alice
 ac run
 ```
 

@@ -26,6 +26,10 @@ use ac_net::swarm::{AcBehaviour, AcBehaviourEvent, Role, build};
 /// fails the test rather than blocking forever.
 const TIMEOUT: Duration = Duration::from_secs(20);
 
+/// These tests exercise connectivity, so they mount no application layer.
+type NoApp = libp2p::swarm::dummy::Behaviour;
+const NO_APP: NoApp = libp2p::swarm::dummy::Behaviour;
+
 fn identity() -> Identity {
     let dir = tempfile::tempdir().expect("tempdir");
     Identity::load_or_generate(&dir.path().join("identity.key"))
@@ -50,7 +54,9 @@ fn loopback_config() -> Config {
 }
 
 /// Drive the swarm until it reports a listen address.
-async fn first_listen_addr(swarm: &mut libp2p::Swarm<AcBehaviour<AcceptAnyPeer>>) -> Multiaddr {
+async fn first_listen_addr(
+    swarm: &mut libp2p::Swarm<AcBehaviour<AcceptAnyPeer, NoApp>>,
+) -> Multiaddr {
     loop {
         if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
             return address;
@@ -64,7 +70,7 @@ async fn first_listen_addr(swarm: &mut libp2p::Swarm<AcBehaviour<AcceptAnyPeer>>
 /// `Received` event the address describes the local node, not the remote one. Getting
 /// this backwards is easy and silent, which is most of why this test exists.
 fn self_addr_reported_by(
-    event: &SwarmEvent<AcBehaviourEvent<AcceptAnyPeer>>,
+    event: &SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, NoApp>>,
 ) -> Option<(PeerId, Multiaddr)> {
     match event {
         SwarmEvent::Behaviour(AcBehaviourEvent::Identify(identify::Event::Received {
@@ -81,8 +87,22 @@ async fn two_nodes_connect_and_report_observed_addresses() {
     let (id_a, id_b) = (identity(), identity());
     let (peer_a, peer_b) = (id_a.peer_id(), id_b.peer_id());
 
-    let mut a = build(&id_a, &loopback_config(), Role::Client, AcceptAnyPeer).expect("swarm a");
-    let mut b = build(&id_b, &loopback_config(), Role::Client, AcceptAnyPeer).expect("swarm b");
+    let mut a = build(
+        &id_a,
+        &loopback_config(),
+        Role::Client,
+        AcceptAnyPeer,
+        NO_APP,
+    )
+    .expect("swarm a");
+    let mut b = build(
+        &id_b,
+        &loopback_config(),
+        Role::Client,
+        AcceptAnyPeer,
+        NO_APP,
+    )
+    .expect("swarm b");
 
     let addr_a = tokio::time::timeout(TIMEOUT, first_listen_addr(&mut a))
         .await
@@ -155,8 +175,22 @@ async fn dialling_the_wrong_peer_id_is_refused() {
     // authorised peer id cannot be worn by someone else.
     let (id_a, id_b, impostor) = (identity(), identity(), identity());
 
-    let mut a = build(&id_a, &loopback_config(), Role::Client, AcceptAnyPeer).expect("swarm a");
-    let mut b = build(&id_b, &loopback_config(), Role::Client, AcceptAnyPeer).expect("swarm b");
+    let mut a = build(
+        &id_a,
+        &loopback_config(),
+        Role::Client,
+        AcceptAnyPeer,
+        NO_APP,
+    )
+    .expect("swarm a");
+    let mut b = build(
+        &id_b,
+        &loopback_config(),
+        Role::Client,
+        AcceptAnyPeer,
+        NO_APP,
+    )
+    .expect("swarm b");
 
     let addr_a = tokio::time::timeout(TIMEOUT, first_listen_addr(&mut a))
         .await

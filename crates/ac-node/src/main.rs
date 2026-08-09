@@ -47,6 +47,13 @@ enum Command {
         server: Multiaddr,
         /// The invite code, as issued by `ac-server invite new`.
         code: String,
+        /// The name other peers will know you by. Must be free on this server.
+        ///
+        /// 3-32 characters: letters, digits, '-' and '_', starting with a letter or
+        /// digit. It goes into the signed attestation this node shows other peers, so
+        /// changing it later means enrolling again with a fresh invite.
+        #[arg(long)]
+        username: String,
     },
 
     /// Run the node.
@@ -99,7 +106,11 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Id => cmd::id::run(&paths),
-        Command::Join { server, code } => cmd::join::run(&paths, &server, &code),
+        Command::Join {
+            server,
+            code,
+            username,
+        } => cmd::join::run(&paths, &server, &code, &username),
         Command::Run { dial } => cmd::run::run(&paths, &dial),
         Command::Probe { peer } => cmd::probe::run(&paths, peer),
         Command::Peer(PeerCommand::Add { peer, label }) => cmd::peer::add(&paths, &peer, &label),

@@ -40,6 +40,10 @@ pub enum Redemption {
     UnknownCode,
     AlreadyRedeemed,
     Expired,
+    /// The code was good, but the username belongs to somebody else. Distinct from every
+    /// other refusal because it is the only one the user can fix by choosing again — the
+    /// invite is still unspent.
+    UsernameTaken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +57,11 @@ pub struct InviteRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientRecord {
     pub peer: PeerId,
-    pub label: String,
+    /// The name this client chose at enrolment, and what its attestation asserts.
+    ///
+    /// `None` only for a row predating usernames whose legacy label could not be carried
+    /// over — see [`Store::migrate`]. Such a client must enrol again to get an attestation.
+    pub username: Option<String>,
     pub enrolled_at: i64,
     /// `None` while the client is active. Kept as a timestamp rather than a flag so a
     /// revocation stays visible after the fact — the row is evidence, not just state.
@@ -97,12 +105,54 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS clients (
                  peer_id     TEXT PRIMARY KEY NOT NULL,
-                 label       TEXT NOT NULL,
+                 label       TEXT NOT NULL DEFAULT '',
+                 username    TEXT,
                  enrolled_at INTEGER NOT NULL,
                  revoked_at  INTEGER
              );",
         )?;
-        Ok(Self { db })
+
+        let store = Self { db };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// Bring a database written before usernames existed up to date.
+    ///
+    /// Idempotent, and run on every open: `CREATE TABLE IF NOT EXISTS` above leaves an
+    /// older `clients` table exactly as it was, so the column has to be added separately.
+    ///
+    /// The backfill copies each client's old admin-chosen label into `username`, because
+    /// the alternative is that every already-enrolled client silently loses the ability to
+    /// obtain an attestation and has to re-enrol. `UPDATE OR IGNORE` is what makes that
+    /// safe: labels were never unique, so two clients called `laptop` would violate the
+    /// index. The first keeps the name, the rest are left `NULL` and must enrol again —
+    /// which is the honest outcome, since only one of them can have the name.
+    fn migrate(&self) -> rusqlite::Result<()> {
+        let has_username = self
+            .db
+            .prepare("SELECT username FROM clients LIMIT 1")
+            .is_ok();
+        if !has_username {
+            self.db
+                .execute_batch("ALTER TABLE clients ADD COLUMN username TEXT;")?;
+        }
+
+        // Partial, so the many legacy rows that end up `NULL` do not collide with each
+        // other — SQLite treats NULLs as distinct in a unique index, but being explicit
+        // here documents that it is intended rather than relied upon by accident.
+        self.db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS clients_username
+                 ON clients(username) WHERE username IS NOT NULL;",
+        )?;
+
+        if !has_username {
+            self.db.execute_batch(
+                "UPDATE OR IGNORE clients SET username = label
+                     WHERE username IS NULL AND label <> '';",
+            )?;
+        }
+        Ok(())
     }
 
     // ---- invites ----
@@ -136,28 +186,34 @@ impl Store {
         rows.collect()
     }
 
-    /// Spend an invite and enroll `peer`.
+    /// Spend an invite and enroll `peer` under `username`.
     ///
     /// The read and both writes share one transaction, so two clients racing on the same
-    /// code cannot both win — single use is enforced by the database, not by timing.
+    /// code cannot both win — single use is enforced by the database, not by timing. The
+    /// same transaction covers the username check, so two clients racing for one name
+    /// cannot both take it either.
+    ///
+    /// `username` is expected to be already normalised by
+    /// [`ac_net::attest::normalise_username`]; this enforces uniqueness, not shape.
     pub fn redeem(
         &self,
         code: &InviteCode,
         peer: &PeerId,
+        username: &str,
         now: i64,
     ) -> rusqlite::Result<Redemption> {
         let tx = self.db.unchecked_transaction()?;
         let hash = code.hash();
 
-        let found: Option<(i64, Option<String>, String)> = tx
+        let found: Option<(i64, Option<String>)> = tx
             .query_row(
-                "SELECT expires_at, redeemed_by, label FROM invites WHERE code_hash = ?1",
+                "SELECT expires_at, redeemed_by FROM invites WHERE code_hash = ?1",
                 params![hash],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
 
-        let Some((expires_at, redeemed_by, label)) = found else {
+        let Some((expires_at, redeemed_by)) = found else {
             return Ok(Redemption::UnknownCode);
         };
         if redeemed_by.is_some() {
@@ -165,6 +221,19 @@ impl Store {
         }
         if expires_at <= now {
             return Ok(Redemption::Expired);
+        }
+
+        // Checked before the invite is spent, so a user who picks a taken name can try
+        // again with the same code rather than being told to ask for a new invite.
+        let taken: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM clients WHERE username = ?1 AND peer_id <> ?2",
+                params![username, peer.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Ok(Redemption::UsernameTaken);
         }
 
         // `redeemed_by IS NULL` repeats what the SELECT above already established, on
@@ -187,9 +256,9 @@ impl Store {
         // server does not have. Reversing a revocation is [`Self::unrevoke`], an explicit
         // admin action, matching the explicit action that caused it.
         tx.execute(
-            "INSERT INTO clients (peer_id, label, enrolled_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(peer_id) DO UPDATE SET label = excluded.label",
-            params![peer.to_string(), label, now],
+            "INSERT INTO clients (peer_id, username, enrolled_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(peer_id) DO UPDATE SET username = excluded.username",
+            params![peer.to_string(), username, now],
         )?;
         tx.commit()?;
 
@@ -200,13 +269,14 @@ impl Store {
 
     pub fn list_clients(&self) -> rusqlite::Result<Vec<ClientRecord>> {
         let mut stmt = self.db.prepare(
-            "SELECT peer_id, label, enrolled_at, revoked_at FROM clients ORDER BY label",
+            "SELECT peer_id, username, enrolled_at, revoked_at FROM clients
+             ORDER BY username IS NULL, username",
         )?;
         let rows = stmt.query_map([], |r| {
             let raw: String = r.get(0)?;
             Ok(raw.parse::<PeerId>().ok().map(|peer| ClientRecord {
                 peer,
-                label: r.get(1).unwrap_or_default(),
+                username: r.get(1).unwrap_or_default(),
                 enrolled_at: r.get(2).unwrap_or_default(),
                 revoked_at: r.get(3).unwrap_or_default(),
             }))
@@ -219,6 +289,22 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// The username to put in an attestation for `peer`.
+    ///
+    /// `None` for a peer with no client row, or one carried over from before usernames
+    /// existed whose label collided with another client's. Revoked clients are excluded —
+    /// belt and braces, since a revoked peer cannot reach the service listener to ask.
+    pub fn username_of(&self, peer: &PeerId) -> rusqlite::Result<Option<String>> {
+        self.db
+            .query_row(
+                "SELECT username FROM clients WHERE peer_id = ?1 AND revoked_at IS NULL",
+                params![peer.to_string()],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
     }
 
     /// Returns whether a client was there to revoke.
@@ -318,7 +404,7 @@ mod tests {
         let p = peer();
 
         assert_eq!(
-            store.redeem(&code, &p, now()).unwrap(),
+            store.redeem(&code, &p, "alice", now()).unwrap(),
             Redemption::Enrolled
         );
         assert!(store.is_enrolled(&p));
@@ -326,14 +412,77 @@ mod tests {
     }
 
     #[test]
-    fn the_label_carries_from_invite_to_client() {
+    fn the_username_is_what_the_client_asked_for_not_the_invite_label() {
+        // The invite's label is the admin's note about who a code was meant for. The
+        // username is the user's own choice, and it is the one that ends up in the
+        // attestation, so it must not be quietly overwritten by the label.
         let (store, code) = store_with_invite(now() + HOUR);
         let p = peer();
-        store.redeem(&code, &p, now()).unwrap();
+        store.redeem(&code, &p, "alice", now()).unwrap();
 
         let clients = store.list_clients().unwrap();
         assert_eq!(clients.len(), 1);
-        assert_eq!(clients[0].label, "bobs-laptop");
+        assert_eq!(clients[0].username.as_deref(), Some("alice"));
+        assert_eq!(store.username_of(&p).unwrap().as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_username_cannot_be_taken_twice() {
+        let store = Store::in_memory().unwrap();
+        let first = InviteCode::generate().unwrap();
+        let second = InviteCode::generate().unwrap();
+        store.create_invite(&first, "laptop", now() + HOUR).unwrap();
+        store.create_invite(&second, "phone", now() + HOUR).unwrap();
+
+        assert_eq!(
+            store.redeem(&first, &peer(), "alice", now()).unwrap(),
+            Redemption::Enrolled
+        );
+        assert_eq!(
+            store.redeem(&second, &peer(), "alice", now()).unwrap(),
+            Redemption::UsernameTaken
+        );
+    }
+
+    #[test]
+    fn a_taken_username_does_not_burn_the_invite() {
+        // The user can just pick another name, so spending their one code over it would
+        // strand them behind an admin action for a recoverable mistake.
+        let store = Store::in_memory().unwrap();
+        let taken = InviteCode::generate().unwrap();
+        let mine = InviteCode::generate().unwrap();
+        store.create_invite(&taken, "first", now() + HOUR).unwrap();
+        store.create_invite(&mine, "second", now() + HOUR).unwrap();
+        store.redeem(&taken, &peer(), "alice", now()).unwrap();
+
+        let p = peer();
+        assert_eq!(
+            store.redeem(&mine, &p, "alice", now()).unwrap(),
+            Redemption::UsernameTaken
+        );
+        assert_eq!(
+            store.redeem(&mine, &p, "bob", now()).unwrap(),
+            Redemption::Enrolled,
+            "the same code must still work with a free name"
+        );
+    }
+
+    #[test]
+    fn re_enrolling_may_keep_your_own_username() {
+        // The uniqueness check excludes the asking peer, so a client redeeming a second
+        // invite is not blocked by the name it already holds.
+        let store = Store::in_memory().unwrap();
+        let first = InviteCode::generate().unwrap();
+        let second = InviteCode::generate().unwrap();
+        store.create_invite(&first, "a", now() + HOUR).unwrap();
+        store.create_invite(&second, "b", now() + HOUR).unwrap();
+        let p = peer();
+
+        store.redeem(&first, &p, "alice", now()).unwrap();
+        assert_eq!(
+            store.redeem(&second, &p, "alice", now()).unwrap(),
+            Redemption::Enrolled
+        );
     }
 
     #[test]
@@ -341,11 +490,11 @@ mod tests {
         let (store, code) = store_with_invite(now() + HOUR);
 
         assert_eq!(
-            store.redeem(&code, &peer(), now()).unwrap(),
+            store.redeem(&code, &peer(), "alice", now()).unwrap(),
             Redemption::Enrolled
         );
         assert_eq!(
-            store.redeem(&code, &peer(), now()).unwrap(),
+            store.redeem(&code, &peer(), "bob", now()).unwrap(),
             Redemption::AlreadyRedeemed,
             "a replayed code must not enroll a second peer"
         );
@@ -356,7 +505,10 @@ mod tests {
         let (store, code) = store_with_invite(now() - 1);
         let p = peer();
 
-        assert_eq!(store.redeem(&code, &p, now()).unwrap(), Redemption::Expired);
+        assert_eq!(
+            store.redeem(&code, &p, "alice", now()).unwrap(),
+            Redemption::Expired
+        );
         assert!(!store.is_enrolled(&p));
     }
 
@@ -366,7 +518,9 @@ mod tests {
         let (store, code) = store_with_invite(issued + HOUR);
 
         assert_eq!(
-            store.redeem(&code, &peer(), issued + HOUR - 1).unwrap(),
+            store
+                .redeem(&code, &peer(), "alice", issued + HOUR - 1)
+                .unwrap(),
             Redemption::Enrolled
         );
     }
@@ -377,8 +531,30 @@ mod tests {
         let never_issued = InviteCode::generate().unwrap();
 
         assert_eq!(
-            store.redeem(&never_issued, &peer(), now()).unwrap(),
+            store
+                .redeem(&never_issued, &peer(), "alice", now())
+                .unwrap(),
             Redemption::UnknownCode
+        );
+    }
+
+    #[test]
+    fn there_is_no_username_for_a_peer_that_never_enrolled() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(store.username_of(&peer()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_revoked_client_has_no_username_to_attest() {
+        let (store, code) = store_with_invite(now() + HOUR);
+        let p = peer();
+        store.redeem(&code, &p, "alice", now()).unwrap();
+        store.revoke(&p, now()).unwrap();
+
+        assert_eq!(
+            store.username_of(&p).unwrap(),
+            None,
+            "a revoked client must not be issued a fresh attestation"
         );
     }
 
@@ -400,7 +576,7 @@ mod tests {
     fn revocation_takes_the_client_out() {
         let (store, code) = store_with_invite(now() + HOUR);
         let p = peer();
-        store.redeem(&code, &p, now()).unwrap();
+        store.redeem(&code, &p, "alice", now()).unwrap();
 
         assert!(store.revoke(&p, now()).unwrap());
         assert!(!store.is_enrolled(&p));
@@ -411,7 +587,7 @@ mod tests {
     fn revoking_twice_reports_nothing_to_do() {
         let (store, code) = store_with_invite(now() + HOUR);
         let p = peer();
-        store.redeem(&code, &p, now()).unwrap();
+        store.redeem(&code, &p, "alice", now()).unwrap();
 
         assert!(store.revoke(&p, now()).unwrap());
         assert!(!store.revoke(&p, now()).unwrap());
@@ -421,7 +597,7 @@ mod tests {
     fn revocation_is_recorded_not_erased() {
         let (store, code) = store_with_invite(now() + HOUR);
         let p = peer();
-        store.redeem(&code, &p, now()).unwrap();
+        store.redeem(&code, &p, "alice", now()).unwrap();
         store.revoke(&p, 1_234_567).unwrap();
 
         let clients = store.list_clients().unwrap();
@@ -433,20 +609,25 @@ mod tests {
     fn unrevoke_restores_a_revoked_client() {
         let (store, code) = store_with_invite(now() + HOUR);
         let p = peer();
-        store.redeem(&code, &p, now()).unwrap();
+        store.redeem(&code, &p, "alice", now()).unwrap();
         store.revoke(&p, now()).unwrap();
 
         assert!(store.unrevoke(&p).unwrap());
         assert!(store.is_enrolled(&p));
         assert!(!store.is_revoked(&p));
         assert!(store.is_allowed(&p), "they may connect again");
+        assert_eq!(
+            store.username_of(&p).unwrap().as_deref(),
+            Some("alice"),
+            "restoring a client restores its ability to renew"
+        );
     }
 
     #[test]
     fn unrevoke_reports_when_there_was_nothing_to_undo() {
         let (store, code) = store_with_invite(now() + HOUR);
         let p = peer();
-        store.redeem(&code, &p, now()).unwrap();
+        store.redeem(&code, &p, "alice", now()).unwrap();
 
         assert!(!store.unrevoke(&p).unwrap(), "this client is not revoked");
         assert!(!store.unrevoke(&peer()).unwrap(), "this one does not exist");
@@ -461,12 +642,12 @@ mod tests {
         let first = InviteCode::generate().unwrap();
         store.create_invite(&first, "bob", now() + HOUR).unwrap();
         let p = peer();
-        store.redeem(&first, &p, now()).unwrap();
+        store.redeem(&first, &p, "bob", now()).unwrap();
         store.revoke(&p, now()).unwrap();
 
         let second = InviteCode::generate().unwrap();
         store.create_invite(&second, "bob", now() + HOUR).unwrap();
-        store.redeem(&second, &p, now()).unwrap();
+        store.redeem(&second, &p, "bob", now()).unwrap();
 
         assert!(
             store.is_revoked(&p),
@@ -479,7 +660,7 @@ mod tests {
         let (store, code) = store_with_invite(now() + HOUR);
         let enrolled = peer();
         let stranger = peer();
-        store.redeem(&code, &enrolled, now()).unwrap();
+        store.redeem(&code, &enrolled, "alice", now()).unwrap();
 
         assert!(store.is_allowed(&enrolled));
         assert!(
@@ -503,7 +684,7 @@ mod tests {
         let code = InviteCode::generate().unwrap();
         admin.create_invite(&code, "bob", now() + HOUR).unwrap();
         let p = peer();
-        admin.redeem(&code, &p, now()).unwrap();
+        admin.redeem(&code, &p, "bob", now()).unwrap();
 
         assert!(daemon.is_allowed(&p));
         admin.revoke(&p, now()).unwrap();
@@ -511,5 +692,74 @@ mod tests {
             !daemon.is_allowed(&p),
             "the daemon must see a revocation without restarting"
         );
+    }
+
+    // ---------------------------------------------------------------- migration
+
+    /// Build a `clients` table exactly as it looked before usernames existed.
+    fn legacy_db(rows: &[(&str, &str)]) -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE clients (
+                 peer_id     TEXT PRIMARY KEY NOT NULL,
+                 label       TEXT NOT NULL,
+                 enrolled_at INTEGER NOT NULL,
+                 revoked_at  INTEGER
+             );",
+        )
+        .unwrap();
+        for (peer, label) in rows {
+            db.execute(
+                "INSERT INTO clients (peer_id, label, enrolled_at) VALUES (?1, ?2, 0)",
+                params![peer, label],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn an_existing_client_keeps_working_across_the_upgrade() {
+        // Without the backfill, every already-enrolled client would silently lose the
+        // ability to obtain an attestation and would have to re-enrol.
+        let p = peer();
+        let db = legacy_db(&[(&p.to_string(), "bobs-laptop")]);
+
+        let store = Store::from_connection(db).unwrap();
+
+        assert_eq!(
+            store.username_of(&p).unwrap().as_deref(),
+            Some("bobs-laptop")
+        );
+    }
+
+    #[test]
+    fn duplicate_legacy_labels_do_not_break_the_upgrade() {
+        // Labels were never unique. One client gets to keep the name; the others are left
+        // without one and must enrol again, which is the only honest outcome.
+        let (a, b) = (peer(), peer());
+        let db = legacy_db(&[(&a.to_string(), "laptop"), (&b.to_string(), "laptop")]);
+
+        let store = Store::from_connection(db).unwrap();
+
+        let named = [&a, &b]
+            .iter()
+            .filter(|p| store.username_of(p).unwrap().is_some())
+            .count();
+        assert_eq!(named, 1, "exactly one client may hold the name");
+    }
+
+    #[test]
+    fn migrating_twice_is_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let (store, code) = (Store::open(&path).unwrap(), InviteCode::generate().unwrap());
+        store.create_invite(&code, "bob", now() + HOUR).unwrap();
+        let p = peer();
+        store.redeem(&code, &p, "alice", now()).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.username_of(&p).unwrap().as_deref(), Some("alice"));
     }
 }

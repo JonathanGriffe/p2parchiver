@@ -80,8 +80,14 @@ async fn probe(
     server: &Multiaddr,
     target: Option<PeerId>,
 ) -> Result<()> {
-    let mut swarm =
-        build(identity, config, Role::Client, AcceptAnyPeer).context("building the swarm")?;
+    let mut swarm = build(
+        identity,
+        config,
+        Role::Client,
+        AcceptAnyPeer,
+        libp2p::swarm::dummy::Behaviour,
+    )
+    .context("building the swarm")?;
 
     let server_peer = server
         .iter()

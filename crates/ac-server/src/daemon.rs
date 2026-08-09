@@ -13,20 +13,41 @@ use libp2p::request_response;
 use libp2p::swarm::{ConnectionId, Swarm, SwarmEvent};
 use libp2p::{PeerId, identify, ping, relay, rendezvous};
 
+use ac_net::attest::{self, Attestation, normalise_username};
 use ac_net::config::Config;
 use ac_net::identity::Identity;
-use ac_net::proto::{EnrollRequest, EnrollResponse, Refusal};
+use ac_net::proto::{
+    AttestRefusal, AttestRequest, AttestResponse, EnrollRequest, EnrollResponse, Refusal,
+};
 use ac_net::swarm::{AcBehaviour, AcBehaviourEvent, Role, build};
 
 use crate::invite::InviteCode;
 use crate::store::{Enrolled, Redemption, Store, now};
 
+/// The server mounts no application layer.
+///
+/// Its whole job is connectivity and admission — relaying, directing, and deciding who may
+/// consume its bandwidth. Groups and anything built on them are a client concern, so the
+/// `app` slot in [`AcBehaviour`] stays empty here. `dummy::Behaviour`'s `ToSwarm` is
+/// `Infallible`, which makes `AcBehaviourEvent::App` an uninhabited variant: the compiler,
+/// not a runtime check, proves this process can never receive an application event.
+type NoApp = libp2p::swarm::dummy::Behaviour;
+
+/// The value form of [`NoApp`]; a type alias cannot be used as a constructor.
+const NO_APP: NoApp = libp2p::swarm::dummy::Behaviour;
+
+/// The service listener's swarm: relay, rendezvous, AutoNAT, attestation renewal.
+type ServiceSwarm = Swarm<AcBehaviour<Enrolled, NoApp>>;
+
+/// The enrolment listener's swarm: `/ac/enroll/2.0.0` and nothing else.
+type EnrollSwarm = Swarm<AcBehaviour<Store, NoApp>>;
+
 /// Run the server: two listeners, one policy each.
 ///
 /// | | admits | speaks |
 /// | --- | --- | --- |
-/// | enrolment | anyone | `/ac/enroll/1.0.0` |
-/// | service | enrolled peers only | relay, rendezvous, AutoNAT |
+/// | enrolment | anyone | `/ac/enroll/2.0.0` |
+/// | service | enrolled peers only | relay, rendezvous, AutoNAT, `/ac/attest/1.0.0` |
 ///
 /// One listener could not do this. Strangers must reach enrolment, and only members may
 /// reach the services — contradictory policies for a single admission check, which is why
@@ -44,7 +65,7 @@ pub async fn run(
     service_gate: Enrolled,
     enroll_gate: Store,
 ) -> Result<()> {
-    let mut swarm = build(identity, config, Role::Server, service_gate)
+    let mut swarm = build(identity, config, Role::Server, service_gate, NO_APP)
         .context("building the service swarm")?;
 
     if config.listen_enroll.is_empty() {
@@ -72,8 +93,14 @@ pub async fn run(
         listen: config.listen_enroll.clone(),
         ..Config::default()
     };
-    let mut enroll_swarm = build(identity, &enroll_config, Role::Enrollment, enroll_gate)
-        .context("building the enrolment swarm")?;
+    let mut enroll_swarm = build(
+        identity,
+        &enroll_config,
+        Role::Enrollment,
+        enroll_gate,
+        NO_APP,
+    )
+    .context("building the enrolment swarm")?;
 
     println!("peer {}", identity.peer_id());
     tracing::info!(peer = %identity.peer_id(), "server starting");
@@ -134,6 +161,12 @@ pub async fn run(
                     SwarmEvent::Behaviour(AcBehaviourEvent::Relay(event)) => {
                         on_relay(event);
                     }
+                    // Renewal. Lives on this listener precisely because it admits enrolled
+                    // peers only: the connection is the credential, so there is nothing to
+                    // check here beyond looking up the name.
+                    SwarmEvent::Behaviour(AcBehaviourEvent::Attest(event)) => {
+                        on_attest(&mut swarm, identity, &store, event);
+                    }
                     // Promote each bound address as it appears, when the operator has not
                     // said otherwise. Done here rather than at startup because listeners
                     // resolve asynchronously — `0.0.0.0` becomes one address per interface,
@@ -156,7 +189,7 @@ pub async fn run(
             event = enroll_swarm.select_next_some() => {
                 match event {
                     SwarmEvent::Behaviour(AcBehaviourEvent::Enroll(event)) => {
-                        on_enroll(&mut enroll_swarm, &store, &service_addrs, event);
+                        on_enroll(&mut enroll_swarm, identity, &store, &service_addrs, event);
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         // Printed, not logged: this is the address that goes into invites.
@@ -238,12 +271,13 @@ fn is_announceable(addr: &libp2p::Multiaddr) -> bool {
     })
 }
 
-/// Answer `/ac/enroll/1.0.0`.
+/// Answer `/ac/enroll/2.0.0`.
 ///
 /// `peer` comes from the connection, not the message — libp2p proved it during the
 /// handshake, so the enrolling client cannot claim to be anyone else.
 fn on_enroll(
-    swarm: &mut Swarm<AcBehaviour<Store>>,
+    swarm: &mut EnrollSwarm,
+    identity: &Identity,
     store: &Store,
     service_addrs: &[libp2p::Multiaddr],
     event: request_response::Event<EnrollRequest, EnrollResponse>,
@@ -269,11 +303,18 @@ fn on_enroll(
             .count(),
         "service addresses offered to the enrolling client"
     );
-    let response = decide(store, &request.code, &peer, service_addrs);
+    let response = decide(
+        store,
+        identity,
+        &request.code,
+        &request.username,
+        &peer,
+        service_addrs,
+    );
 
     match &response {
-        EnrollResponse::Enrolled { label, .. } => {
-            tracing::info!(%peer, %label, "enrolled a client")
+        EnrollResponse::Enrolled { username, .. } => {
+            tracing::info!(%peer, %username, "enrolled a client")
         }
         EnrollResponse::Refused(reason) => {
             tracing::warn!(%peer, ?reason, "refused an enrolment")
@@ -324,43 +365,119 @@ fn on_relay(event: relay::Event) {
     }
 }
 
+/// Issue a fresh attestation to a client that already has one.
+///
+/// `peer` comes from the connection, and the connection came through the service
+/// listener's gate, so this peer is enrolled by construction. That is the entire access
+/// check: a revoked client cannot open the connection this arrives on, so it can never
+/// renew, and the attestation it is holding runs out on its own.
+fn on_attest(
+    swarm: &mut ServiceSwarm,
+    identity: &Identity,
+    store: &Store,
+    event: request_response::Event<AttestRequest, AttestResponse>,
+) {
+    let request_response::Event::Message {
+        peer,
+        message: request_response::Message::Request { channel, .. },
+        ..
+    } = event
+    else {
+        // Outbound events cannot occur: the service listener advertises inbound only.
+        tracing::trace!(?event, "attest event");
+        return;
+    };
+
+    let response = match store.username_of(&peer) {
+        Ok(Some(username)) => {
+            match Attestation::issue(
+                identity.keypair(),
+                &peer,
+                &username,
+                now(),
+                attest::LIFETIME,
+            ) {
+                Ok(attestation) => {
+                    tracing::info!(%peer, %username, "issued an attestation");
+                    AttestResponse::Issued(attestation)
+                }
+                Err(e) => {
+                    tracing::error!(%peer, error = %e, "could not sign an attestation");
+                    AttestResponse::Refused(AttestRefusal::ServerError)
+                }
+            }
+        }
+        Ok(None) => {
+            // Enrolled enough to connect, but with no name on file — a row from before
+            // usernames existed whose label collided with another client's.
+            tracing::warn!(%peer, "no username on file; cannot attest");
+            AttestResponse::Refused(AttestRefusal::NoUsername)
+        }
+        Err(e) => {
+            tracing::error!(%peer, error = %e, "could not read the username");
+            AttestResponse::Refused(AttestRefusal::ServerError)
+        }
+    };
+
+    let Some(attest) = swarm.behaviour_mut().attest.as_mut() else {
+        tracing::error!(%peer, "attestation request on a listener that does not speak it");
+        return;
+    };
+    if attest.send_response(channel, response).is_err() {
+        tracing::warn!(%peer, "client disconnected before the attestation was sent");
+    }
+}
+
 /// Pure decision, so the outcomes can be tested without a swarm.
 fn decide(
     store: &Store,
+    identity: &Identity,
     raw_code: &str,
+    raw_username: &str,
     peer: &PeerId,
     service_addrs: &[libp2p::Multiaddr],
 ) -> EnrollResponse {
     let Ok(code) = InviteCode::parse(raw_code) else {
         return EnrollResponse::Refused(Refusal::Malformed);
     };
+    // Normalised here and not merely validated, so what gets stored, what gets signed, and
+    // what the client is told its name is are all the same string. The client runs the same
+    // check before asking, but that one is a courtesy that fails fast — this is the control.
+    let Ok(username) = normalise_username(raw_username) else {
+        return EnrollResponse::Refused(Refusal::InvalidUsername);
+    };
 
-    match store.redeem(&code, peer, now()) {
+    match store.redeem(&code, peer, &username, now()) {
         Ok(Redemption::Enrolled) => {
-            let label = store
-                .list_clients()
-                .ok()
-                .and_then(|clients| clients.into_iter().find(|c| &c.peer == peer))
-                .map(|c| c.label)
-                .unwrap_or_default();
-            EnrollResponse::Enrolled {
-                label,
-                service: service_addrs.to_vec(),
+            match Attestation::issue(identity.keypair(), peer, &username, now(), attest::LIFETIME) {
+                Ok(attestation) => EnrollResponse::Enrolled {
+                    username,
+                    service: service_addrs.to_vec(),
+                    attestation,
+                },
+                Err(e) => {
+                    // The invite is spent and the client row exists, so the peer is
+                    // genuinely enrolled — it just has no credential yet. Renewal will
+                    // hand it one as soon as it connects to the service listener.
+                    tracing::error!(%peer, error = %e, "enrolled, but could not sign an attestation");
+                    EnrollResponse::Refused(Refusal::ServerError)
+                }
             }
         }
         Ok(Redemption::UnknownCode) => EnrollResponse::Refused(Refusal::UnknownCode),
         Ok(Redemption::AlreadyRedeemed) => EnrollResponse::Refused(Refusal::AlreadyRedeemed),
         Ok(Redemption::Expired) => EnrollResponse::Refused(Refusal::Expired),
+        Ok(Redemption::UsernameTaken) => EnrollResponse::Refused(Refusal::UsernameTaken),
         Err(e) => {
             // Never report a database fault as "wrong code" — the admin needs to see it,
             // and the client should not be told to check something that is not the cause.
             tracing::error!(%peer, error = %e, "enrolment failed on the database");
-            EnrollResponse::Refused(Refusal::UnknownCode)
+            EnrollResponse::Refused(Refusal::ServerError)
         }
     }
 }
 
-fn on_event(event: SwarmEvent<AcBehaviourEvent<Enrolled>>) {
+fn on_event(event: SwarmEvent<AcBehaviourEvent<Enrolled, NoApp>>) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             // A server's addresses are meant to be shared — this is what goes into an
@@ -535,7 +652,7 @@ mod tests {
     }
 
     async fn first_listen_addr<A: ac_net::authz::PeerAuthorizer>(
-        swarm: &mut Swarm<AcBehaviour<A>>,
+        swarm: &mut Swarm<AcBehaviour<A, NoApp>>,
     ) -> Multiaddr {
         loop {
             if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
@@ -556,8 +673,8 @@ mod tests {
     /// Both swarms must still be polled: a connection needs the listening side to make
     /// progress, so driving only the dialer would time out whatever the policy.
     async fn admits<S, C>(
-        server: &mut Swarm<AcBehaviour<S>>,
-        client: &mut Swarm<AcBehaviour<C>>,
+        server: &mut Swarm<AcBehaviour<S, NoApp>>,
+        client: &mut Swarm<AcBehaviour<C, NoApp>>,
         addr: Multiaddr,
         who: PeerId,
     ) -> bool
@@ -597,7 +714,14 @@ mod tests {
         let (store, code) = store_with_invite();
         assert!(
             matches!(
-                decide(&store, &code.to_string(), &member.peer_id(), &[]),
+                decide(
+                    &store,
+                    &test_identity(),
+                    &code.to_string(),
+                    "alice",
+                    &member.peer_id(),
+                    &[]
+                ),
                 EnrollResponse::Enrolled { .. }
             ),
             "the member must start out enrolled"
@@ -609,21 +733,34 @@ mod tests {
             &loopback_config(),
             Role::Server,
             Enrolled(store),
+            NO_APP,
         )
         .expect("server swarm");
         let addr = first_listen_addr(&mut server).await;
 
         let member_peer = member.peer_id();
-        let mut member_swarm =
-            build(&member, &loopback_config(), Role::Client, AcceptAnyPeer).expect("member swarm");
+        let mut member_swarm = build(
+            &member,
+            &loopback_config(),
+            Role::Client,
+            AcceptAnyPeer,
+            NO_APP,
+        )
+        .expect("member swarm");
         assert!(
             admits(&mut server, &mut member_swarm, addr.clone(), member_peer).await,
             "an enrolled peer must reach the service listener"
         );
 
         let stranger_peer = stranger.peer_id();
-        let mut stranger_swarm = build(&stranger, &loopback_config(), Role::Client, AcceptAnyPeer)
-            .expect("stranger swarm");
+        let mut stranger_swarm = build(
+            &stranger,
+            &loopback_config(),
+            Role::Client,
+            AcceptAnyPeer,
+            NO_APP,
+        )
+        .expect("stranger swarm");
         assert!(
             !admits(&mut server, &mut stranger_swarm, addr, stranger_peer).await,
             "an unenrolled peer must be refused before it can negotiate a single protocol \
@@ -647,12 +784,19 @@ mod tests {
             &loopback_config(),
             Role::Server,
             AcceptAnyPeer,
+            NO_APP,
         )
         .expect("open server swarm");
         let addr = first_listen_addr(&mut open).await;
 
-        let mut stranger_swarm = build(&stranger, &loopback_config(), Role::Client, AcceptAnyPeer)
-            .expect("stranger swarm");
+        let mut stranger_swarm = build(
+            &stranger,
+            &loopback_config(),
+            Role::Client,
+            AcceptAnyPeer,
+            NO_APP,
+        )
+        .expect("stranger swarm");
 
         assert!(
             admits(&mut open, &mut stranger_swarm, addr, stranger_peer).await,
@@ -666,13 +810,20 @@ mod tests {
         let dialer = test_identity();
         let dialer_peer = dialer.peer_id();
 
-        let mut a =
-            build(&dialer, &loopback_config(), Role::Client, AcceptAnyPeer).expect("swarm a");
+        let mut a = build(
+            &dialer,
+            &loopback_config(),
+            Role::Client,
+            AcceptAnyPeer,
+            NO_APP,
+        )
+        .expect("swarm a");
         let mut b = build(
             &test_identity(),
             &loopback_config(),
             Role::Client,
             AcceptAnyPeer,
+            NO_APP,
         )
         .expect("swarm b");
 
@@ -704,14 +855,94 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_code_returns_the_label_from_the_invite() {
+    fn a_valid_code_returns_the_username_that_was_asked_for() {
         let (store, code) = store_with_invite();
+        let identity = test_identity();
+        let p = peer();
+
+        let EnrollResponse::Enrolled {
+            username,
+            service,
+            attestation,
+        } = decide(&store, &identity, &code.to_string(), "Alice", &p, &[])
+        else {
+            panic!("expected an enrolment");
+        };
+
+        // Normalised, so the client learns the canonical form of its own name rather than
+        // the one it happened to type.
+        assert_eq!(username, "alice");
+        assert!(service.is_empty());
+
+        let statement = attestation
+            .verify(&p, &identity.peer_id(), now())
+            .expect("the attestation the server just issued must verify");
+        assert_eq!(statement.username, "alice");
+    }
+
+    #[test]
+    fn the_attestation_is_signed_by_this_server_and_no_other() {
+        let (store, code) = store_with_invite();
+        let identity = test_identity();
+        let p = peer();
+
+        let EnrollResponse::Enrolled { attestation, .. } =
+            decide(&store, &identity, &code.to_string(), "alice", &p, &[])
+        else {
+            panic!("expected an enrolment");
+        };
+
+        assert!(
+            attestation
+                .verify(&p, &test_identity().peer_id(), now())
+                .is_err(),
+            "an attestation must not verify against an unrelated server's peer id"
+        );
+    }
+
+    #[test]
+    fn a_taken_username_is_refused() {
+        let store = Store::in_memory().unwrap();
+        let identity = test_identity();
+        let first = InviteCode::generate().unwrap();
+        let second = InviteCode::generate().unwrap();
+        store.create_invite(&first, "a", now() + HOUR).unwrap();
+        store.create_invite(&second, "b", now() + HOUR).unwrap();
+
+        decide(&store, &identity, &first.to_string(), "alice", &peer(), &[]);
+
         assert_eq!(
-            decide(&store, &code.to_string(), &peer(), &[]),
-            EnrollResponse::Enrolled {
-                label: "bobs-laptop".to_owned(),
-                service: Vec::new(),
-            }
+            decide(
+                &store,
+                &identity,
+                &second.to_string(),
+                "alice",
+                &peer(),
+                &[]
+            ),
+            EnrollResponse::Refused(Refusal::UsernameTaken)
+        );
+    }
+
+    #[test]
+    fn a_username_that_breaks_the_rules_is_refused_before_the_code_is_spent() {
+        let (store, code) = store_with_invite();
+        let identity = test_identity();
+
+        for bad in ["ab", "alice smith", "-alice", &"a".repeat(64)] {
+            assert_eq!(
+                decide(&store, &identity, &code.to_string(), bad, &peer(), &[]),
+                EnrollResponse::Refused(Refusal::InvalidUsername),
+                "{bad:?}"
+            );
+        }
+
+        assert!(
+            matches!(
+                decide(&store, &identity, &code.to_string(), "alice", &peer(), &[]),
+                EnrollResponse::Enrolled { .. }
+            ),
+            "a bad username must not consume the invite"
         );
     }
 
@@ -720,16 +951,19 @@ mod tests {
         // The two deserve different messages: one means "you already used this", the
         // other means "check what you typed".
         let (store, code) = store_with_invite();
-        decide(&store, &code.to_string(), &peer(), &[]);
+        let identity = test_identity();
+        decide(&store, &identity, &code.to_string(), "alice", &peer(), &[]);
 
         assert_eq!(
-            decide(&store, &code.to_string(), &peer(), &[]),
+            decide(&store, &identity, &code.to_string(), "bob", &peer(), &[]),
             EnrollResponse::Refused(Refusal::AlreadyRedeemed)
         );
         assert_eq!(
             decide(
                 &store,
+                &identity,
                 &InviteCode::generate().unwrap().to_string(),
+                "carol",
                 &peer(),
                 &[],
             ),
@@ -744,7 +978,14 @@ mod tests {
         store.create_invite(&code, "stale", now() - 1).unwrap();
 
         assert_eq!(
-            decide(&store, &code.to_string(), &peer(), &[]),
+            decide(
+                &store,
+                &test_identity(),
+                &code.to_string(),
+                "alice",
+                &peer(),
+                &[]
+            ),
             EnrollResponse::Refused(Refusal::Expired)
         );
     }
@@ -752,9 +993,10 @@ mod tests {
     #[test]
     fn something_that_is_not_a_code_is_refused_as_malformed() {
         let store = Store::in_memory().unwrap();
+        let identity = test_identity();
         for junk in ["", "hello", "AAAA-BBBB", "!!!!-!!!!-!!!!-!!!!"] {
             assert_eq!(
-                decide(&store, junk, &peer(), &[]),
+                decide(&store, &identity, junk, "alice", &peer(), &[]),
                 EnrollResponse::Refused(Refusal::Malformed),
                 "{junk:?}"
             );
@@ -769,7 +1011,7 @@ mod tests {
         let mangled = code.to_string().to_lowercase().replace('-', "");
 
         assert!(matches!(
-            decide(&store, &mangled, &peer(), &[]),
+            decide(&store, &test_identity(), &mangled, "alice", &peer(), &[]),
             EnrollResponse::Enrolled { .. }
         ));
     }
@@ -780,10 +1022,34 @@ mod tests {
         let asker = peer();
         let bystander = peer();
 
-        decide(&store, &code.to_string(), &asker, &[]);
+        decide(
+            &store,
+            &test_identity(),
+            &code.to_string(),
+            "alice",
+            &asker,
+            &[],
+        );
 
         assert!(store.is_enrolled(&asker));
         assert!(!store.is_enrolled(&bystander));
+    }
+
+    #[test]
+    fn a_renewed_attestation_verifies_just_like_the_first() {
+        // Renewal reads the stored username rather than being told one, so this is also
+        // the check that enrolment and renewal agree on the name.
+        let (store, code) = store_with_invite();
+        let identity = test_identity();
+        let p = peer();
+        decide(&store, &identity, &code.to_string(), "alice", &p, &[]);
+
+        let username = store.username_of(&p).unwrap().expect("a username on file");
+        let renewed =
+            Attestation::issue(identity.keypair(), &p, &username, now(), attest::LIFETIME).unwrap();
+
+        let statement = renewed.verify(&p, &identity.peer_id(), now()).unwrap();
+        assert_eq!(statement.username, "alice");
     }
 
     #[test]

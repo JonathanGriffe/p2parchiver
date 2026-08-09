@@ -18,5 +18,5 @@ pub fn run(paths: &Paths, dial: &[Multiaddr]) -> Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
     let runtime = tokio::runtime::Runtime::new().context("starting the tokio runtime")?;
-    runtime.block_on(daemon::run(&identity, &config, dial))
+    runtime.block_on(daemon::run(&identity, &config, paths, dial))
 }

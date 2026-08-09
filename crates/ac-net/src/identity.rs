@@ -13,10 +13,39 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use libp2p::PeerId;
-use libp2p::identity::Keypair;
+use libp2p::identity::{Keypair, PublicKey};
 
 /// Name of the key file inside the node's data directory.
 pub const KEY_FILENAME: &str = "identity.key";
+
+/// A peer id that carries no recoverable public key.
+#[derive(Debug, thiserror::Error)]
+#[error("no public key could be recovered from peer id {peer}")]
+pub struct KeyRecoveryError {
+    pub peer: PeerId,
+}
+
+/// Recover a node's public key from its peer id.
+///
+/// Ed25519 public keys are 36 bytes once protobuf-encoded, comfortably under the 42-byte
+/// threshold at which libp2p inlines the key into the peer id under the identity hash
+/// (multihash code `0x00`) instead of hashing it. [`Identity`] only ever generates Ed25519, so
+/// every peer id in this system carries its own key.
+///
+/// **This is what removes key distribution from the design.** A client pins `/p2p/<peer-id>`
+/// at enrolment, and the verification key for every signature it will ever check against that
+/// peer is already inside that string. Both the attestation layer and, from milestone 2, the
+/// group layer are built on it — which is why it lives here, with identities, rather than
+/// inside either of them.
+pub fn public_key_of(peer: &PeerId) -> Result<PublicKey, KeyRecoveryError> {
+    let multihash: &libp2p::multihash::Multihash<64> = peer.as_ref();
+    if multihash.code() != 0x00 {
+        // A hashed peer id — an RSA key, or one from another implementation. Nothing is
+        // recoverable, and a signature by it cannot be checked without the key itself.
+        return Err(KeyRecoveryError { peer: *peer });
+    }
+    PublicKey::try_decode_protobuf(multihash.digest()).map_err(|_| KeyRecoveryError { peer: *peer })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
@@ -181,6 +210,26 @@ fn warn_if_world_readable(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_public_key_comes_back_out_of_the_peer_id() {
+        // The property the whole design rests on: no key distribution, because a pinned
+        // peer id already contains the verification key.
+        let key = Keypair::generate_ed25519();
+        let recovered = public_key_of(&key.public().to_peer_id()).unwrap();
+        assert_eq!(recovered, key.public());
+    }
+
+    #[test]
+    fn a_hashed_peer_id_yields_no_key() {
+        // An RSA key, or a peer id from an implementation that hashes rather than inlines.
+        // Nothing is recoverable and callers must fail rather than guess.
+        use libp2p::multihash::Multihash;
+        let hashed = Multihash::<64>::wrap(0x12, &[0u8; 32]).unwrap();
+        let peer = PeerId::from_multihash(hashed).unwrap();
+
+        assert!(public_key_of(&peer).is_err());
+    }
 
     #[test]
     fn generates_then_reloads_the_same_peer_id() {

@@ -7,6 +7,26 @@
 //!
 //! This module decides nothing about *who* may connect — that is the binaries' job, via
 //! the `PeerAuthorizer` they supply.
+//!
+//! # What belongs here, and what does not
+//!
+//! Everything in [`AcBehaviour`] answers one of two questions: **can we talk** (identify,
+//! ping, relay, rendezvous, AutoNAT, DCUtR, mDNS, UPnP) or **should we** (enrol, attest,
+//! peer-attest, and the authorizer). What a node then *does* over a verified connection is
+//! not this crate's business.
+//!
+//! That distinction is load-bearing rather than tidy-minded. Rust only lets a field be added
+//! to a struct from the crate that defines it, so without an escape hatch every application
+//! protocol would have to be declared here — dragging its wire types, and transitively its
+//! whole model, into the networking crate, and making the server compile code it never runs.
+//!
+//! [`AcBehaviour::app`] is that escape hatch: a generic slot the binary fills in. `ac-net`
+//! never names what goes in it. `ac-server` passes `dummy::Behaviour` and provably cannot
+//! receive an application event; `ac-node` will pass the group protocol from `ac-groups`.
+//!
+//! **Do not "simplify" the parameter away** by declaring an application protocol here. It is
+//! the boundary that keeps the group layer — and whatever follows it — out of the networking
+//! crate. `tests/app_slot.rs` exercises it with a protocol defined outside `ac-net`.
 
 use std::time::Duration;
 
@@ -22,7 +42,10 @@ use crate::authz::{self, PeerAuthorizer};
 use crate::config::Config;
 use crate::identity::Identity;
 use crate::limits;
-use crate::proto::{ENROLL_PROTOCOL, EnrollRequest, EnrollResponse};
+use crate::proto::{
+    ATTEST_PROTOCOL, AttestRequest, AttestResponse, ENROLL_PROTOCOL, EnrollRequest, EnrollResponse,
+    PEER_ATTEST_PROTOCOL, PeerAttestRequest, PeerAttestResponse,
+};
 
 /// How long a connection with no active streams is held open.
 ///
@@ -59,7 +82,7 @@ pub enum Role {
     Client,
     /// The service listener: relay, rendezvous, AutoNAT. Admits enrolled peers only.
     Server,
-    /// The enrolment listener: `/ac/enroll/1.0.0` and nothing else. Admits anyone,
+    /// The enrolment listener: `/ac/enroll/2.0.0` and nothing else. Admits anyone,
     /// because a peer that has not enrolled yet is exactly who needs to reach it.
     Enrollment,
 }
@@ -90,10 +113,11 @@ pub enum SwarmError {
 
 /// The protocols this node speaks.
 ///
-/// Generic over the authorization policy so both binaries share one behaviour type: the
-/// server supplies its allowlist, the client supplies [`authz::AcceptAnyPeer`].
+/// Generic over two things. `A` is the authorization policy, so both binaries share one
+/// behaviour type: the server supplies its allowlist, the client supplies
+/// [`authz::AcceptAnyPeer`]. `X` is the application layer — see [`AcBehaviour::app`].
 #[derive(NetworkBehaviour)]
-pub struct AcBehaviour<A: PeerAuthorizer> {
+pub struct AcBehaviour<A: PeerAuthorizer, X: NetworkBehaviour> {
     /// Caps on connection count. Listed first so a connection over budget is refused
     /// before the rest of the behaviours are asked about it.
     pub connection_limits: connection_limits::Behaviour,
@@ -111,10 +135,26 @@ pub struct AcBehaviour<A: PeerAuthorizer> {
     /// is what keeps a UDP mapping open and what determines how fast a dead peer is
     /// noticed. Both are consequences of a setting whose name mentions neither.
     pub ping: ping::Behaviour,
-    /// `/ac/enroll/1.0.0`. Present only where it belongs: outbound on a client, inbound
+    /// `/ac/enroll/2.0.0`. Present only where it belongs: outbound on a client, inbound
     /// on the enrolment listener, and **absent entirely on the service listener** — which
     /// is what lets that listener demand enrollment of everyone who connects.
     pub enroll: Toggle<request_response::cbor::Behaviour<EnrollRequest, EnrollResponse>>,
+
+    /// `/ac/attest/1.0.0` — attestation renewal. Outbound on a client, inbound on the
+    /// service listener, absent on enrolment.
+    ///
+    /// On the *service* listener rather than the enrolment one, which is what makes
+    /// revocation self-enforcing: that listener admits enrolled peers only, so a revoked
+    /// client cannot ask for a fresh attestation and the one it holds simply expires.
+    pub attest: Toggle<request_response::cbor::Behaviour<AttestRequest, AttestResponse>>,
+
+    /// `/ac/peer-attest/1.0.0` — the mutual check between two clients. Clients only.
+    ///
+    /// [`ProtocolSupport::Full`] on both sides because the exchange is symmetric: each peer
+    /// sends its own attestation and answers with a verdict on the other's, so neither is
+    /// the interrogator.
+    pub peer_attest:
+        Toggle<request_response::cbor::Behaviour<PeerAttestRequest, PeerAttestResponse>>,
 
     /// Circuit relay v2, server side. Off on clients.
     ///
@@ -184,22 +224,54 @@ pub struct AcBehaviour<A: PeerAuthorizer> {
     /// requires a matching transport — `/p2p-circuit` addresses have to be dialable, not
     /// just representable.
     pub relay_client: Toggle<relay::client::Behaviour>,
+
+    /// The application layer's protocol, chosen by the binary rather than named here.
+    ///
+    /// # Why this is a hole and not a field
+    ///
+    /// Everything above is a *connectivity or admission* concern — "can we talk, and should
+    /// we". What a node does over an established, verified connection is somebody else's
+    /// business, and Rust only lets a field be added from the crate that defines the struct.
+    /// Without this slot, every application protocol would have to be declared in `ac-net`,
+    /// which would drag its wire types — and transitively its whole model — into the
+    /// networking crate, and make the server compile code it never runs.
+    ///
+    /// So `ac-net` never names what goes here. It stores the value and lets the derive do
+    /// the rest: create the handler per connection, poll it, and wrap whatever it emits as
+    /// `AcBehaviourEvent::App`. A binary with no application layer passes
+    /// [`libp2p::swarm::dummy::Behaviour`], whose `ToSwarm` is [`std::convert::Infallible`] —
+    /// so on the server that event variant is uninhabited and the compiler, not a runtime
+    /// check, proves no application event can arrive.
+    ///
+    /// # Two rules for whatever is mounted here
+    ///
+    /// **It must not refuse connections.** [`NetworkBehaviour`] exposes
+    /// `handle_established_inbound_connection`, so an app behaviour *could* deny a peer. It
+    /// must not: that is exactly the deadlock [`crate::authz`] spends its module docs on,
+    /// where the peer able to deliver your membership proof is the one being turned away.
+    /// Admission belongs to [`authz`]; the app layer authorizes data on a live connection.
+    ///
+    /// **Its protocol names are public.** Mounting a behaviour advertises them through
+    /// `identify`, so a peer can see *that* this node runs a given application protocol. It
+    /// never reveals what the node does with it, but a protocol name is not a secret.
+    pub app: X,
 }
 
-impl<A: PeerAuthorizer> AcBehaviour<A> {
+impl<A: PeerAuthorizer, X: NetworkBehaviour> AcBehaviour<A, X> {
     fn new(
         keypair: &libp2p::identity::Keypair,
         config: &Config,
         role: Role,
         authorizer: A,
         relay_client: relay::client::Behaviour,
+        app: X,
     ) -> Self {
         let peer_id = keypair.public().to_peer_id();
         let is_server = role == Role::Server;
         let is_client = role == Role::Client;
         // `protocol_version` is a label peers display, not a compatibility gate — libp2p
         // never rejects a connection over it. Version enforcement comes from the
-        // per-protocol names (`/ac/enroll/1.0.0` and friends), which multistream-select
+        // per-protocol names (`/ac/enroll/2.0.0` and friends), which multistream-select
         // actually negotiates, so an incompatible peer fails cleanly on that protocol
         // rather than on the connection.
         // `hide_listen_addrs` drops the "here is where I can be reached" half of identify
@@ -220,6 +292,16 @@ impl<A: PeerAuthorizer> AcBehaviour<A> {
             Role::Client => Some(ProtocolSupport::Outbound),
             Role::Enrollment => Some(ProtocolSupport::Inbound),
             Role::Server => None,
+        };
+
+        // The mirror image of enrolment: a client only ever asks for an attestation, and
+        // only the service listener issues one. The enrolment listener is deliberately left
+        // out — it hands over the *first* attestation inside the enrolment reply, and a peer
+        // that has not enrolled has nothing to renew.
+        let attest_direction = match role {
+            Role::Client => Some(ProtocolSupport::Outbound),
+            Role::Server => Some(ProtocolSupport::Inbound),
+            Role::Enrollment => None,
         };
 
         // mDNS needs a multicast socket, which a container or a locked-down interface may
@@ -246,6 +328,21 @@ impl<A: PeerAuthorizer> AcBehaviour<A> {
                     request_response::Config::default(),
                 )
             })),
+            attest: Toggle::from(attest_direction.map(|direction| {
+                request_response::cbor::Behaviour::new(
+                    [(StreamProtocol::new(ATTEST_PROTOCOL), direction)],
+                    request_response::Config::default(),
+                )
+            })),
+            peer_attest: Toggle::from(is_client.then(|| {
+                request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new(PEER_ATTEST_PROTOCOL),
+                        ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                )
+            })),
             relay: Toggle::from(
                 is_server.then(|| relay::Behaviour::new(peer_id, relay::Config::default())),
             ),
@@ -263,6 +360,7 @@ impl<A: PeerAuthorizer> AcBehaviour<A> {
             // installs is not optional. Toggling the *behaviour* off on the server is what
             // stops a server from trying to reserve a slot on someone else's relay.
             relay_client: Toggle::from(is_client.then_some(relay_client)),
+            app,
         }
     }
 }
@@ -272,12 +370,16 @@ impl<A: PeerAuthorizer> AcBehaviour<A> {
 /// Listen failures are per-address and non-fatal: a host without IPv6 should still come
 /// up on IPv4. Only failing to bind *every* address is an error, because a node that
 /// listens nowhere can never be dialled and would otherwise fail silently.
-pub fn build<A: PeerAuthorizer>(
+///
+/// `app` is the caller's application layer — see [`AcBehaviour::app`]. Pass
+/// [`libp2p::swarm::dummy::Behaviour`] to mount none.
+pub fn build<A: PeerAuthorizer, X: NetworkBehaviour>(
     identity: &Identity,
     config: &Config,
     role: Role,
     authorizer: A,
-) -> Result<Swarm<AcBehaviour<A>>, SwarmError> {
+    app: X,
+) -> Result<Swarm<AcBehaviour<A, X>>, SwarmError> {
     let mut swarm = SwarmBuilder::with_existing_identity(identity.keypair().clone())
         .with_tokio()
         .with_tcp(
@@ -295,7 +397,7 @@ pub fn build<A: PeerAuthorizer>(
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(SwarmError::Relay)?
         .with_behaviour(|keypair, relay_client| {
-            AcBehaviour::new(keypair, config, role, authorizer, relay_client)
+            AcBehaviour::new(keypair, config, role, authorizer, relay_client, app)
         })
         .map_err(|never: std::convert::Infallible| match never {})?
         .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
@@ -348,6 +450,7 @@ mod tests {
             &config,
             Role::Client,
             crate::authz::AcceptAnyPeer,
+            libp2p::swarm::dummy::Behaviour,
         )
         .unwrap();
         assert_eq!(*swarm.local_peer_id(), identity.peer_id());
@@ -371,7 +474,8 @@ mod tests {
                 &identity,
                 &config,
                 Role::Client,
-                crate::authz::AcceptAnyPeer
+                crate::authz::AcceptAnyPeer,
+                libp2p::swarm::dummy::Behaviour,
             ),
             Err(SwarmError::NoListenAddr { attempted: 1 })
         ));

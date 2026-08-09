@@ -17,14 +17,21 @@ pub fn list(paths: &Paths) -> Result<()> {
         return Ok(());
     }
 
-    let widest = clients.iter().map(|c| c.label.len()).max().unwrap_or(0);
-    for client in clients {
-        let status = if client.is_revoked() {
-            "  (revoked)"
-        } else {
-            ""
+    // A client with no username predates them, and its old label collided with another's
+    // during the upgrade. It can still use the server, but cannot be issued an attestation
+    // — so it is worth naming as a thing to fix rather than printing as a blank.
+    let name = |c: &crate::store::ClientRecord| {
+        c.username.clone().unwrap_or_else(|| "(no username)".into())
+    };
+
+    let widest = clients.iter().map(|c| name(c).len()).max().unwrap_or(0);
+    for client in &clients {
+        let status = match (client.is_revoked(), client.username.is_none()) {
+            (true, _) => "  (revoked)",
+            (false, true) => "  (must re-enrol to get an attestation)",
+            (false, false) => "",
         };
-        println!("{:<widest$}  {}{status}", client.label, client.peer);
+        println!("{:<widest$}  {}{status}", name(client), client.peer);
     }
     Ok(())
 }

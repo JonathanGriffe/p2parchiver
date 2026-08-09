@@ -11,6 +11,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, request_response};
 
+use ac_net::attest::{self, Attestation, normalise_username};
 use ac_net::authz::AcceptAnyPeer;
 use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
@@ -21,13 +22,19 @@ use ac_net::swarm::{AcBehaviourEvent, Role, build};
 /// while the user is still watching.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn run(paths: &Paths, server: &Multiaddr, code: &str) -> Result<()> {
+pub fn run(paths: &Paths, server: &Multiaddr, code: &str, username: &str) -> Result<()> {
     let server_peer = peer_id_of(server).ok_or_else(|| {
         anyhow!(
             "the server address must end with /p2p/<peer-id> so the right server can be \
              identified; `ac-server init` prints it"
         )
     })?;
+
+    // Checked here as well as on the server so a typo costs nothing — no dial, no round
+    // trip, and the invite stays unspent. The server's check is the one that counts.
+    let username = normalise_username(username)
+        .map_err(|e| anyhow!("{e}"))
+        .context("that username cannot be used")?;
 
     let key_path = paths.identity_file();
     let (identity, _) = Identity::load_or_generate(&key_path)
@@ -38,8 +45,22 @@ pub fn run(paths: &Paths, server: &Multiaddr, code: &str) -> Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
     let runtime = tokio::runtime::Runtime::new().context("starting the tokio runtime")?;
-    let (label, service) =
-        runtime.block_on(enroll(&identity, &config, server, server_peer, code))?;
+    let (username, service, attestation) = runtime.block_on(enroll(
+        &identity,
+        &config,
+        server,
+        server_peer,
+        code,
+        &username,
+    ))?;
+
+    // Verified before it is stored, so a server that hands out something unusable is
+    // caught here rather than on the first peer connection days later. Everything checked
+    // is known locally: our own peer id, and the server's from the address just dialled.
+    attestation
+        .verify(&identity.peer_id(), &server_peer, attest::now())
+        .map_err(|e| anyhow!("{e}"))
+        .context("the server issued an attestation this node cannot use")?;
 
     // The address given on the command line reaches the *enrolment* listener, which
     // speaks nothing else. Everything from here on — relay, rendezvous, AutoNAT — lives
@@ -56,10 +77,19 @@ pub fn run(paths: &Paths, server: &Multiaddr, code: &str) -> Result<()> {
         .save(&config_path)
         .with_context(|| format!("saving config to {}", config_path.display()))?;
 
-    println!("enrolled as {label}");
+    let attestation_path = paths.attestation_file();
+    attest::save(&attestation_path, &attestation)
+        .with_context(|| format!("saving the attestation to {}", attestation_path.display()))?;
+
+    let expires_at = attestation.expires_at().unwrap_or_default();
+    println!("enrolled as {username}");
     println!("peer     {}", identity.peer_id());
     println!("server   {server_peer}");
     println!("services {service_addr}");
+    println!(
+        "attested for {}h, renewed automatically while `ac run` is up",
+        (expires_at - attest::now()).max(0) / 3600
+    );
     println!();
     println!("Compare that server peer id against what `ac-server init` printed. It is");
     println!("pinned now: a different server at the same address will fail to connect.");
@@ -73,9 +103,16 @@ async fn enroll(
     server: &Multiaddr,
     server_peer: PeerId,
     code: &str,
-) -> Result<(String, Vec<Multiaddr>)> {
-    let mut swarm =
-        build(identity, config, Role::Client, AcceptAnyPeer).context("building the swarm")?;
+    username: &str,
+) -> Result<(String, Vec<Multiaddr>, Attestation)> {
+    let mut swarm = build(
+        identity,
+        config,
+        Role::Client,
+        AcceptAnyPeer,
+        libp2p::swarm::dummy::Behaviour,
+    )
+    .context("building the swarm")?;
 
     swarm
         .dial(server.clone())
@@ -94,6 +131,7 @@ async fn enroll(
                             &server_peer,
                             EnrollRequest {
                                 code: code.to_owned(),
+                                username: username.to_owned(),
                             },
                         );
                     }
@@ -106,7 +144,11 @@ async fn enroll(
                     },
                 )) => {
                     return match response {
-                        EnrollResponse::Enrolled { label, service } => Ok((label, service)),
+                        EnrollResponse::Enrolled {
+                            username,
+                            service,
+                            attestation,
+                        } => Ok((username, service, attestation)),
                         EnrollResponse::Refused(reason) => Err(anyhow!("{}", reason.explain())),
                     };
                 }
