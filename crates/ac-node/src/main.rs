@@ -87,6 +87,13 @@ enum Command {
     /// change its membership — and only you can decide whether you take part in it.
     #[command(subcommand)]
     Group(GroupCommand),
+
+    /// Manage the files a group holds on this node.
+    ///
+    /// Content lives under the storage root, one directory per group. Nothing here talks to
+    /// the network: a file is added locally and shared later.
+    #[command(subcommand)]
+    File(FileCommand),
 }
 
 #[derive(Subcommand)]
@@ -140,6 +147,45 @@ enum GroupCommand {
     Forget { group: String },
 }
 
+#[derive(Subcommand)]
+enum FileCommand {
+    /// Copy files into a group. Directories need --recursive.
+    Add {
+        /// A group id, a unique prefix of one, or an exact name.
+        group: String,
+        /// One or more files, or directories with --recursive.
+        #[arg(required = true)]
+        source: Vec<PathBuf>,
+        /// Directory inside the group to put them in. Defaults to its root.
+        #[arg(long)]
+        to: Option<String>,
+        /// Exact path inside the group for a single source. Not with --to.
+        #[arg(long, conflicts_with = "to")]
+        r#as: Option<String>,
+        /// Add what is inside a directory, keeping its shape.
+        #[arg(long)]
+        recursive: bool,
+        /// Replace a path that already holds different content.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the files in a group.
+    List {
+        group: String,
+        /// Only paths starting with this.
+        prefix: Option<String>,
+        /// Include files that have been removed.
+        #[arg(long)]
+        removed: bool,
+    },
+    /// Show one file's details.
+    Show { group: String, path: String },
+    /// Remove a file: delete its bytes, and stop offering it.
+    Remove { group: String, path: String },
+    /// Check the index against what is actually on disk.
+    Verify { group: String },
+}
+
 fn main() -> Result<()> {
     init_tracing();
 
@@ -175,6 +221,32 @@ fn main() -> Result<()> {
         Command::Group(GroupCommand::Accept { group }) => cmd::group::accept(&paths, &group),
         Command::Group(GroupCommand::Leave { group }) => cmd::group::leave(&paths, &group),
         Command::Group(GroupCommand::Forget { group }) => cmd::group::forget(&paths, &group),
+        Command::File(FileCommand::Add {
+            group,
+            source,
+            to,
+            r#as,
+            recursive,
+            force,
+        }) => cmd::file::add(
+            &paths,
+            &group,
+            &source,
+            to.as_deref(),
+            r#as.as_deref(),
+            recursive,
+            force,
+        ),
+        Command::File(FileCommand::List {
+            group,
+            prefix,
+            removed,
+        }) => cmd::file::list(&paths, &group, prefix.as_deref(), removed),
+        Command::File(FileCommand::Show { group, path }) => cmd::file::show(&paths, &group, &path),
+        Command::File(FileCommand::Remove { group, path }) => {
+            cmd::file::remove(&paths, &group, &path)
+        }
+        Command::File(FileCommand::Verify { group }) => cmd::file::verify(&paths, &group),
     }
 }
 

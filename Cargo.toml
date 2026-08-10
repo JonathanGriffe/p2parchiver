@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/ac-groups", "crates/ac-net", "crates/ac-node", "crates/ac-server"]
+members = [
+    "crates/ac-files",
+    "crates/ac-groups",
+    "crates/ac-net",
+    "crates/ac-node",
+    "crates/ac-server",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +18,9 @@ ac-net = { path = "crates/ac-net" }
 # The application layer. Depends on `ac-net`, never the reverse — which is what lets the
 # group protocol live outside the networking crate and keeps `ac-server` free of it.
 ac-groups = { path = "crates/ac-groups" }
+# Content. Depends on `ac-groups` for the group id it files things under, never the reverse:
+# a group is a membership question and stays answerable with nothing stored.
+ac-files = { path = "crates/ac-files" }
 
 libp2p = { version = "0.56", features = [
     "ed25519", "serde", "macros", "tokio",

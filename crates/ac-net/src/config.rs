@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILENAME: &str = "config.toml";
 pub const DB_FILENAME: &str = "state.sqlite";
+pub const STORAGE_DIRNAME: &str = "files";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -102,6 +103,16 @@ impl Paths {
     pub fn attestation_file(&self) -> PathBuf {
         self.data_dir.join(super::attest::ATTESTATION_FILENAME)
     }
+
+    /// Where a node keeps the files it holds, absent a `storage_root` in the config.
+    ///
+    /// Under the data directory by default, so a fresh node needs no configuration and a
+    /// node rooted by `AC_HOME` keeps everything it owns beneath that one root. The default
+    /// is separate from the config because content is the one thing here likely to outgrow
+    /// its disk: [`Config::storage_root`] is what points it at a bigger one.
+    pub fn default_storage_root(&self) -> PathBuf {
+        self.data_dir.join(STORAGE_DIRNAME)
+    }
 }
 
 /// A node's on-disk settings.
@@ -159,6 +170,18 @@ pub struct Config {
     /// server that changed identity fails the dial rather than being trusted silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<Multiaddr>,
+
+    /// Where this node keeps the files it holds, overriding `<data_dir>/files`.
+    ///
+    /// Content is the one thing a node stores that can outgrow its disk, so it is the one
+    /// path worth pointing somewhere else — an external drive, a NAS mount, a larger volume.
+    ///
+    /// A relative path resolves against the **data directory**, never the working directory.
+    /// The CLI and the daemon are separate processes started from wherever the user happened
+    /// to be, and a root that moved with `cwd` would have them disagree about where a group's
+    /// files live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -169,6 +192,7 @@ impl Default for Config {
             external: Vec::new(),
             mdns: true,
             server: None,
+            storage_root: None,
         }
     }
 }
@@ -191,6 +215,19 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })
+    }
+
+    /// Where this node's files live, resolved against `paths`.
+    ///
+    /// The single answer to that question: every caller goes through here rather than reading
+    /// [`Self::storage_root`] directly, so the relative-path rule is applied once.
+    pub fn storage_root(&self, paths: &Paths) -> PathBuf {
+        match &self.storage_root {
+            // `join` with an absolute path discards the base, which is exactly the rule:
+            // absolute is taken as given, relative hangs off the data directory.
+            Some(root) => paths.data_dir.join(root),
+            None => paths.default_storage_root(),
+        }
     }
 
     /// Write the config file, creating parent directories as needed.
@@ -258,6 +295,7 @@ mod tests {
                     .parse()
                     .unwrap(),
             ),
+            storage_root: Some(PathBuf::from("/mnt/archive")),
         };
         config.save(&path).unwrap();
 
@@ -265,6 +303,55 @@ mod tests {
         assert_eq!(loaded.listen, config.listen);
         assert_eq!(loaded.external, config.external);
         assert_eq!(loaded.server, config.server);
+        assert_eq!(loaded.storage_root, config.storage_root);
+    }
+
+    #[test]
+    fn storage_root_defaults_under_the_data_directory() {
+        let paths = Paths::rooted_at("/tmp/ac-test-root");
+
+        assert_eq!(
+            Config::default().storage_root(&paths),
+            PathBuf::from("/tmp/ac-test-root/files")
+        );
+    }
+
+    #[test]
+    fn an_absolute_storage_root_is_taken_as_given() {
+        let paths = Paths::rooted_at("/tmp/ac-test-root");
+        let config = Config {
+            storage_root: Some(PathBuf::from("/mnt/archive")),
+            ..Config::default()
+        };
+
+        assert_eq!(config.storage_root(&paths), PathBuf::from("/mnt/archive"));
+    }
+
+    #[test]
+    fn a_relative_storage_root_hangs_off_the_data_directory() {
+        // Never off the working directory: the CLI and the daemon are started from wherever
+        // the user happened to be, and must agree on where a group's files live.
+        let paths = Paths::rooted_at("/tmp/ac-test-root");
+        let config = Config {
+            storage_root: Some(PathBuf::from("bulk")),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.storage_root(&paths),
+            PathBuf::from("/tmp/ac-test-root/bulk")
+        );
+    }
+
+    #[test]
+    fn a_config_without_a_storage_root_still_loads() {
+        // Every config written before this field existed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+        fs::write(&path, "mdns = false\n").unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.storage_root, None);
     }
 
     #[test]

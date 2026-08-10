@@ -1141,7 +1141,15 @@ mod tests {
             Err(StoreError::Quarantined { .. })
         ));
         assert!(matches!(
-            store.author(&admin, id, Op::Rename { name: "x".into() }, AT),
+            store.author(
+                &admin,
+                id,
+                Op::Add {
+                    peer: peer_of(&key()).to_base58(),
+                    username: "x".into(),
+                },
+                AT
+            ),
             Err(StoreError::Quarantined { .. })
         ));
     }

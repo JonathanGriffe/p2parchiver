@@ -102,9 +102,6 @@ pub enum Op {
     Remove {
         peer: String,
     },
-    Rename {
-        name: String,
-    },
 }
 
 /// An [`EntryBody`] and the admin's signature over its encoding.
@@ -290,13 +287,16 @@ impl Chain {
         self.entries.get(seq as usize).map(|e| e.hash)
     }
 
-    /// The latest name: the most recent `Rename`, else the one `Create` gave.
+    /// The name the genesis gave, which is the only name this group ever has.
+    ///
+    /// There is no rename: a group's name is fixed at creation. It is display text that also
+    /// names a directory on disk, and a name that could change would leave every holder's
+    /// storage layout to be reconciled against an entry arriving from the network.
     pub fn name(&self) -> &str {
         self.entries
-            .iter()
-            .rev()
-            .find_map(|e| match &e.body.op {
-                Op::Rename { name } | Op::Create { name, .. } => Some(name.as_str()),
+            .first()
+            .and_then(|e| match &e.body.op {
+                Op::Create { name, .. } => Some(name.as_str()),
                 _ => None,
             })
             .unwrap_or("")
@@ -349,7 +349,7 @@ impl Chain {
         removed_at
     }
 
-    /// Current membership: `Create`/`Add`/`Remove`/`Rename` applied in seq order.
+    /// Current membership: `Create`/`Add`/`Remove` applied in seq order.
     ///
     /// Standings do not enter this. A departure is a signal that prompts the admin to write a
     /// `Remove`; until then the chain still lists the member, and the member's own local state
@@ -376,7 +376,6 @@ impl Chain {
                         members.remove(&peer);
                     }
                 }
-                Op::Rename { .. } => {}
             }
         }
         members
@@ -460,7 +459,6 @@ impl Chain {
         // Everything below is now known to be what the admin signed.
         match &body.op {
             Op::Create { .. } => return Err(ChainError::SecondGenesis { seq }),
-            Op::Rename { name } => check_name(name, seq)?,
             Op::Add { peer, username } => {
                 let peer = parse_peer(peer, seq)?;
                 check_username(username, seq)?;
@@ -592,6 +590,15 @@ mod tests {
         Chain::create(admin, "family", "alice", [1u8; 16], AT).unwrap()
     }
 
+    /// A valid entry for tests about chaining itself, where which op it carries is beside the
+    /// point. Each call names a fresh peer, so repeated fillers are distinct entries.
+    fn filler() -> Op {
+        Op::Add {
+            peer: peer().to_base58(),
+            username: "bob".into(),
+        }
+    }
+
     #[test]
     fn a_group_is_named_by_the_hash_of_its_genesis() {
         let admin = key();
@@ -672,13 +679,7 @@ mod tests {
         let impostor = key();
 
         assert!(matches!(
-            chain.author(
-                &impostor,
-                Op::Rename {
-                    name: "theirs".into()
-                },
-                AT
-            ),
+            chain.author(&impostor, filler(), AT),
             Err(ChainError::NotAdmin)
         ));
     }
@@ -687,15 +688,7 @@ mod tests {
     fn a_gap_and_a_replay_are_both_refused() {
         let admin = key();
         let mut chain = group(&admin);
-        let e1 = chain
-            .author(
-                &admin,
-                Op::Rename {
-                    name: "second".into(),
-                },
-                AT,
-            )
-            .unwrap();
+        let e1 = chain.author(&admin, filler(), AT).unwrap();
 
         // Replaying an entry we already hold.
         assert!(matches!(
@@ -705,24 +698,8 @@ mod tests {
 
         // A batch that starts past our head.
         let mut ahead = group(&admin);
-        ahead
-            .author(
-                &admin,
-                Op::Rename {
-                    name: "second".into(),
-                },
-                AT,
-            )
-            .unwrap();
-        let far = ahead
-            .author(
-                &admin,
-                Op::Rename {
-                    name: "third".into(),
-                },
-                AT,
-            )
-            .unwrap();
+        ahead.author(&admin, filler(), AT).unwrap();
+        let far = ahead.author(&admin, filler(), AT).unwrap();
         let mut behind = group(&admin);
         assert!(matches!(
             behind.extend(&[far]),
@@ -734,15 +711,7 @@ mod tests {
     fn an_entry_from_another_group_is_refused() {
         let admin = key();
         let mut theirs = Chain::create(&admin, "other", "alice", [9u8; 16], AT).unwrap();
-        let foreign = theirs
-            .author(
-                &admin,
-                Op::Rename {
-                    name: "renamed".into(),
-                },
-                AT,
-            )
-            .unwrap();
+        let foreign = theirs.author(&admin, filler(), AT).unwrap();
 
         let mut ours = group(&admin);
         assert!(matches!(
@@ -949,15 +918,7 @@ mod tests {
         let mut chain = group(&admin);
         let good = {
             let mut scratch = group(&admin);
-            scratch
-                .author(
-                    &admin,
-                    Op::Rename {
-                        name: "second".into(),
-                    },
-                    AT,
-                )
-                .unwrap()
+            scratch.author(&admin, filler(), AT).unwrap()
         };
         let bad = Entry {
             body: b"not cbor".to_vec(),
@@ -1086,10 +1047,8 @@ mod tests {
     fn entries_between_bounds_both_ends() {
         let admin = key();
         let mut chain = group(&admin);
-        for name in ["a", "b", "c"] {
-            chain
-                .author(&admin, Op::Rename { name: name.into() }, AT)
-                .unwrap();
+        for _ in 0..3 {
+            chain.author(&admin, filler(), AT).unwrap();
         }
 
         assert_eq!(chain.entries_between(1, 3).count(), 2);

@@ -517,6 +517,7 @@ mod tests {
             external: Vec::new(),
             mdns: false,
             server: None,
+            storage_root: None,
         };
 
         let swarm = build(
@@ -541,6 +542,7 @@ mod tests {
             external: Vec::new(),
             mdns: false,
             server: None,
+            storage_root: None,
         };
 
         assert!(matches!(

@@ -1,0 +1,26 @@
+[package]
+name = "ac-files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ac-net.workspace = true
+ac-groups.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Deliberately absent: `tokio` (this crate has no async), and `anyhow` (a library returns
+# typed errors; the binaries add context). Also `libp2p` beyond what `ac-net` re-exports —
+# nothing here names a networking type, and `tests/layering.rs` holds that.
+
+[dev-dependencies]
+tempfile = "3"
+# Tests need to mint peer ids. The crate itself takes `PeerId` from `ac-net`.
+libp2p.workspace = true
+
+[lints]
+workspace = true

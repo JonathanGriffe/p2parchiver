@@ -524,8 +524,9 @@ fn a_local_change_is_announced_on_the_next_tick() {
         .author(
             &admin.key,
             id,
-            Op::Rename {
-                name: "the family".into(),
+            Op::Add {
+                peer: peer_of(&key()).to_base58(),
+                username: "carol".into(),
             },
             AT,
         )

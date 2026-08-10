@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "ac-files"
+version = "0.1.0"
+dependencies = [
+ "ac-groups",
+ "ac-net",
+ "hex",
+ "libp2p",
+ "rusqlite",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "ac-groups"
 version = "0.1.0"
 dependencies = [
@@ -38,6 +53,7 @@ dependencies = [
 name = "ac-node"
 version = "0.1.0"
 dependencies = [
+ "ac-files",
  "ac-groups",
  "ac-net",
  "anyhow",

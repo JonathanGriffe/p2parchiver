@@ -570,11 +570,28 @@ mod tests {
         Keypair::generate_ed25519().public().to_peer_id()
     }
 
+    /// A writable path for an [`Admission`]'s attestation cache.
+    ///
+    /// A relative path here would be written **into the source tree**: renewal calls
+    /// `attest::save`, and `cargo test` runs with the working directory set to the crate
+    /// root. One shared directory for the whole test binary, rather than one per helper,
+    /// because [`Admission`] is returned by value and a per-call `TempDir` would be dropped —
+    /// deleting the directory — before the test ever ran.
+    fn scratch() -> PathBuf {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let dir = DIR.get_or_init(|| tempfile::tempdir().expect("a scratch directory"));
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        dir.path()
+            .join(format!("{n}-{}", attest::ATTESTATION_FILENAME))
+    }
+
     /// An [`Admission`] holding no attestation. Enough for anything that does not put one on
     /// the wire.
     fn admission() -> Admission {
         Admission {
-            path: PathBuf::from("attestation.cbor"),
+            path: scratch(),
             me: peer(),
             server: Some(peer()),
             mine: None,
@@ -590,7 +607,7 @@ mod tests {
         let mine = Attestation::issue(&server_key, &me, "us", AT, Duration::from_secs(86_400))
             .expect("issue");
         let admission = Admission {
-            path: PathBuf::from("attestation.cbor"),
+            path: scratch(),
             me,
             server: Some(server_key.public().to_peer_id()),
             mine: Some(mine),

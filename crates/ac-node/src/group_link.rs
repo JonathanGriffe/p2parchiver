@@ -345,6 +345,7 @@ mod tests {
                 external: Vec::new(),
                 mdns: false,
                 server: None,
+                storage_root: None,
             };
 
             Self {
@@ -468,8 +469,12 @@ mod tests {
                 chain
                     .author(
                         key,
-                        Op::Rename {
-                            name: format!("family {i}"),
+                        Op::Add {
+                            peer: libp2p::identity::Keypair::generate_ed25519()
+                                .public()
+                                .to_peer_id()
+                                .to_base58(),
+                            username: format!("filler{i}"),
                         },
                         AT,
                     )

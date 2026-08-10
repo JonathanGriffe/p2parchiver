@@ -11,62 +11,15 @@
 //! unseen until someone connects.
 
 use ac_groups::chain::Op;
-use ac_groups::id::GroupId;
-use ac_groups::store::{GroupRow, Groups, Resolved, State};
+use ac_groups::store::{GroupRow, State};
 use ac_net::PeerId;
 use ac_net::attest;
 use ac_net::config::Paths;
 use ac_net::identity::Identity;
 use anyhow::{Context, Result, anyhow, bail};
 
+use super::{now, open, open_files, resolve};
 use crate::contacts::Contacts;
-
-/// Unix seconds, for the `at` field of anything we sign. Advisory and never validated — see
-/// `ac_groups::chain`.
-fn now() -> i64 {
-    attest::now()
-}
-
-/// This node's identity and its group store.
-fn open(paths: &Paths) -> Result<(Identity, Groups)> {
-    let key_path = paths.identity_file();
-    let (identity, _) = Identity::load_or_generate(&key_path)
-        .with_context(|| format!("loading identity from {}", key_path.display()))?;
-
-    let db = paths.db_file();
-    let groups = Groups::open(&db, identity.peer_id())
-        .with_context(|| format!("opening the group store at {}", db.display()))?;
-
-    Ok((identity, groups))
-}
-
-/// Turn what the user typed into one group, or explain why it was not one.
-///
-/// Returns the row as well as the id: resolving already proved the group is there, and
-/// handing back only an id would leave every caller re-reading it and re-handling a `None`
-/// that cannot happen.
-fn resolve(groups: &Groups, needle: &str) -> Result<(GroupId, GroupRow)> {
-    match groups.resolve(needle).context("looking up the group")? {
-        Resolved::One(id) => {
-            let row = groups
-                .get(id)
-                .context("reading the group")?
-                .ok_or_else(|| anyhow!("group {needle:?} vanished while being read"))?;
-            Ok((id, row))
-        }
-        Resolved::None => Err(anyhow!(
-            "no group matches {needle:?}; `ac group list` shows what this node holds"
-        )),
-        Resolved::Ambiguous(ids) => {
-            let names: Vec<String> = ids.iter().map(|id| id.short()).collect();
-            Err(anyhow!(
-                "{needle:?} matches {} groups ({}); use a longer id",
-                ids.len(),
-                names.join(", ")
-            ))
-        }
-    }
-}
 
 pub fn create(paths: &Paths, name: &str) -> Result<()> {
     let (identity, mut groups) = open(paths)?;
@@ -326,11 +279,27 @@ pub fn forget(paths: &Paths, needle: &str) -> Result<()> {
     let (id, row) = resolve(&groups, needle)?;
     let admin = row.admin == identity.peer_id();
 
+    // The index goes; the bytes stay. Forgetting a group is a local bookkeeping act, and
+    // deleting someone's photos as a side effect of it is not something to do unasked.
+    let (mut files, content) = open_files(paths, &identity)?;
+    let held = files.list(id, None, false).unwrap_or_default().len();
+    let dir = files.dir_of(id).ok().flatten();
+    files
+        .forget_group(id)
+        .with_context(|| format!("forgetting the files of {needle}"))?;
+
     groups
         .forget(id)
         .with_context(|| format!("forgetting {needle}"))?;
 
     println!("forgot {} locally", row.name);
+    if held > 0 {
+        println!();
+        println!("{held} file(s) were left on disk, no longer indexed:");
+        if let Some(dir) = dir {
+            println!("  {}", content.group_dir(&dir).display());
+        }
+    }
     if admin {
         println!();
         println!("You were this group's admin, so nobody can change its membership again.");
@@ -367,6 +336,5 @@ fn describe(op: &Op) -> String {
         Op::Create { name, admin, .. } => format!("created {name:?} by {admin}"),
         Op::Add { peer, username } => format!("added {username} ({peer})"),
         Op::Remove { peer } => format!("removed {peer}"),
-        Op::Rename { name } => format!("renamed to {name:?}"),
     }
 }

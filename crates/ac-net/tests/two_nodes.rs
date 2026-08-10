@@ -50,6 +50,7 @@ fn loopback_config() -> Config {
         external: Vec::new(),
         mdns: false,
         server: None,
+        storage_root: None,
     }
 }
 
