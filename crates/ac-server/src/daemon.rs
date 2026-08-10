@@ -5,6 +5,7 @@
 //! the authorizer — here, the enrollment database.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use libp2p::futures::StreamExt;
@@ -131,8 +132,19 @@ pub async fn run(
     // displace the connection it replaced rather than waiting for a timeout to notice.
     let mut links = ServiceLinks::default();
 
+    // Relay use, reported once per sweep rather than per circuit.
+    let mut meter = RelayMeter::default();
+
+    let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
+            _ = tick.tick() => {
+                disconnect_revoked(&mut swarm, &store);
+                meter.report();
+            }
+
             event = swarm.select_next_some() => {
                 // Inspected before dispatch: closing a superseded connection needs the
                 // swarm, which the reporting path deliberately does not get.
@@ -159,7 +171,7 @@ pub async fn run(
                     // Enrolment cannot arrive here — the service listener does not speak
                     // it — so the only events needing the swarm are relay grants.
                     SwarmEvent::Behaviour(AcBehaviourEvent::Relay(event)) => {
-                        on_relay(event);
+                        on_relay(&mut meter, event);
                     }
                     // Renewal. Lives on this listener precisely because it admits enrolled
                     // peers only: the connection is the credential, so there is nothing to
@@ -340,14 +352,101 @@ fn on_enroll(
 /// client that is already enrolled. The previous reactive gate — grant, notice, disconnect
 /// — existed solely because one listener had to admit strangers so they could enrol.
 ///
-/// # What milestone 2 changes
+/// # How a stale authorization is bounded
 ///
-/// Enrolment is checked when the connection is made and not again. Today a circuit dies
-/// after 128 KiB or two minutes, so a stale authorization cannot outlive much. Raise that
-/// cap to carry a gigabyte over an hour and a peer revoked mid-transfer keeps relaying for
-/// the rest of it, because nothing re-asks. Periodically re-checking live circuits is the
-/// requirement that arrives with media.
-fn on_relay(event: relay::Event) {
+/// Enrolment is checked when the connection is made and not again, so on its own a circuit
+/// could outlive the permission that allowed it. Two things bound that. A circuit dies after
+/// `MAX_CIRCUIT_BYTES` or `MAX_CIRCUIT_DURATION` regardless, and [`disconnect_revoked`] closes
+/// a revoked client's connection — and with it every circuit riding on that connection —
+/// within one housekeeping tick.
+///
+/// That is enough for a relay sized to coordinate. It would not be enough for one carrying
+/// media: an hour-long circuit needs re-authorization *during* the transfer, not only at its
+/// start and end.
+/// How often the server sweeps: enforcing revocation, and reporting relay use.
+///
+/// The CLI writes to the store and this process holds the swarm, so anything the CLI decides
+/// reaches the network on the next sweep. Five seconds is the same cadence `ac` uses, and it
+/// is the bound on how long a revoked client keeps a connection it is no longer entitled to.
+const HOUSEKEEPING_TICK: Duration = Duration::from_secs(5);
+
+/// Circuits opened per client since the last report.
+///
+/// # Why counting circuits is enough
+///
+/// `relay::Event` reports no byte counts, so there is nothing to sum. There does not need to
+/// be: a circuit is capped at `MAX_CIRCUIT_BYTES` and a client is rate-limited to
+/// `CIRCUITS_PER_PEER_PER_WINDOW` of them, so a count multiplied by the cap is already an
+/// upper bound on what a client cost us. That bound is what the limits enforce; this is how an
+/// operator sees whether anyone is approaching it.
+#[derive(Default)]
+struct RelayMeter {
+    opened: HashMap<PeerId, u32>,
+    closed: u32,
+}
+
+impl RelayMeter {
+    fn opened(&mut self, src: PeerId) {
+        *self.opened.entry(src).or_default() += 1;
+    }
+
+    fn closed(&mut self) {
+        self.closed += 1;
+    }
+
+    /// Log what happened this window and start a fresh one.
+    ///
+    /// Silent when nothing was relayed, so an idle server does not fill its log with zeroes —
+    /// which is what would make the non-zero lines easy to miss.
+    fn report(&mut self) {
+        if self.opened.is_empty() && self.closed == 0 {
+            return;
+        }
+
+        let total: u32 = self.opened.values().sum();
+        let busiest = self
+            .opened
+            .iter()
+            .max_by_key(|(_, n)| **n)
+            .map(|(peer, n)| (*peer, *n));
+
+        match busiest {
+            Some((peer, n)) => tracing::info!(
+                circuits_opened = total,
+                circuits_closed = self.closed,
+                clients = self.opened.len(),
+                busiest_client = %peer,
+                busiest_circuits = n,
+                "relay use"
+            ),
+            None => tracing::info!(circuits_closed = self.closed, "relay use"),
+        }
+
+        self.opened.clear();
+        self.closed = 0;
+    }
+}
+
+/// Close connections held by clients revoked since they connected.
+///
+/// Enrolment is checked when a connection is established and never again, so without this a
+/// revoked client keeps whatever it already holds — including live circuits — until it
+/// disconnects on its own. `ac-server client revoke` runs in a different process and holds no
+/// swarm, so it can only write to the store; this is the half that acts on it.
+fn disconnect_revoked(swarm: &mut ServiceSwarm, store: &Store) {
+    let revoked: Vec<PeerId> = swarm
+        .connected_peers()
+        .copied()
+        .filter(|peer| store.is_revoked(peer))
+        .collect();
+
+    for peer in revoked {
+        tracing::warn!(%peer, "revoked; closing the connection and any circuits on it");
+        let _ = swarm.disconnect_peer_id(peer);
+    }
+}
+
+fn on_relay(meter: &mut RelayMeter, event: relay::Event) {
     match event {
         relay::Event::ReservationReqAccepted {
             src_peer_id,
@@ -359,8 +458,10 @@ fn on_relay(event: relay::Event) {
             src_peer_id,
             dst_peer_id,
         } => {
+            meter.opened(src_peer_id);
             tracing::info!(src = %src_peer_id, dst = %dst_peer_id, "relay circuit opened");
         }
+        relay::Event::CircuitClosed { .. } => meter.closed(),
         other => tracing::debug!(?other, "relay event"),
     }
 }
@@ -569,6 +670,36 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<Enrolled, NoApp>>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_relay_meter_reports_then_starts_a_fresh_window() {
+        // A window that did not reset would make every report cumulative, so a busy minute an
+        // hour ago would look like a busy minute now — the opposite of what an operator
+        // watching for abuse needs.
+        let mut meter = RelayMeter::default();
+        let noisy = peer();
+
+        meter.opened(noisy);
+        meter.opened(noisy);
+        meter.opened(peer());
+        meter.closed();
+
+        assert_eq!(meter.opened.len(), 2, "two distinct clients");
+        assert_eq!(meter.opened[&noisy], 2);
+
+        meter.report();
+
+        assert!(meter.opened.is_empty(), "the window starts over");
+        assert_eq!(meter.closed, 0);
+    }
+
+    #[test]
+    fn an_idle_meter_reports_nothing() {
+        // An idle server logging a zero every five seconds buries the lines that matter.
+        let mut meter = RelayMeter::default();
+        meter.report();
+        assert!(meter.opened.is_empty());
+    }
     use super::*;
 
     #[test]

@@ -10,9 +10,14 @@
 //! access list that is out of date means a member returning from an absence can be
 //! refused by peers that have not heard of them yet.
 //!
-//! Entries are added by hand and only by hand. When groups arrive, a group's signed
-//! membership log is itself the record of who belongs, and discovery reads that log
-//! directly rather than copying peers in here — one fact, one place.
+//! Entries are added by hand and only by hand. Groups have since arrived, and a group's
+//! signed membership log — `ac_groups::chain` — is now the record of who belongs. Discovery
+//! should read that log directly rather than copying its peers in here: one fact, one place.
+//! It does not yet, because discovery itself is not wired up; when it is, this list narrows to
+//! what it is actually for, which is peers a person named who are in no group.
+//!
+//! Note that the two are not redundant even once that lands. Membership says who belongs;
+//! this says who to go looking for. A group of two hundred does not mean two hundred dials.
 
 use std::path::Path;
 
@@ -41,7 +46,7 @@ impl Contacts {
     }
 
     #[cfg(test)]
-    fn in_memory() -> rusqlite::Result<Self> {
+    pub(crate) fn in_memory() -> rusqlite::Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
@@ -49,6 +54,10 @@ impl Contacts {
         // WAL lets `ac peer add` write while `ac run` reads, which is the whole point of
         // querying SQLite live rather than caching in the daemon.
         db.pragma_update(None, "journal_mode", "WAL")?;
+        // This file is shared with the group tables, which the *daemon* writes on every
+        // ingest — so two processes can now genuinely collide here. Without a timeout that is
+        // an immediate `SQLITE_BUSY` rather than a short wait.
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS contacts (
                  peer_id TEXT PRIMARY KEY NOT NULL,

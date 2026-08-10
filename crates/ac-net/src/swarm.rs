@@ -28,6 +28,7 @@
 //! the boundary that keeps the group layer — and whatever follows it — out of the networking
 //! crate. `tests/app_slot.rs` exercises it with a protocol defined outside `ac-net`.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use libp2p::request_response::{self, ProtocolSupport};
@@ -131,7 +132,7 @@ pub struct AcBehaviour<A: PeerAuthorizer, X: NetworkBehaviour> {
     pub identify: identify::Behaviour,
     /// Liveness and round-trip time — and, less obviously, the NAT keepalive.
     ///
-    /// See [`PING_INTERVAL`]: this is the only traffic a quiet connection carries, so it
+    /// See `PING_INTERVAL`: this is the only traffic a quiet connection carries, so it
     /// is what keeps a UDP mapping open and what determines how fast a dead peer is
     /// noticed. Both are consequences of a setting whose name mentions neither.
     pub ping: ping::Behaviour,
@@ -158,14 +159,9 @@ pub struct AcBehaviour<A: PeerAuthorizer, X: NetworkBehaviour> {
 
     /// Circuit relay v2, server side. Off on clients.
     ///
-    /// Left at libp2p's defaults, which cap a circuit at 128 KiB over 2 minutes with
-    /// per-peer and per-IP rate limits. That is deliberate: the relay here is a
-    /// *coordination* service, sized for DCUtR to agree on a hole punch, not a data pipe.
-    /// Enrolment is enforced reactively on `ReservationReqAccepted` rather than by
-    /// withholding the protocol, because at 128 KiB there is little worth stealing.
-    ///
-    /// Raising this cap to carry media in milestone 2 is the moment that stops being
-    /// true, and the moment stronger gating has to arrive with it.
+    /// Configured explicitly by `relay_config` rather than left at libp2p's defaults,
+    /// because the numbers are now load-bearing: they are what bounds a client's claim on
+    /// this server's bandwidth.
     pub relay: Toggle<relay::Behaviour>,
 
     /// Rendezvous server: the address directory. Off on clients.
@@ -343,9 +339,7 @@ impl<A: PeerAuthorizer, X: NetworkBehaviour> AcBehaviour<A, X> {
                     request_response::Config::default(),
                 )
             })),
-            relay: Toggle::from(
-                is_server.then(|| relay::Behaviour::new(peer_id, relay::Config::default())),
-            ),
+            relay: Toggle::from(is_server.then(|| relay::Behaviour::new(peer_id, relay_config()))),
             rendezvous: Toggle::from(is_server.then(|| {
                 rendezvous::server::Behaviour::new(rendezvous::server::Config::default())
             })),
@@ -364,6 +358,85 @@ impl<A: PeerAuthorizer, X: NetworkBehaviour> AcBehaviour<A, X> {
         }
     }
 }
+
+/// How much relaying one client may ask this server to do.
+///
+/// # Why these are explicit
+///
+/// The relay is a **coordination** service — sized for DCUtR to agree on a hole punch, not a
+/// data pipe — and libp2p's defaults happened to express that. Once any of these numbers is
+/// deliberately chosen, all of them become load-bearing, because they multiply: bytes per
+/// circuit is only a bound on a client's cost if the number of circuits it may open is also
+/// bounded. Inheriting one while tuning another is how a per-circuit cap turns into no cap.
+///
+/// The bound this yields is arithmetic rather than something to measure:
+///
+/// > per-peer bandwidth ≤ `MAX_CIRCUIT_BYTES × CIRCUITS_PER_PEER_PER_WINDOW / RATE_WINDOW`
+///
+/// which is why there is no byte accounting anywhere: `relay::Event` reports no byte counts,
+/// and with circuits individually capped and rate-limited, none is needed to hold the bound.
+fn relay_config() -> relay::Config {
+    relay::Config {
+        max_circuit_bytes: MAX_CIRCUIT_BYTES,
+        max_circuit_duration: MAX_CIRCUIT_DURATION,
+        max_circuits: MAX_CIRCUITS,
+        max_circuits_per_peer: MAX_CIRCUITS_PER_PEER,
+        ..relay::Config::default()
+    }
+    .circuit_src_per_peer(CIRCUITS_PER_PEER_PER_WINDOW, RATE_WINDOW)
+}
+
+/// Data one circuit may carry before it is closed.
+///
+/// Sized to [`crate::limits`]-style reasoning rather than to a transfer: the largest thing the
+/// protocol legitimately sends over a circuit is a group chain, capped at 1 MiB by
+/// `ac_groups::wire`. Matching that removes the relay as the binding constraint on how much
+/// history a group may accumulate, which at 128 KiB it was — and by a factor of eight.
+///
+/// It is **not** sized to carry media. Doing that needs live re-authorization of circuits,
+/// because enrolment is checked when a connection is established and a long circuit would
+/// outlive its own authorization.
+const MAX_CIRCUIT_BYTES: u64 = 1024 * 1024;
+
+/// Wall-clock ceiling on one circuit, independent of bytes. A slow trickle is still a held
+/// resource.
+const MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(120);
+
+/// Circuits in flight across all clients.
+const MAX_CIRCUITS: usize = 16;
+
+/// Circuits in flight for one client.
+const MAX_CIRCUITS_PER_PEER: usize = 4;
+
+/// Circuits one client may *open* per [`RATE_WINDOW`].
+///
+/// This is the term that turns a per-circuit cap into a per-client budget. Without it a client
+/// can reopen a capped circuit as fast as it likes and the cap bounds nothing.
+const CIRCUITS_PER_PEER_PER_WINDOW: NonZeroU32 = NonZeroU32::new(8).expect("nonzero");
+
+/// Window for [`CIRCUITS_PER_PEER_PER_WINDOW`]. With the constants above, one client's ceiling
+/// is 8 MiB per minute, and the whole server's is bounded by `MAX_CIRCUITS` besides.
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+// Checked at compile time rather than in tests, matching [`crate::limits`]: these are
+// relationships between constants, so a bad edit should fail the build.
+
+/// The budget only bounds anything as a *product*. Bytes per circuit limits a client's cost
+/// only if how often it may open one is limited too — inheriting one of these from libp2p's
+/// defaults while choosing the other is how a per-circuit cap silently becomes no cap.
+const _: () = assert!(
+    MAX_CIRCUIT_BYTES * CIRCUITS_PER_PEER_PER_WINDOW.get() as u64 == 8 * 1024 * 1024,
+    "one client's ceiling is 8 MiB per window; if that changed, it was not by accident"
+);
+
+/// One client must not be able to take every circuit on the server.
+const _: () = assert!(MAX_CIRCUITS_PER_PEER < MAX_CIRCUITS);
+
+/// Past a megabyte this stops being a coordination service. A circuit that long outlives the
+/// authorization it was opened under, which is only re-checked when a connection is
+/// established and on the server's sweep — carrying media needs re-authorization *during* a
+/// transfer, not just around it.
+const _: () = assert!(MAX_CIRCUIT_BYTES <= 1024 * 1024);
 
 /// Build a swarm and start listening on the configured addresses.
 ///
@@ -422,6 +495,7 @@ pub fn build<A: PeerAuthorizer, X: NetworkBehaviour>(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn test_identity() -> Identity {

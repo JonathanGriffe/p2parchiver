@@ -1,3 +1,4 @@
+pub mod group;
 pub mod id;
 pub mod join;
 pub mod peer;

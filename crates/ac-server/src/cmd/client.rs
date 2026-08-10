@@ -43,10 +43,11 @@ pub fn revoke(paths: &Paths, peer: &PeerId) -> Result<()> {
 
     if revoked {
         println!("revoked {peer}");
-        // Denial runs when a connection is established, so one already open survives
-        // until it ends on its own. What matters is that the peer cannot reconnect, and
-        // from stage 6 cannot renew a relay reservation or rendezvous registration.
-        println!("takes effect on their next connection; an open one may persist briefly");
+        // A running server sweeps for this on its housekeeping tick and closes whatever the
+        // peer still holds, circuits included. Said in seconds rather than "immediately"
+        // because this process only writes the store — the daemon is what acts on it, and if
+        // none is running the change takes effect when one next starts.
+        println!("a running server drops their connection within a few seconds");
         // Worth saying, because a revoked peer cannot reach enrolment either: issuing
         // them a fresh invite will not work, and the failure looks like a network fault.
         println!("to reverse this later: ac-server client unrevoke {peer}");

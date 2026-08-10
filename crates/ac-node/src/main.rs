@@ -10,6 +10,8 @@
 mod cmd;
 mod contacts;
 mod daemon;
+mod directory;
+mod group_link;
 
 use std::path::PathBuf;
 
@@ -43,7 +45,7 @@ enum Command {
 
     /// Enrol with a server by redeeming an invite code.
     Join {
-        /// The server's address, ending in /p2p/<peer-id>.
+        /// The server's address, ending in `/p2p/<peer-id>`.
         server: Multiaddr,
         /// The invite code, as issued by `ac-server invite new`.
         code: String,
@@ -78,6 +80,13 @@ enum Command {
     /// obtain is decided per group.
     #[command(subcommand)]
     Peer(PeerCommand),
+
+    /// Manage groups: who this node shares with.
+    ///
+    /// A group is a signed log, not a local list. Only the node that created a group can
+    /// change its membership — and only you can decide whether you take part in it.
+    #[command(subcommand)]
+    Group(GroupCommand),
 }
 
 #[derive(Subcommand)]
@@ -93,6 +102,42 @@ enum PeerCommand {
     Remove { peer: PeerId },
     /// Show every contact.
     List,
+}
+
+#[derive(Subcommand)]
+enum GroupCommand {
+    /// Create a group. This node becomes its sole, permanent admin.
+    Create {
+        #[arg(long)]
+        name: String,
+    },
+    /// Show every group this node holds.
+    List,
+    /// Show one group's members, and optionally its whole log.
+    Show {
+        /// A group id, a unique prefix of one, or an exact name.
+        group: String,
+        /// Also print every entry in the log.
+        #[arg(long)]
+        log: bool,
+    },
+    /// Invite a peer. Admin only.
+    Add {
+        group: String,
+        peer: PeerId,
+        /// What to call them. Defaults to their contact label if they have one.
+        #[arg(long)]
+        username: Option<String>,
+    },
+    /// Remove a member. Admin only.
+    Remove { group: String, peer: PeerId },
+    /// Take part in a group you have been invited to, or rejoin one you left.
+    Accept { group: String },
+    /// Stop taking part, and tell the others. Aliased as `decline` for an invitation.
+    #[command(alias = "decline")]
+    Leave { group: String },
+    /// Drop a group from this node only, telling nobody.
+    Forget { group: String },
 }
 
 fn main() -> Result<()> {
@@ -116,6 +161,20 @@ fn main() -> Result<()> {
         Command::Peer(PeerCommand::Add { peer, label }) => cmd::peer::add(&paths, &peer, &label),
         Command::Peer(PeerCommand::Remove { peer }) => cmd::peer::remove(&paths, &peer),
         Command::Peer(PeerCommand::List) => cmd::peer::list(&paths),
+        Command::Group(GroupCommand::Create { name }) => cmd::group::create(&paths, &name),
+        Command::Group(GroupCommand::List) => cmd::group::list(&paths),
+        Command::Group(GroupCommand::Show { group, log }) => cmd::group::show(&paths, &group, log),
+        Command::Group(GroupCommand::Add {
+            group,
+            peer,
+            username,
+        }) => cmd::group::add(&paths, &group, &peer, username.as_deref()),
+        Command::Group(GroupCommand::Remove { group, peer }) => {
+            cmd::group::remove(&paths, &group, &peer)
+        }
+        Command::Group(GroupCommand::Accept { group }) => cmd::group::accept(&paths, &group),
+        Command::Group(GroupCommand::Leave { group }) => cmd::group::leave(&paths, &group),
+        Command::Group(GroupCommand::Forget { group }) => cmd::group::forget(&paths, &group),
     }
 }
 

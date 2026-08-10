@@ -9,12 +9,14 @@
 // daemon down. In tests a panic *is* the failure report, so let them through.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod admission;
 pub mod attest;
 pub mod authz;
 pub mod config;
 pub mod connectivity;
 pub mod identity;
 pub mod limits;
+pub mod link;
 pub mod proto;
 pub mod swarm;
 
