@@ -179,15 +179,32 @@ fn step(
 }
 
 /// Connect two nodes and let them sync to quiescence. `a` is [`Side::A`].
+/// Verify both ways and let each side offer, as the supervisor does on a fresh connection.
+///
+/// The offer is seeded here rather than produced by `PeerVerified`, because deciding *when* to
+/// talk to a peer belongs to `ac-peers` — this machine only decides what to say. Playing that
+/// part explicitly is what keeps these tests about the chain rules.
 fn connect(a: &mut Node, b: &mut Node) -> Vec<Notice> {
-    let from_a = a.verify(b.peer());
-    let from_b = b.verify(a.peer());
+    a.verify(b.peer());
+    b.verify(a.peer());
 
-    let seed = from_a
-        .into_iter()
-        .map(|x| (Side::A, x))
-        .chain(from_b.into_iter().map(|x| (Side::B, x)))
-        .collect();
+    let (peer_a, peer_b) = (a.peer(), b.peer());
+    let seed = vec![
+        (
+            Side::A,
+            GroupAction::Offer {
+                peer: peer_b,
+                heads: a.sync.heads_for(&peer_b),
+            },
+        ),
+        (
+            Side::B,
+            GroupAction::Offer {
+                peer: peer_a,
+                heads: b.sync.heads_for(&peer_a),
+            },
+        ),
+    ];
     settle(a, b, seed)
 }
 
@@ -244,19 +261,23 @@ fn join(admin: &mut Node, member: &mut Node, id: GroupId) {
 }
 
 #[test]
-fn verification_offers_exactly_the_shared_groups() {
-    let (mut admin, member, id) = admin_and_member();
+fn an_offer_names_exactly_the_shared_groups() {
+    // `shared_with` is the only thing allowed to build a head bound for a peer, and this is
+    // what it comes to: a member is named the group, a stranger is named nothing at all — not
+    // even that it exists.
+    let (admin, member, id) = admin_and_member();
     let stranger = Node::new();
 
-    let to_member = admin.verify(member.peer());
-    assert_eq!(offers(&to_member), vec![(member.peer(), vec![id])]);
-
-    let to_stranger = admin.verify(stranger.peer());
     assert_eq!(
-        offers(&to_stranger),
-        vec![(stranger.peer(), vec![])],
-        "a non-member is named nothing, not even that the group exists"
+        admin
+            .sync
+            .heads_for(&member.peer())
+            .iter()
+            .map(|h| h.group)
+            .collect::<Vec<_>>(),
+        vec![id]
     );
+    assert!(admin.sync.heads_for(&stranger.peer()).is_empty());
 }
 
 #[test]
@@ -509,34 +530,6 @@ fn a_non_admin_notes_a_departure_but_does_not_ratify_it() {
         head_before,
         "a non-admin appends nothing"
     );
-}
-
-#[test]
-fn a_local_change_is_announced_on_the_next_tick() {
-    // `ac group add` runs in another process; SQLite is the only channel between them.
-    let (mut admin, member, id) = admin_and_member();
-    admin.verify(member.peer());
-    admin.tick(); // settle the baseline
-
-    admin
-        .sync
-        .store_mut()
-        .author(
-            &admin.key,
-            id,
-            Op::Add {
-                peer: peer_of(&key()).to_base58(),
-                username: "carol".into(),
-            },
-            AT,
-        )
-        .unwrap();
-
-    let actions = admin.tick();
-    assert_eq!(offers(&actions), vec![(member.peer(), vec![id])]);
-
-    let quiet = admin.tick();
-    assert!(offers(&quiet).is_empty(), "announced once, not every tick");
 }
 
 #[test]

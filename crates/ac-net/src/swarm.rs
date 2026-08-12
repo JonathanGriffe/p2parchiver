@@ -45,7 +45,8 @@ use crate::identity::Identity;
 use crate::limits;
 use crate::proto::{
     ATTEST_PROTOCOL, AttestRequest, AttestResponse, ENROLL_PROTOCOL, EnrollRequest, EnrollResponse,
-    PEER_ATTEST_PROTOCOL, PeerAttestRequest, PeerAttestResponse,
+    PEER_ATTEST_PROTOCOL, PRESENCE_PROTOCOL, PeerAttestRequest, PeerAttestResponse,
+    PresenceRequest, PresenceResponse,
 };
 
 /// How long a connection with no active streams is held open.
@@ -69,6 +70,15 @@ const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 /// dead peer is noticed only when a ping times out. Raising this slows reconnection by
 /// roughly the same amount.
 const PING_INTERVAL: Duration = Duration::from_secs(25);
+
+/// Largest presence message either side will decode.
+///
+/// Set explicitly rather than left at the codec's 1 MiB request and 10 MiB response, which
+/// are both absurd for a list of peer ids. `MAX_PRESENCE_QUERY` peer ids come to roughly
+/// 11 KiB, so this is comfortable room and still bounds what one request can allocate on
+/// the server — `request_response` buffers whole messages. `proto`'s
+/// `a_full_presence_query_fits_the_request_ceiling` holds the two numbers together.
+pub const MAX_PRESENCE_BYTES: u64 = 32 * 1024;
 
 /// Which side of the network this process is. Fixed by the binary, not by config.
 ///
@@ -148,6 +158,18 @@ pub struct AcBehaviour<A: PeerAuthorizer, X: NetworkBehaviour> {
     /// revocation self-enforcing: that listener admits enrolled peers only, so a revoked
     /// client cannot ask for a fresh attestation and the one it holds simply expires.
     pub attest: Toggle<request_response::cbor::Behaviour<AttestRequest, AttestResponse>>,
+
+    /// `/ac/presence/1.0.0` — "which of these peers are connected to you?". Outbound on a
+    /// client, inbound on the service listener, absent on enrolment.
+    ///
+    /// The same shape as [`AcBehaviour::attest`] and gated by the same thing: the service
+    /// listener admits enrolled peers only, so the connection is the credential.
+    ///
+    /// Why it lives here rather than in the supervisor that asks: the question is *can we talk
+    /// to this peer*, which is what this crate is for, and putting it in `ac-peers` would mean
+    /// the server compiling the group and file model to answer it. See
+    /// [`crate::proto::PRESENCE_PROTOCOL`] for what it discloses.
+    pub presence: Toggle<request_response::cbor::Behaviour<PresenceRequest, PresenceResponse>>,
 
     /// `/ac/peer-attest/1.0.0` — the mutual check between two clients. Clients only.
     ///
@@ -290,11 +312,12 @@ impl<A: PeerAuthorizer, X: NetworkBehaviour> AcBehaviour<A, X> {
             Role::Server => None,
         };
 
-        // The mirror image of enrolment: a client only ever asks for an attestation, and
-        // only the service listener issues one. The enrolment listener is deliberately left
-        // out — it hands over the *first* attestation inside the enrolment reply, and a peer
-        // that has not enrolled has nothing to renew.
-        let attest_direction = match role {
+        // The mirror image of enrolment, and shared by both of the service listener's
+        // protocols: a client only ever asks for an attestation or for who is online, and
+        // only the service listener answers either. The enrolment listener is deliberately
+        // left out — it hands over the *first* attestation inside the enrolment reply, a peer
+        // that has not enrolled has nothing to renew, and it knows nothing about liveness.
+        let service_direction = match role {
             Role::Client => Some(ProtocolSupport::Outbound),
             Role::Server => Some(ProtocolSupport::Inbound),
             Role::Enrollment => None,
@@ -324,9 +347,22 @@ impl<A: PeerAuthorizer, X: NetworkBehaviour> AcBehaviour<A, X> {
                     request_response::Config::default(),
                 )
             })),
-            attest: Toggle::from(attest_direction.map(|direction| {
+            attest: Toggle::from(service_direction.clone().map(|direction| {
                 request_response::cbor::Behaviour::new(
                     [(StreamProtocol::new(ATTEST_PROTOCOL), direction)],
+                    request_response::Config::default(),
+                )
+            })),
+            // Same direction as renewal, and for the same reason: only a client asks, and
+            // only the service listener can answer, since it is the one holding the
+            // connections the answer is read from.
+            presence: Toggle::from(service_direction.map(|direction| {
+                let codec = request_response::cbor::codec::Codec::default()
+                    .set_request_size_maximum(MAX_PRESENCE_BYTES)
+                    .set_response_size_maximum(MAX_PRESENCE_BYTES);
+                request_response::cbor::Behaviour::with_codec(
+                    codec,
+                    [(StreamProtocol::new(PRESENCE_PROTOCOL), direction)],
                     request_response::Config::default(),
                 )
             })),
@@ -363,11 +399,16 @@ impl<A: PeerAuthorizer, X: NetworkBehaviour> AcBehaviour<A, X> {
 ///
 /// # Why these are explicit
 ///
-/// The relay is a **coordination** service — sized for DCUtR to agree on a hole punch, not a
-/// data pipe — and libp2p's defaults happened to express that. Once any of these numbers is
-/// deliberately chosen, all of them become load-bearing, because they multiply: bytes per
-/// circuit is only a bound on a client's cost if the number of circuits it may open is also
-/// bounded. Inheriting one while tuning another is how a per-circuit cap turns into no cap.
+/// The relay began as a **coordination** service — sized for DCUtR to agree on a hole punch,
+/// not a data pipe — and libp2p's defaults happened to express that. It now also carries
+/// content for peers that cannot punch, which is a deliberate change of role rather than a
+/// slackening: a pair behind symmetric NAT can never hole-punch, and refusing them any
+/// transfer meant the feature simply did not exist for them.
+///
+/// Once any of these numbers is deliberately chosen, all of them become load-bearing, because
+/// they multiply: bytes per circuit is only a bound on a client's cost if the number of
+/// circuits it may open is also bounded. Inheriting one while tuning another is how a
+/// per-circuit cap turns into no cap.
 ///
 /// The bound this yields is arithmetic rather than something to measure:
 ///
@@ -388,22 +429,48 @@ fn relay_config() -> relay::Config {
 
 /// Data one circuit may carry before it is closed.
 ///
-/// Sized to [`crate::limits`]-style reasoning rather than to a transfer: the largest thing the
-/// protocol legitimately sends over a circuit is a group chain, capped at 1 MiB by
-/// `ac_groups::wire`. Matching that removes the relay as the binding constraint on how much
-/// history a group may accumulate, which at 128 KiB it was — and by a factor of eight.
+/// This now carries content, not only coordination. Two earlier sizings are worth recording
+/// because each was right for its milestone: libp2p's 128 KiB default, enough for DCUtR to
+/// arrange a hole punch; then 1 MiB, matching `ac_groups::wire` so a group's history was never
+/// the thing a circuit could not deliver.
 ///
-/// It is **not** sized to carry media. Doing that needs live re-authorization of circuits,
-/// because enrolment is checked when a connection is established and a long circuit would
-/// outlive its own authorization.
-const MAX_CIRCUIT_BYTES: u64 = 1024 * 1024;
+/// Raising it past that was previously refused on the grounds that a long circuit outlives the
+/// authorization it was opened under. That turned out to be mostly answered already:
+/// `ac-server`'s `disconnect_revoked` runs every `HOUSEKEEPING_TICK` and closes a revoked
+/// client's connection, taking every circuit riding on it. Revocation is therefore bounded by
+/// the sweep — five seconds — and not by how long a circuit may live. What actually remains is
+/// the operator's bandwidth bill, which is a budget to choose rather than a risk to avoid.
+///
+/// So this is a **policy number**, and the first one an operator should tune.
+///
+/// Lowered from 64 MiB when the rate below rose by the same factor, leaving the product — the
+/// only thing that bounds anything — untouched. The reason is that a circuit is the unit
+/// everything is charged in, and it was priced for bulk: a two-hundred-byte catalogue offer cost
+/// a client exactly what a 64 MiB file transfer cost it. That mispricing is what forced the
+/// supervisor to ration gossip, and rationing gossip is what made a change take minutes to reach
+/// a group. Smaller, more frequent circuits carry bulk at precisely the same rate — a 4 GiB file
+/// is 32 minutes either way — while leaving coordination affordable.
+///
+/// It also fits what most circuits actually are. A pair that can hole-punch uses the circuit
+/// only to arrange the punch and then talks directly, spending kilobytes; sizing the unit for
+/// the transfers that *cannot* punch made every one of those pay for a budget it never used.
+const MAX_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Wall-clock ceiling on one circuit, independent of bytes. A slow trickle is still a held
 /// resource.
-const MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(120);
+///
+/// Ten minutes rather than two: a client on a slow link must be able to spend
+/// [`MAX_CIRCUIT_BYTES`] before this expires, or the byte cap never binds and every transfer
+/// is cut by the clock instead.
+const MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(600);
 
 /// Circuits in flight across all clients.
-const MAX_CIRCUITS: usize = 16;
+///
+/// Raised with the byte cap's fall: sixteen circuits of 64 MiB was the whole server's exposure
+/// budget, and sixteen of 8 MiB is an eighth of it. Concurrency was never the thing being
+/// bought — bandwidth was — and at sixteen only four clients could hold a circuit at once, which
+/// in a group of twenty is a queue rather than a limit.
+const MAX_CIRCUITS: usize = 64;
 
 /// Circuits in flight for one client.
 const MAX_CIRCUITS_PER_PEER: usize = 4;
@@ -412,10 +479,16 @@ const MAX_CIRCUITS_PER_PEER: usize = 4;
 ///
 /// This is the term that turns a per-circuit cap into a per-client budget. Without it a client
 /// can reopen a capped circuit as fast as it likes and the cap bounds nothing.
-const CIRCUITS_PER_PEER_PER_WINDOW: NonZeroU32 = NonZeroU32::new(8).expect("nonzero");
+///
+/// Raised from 2 as [`MAX_CIRCUIT_BYTES`] fell by the same factor, so the bandwidth ceiling is
+/// unchanged and the *number of decisions* a client may act on is not. At two a minute a client
+/// could not tell a group of ten about a change without rationing, and every scheme for
+/// rationing it went wrong in a way that looked like a healthy node making no progress. At
+/// sixteen it simply tells them.
+const CIRCUITS_PER_PEER_PER_WINDOW: NonZeroU32 = NonZeroU32::new(16).expect("nonzero");
 
 /// Window for [`CIRCUITS_PER_PEER_PER_WINDOW`]. With the constants above, one client's ceiling
-/// is 8 MiB per minute, and the whole server's is bounded by `MAX_CIRCUITS` besides.
+/// is 128 MiB per minute, and the whole server's is bounded by `MAX_CIRCUITS` besides.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 
 // Checked at compile time rather than in tests, matching [`crate::limits`]: these are
@@ -425,18 +498,25 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// only if how often it may open one is limited too — inheriting one of these from libp2p's
 /// defaults while choosing the other is how a per-circuit cap silently becomes no cap.
 const _: () = assert!(
-    MAX_CIRCUIT_BYTES * CIRCUITS_PER_PEER_PER_WINDOW.get() as u64 == 8 * 1024 * 1024,
-    "one client's ceiling is 8 MiB per window; if that changed, it was not by accident"
+    MAX_CIRCUIT_BYTES * CIRCUITS_PER_PEER_PER_WINDOW.get() as u64 == 128 * 1024 * 1024,
+    "one client's ceiling is 128 MiB per window; if that changed, it was not by accident"
 );
 
 /// One client must not be able to take every circuit on the server.
 const _: () = assert!(MAX_CIRCUITS_PER_PEER < MAX_CIRCUITS);
 
-/// Past a megabyte this stops being a coordination service. A circuit that long outlives the
-/// authorization it was opened under, which is only re-checked when a connection is
-/// established and on the server's sweep — carrying media needs re-authorization *during* a
-/// transfer, not just around it.
-const _: () = assert!(MAX_CIRCUIT_BYTES <= 1024 * 1024);
+/// A circuit must be able to spend its byte budget before its clock runs out, or the byte cap
+/// never binds and [`MAX_CIRCUIT_DURATION`] silently becomes the only limit. The floor is the
+/// slowest link worth serving: at 128 KiB/s, 8 MiB needs 64 seconds.
+const _: () = assert!(
+    MAX_CIRCUIT_BYTES / (128 * 1024) <= MAX_CIRCUIT_DURATION.as_secs(),
+    "a circuit cannot spend its bytes before it expires; raise the duration or lower the bytes"
+);
+
+/// The whole server's exposure, which is what an operator is actually buying. Past this the
+/// relay is a file host rather than a service that helps peers find each other, and that is a
+/// different thing to run and to pay for.
+const _: () = assert!(MAX_CIRCUITS as u64 * MAX_CIRCUIT_BYTES <= 1024 * 1024 * 1024);
 
 /// Build a swarm and start listening on the configured addresses.
 ///
@@ -518,6 +598,7 @@ mod tests {
             mdns: false,
             server: None,
             storage_root: None,
+            storage_max: None,
         };
 
         let swarm = build(
@@ -543,6 +624,7 @@ mod tests {
             mdns: false,
             server: None,
             storage_root: None,
+            storage_max: None,
         };
 
         assert!(matches!(

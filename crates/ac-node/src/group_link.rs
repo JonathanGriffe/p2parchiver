@@ -33,6 +33,7 @@ use ac_groups::sync::{GroupAction, GroupEvent, GroupSync, Notice};
 use ac_groups::wire::{GroupRequest, GroupResponse};
 
 use crate::daemon::ClientSwarm;
+use crate::file_link::RoundOutcome;
 
 /// What we asked a peer, kept so a bare reply can be matched back to it.
 ///
@@ -41,8 +42,17 @@ use crate::daemon::ClientSwarm;
 /// map here rather than in `ac-groups` is what keeps `OutboundRequestId` — a libp2p type — out
 /// of that crate.
 enum Outbound {
-    Offer { peer: PeerId },
-    Fetch { peer: PeerId, group: GroupId },
+    /// The groups it named are kept, because the answer may name fewer — see
+    /// [`crate::file_link::RoundOutcome::Declined`], which the catalogue side reports for the
+    /// same reason.
+    Offer {
+        peer: PeerId,
+        groups: Vec<GroupId>,
+    },
+    Fetch {
+        peer: PeerId,
+        group: GroupId,
+    },
 }
 
 /// The only place a swarm and `ac-groups` are named together.
@@ -53,6 +63,12 @@ enum Outbound {
 pub struct GroupLink {
     sync: GroupSync,
     outbound: HashMap<request_response::OutboundRequestId, Outbound>,
+    /// Exchange outcomes waiting to be handed to the supervisor, drained each tick.
+    ///
+    /// The same report `FileLink` makes, for the same reason: the supervisor decides when to
+    /// talk to a peer, and the one thing it cannot work out for itself is whether a given
+    /// exchange delivered anything.
+    rounds: Vec<RoundOutcome>,
     /// Peers that passed attestation but whose connection has not settled yet.
     ///
     /// Attestation finishes in about a second, over whatever connection exists — often a
@@ -75,14 +91,57 @@ impl GroupLink {
         Ok(Self {
             sync: GroupSync::new(store, identity.keypair().clone()),
             outbound: HashMap::new(),
+            rounds: Vec::new(),
             settling: HashSet::new(),
             announced: HashSet::new(),
         })
     }
 
+    /// Everything the supervisor needs to know about exchanges since it last asked.
+    pub fn drain_rounds(&mut self) -> Vec<RoundOutcome> {
+        std::mem::take(&mut self.rounds)
+    }
+
+    /// Offer this peer our heads for every group we share with them, because the supervisor
+    /// decided it was time.
+    ///
+    /// Answers whether anything went out. `false` means we share no group with them at all.
+    pub fn offer(&mut self, swarm: &mut ClientSwarm, peer: PeerId) -> bool {
+        let heads = self.sync.heads_for(&peer);
+        if heads.is_empty() {
+            return false;
+        }
+        self.dispatch(swarm, vec![GroupAction::Offer { peer, heads }]);
+        true
+    }
+
     /// A peer completed mutual attestation. It is not usable to the group layer yet.
     pub fn attested(&mut self, peer: PeerId) {
         self.settling.insert(peer);
+    }
+
+    /// Whether a chain exchange with this peer is still outstanding.
+    ///
+    /// Asked by the supervisor before it hangs up. Membership arrives over *this* protocol, and
+    /// nothing about it is visible to `ac-peers` — so without this a freshly connected peer
+    /// looks idle the instant it is verified and is closed a few milliseconds later, before the
+    /// group it was about to be told about has reached it.
+    pub fn busy_with(&self, peer: &PeerId) -> bool {
+        self.settling.contains(peer)
+            || self.outbound.values().any(|out| match out {
+                Outbound::Offer { peer: p, .. } | Outbound::Fetch { peer: p, .. } => p == peer,
+            })
+    }
+
+    /// Whether the group layer has been told about this peer.
+    ///
+    /// A connection is not the same thing: a peer stays in `settling` until its connection
+    /// stops changing shape, and until then every request from it is refused. Tests that mean
+    /// "ready to talk" have to wait on this rather than on `is_connected`, or they race the
+    /// promotion and read a refusal as if it were the answer.
+    #[cfg(test)]
+    pub(crate) fn knows(&self, peer: &PeerId) -> bool {
+        self.announced.contains(peer)
     }
 
     pub fn on_disconnected(&mut self, swarm: &mut ClientSwarm, peer: PeerId) {
@@ -144,7 +203,11 @@ impl GroupLink {
                 // always consumed and can never be stranded. That is why `GroupAction` has
                 // no `Respond` variant to defer.
                 let (response, actions) = self.sync.on_request(peer, request);
-                let _ = swarm.behaviour_mut().app.send_response(channel, response);
+                let _ = swarm
+                    .behaviour_mut()
+                    .app
+                    .groups
+                    .send_response(channel, response);
                 actions
             }
 
@@ -157,7 +220,16 @@ impl GroupLink {
                     },
                 ..
             } => match (self.outbound.remove(&request_id), response) {
-                (Some(Outbound::Offer { .. }), GroupResponse::Offer(heads)) => {
+                (Some(Outbound::Offer { groups, .. }), GroupResponse::Offer(heads)) => {
+                    // Whatever they did not mention, they will not discuss — they have not
+                    // accepted the group, have not learned we are a member, or have left.
+                    for group in groups {
+                        if heads.iter().any(|h| h.group == group) {
+                            self.rounds.push(RoundOutcome::Settled { peer, group });
+                        } else {
+                            self.rounds.push(RoundOutcome::Declined { peer, group });
+                        }
+                    }
                     self.sync.on(GroupEvent::Offered { peer, heads })
                 }
                 (
@@ -188,7 +260,10 @@ impl GroupLink {
                 Some(Outbound::Fetch { peer, group }) => {
                     self.sync.on(GroupEvent::FetchFailed { peer, group })
                 }
-                Some(Outbound::Offer { peer }) => self.sync.on(GroupEvent::OfferFailed { peer }),
+                Some(Outbound::Offer { peer, .. }) => {
+                    self.rounds.push(RoundOutcome::Failed { peer });
+                    self.sync.on(GroupEvent::OfferFailed { peer })
+                }
                 None => return,
             },
 
@@ -208,16 +283,19 @@ impl GroupLink {
         for action in actions {
             match action {
                 GroupAction::Offer { peer, heads } => {
+                    let groups = heads.iter().map(|h| h.group).collect();
                     let id = swarm
                         .behaviour_mut()
                         .app
+                        .groups
                         .send_request(&peer, GroupRequest::Offer(heads));
-                    self.outbound.insert(id, Outbound::Offer { peer });
+                    self.outbound.insert(id, Outbound::Offer { peer, groups });
                 }
                 GroupAction::Fetch { peer, group, from } => {
                     let id = swarm
                         .behaviour_mut()
                         .app
+                        .groups
                         .send_request(&peer, GroupRequest::Fetch { group, from });
                     self.outbound.insert(id, Outbound::Fetch { peer, group });
                 }
@@ -234,7 +312,7 @@ impl GroupLink {
 /// forever. `effective_state` turns a pending upgrade older than `UPGRADE_TIMEOUT` into a
 /// settled `Relayed`, which is the honest verdict for a pair that cannot punch at all — and
 /// `connectivity.rs` is explicit that relayed is a correct final answer, not a degraded one.
-fn settled(connectivity: &Connectivity, peer: &PeerId) -> bool {
+pub(crate) fn settled(connectivity: &Connectivity, peer: &PeerId) -> bool {
     !matches!(
         connectivity.get(peer).map(|s| s.effective_state()),
         Some(ConnState::UpgradePending)
@@ -346,6 +424,7 @@ mod tests {
                 mdns: false,
                 server: None,
                 storage_root: None,
+                storage_max: None,
             };
 
             Self {
@@ -378,7 +457,12 @@ mod tests {
                 _ => {}
             }
 
-            if let SwarmEvent::Behaviour(AcBehaviourEvent::App(event)) = event {
+            // Only the group half of the app slot; the manifest and blob protocols are
+            // `FileLink`'s and have their own tests.
+            if let SwarmEvent::Behaviour(AcBehaviourEvent::App(crate::daemon::AppEvent::Groups(
+                event,
+            ))) = event
+            {
                 if let request_response::Event::Message {
                     message: request_response::Message::Response { response, .. },
                     ..
@@ -390,9 +474,22 @@ mod tests {
             }
         }
 
+        /// Housekeeping, then offer to whoever is connected — standing in for the supervisor.
+        ///
+        /// `ac-peers` decides when to talk to a peer, and these tests do not run it, so without
+        /// this the two nodes connect and then sit in silence. Offering on every tick is
+        /// wasteful and exactly right here: it is what a supervisor with no record of the peer
+        /// would do, and it lets the exchange start as soon as the connection settles.
         fn tick(&mut self) {
             self.link
                 .housekeeping(&mut self.swarm, &self.conn, Instant::now(), AT);
+
+            let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+            for peer in peers {
+                if !self.link.busy_with(&peer) {
+                    self.link.offer(&mut self.swarm, peer);
+                }
+            }
         }
 
         async fn listen_addr(&mut self) -> Multiaddr {
@@ -631,18 +728,43 @@ mod tests {
         let alice_peer = alice.peer;
         let _ = connect(&mut alice, &mut carol).await;
 
-        // Ask directly, naming the group id she should have no way to know.
-        run_until(&mut alice, &mut carol, move |_, c| {
-            c.swarm.is_connected(&alice_peer)
+        let carol_peer = carol.peer;
+        run_until(&mut alice, &mut carol, move |a, c| {
+            // Promotion, not connection. Alice refuses everything from a peer still in
+            // `settling`, so asking before she has promoted carol would test that refusal
+            // instead of the membership one — and carol never re-asks, so the exchange would
+            // then simply never produce the answer under test.
+            a.link.knows(&carol_peer) && c.link.knows(&alice_peer)
         })
         .await;
+
+        // Asked explicitly rather than relying on the offer the promotion happens to send:
+        // this test is about what a non-member is told, not about when a tick fires.
         carol
             .swarm
             .behaviour_mut()
             .app
+            .groups
+            .send_request(&alice_peer, GroupRequest::Offer(Vec::new()));
+        carol
+            .swarm
+            .behaviour_mut()
+            .app
+            .groups
             .send_request(&alice_peer, GroupRequest::Fetch { group: id, from: 0 });
 
-        run_until(&mut alice, &mut carol, |_, c| c.seen.len() >= 2).await;
+        // Waited on by *shape*, not by count. A count is satisfied by two of the same reply,
+        // and then the assertions below fail for a reason that has nothing to do with
+        // membership.
+        run_until(&mut alice, &mut carol, |_, c| {
+            c.seen
+                .iter()
+                .any(|r| matches!(r, GroupResponse::Offer(h) if h.is_empty()))
+                && c.seen
+                    .iter()
+                    .any(|r| matches!(r, GroupResponse::Unavailable))
+        })
+        .await;
 
         assert!(
             carol

@@ -18,7 +18,8 @@ use ac_net::attest::{self, Attestation, normalise_username};
 use ac_net::config::Config;
 use ac_net::identity::Identity;
 use ac_net::proto::{
-    AttestRefusal, AttestRequest, AttestResponse, EnrollRequest, EnrollResponse, Refusal,
+    AttestRefusal, AttestRequest, AttestResponse, EnrollRequest, EnrollResponse,
+    MAX_PRESENCE_QUERY, PresenceRequest, PresenceResponse, Refusal,
 };
 use ac_net::swarm::{AcBehaviour, AcBehaviourEvent, Role, build};
 
@@ -37,7 +38,7 @@ type NoApp = libp2p::swarm::dummy::Behaviour;
 /// The value form of [`NoApp`]; a type alias cannot be used as a constructor.
 const NO_APP: NoApp = libp2p::swarm::dummy::Behaviour;
 
-/// The service listener's swarm: relay, rendezvous, AutoNAT, attestation renewal.
+/// The service listener's swarm: relay, rendezvous, AutoNAT, attestation renewal, presence.
 type ServiceSwarm = Swarm<AcBehaviour<Enrolled, NoApp>>;
 
 /// The enrolment listener's swarm: `/ac/enroll/2.0.0` and nothing else.
@@ -48,7 +49,7 @@ type EnrollSwarm = Swarm<AcBehaviour<Store, NoApp>>;
 /// | | admits | speaks |
 /// | --- | --- | --- |
 /// | enrolment | anyone | `/ac/enroll/2.0.0` |
-/// | service | enrolled peers only | relay, rendezvous, AutoNAT, `/ac/attest/1.0.0` |
+/// | service | enrolled peers only | relay, rendezvous, AutoNAT, `/ac/attest/1.0.0`, `/ac/presence/1.0.0` |
 ///
 /// One listener could not do this. Strangers must reach enrolment, and only members may
 /// reach the services — contradictory policies for a single admission check, which is why
@@ -178,6 +179,11 @@ pub async fn run(
                     // check here beyond looking up the name.
                     SwarmEvent::Behaviour(AcBehaviourEvent::Attest(event)) => {
                         on_attest(&mut swarm, identity, &store, event);
+                    }
+                    // Liveness, on the same listener and gated by the same thing. Reads no
+                    // database at all: the answer is who this swarm is connected to.
+                    SwarmEvent::Behaviour(AcBehaviourEvent::Presence(event)) => {
+                        on_presence(&mut swarm, event);
                     }
                     // Promote each bound address as it appears, when the operator has not
                     // said otherwise. Done here rather than at startup because listeners
@@ -360,9 +366,16 @@ fn on_enroll(
 /// a revoked client's connection — and with it every circuit riding on that connection —
 /// within one housekeeping tick.
 ///
-/// That is enough for a relay sized to coordinate. It would not be enough for one carrying
-/// media: an hour-long circuit needs re-authorization *during* the transfer, not only at its
-/// start and end.
+/// **The sweep is the one that matters, and it is what let the relay start carrying content.**
+/// An earlier draft argued the opposite — that circuit-sized caps were fine for coordination
+/// but that media would need re-authorization *during* a transfer rather than only around it.
+/// The second half of that is true and the conclusion did not follow: the sweep already
+/// re-authorizes during the transfer, every [`HOUSEKEEPING_TICK`], because it closes the
+/// underlying connection rather than waiting for the circuit. A revoked client loses an
+/// in-flight transfer within five seconds however long its circuit was entitled to run.
+///
+/// So the bound on a stale authorization is the sweep interval, independent of
+/// `MAX_CIRCUIT_DURATION`. What the circuit caps bound is cost, not permission.
 /// How often the server sweeps: enforcing revocation, and reporting relay use.
 ///
 /// The CLI writes to the store and this process holds the swarm, so anything the CLI decides
@@ -446,6 +459,31 @@ fn disconnect_revoked(swarm: &mut ServiceSwarm, store: &Store) {
     }
 }
 
+/// What the relay saw, including who asked to reach whom.
+///
+/// # What this can and cannot answer
+///
+/// Every circuit request is one client trying to reach another, so these lines are a record of
+/// **attempts to make contact through this server** — and deliberately nothing more.
+///
+/// They are not a record of contact. A pair with a routable address, or two devices on one
+/// wifi, are dialled directly by `PeerLink::address_of` and never ask for a circuit at all, so
+/// they appear here not once. Nor is a circuit an outcome: DCUtR uses one purely to swap
+/// addresses and agree on timing, the punched packets go peer to peer, and — per
+/// `ac_net::swarm`'s note on the behaviour — *the relay carries none of the result*. A circuit
+/// that led to a direct connection and one that stayed relayed look identical from here.
+///
+/// So: attempts that came through the relay, whatever became of them. Counting these as
+/// connections, or their absence as silence between two people, would both be wrong.
+///
+/// # It is a social graph
+///
+/// `src`/`dst` pairs are who talks to whom, which `ac_net::proto` goes out of its way not to
+/// let this server learn — a single rendezvous namespace exists precisely so the registry has
+/// no partition to leak. Relaying cannot avoid *observing* it, but writing it down keeps it,
+/// and an operator's log is backed up like anything else. `RelayMeter` reports the same traffic
+/// in aggregate and names nobody; if that is enough for a deployment, these lines can drop to
+/// `debug!` without losing it.
 fn on_relay(meter: &mut RelayMeter, event: relay::Event) {
     match event {
         relay::Event::ReservationReqAccepted {
@@ -461,7 +499,41 @@ fn on_relay(meter: &mut RelayMeter, event: relay::Event) {
             meter.opened(src_peer_id);
             tracing::info!(src = %src_peer_id, dst = %dst_peer_id, "relay circuit opened");
         }
-        relay::Event::CircuitClosed { .. } => meter.closed(),
+        // Also an attempt to reach someone, and the one worth reading. `ResourceLimitExceeded`
+        // is this server's own circuit allowance saying no, which the client cannot distinguish
+        // from the peer being away — `ac_peers::sync::DialFailed` says as much — so a member who
+        // seems slow to be reached is diagnosed here or not at all. `NoReservation` is a
+        // different fact and just as useful: the destination had not reserved a slot yet.
+        relay::Event::CircuitReqDenied {
+            src_peer_id,
+            dst_peer_id,
+            status,
+        } => {
+            tracing::info!(
+                src = %src_peer_id,
+                dst = %dst_peer_id,
+                reason = ?status,
+                "relay circuit refused"
+            );
+        }
+        // Not an attempt, so it stays out of the way at `debug` — but carrying the pair, since a
+        // close with no matching open is how a circuit that never came through here shows up.
+        relay::Event::CircuitClosed {
+            src_peer_id,
+            dst_peer_id,
+            error,
+        } => {
+            meter.closed();
+            tracing::debug!(
+                src = %src_peer_id,
+                dst = %dst_peer_id,
+                error = ?error,
+                "relay circuit closed"
+            );
+        }
+        // Three of the remaining variants are `#[deprecated]` upstream — rust-libp2p#4757 moves
+        // them to internal logging — so they are read through this catch-all rather than matched
+        // and pinned to a shape that is going away.
         other => tracing::debug!(?other, "relay event"),
     }
 }
@@ -526,6 +598,70 @@ fn on_attest(
     };
     if attest.send_response(channel, response).is_err() {
         tracing::warn!(%peer, "client disconnected before the attestation was sent");
+    }
+}
+
+/// Answer "which of these peers are connected to you?".
+///
+/// No database, no state, and no policy beyond the one the listener already applied: a peer
+/// that reached this protocol is enrolled, and that is the whole access check — the same
+/// reasoning as [`on_attest`].
+///
+/// The answer is a **filter over what was asked**, never a listing. That is what stops this
+/// becoming a directory of the server's clients: an asker learns only about peer ids it could
+/// already name, which in practice means the members of its own groups. The server itself
+/// still knows nothing about groups, which is the property this protocol was careful not to
+/// trade away.
+fn on_presence(
+    swarm: &mut ServiceSwarm,
+    event: request_response::Event<PresenceRequest, PresenceResponse>,
+) {
+    let request_response::Event::Message {
+        peer,
+        message:
+            request_response::Message::Request {
+                channel,
+                request: PresenceRequest::Who(asked),
+                ..
+            },
+        ..
+    } = event
+    else {
+        // Outbound events cannot occur: the service listener advertises inbound only.
+        tracing::trace!(?event, "presence event");
+        return;
+    };
+
+    // Collected before the mutable borrow below, and capped here rather than refused: a
+    // truncated answer degrades into "assume the rest are offline", which costs the asker a
+    // delay and costs nobody else anything.
+    let asked_count = asked.len();
+    let online: Vec<PeerId> = {
+        let connected: std::collections::HashSet<PeerId> =
+            swarm.connected_peers().copied().collect();
+        asked
+            .into_iter()
+            .take(MAX_PRESENCE_QUERY)
+            .filter(|p| connected.contains(p))
+            .collect()
+    };
+
+    tracing::debug!(
+        %peer,
+        asked = asked_count,
+        online = online.len(),
+        "answered a presence query"
+    );
+
+    let Some(presence) = swarm.behaviour_mut().presence.as_mut() else {
+        tracing::error!(%peer, "presence query on a listener that does not speak it");
+        return;
+    };
+    if presence
+        .send_response(channel, PresenceResponse::Online(online))
+        .is_err()
+    {
+        tracing::warn!(%peer, "client disconnected before the presence answer was sent");
     }
 }
 
@@ -780,6 +916,7 @@ mod tests {
             mdns: false,
             server: None,
             storage_root: None,
+            storage_max: None,
         }
     }
 
@@ -966,6 +1103,131 @@ mod tests {
             "clients must not filter by identity: a peer with no prior knowledge of the \
              dialer has to accept it, or a returning member can never be handed proof of \
              its own membership"
+        );
+    }
+
+    // ------------------------------------------------------------------ presence
+
+    #[tokio::test]
+    async fn presence_answers_about_the_connected_and_nobody_else() {
+        // Two properties in one exchange, both of which have to hold against a real swarm:
+        // the answer distinguishes a live peer from an absent one, and it names **only** peers
+        // the asker named. The second is what stops this being a directory of the server's
+        // clients — alice is connected throughout and must not appear, because she did not
+        // ask about herself.
+        //
+        // Driven by hand rather than through `run`, calling the same handler the loop calls.
+        let server_identity = test_identity();
+        let alice = test_identity();
+        let bob = test_identity();
+        // Enrolled, and never connects. The case presence exists to detect.
+        let absent = peer();
+
+        let store = Store::in_memory().unwrap();
+        for (who, name) in [
+            (alice.peer_id(), "alice"),
+            (bob.peer_id(), "bob"),
+            (absent, "carol"),
+        ] {
+            let code = InviteCode::generate().unwrap();
+            store.create_invite(&code, name, now() + HOUR).unwrap();
+            assert!(
+                matches!(
+                    decide(&store, &server_identity, &code.to_string(), name, &who, &[]),
+                    EnrollResponse::Enrolled { .. }
+                ),
+                "{name} must start out enrolled"
+            );
+        }
+
+        let mut server = build(
+            &server_identity,
+            &loopback_config(),
+            Role::Server,
+            Enrolled(store),
+            NO_APP,
+        )
+        .expect("server swarm");
+        let addr = first_listen_addr(&mut server).await;
+
+        let mut alice_swarm = build(
+            &alice,
+            &loopback_config(),
+            Role::Client,
+            AcceptAnyPeer,
+            NO_APP,
+        )
+        .expect("alice swarm");
+        let mut bob_swarm = build(
+            &bob,
+            &loopback_config(),
+            Role::Client,
+            AcceptAnyPeer,
+            NO_APP,
+        )
+        .expect("bob swarm");
+
+        alice_swarm.dial(addr.clone()).expect("alice dials");
+        bob_swarm.dial(addr).expect("bob dials");
+
+        let server_peer = server_identity.peer_id();
+        let asked = vec![bob.peer_id(), absent];
+        let mut connected = std::collections::HashSet::new();
+        let mut sent = false;
+
+        let answered = async {
+            loop {
+                tokio::select! {
+                    event = server.select_next_some() => match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            connected.insert(peer_id);
+                        }
+                        SwarmEvent::Behaviour(AcBehaviourEvent::Presence(event)) => {
+                            on_presence(&mut server, event);
+                        }
+                        _ => {}
+                    },
+                    event = alice_swarm.select_next_some() => {
+                        if let SwarmEvent::Behaviour(AcBehaviourEvent::Presence(
+                            request_response::Event::Message {
+                                message: request_response::Message::Response { response, .. },
+                                ..
+                            },
+                        )) = event
+                        {
+                            let PresenceResponse::Online(online) = response;
+                            return online;
+                        }
+                    },
+                    _ = bob_swarm.select_next_some() => {},
+                }
+
+                // Both have to be in before asking, or the answer would be racing the
+                // connection rather than reporting it.
+                if !sent && connected.len() == 2 {
+                    sent = true;
+                    alice_swarm
+                        .behaviour_mut()
+                        .presence
+                        .as_mut()
+                        .expect("a client speaks presence")
+                        .send_request(&server_peer, PresenceRequest::Who(asked.clone()));
+                }
+            }
+        };
+
+        let online = tokio::time::timeout(GATE_TIMEOUT, answered)
+            .await
+            .expect("the server must answer a presence query");
+
+        assert_eq!(
+            online,
+            vec![bob.peer_id()],
+            "only the connected peer that was asked about"
+        );
+        assert!(
+            !online.contains(&alice.peer_id()),
+            "the answer is a filter over what was asked, never a listing of who is connected"
         );
     }
 

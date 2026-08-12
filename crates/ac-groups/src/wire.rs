@@ -180,12 +180,13 @@ mod tests {
     fn a_chain_transfers_at_a_size_that_leaves_room_for_real_history() {
         // Entries are the bulk of everything that crosses the wire, and the chain never
         // shrinks — there is no compaction — so the per-entry cost sets how long a group can
-        // live. Two ceilings follow from it, and the tighter one is not the obvious one:
+        // live.
         //
-        //   * `MAX_RESPONSE_BYTES` (1 MiB) — a chain past this cannot transfer to anyone.
-        //   * a relay circuit's 128 KiB budget — a chain past *this* cannot reach a peer that
-        //     is only reachable relayed, and retrying gets a fresh circuit with the same
-        //     limit, so it fails permanently rather than slowly.
+        // `MAX_RESPONSE_BYTES` (1 MiB) is now the only ceiling: a chain past it cannot
+        // transfer to anyone. The relay used to be the tighter one and no longer is — a
+        // circuit carries 64 MiB, so a chain that fits in a response fits in a circuit with
+        // room to spare. That ordering is worth re-checking rather than assuming if either
+        // number moves again.
         //
         // Measured, not assumed: an earlier plan put an entry at ~250 bytes when it was 590,
         // and drew the ceiling 8x too high as a result.

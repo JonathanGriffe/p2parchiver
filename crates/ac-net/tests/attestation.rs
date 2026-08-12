@@ -59,6 +59,7 @@ fn loopback_config() -> Config {
         mdns: false,
         server: None,
         storage_root: None,
+        storage_max: None,
     }
 }
 

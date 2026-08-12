@@ -41,6 +41,8 @@ pub enum ConfigError {
     },
     #[error("could not serialize config")]
     Serialize(#[source] toml::ser::Error),
+    #[error("{text:?} is not a size. Write it like \"200 GiB\", \"1.5 TB\" or a plain byte count")]
+    Size { text: String },
 }
 
 /// The directories a node reads and writes.
@@ -182,6 +184,61 @@ pub struct Config {
     /// files live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_root: Option<PathBuf>,
+
+    /// Stop mirroring once this node holds this much content.
+    ///
+    /// Written the way a person would say it — `"200 GiB"`, `"1.5 TB"`, `"500M"` — because a
+    /// raw byte count is a number nobody can check at a glance. Absent means no ceiling beyond
+    /// the free-space floor the node keeps regardless.
+    ///
+    /// Reaching it stops *fetching* and deletes nothing. Files stay listed as remote and
+    /// arrive if the limit is raised or something is removed, so hitting it is legible in
+    /// `ac file list` rather than surfacing as an I/O error inside a transfer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_max: Option<String>,
+}
+
+/// Parse a human-written size into bytes.
+///
+/// Accepts a bare number, or a number with a unit. Both conventions are honoured and they
+/// differ: `KiB`/`MiB`/`GiB`/`TiB` are powers of 1024, `KB`/`MB`/`GB`/`TB` powers of 1000, and
+/// a bare `K`/`M`/`G`/`T` is read as the binary form because that is what a person setting a
+/// disk budget almost always means. Case-insensitive, and whitespace before the unit is fine.
+///
+/// Deliberately strict about everything else: a `storage_max` that silently parsed to zero
+/// would stop the node fetching anything and look like a network fault.
+pub fn parse_size(text: &str) -> Result<u64, ConfigError> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+
+    let number: f64 = number
+        .parse()
+        .map_err(|_| ConfigError::Size { text: text.into() })?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(ConfigError::Size { text: text.into() });
+    }
+
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1024,
+        "m" | "mib" => 1024 * 1024,
+        "g" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tib" => 1024u64.pow(4),
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        _ => return Err(ConfigError::Size { text: text.into() }),
+    };
+
+    let bytes = number * multiplier as f64;
+    if bytes > u64::MAX as f64 {
+        return Err(ConfigError::Size { text: text.into() });
+    }
+    Ok(bytes as u64)
 }
 
 impl Default for Config {
@@ -193,6 +250,7 @@ impl Default for Config {
             mdns: true,
             server: None,
             storage_root: None,
+            storage_max: None,
         }
     }
 }
@@ -215,6 +273,15 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })
+    }
+
+    /// The configured storage ceiling in bytes, if there is one.
+    ///
+    /// Parsed on every call rather than at load: this is read once per housekeeping tick, and
+    /// a bad value should be a warning a person can fix by editing the file rather than a node
+    /// that refuses to start. The caller decides what to do with the error.
+    pub fn storage_max_bytes(&self) -> Result<Option<u64>, ConfigError> {
+        self.storage_max.as_deref().map(parse_size).transpose()
     }
 
     /// Where this node's files live, resolved against `paths`.
@@ -296,6 +363,7 @@ mod tests {
                     .unwrap(),
             ),
             storage_root: Some(PathBuf::from("/mnt/archive")),
+            storage_max: Some("200 GiB".into()),
         };
         config.save(&path).unwrap();
 
@@ -303,6 +371,7 @@ mod tests {
         assert_eq!(loaded.listen, config.listen);
         assert_eq!(loaded.external, config.external);
         assert_eq!(loaded.server, config.server);
+        assert_eq!(loaded.storage_max, config.storage_max);
         assert_eq!(loaded.storage_root, config.storage_root);
     }
 
@@ -397,5 +466,47 @@ mod tests {
         // override branch, and that the filenames hang off it correctly.
         assert!(paths.data_dir.ends_with("archiverclient-test"));
         assert_eq!(paths.identity_file(), paths.data_dir.join("identity.key"));
+    }
+
+    #[test]
+    fn a_size_is_read_the_way_a_person_wrote_it() {
+        // Both conventions are in the wild and they differ by 7% at GB scale, so guessing one
+        // would quietly hand a user a budget several gigabytes from what they asked for.
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("1 KiB").unwrap(), 1024);
+        assert_eq!(parse_size("1KB").unwrap(), 1000);
+        assert_eq!(parse_size("200 GiB").unwrap(), 200 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1.5 TB").unwrap(), 1_500_000_000_000);
+
+        // A bare suffix is binary, because that is what someone sizing a disk means.
+        assert_eq!(parse_size("500M").unwrap(), 500 * 1024 * 1024);
+        assert_eq!(parse_size("  2 g  ").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_size_that_makes_no_sense_is_refused_rather_than_guessed() {
+        // The failure that matters: a value silently read as zero stops the node fetching
+        // anything at all, which presents as a network fault and not as a typo.
+        for text in ["", "lots", "10 furlongs", "-5", "1.2.3", "GiB"] {
+            assert!(
+                parse_size(text).is_err(),
+                "{text:?} should not parse to a size"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_without_a_ceiling_says_so() {
+        let config = Config::default();
+        assert_eq!(config.storage_max_bytes().unwrap(), None);
+
+        let config = Config {
+            storage_max: Some("200 GiB".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.storage_max_bytes().unwrap(),
+            Some(200 * 1024 * 1024 * 1024)
+        );
     }
 }

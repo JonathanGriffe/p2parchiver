@@ -8,9 +8,11 @@ version = "0.1.0"
 dependencies = [
  "ac-groups",
  "ac-net",
+ "ciborium",
  "hex",
  "libp2p",
  "rusqlite",
+ "serde",
  "sha2",
  "tempfile",
  "thiserror 2.0.19",
@@ -56,14 +58,38 @@ dependencies = [
  "ac-files",
  "ac-groups",
  "ac-net",
+ "ac-peers",
  "anyhow",
+ "ciborium",
  "clap",
+ "fs4",
+ "futures",
+ "hex",
  "libp2p",
+ "libp2p-stream",
  "rusqlite",
+ "serde",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ac-peers"
+version = "0.1.0"
+dependencies = [
+ "ac-files",
+ "ac-groups",
+ "ac-net",
+ "ciborium",
+ "getrandom 0.4.3",
+ "hex",
+ "libp2p",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]
@@ -966,6 +992,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2094,6 +2130,20 @@ dependencies = [
  "rand 0.8.7",
  "serde",
  "smallvec",
+ "tracing",
+]
+
+[[package]]
+name = "libp2p-stream"
+version = "0.4.0-alpha"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d6bd8025c80205ec2810cfb28b02f362ab48a01bee32c50ab5f12761e033464"
+dependencies = [
+ "futures",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.7",
  "tracing",
 ]
 

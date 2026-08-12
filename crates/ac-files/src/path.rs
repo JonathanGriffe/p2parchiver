@@ -91,6 +91,51 @@ impl RelPath {
         &self.0
     }
 
+    /// The name this path takes when it loses a fight for its own name.
+    ///
+    /// Two peers can each add a *different* file at one path. Neither may be discarded, so the
+    /// loser keeps its content here instead. `hash` is the losing content's, which makes the
+    /// result a pure function of what is being renamed: every peer derives the same name
+    /// without coordinating, and re-deriving it for the same content is idempotent.
+    ///
+    /// Inserted before the final extension rather than appended, so the file still opens in
+    /// whatever reads that type — `archive.tar.gz` becomes `archive.tar.conflict-<hex>.gz`.
+    pub fn conflict_name(&self, hash: &str) -> Self {
+        let (dir, name) = match self.0.rfind('/') {
+            Some(at) => (&self.0[..=at], &self.0[at + 1..]),
+            None => ("", self.0.as_str()),
+        };
+
+        // A leading dot is part of the name, not an extension: `.bashrc` has no suffix. Skip
+        // one *character* rather than one byte — a name starting with `é` would otherwise be
+        // sliced mid-character, which panics.
+        let first = name.chars().next().map_or(0, char::len_utf8);
+        let split = name[first..].rfind('.').map(|at| at + first);
+        let (stem, ext) = match split {
+            Some(at) => (&name[..at], &name[at..]),
+            None => (name, ""),
+        };
+
+        let mark = format!(".conflict-{}", &hash[..8.min(hash.len())]);
+
+        // Trim the stem, never the marker or the extension: losing the marker would collide
+        // with the winner, and losing the extension would change what the file is.
+        // The cut is walked back to a character boundary *before* slicing: `&s[..n]` panics
+        // on a non-boundary rather than rounding, and a stem of multibyte characters lands
+        // between them routinely.
+        let room = MAX_COMPONENT.saturating_sub(mark.len() + ext.len());
+        let mut cut = room.min(stem.len());
+        while cut > 0 && !stem.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let stem = &stem[..cut];
+
+        // Already validated by construction: every component came from a valid path, and the
+        // marker is hex. The fallback keeps this total rather than introducing a `Result` no
+        // caller could act on.
+        Self::parse(&format!("{dir}{stem}{mark}{ext}")).unwrap_or_else(|_| self.clone())
+    }
+
     /// Build a path from a directory prefix and a name, validating the result.
     ///
     /// `dir` may be empty, meaning the group's root. Used by `ac file add --to`, where the
@@ -212,6 +257,77 @@ mod tests {
 
         assert_eq!(joined, PathBuf::from("/store/group/photos/beach.jpg"));
         assert!(joined.starts_with(root));
+    }
+
+    #[test]
+    fn a_conflict_name_keeps_the_extension_and_the_directory() {
+        let p = RelPath::parse("photos/2024/beach.jpg").unwrap();
+        assert_eq!(
+            p.conflict_name("a41f9c3d5e").as_str(),
+            "photos/2024/beach.conflict-a41f9c3d.jpg"
+        );
+    }
+
+    #[test]
+    fn a_conflict_name_handles_awkward_filenames() {
+        // No extension at all.
+        assert_eq!(
+            RelPath::parse("notes")
+                .unwrap()
+                .conflict_name("aabbccdd")
+                .as_str(),
+            "notes.conflict-aabbccdd"
+        );
+        // Several extensions: only the last is a suffix.
+        assert_eq!(
+            RelPath::parse("archive.tar.gz")
+                .unwrap()
+                .conflict_name("aabbccdd")
+                .as_str(),
+            "archive.tar.conflict-aabbccdd.gz"
+        );
+        // A leading dot is a name, not an extension.
+        assert_eq!(
+            RelPath::parse(".bashrc")
+                .unwrap()
+                .conflict_name("aabbccdd")
+                .as_str(),
+            ".bashrc.conflict-aabbccdd"
+        );
+    }
+
+    #[test]
+    fn a_conflict_name_is_derived_only_from_the_content() {
+        // Every peer must reach the same name without coordinating, and doing it twice for
+        // the same content must not produce a third name.
+        let p = RelPath::parse("a.jpg").unwrap();
+        assert_eq!(p.conflict_name("deadbeef"), p.conflict_name("deadbeef"));
+        assert_ne!(p.conflict_name("deadbeef"), p.conflict_name("feedface"));
+    }
+
+    #[test]
+    fn a_long_name_still_yields_a_valid_path() {
+        let long = format!("{}.jpg", "x".repeat(MAX_COMPONENT - 4));
+        let renamed = RelPath::parse(&long).unwrap().conflict_name("aabbccdd");
+
+        assert!(RelPath::parse(renamed.as_str()).is_ok());
+        assert!(renamed.file_name().len() <= MAX_COMPONENT);
+        assert!(
+            renamed.as_str().ends_with(".conflict-aabbccdd.jpg"),
+            "the marker and extension survive; the stem is what gives way: {renamed}"
+        );
+    }
+
+    #[test]
+    fn a_multibyte_stem_is_not_cut_mid_character() {
+        // 120 two-byte characters plus ".jpg" is a legal component, and long enough that
+        // adding the marker forces a truncation — right where the boundary matters.
+        let long = format!("{}.jpg", "é".repeat(120));
+        let renamed = RelPath::parse(&long).unwrap().conflict_name("aabbccdd");
+
+        assert!(RelPath::parse(renamed.as_str()).is_ok());
+        assert!(renamed.file_name().len() <= MAX_COMPONENT);
+        assert!(renamed.as_str().ends_with(".conflict-aabbccdd.jpg"));
     }
 
     #[test]

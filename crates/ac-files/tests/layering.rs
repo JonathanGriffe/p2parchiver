@@ -5,17 +5,21 @@
 //! directory and no socket, which is what lets the awkward cases — a hostile group name, an
 //! interrupted write, a symlink inside the root — be tested exhaustively and cheaply.
 //!
-//! # What is actually holding the line today
+//! # This guard is now load-bearing
 //!
-//! Mostly the dependency graph, not this file. `libp2p` is a dev-dependency only, so `Swarm`
-//! and friends are unnameable in `src/` and the compiler refuses them before any grep runs.
-//! The one exception is `Multiaddr`, which `ac-net` re-exports and which this crate could
-//! therefore reach.
+//! It did not used to be. `libp2p` was a dev-dependency, so `Swarm` and friends were
+//! unnameable in `src/` and the compiler refused them before any grep ran; a second test
+//! watched for that changing and said so when it did.
 //!
-//! That changes in the next milestone: transfer needs wire types, wire types need `libp2p`,
-//! and the moment it becomes a real dependency this grep is the only thing left. So the second
-//! test watches for exactly that, and fails when it happens — the point is to hand the next
-//! author the decision rather than let the guard quietly become load-bearing unnoticed.
+//! It changed. `wire.rs` declares the two protocols, which needs `libp2p` for real, and every
+//! forbidden name below is now reachable from anywhere in this crate. The grep is the only
+//! thing keeping them out — so `wire.rs` is exempted narrowly, and
+//! `wire_is_still_the_seam` guards the exemption from going vacuous, exactly as `ac-groups`
+//! does.
+//!
+//! `libp2p-stream` is a separate matter and stays out of this crate entirely: moving bytes
+//! needs an async runtime and a spawned task, so it lives in `ac-node`. Nothing here may name
+//! a stream, and the list below says so.
 //!
 //! It is deliberately crude: a grep over the crate's own source, checking identifiers rather
 //! than parsing Rust. A reviewer will not catch a re-added `use`.
@@ -26,6 +30,10 @@
 use std::path::Path;
 
 /// Types that name libp2p's *networking*. None of these may appear anywhere in this crate.
+///
+/// `libp2p_stream` is on the list because carrying bytes is `ac-node`'s job: it needs a
+/// runtime and a task per transfer, and admitting either here would drag async into a crate
+/// whose whole value is being drivable from a test with no socket.
 const FORBIDDEN: &[&str] = &[
     "Swarm",
     "SwarmEvent",
@@ -35,9 +43,12 @@ const FORBIDDEN: &[&str] = &[
     "InboundRequestId",
     "ConnectionId",
     "Multiaddr",
-    "request_response",
-    "StreamProtocol",
+    "libp2p_stream",
 ];
+
+/// Types that speak a protocol. Confined to `wire.rs`, which is the seam by design: the
+/// messages have to be defined somewhere, and everything else stays ignorant of them.
+const WIRE_ONLY: &[&str] = &["request_response", "StreamProtocol"];
 
 /// Source with line comments removed.
 ///
@@ -91,34 +102,56 @@ fn no_module_names_a_libp2p_networking_type() {
 }
 
 #[test]
-fn libp2p_is_not_a_direct_dependency_yet() {
-    // Guards the guard, the other way round from `ac-groups`. There, `wire_is_still_the_seam`
-    // checks an exemption has not gone vacuous. Here the whole grep is nearly vacuous *by
-    // construction*, and this says so out loud — so that the milestone which changes it has to
-    // notice, rather than inheriting a test that looks stronger than it is.
+fn only_wire_speaks_a_protocol() {
+    for (name, source) in sources() {
+        if name == "wire.rs" {
+            continue;
+        }
+        let code = code(&source);
+        for needle in WIRE_ONLY {
+            assert!(
+                !code.contains(needle),
+                "{name} names `{needle}`, which belongs in wire.rs. Everything else works in \
+                 terms of the message types, not the transport that carries them."
+            );
+        }
+    }
+}
+
+#[test]
+fn wire_is_still_the_seam() {
+    // Guards the guard: if wire.rs were renamed or emptied, the exemption above would silently
+    // start covering nothing and the test would pass for the wrong reason.
+    let (_, wire) = sources()
+        .into_iter()
+        .find(|(name, _)| name == "wire.rs")
+        .expect("wire.rs exists");
+
+    assert!(
+        code(&wire).contains("request_response"),
+        "wire.rs no longer speaks request_response; the exemption is now vacuous"
+    );
+}
+
+#[test]
+fn moving_bytes_stays_in_the_binary() {
+    // `libp2p-stream` must not become a dependency of this crate. A blob transfer needs a
+    // runtime and a task per stream, and the moment either lands here the store, the paths and
+    // the sync policy stop being testable without one.
     let raw = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
         .expect("reading Cargo.toml");
 
-    // The manifest's own comment explains that libp2p is deliberately absent, so it has to be
-    // stripped for the same reason the source is.
+    // The manifest's own comment explains why the dependency is absent, so it is stripped for
+    // the same reason the source is.
     let manifest: String = raw
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let (deps, dev) = manifest
-        .split_once("[dev-dependencies]")
-        .expect("a dev-dependencies section");
-
     assert!(
-        !deps.contains("libp2p"),
-        "libp2p is now a real dependency of ac-files, which is expected once this crate \
-         carries wire types. The grep above just became the only thing keeping a `Swarm` out \
-         of it — check it still covers what it should, then delete this test."
-    );
-    assert!(
-        dev.contains("libp2p"),
-        "the dev-dependency went away; this test no longer describes the situation"
+        !manifest.contains("libp2p-stream"),
+        "ac-files has taken a dependency on libp2p-stream. Streaming belongs in ac-node, \
+         which is the only crate here allowed an async runtime."
     );
 }

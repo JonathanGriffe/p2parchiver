@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/ac-files",
+    "crates/ac-peers",
     "crates/ac-groups",
     "crates/ac-net",
     "crates/ac-node",
@@ -21,6 +22,9 @@ ac-groups = { path = "crates/ac-groups" }
 # Content. Depends on `ac-groups` for the group id it files things under, never the reverse:
 # a group is a membership question and stays answerable with nothing stored.
 ac-files = { path = "crates/ac-files" }
+# The supervisor. Depends on everything below it and nothing depends on it but the binary:
+# deciding who to call needs to see membership and content at once.
+ac-peers = { path = "crates/ac-peers" }
 
 libp2p = { version = "0.56", features = [
     "ed25519", "serde", "macros", "tokio",
@@ -33,10 +37,10 @@ libp2p = { version = "0.56", features = [
     # the protocol version, so a self-describing binary format costs
     # nothing and reads better in a packet capture than raw protobuf.
     "request-response", "cbor",
-    # Stage 6 server services. The relay stays at libp2p's default 128 KiB
-    # per circuit: enough for DCUtR to coordinate a hole punch, far too
-    # little to move media. Raising that cap in milestone 2 is what will
-    # make stronger gating necessary.
+    # Stage 6 server services. The relay's per-circuit budget is set
+    # explicitly in `ac_net::swarm` rather than inherited: it started at
+    # libp2p's 128 KiB default, rose to 1 MiB to fit a group chain, and
+    # now carries content for peers that can never hole-punch.
     "relay", "rendezvous", "autonat",
     # Stage 7 client reachability. UPnP is the cheapest possible outcome:
     # a mapped port means no relay and no hole punch at all.

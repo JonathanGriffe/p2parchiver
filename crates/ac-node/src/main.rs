@@ -7,11 +7,15 @@
 // daemon down. In tests a panic *is* the failure report, so let them through.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod blob;
 mod cmd;
 mod contacts;
 mod daemon;
 mod directory;
+mod file_link;
 mod group_link;
+mod peer_link;
+mod status;
 
 use std::path::PathBuf;
 
@@ -109,6 +113,10 @@ enum PeerCommand {
     Remove { peer: PeerId },
     /// Show every contact.
     List,
+    /// Show what the running node is waiting on, per group and per peer.
+    ///
+    /// Reads a snapshot the daemon publishes; it does not connect to anything.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -180,6 +188,8 @@ enum FileCommand {
     },
     /// Show one file's details.
     Show { group: String, path: String },
+    /// Ask for a file's bytes from whoever in the group holds them.
+    Get { group: String, path: String },
     /// Remove a file: delete its bytes, and stop offering it.
     Remove { group: String, path: String },
     /// Check the index against what is actually on disk.
@@ -207,6 +217,7 @@ fn main() -> Result<()> {
         Command::Peer(PeerCommand::Add { peer, label }) => cmd::peer::add(&paths, &peer, &label),
         Command::Peer(PeerCommand::Remove { peer }) => cmd::peer::remove(&paths, &peer),
         Command::Peer(PeerCommand::List) => cmd::peer::list(&paths),
+        Command::Peer(PeerCommand::Status) => cmd::peer::status(&paths),
         Command::Group(GroupCommand::Create { name }) => cmd::group::create(&paths, &name),
         Command::Group(GroupCommand::List) => cmd::group::list(&paths),
         Command::Group(GroupCommand::Show { group, log }) => cmd::group::show(&paths, &group, log),
@@ -243,6 +254,7 @@ fn main() -> Result<()> {
             removed,
         }) => cmd::file::list(&paths, &group, prefix.as_deref(), removed),
         Command::File(FileCommand::Show { group, path }) => cmd::file::show(&paths, &group, &path),
+        Command::File(FileCommand::Get { group, path }) => cmd::file::get(&paths, &group, &path),
         Command::File(FileCommand::Remove { group, path }) => {
             cmd::file::remove(&paths, &group, &path)
         }

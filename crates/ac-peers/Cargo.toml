@@ -1,0 +1,35 @@
+[package]
+name = "ac-peers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ac-net.workspace = true
+ac-groups.workspace = true
+ac-files.workspace = true
+libp2p.workspace = true
+serde.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Deliberately absent: `tokio` (this crate has no async), and `anyhow` (a library returns
+# typed errors; the binaries add context).
+#
+# `libp2p` is for `wire.rs`, which declares `/ac/session/1.0.0`, and for the `PeerId` the rest
+# of the crate names peers by. Everything that decides *anything* — who to dial, what to ask,
+# when to hang up — is free of networking types, which is what lets the whole supervisor be
+# driven from a test with no socket. `tests/layering.rs` enforces it.
+#
+# `/ac/presence/1.0.0` is deliberately *not* here: it lives in `ac_net::proto` beside
+# attestation renewal, because the server answers it and the server must not compile the group
+# and file model to do so.
+
+[dev-dependencies]
+tempfile = "3"
+ciborium.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true

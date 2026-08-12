@@ -49,6 +49,67 @@ pub struct Staged {
     pub modified: i64,
 }
 
+/// A transfer in progress: bytes going into staging, hashed as they arrive.
+///
+/// Separate from [`Staged`] because a download can stop half way and be picked up later, which
+/// a local copy never does. [`Sink::park`] is what makes that safe — dropping without either
+/// `park` or `finish` leaves the partial file too, but says nothing about whether it is
+/// trustworthy.
+#[derive(Debug)]
+pub struct Sink {
+    file: File,
+    staged: PathBuf,
+    dest: PathBuf,
+    hasher: Sha256,
+    size: u64,
+}
+
+impl Sink {
+    pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.hasher.update(bytes);
+        self.file.write_all(bytes)?;
+        self.size += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Stop, keeping what has arrived so a later attempt can continue from it.
+    pub fn park(mut self) -> io::Result<u64> {
+        self.file.flush()?;
+        self.file.sync_all()?;
+        Ok(self.size)
+    }
+
+    /// Finish, giving back something [`Content::commit`] can put in place.
+    pub fn finish(mut self) -> io::Result<Staged> {
+        self.file.flush()?;
+        self.file.sync_all()?;
+
+        Ok(Staged {
+            staged: self.staged,
+            dest: self.dest,
+            size: self.size,
+            hash: hex::encode(self.hasher.finalize()),
+            modified: crate::content::now(),
+        })
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// Unix seconds, for the mtime a downloaded file gets.
+///
+/// Its own arrival, not the sender's claim: `modified` describes where a copy came from, and
+/// on this node it came from the network just now.
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
+}
+
 /// The storage root, and everything done beneath it.
 #[derive(Debug, Clone)]
 pub struct Content {
@@ -135,6 +196,107 @@ impl Content {
         Ok(())
     }
 
+    /// Where a partly-downloaded file waits between attempts.
+    fn staging_of(&self, dir: &str, path: &RelPath) -> PathBuf {
+        self.group_dir(dir)
+            .join(STAGING_DIRNAME)
+            .join(format!("{}.part", sanitize_stem(path)))
+    }
+
+    /// How much of this file a previous attempt already wrote.
+    ///
+    /// Zero when there is nothing, which is also the right answer for "start from the top".
+    pub fn staged_len(&self, dir: &str, path: &RelPath) -> u64 {
+        fs::metadata(self.staging_of(dir, path)).map_or(0, |m| m.len())
+    }
+
+    /// Open the staging file to continue a transfer at `from`.
+    ///
+    /// The hash state is rebuilt by re-reading what is already there, because sha256 cannot be
+    /// resumed from a length. That is one local pass over the partial file, against
+    /// re-fetching the whole thing over the network — and for a relayed transfer, which is cut
+    /// every circuit, it is the difference between finishing and never finishing.
+    ///
+    /// `from` disagreeing with what is on disk means the peer is answering a different
+    /// question than we asked, so the partial is discarded and the transfer starts over.
+    pub fn resume(&self, dir: &str, path: &RelPath, from: u64) -> io::Result<Sink> {
+        let staged = self.staging_of(dir, path);
+        if let Some(parent) = staged.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+
+        if from > 0 && fs::metadata(&staged).is_ok_and(|m| m.len() == from) {
+            let mut existing = File::open(&staged)?;
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                let n = existing.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                size += n as u64;
+            }
+        } else {
+            // Nothing usable to continue from.
+            let _ = fs::remove_file(&staged);
+        }
+
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(size == 0)
+            .append(size > 0)
+            .open(&staged)?;
+
+        Ok(Sink {
+            file,
+            staged,
+            dest: self.locate(dir, path),
+            hasher,
+            size,
+        })
+    }
+
+    /// Open a file for reading from `offset`, for serving it to a peer.
+    pub fn open_at(&self, dir: &str, path: &RelPath, offset: u64) -> io::Result<File> {
+        let mut file = File::open(self.locate(dir, path))?;
+        if offset > 0 {
+            use std::io::Seek;
+            file.seek(io::SeekFrom::Start(offset))?;
+        }
+        Ok(file)
+    }
+
+    /// Move a file to another path inside the same group.
+    ///
+    /// Used when a path is resolved away from content this node holds — a conflict renaming
+    /// the loser, or duplicate content collapsing onto the earlier path. In both cases the
+    /// bytes are already correct and only their name is wrong, so this is a rename rather
+    /// than a transfer.
+    ///
+    /// Both paths are under one group directory, so the rename never crosses a filesystem and
+    /// cannot silently degrade into a copy.
+    pub fn rename(&self, dir: &str, from: &RelPath, to: &RelPath) -> io::Result<()> {
+        let source = self.locate(dir, from);
+        let dest = self.locate(dir, to);
+
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&source, &dest)?;
+        if let Some(parent) = dest.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+
+        // The source's directories may now be empty. Same sweep as `remove`, and it stops at
+        // the group directory for the same reason.
+        self.prune_above(dir, &source);
+        Ok(())
+    }
+
     /// Throw away a staged file without putting it in place.
     ///
     /// The caller that decides *after* staging not to go ahead — because the content turned
@@ -159,9 +321,16 @@ impl Content {
             Err(e) => return Err(e),
         }
 
-        // Leaving `photos/2024/` behind after its last photo went would make the tree grow
-        // monotonically. `remove_dir` only succeeds on an empty directory, so this cannot
-        // take anything with it.
+        self.prune_above(dir, &target);
+        Ok(())
+    }
+
+    /// Drop directories left empty above `target`, stopping at the group's own directory.
+    ///
+    /// Leaving `photos/2024/` behind after its last photo went would make the tree grow
+    /// monotonically. `remove_dir` only succeeds on an empty directory, so this cannot take
+    /// anything with it.
+    fn prune_above(&self, dir: &str, target: &Path) {
         let group_dir = self.group_dir(dir);
         let mut parent = target.parent().map(Path::to_path_buf);
         while let Some(p) = parent {
@@ -170,7 +339,6 @@ impl Content {
             }
             parent = p.parent().map(Path::to_path_buf);
         }
-        Ok(())
     }
 
     /// The hash of a file already in place, for `verify`.
@@ -396,6 +564,94 @@ mod tests {
             content.walk("g").unwrap().is_empty(),
             "a symlink is not content"
         );
+    }
+
+    #[test]
+    fn a_parked_transfer_resumes_where_it_stopped() {
+        // The path a relayed transfer takes *every* time: a circuit is cut at its byte cap,
+        // and the next attempt continues. sha256 cannot be resumed from a length, so the
+        // partial has to be re-read to rebuild the state — this is what checks that it is.
+        let (content, _tmp) = content();
+        let path = rel("big.bin");
+        let whole: Vec<u8> = (0..CHUNK * 3 + 77).map(|i| (i % 251) as u8).collect();
+        let (first, second) = whole.split_at(CHUNK + 13);
+
+        let mut sink = content.resume("g", &path, 0).unwrap();
+        sink.write(first).unwrap();
+        let parked = sink.park().unwrap();
+
+        assert_eq!(parked, first.len() as u64);
+        assert_eq!(
+            content.staged_len("g", &path),
+            parked,
+            "the next attempt learns where to start from the partial itself"
+        );
+        assert!(!content.exists("g", &path), "nothing is in place yet");
+
+        // A second attempt, as a fresh task would make it.
+        let mut sink = content.resume("g", &path, parked).unwrap();
+        sink.write(second).unwrap();
+        let staged = sink.finish().unwrap();
+        content.commit(staged).unwrap();
+
+        assert_eq!(std::fs::read(content.locate("g", &path)).unwrap(), whole);
+        assert_eq!(
+            content.hash_at("g", &path).unwrap(),
+            sha256_of(&whole),
+            "the hash spans both halves, so the state really was rebuilt"
+        );
+    }
+
+    #[test]
+    fn a_resume_from_the_wrong_offset_starts_over() {
+        // The peer is answering a different question than we asked. Continuing would splice
+        // two unrelated byte ranges into one file that hashes to nothing.
+        let (content, _tmp) = content();
+        let path = rel("big.bin");
+
+        let mut sink = content.resume("g", &path, 0).unwrap();
+        sink.write(b"one hundred bytes of something").unwrap();
+        sink.park().unwrap();
+
+        let mut sink = content.resume("g", &path, 999_999).unwrap();
+        assert_eq!(sink.size(), 0, "the partial was discarded, not appended to");
+
+        sink.write(b"fresh").unwrap();
+        let staged = sink.finish().unwrap();
+        assert_eq!(staged.size, 5);
+        assert_eq!(staged.hash, sha256_of(b"fresh"));
+    }
+
+    #[test]
+    fn a_transfer_that_never_started_resumes_from_zero() {
+        let (content, _tmp) = content();
+        let path = rel("new.bin");
+
+        assert_eq!(content.staged_len("g", &path), 0);
+        let sink = content.resume("g", &path, 0).unwrap();
+        assert_eq!(sink.size(), 0);
+    }
+
+    #[test]
+    fn serving_from_an_offset_sends_only_the_remainder() {
+        let (content, tmp) = content();
+        let path = rel("big.bin");
+        let src = source(tmp.path(), "in.bin", b"0123456789");
+
+        let staged = content.stage("g", &path, &src).unwrap();
+        content.commit(staged).unwrap();
+
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut content.open_at("g", &path, 4).unwrap(), &mut rest)
+            .unwrap();
+        assert_eq!(rest, b"456789");
+    }
+
+    /// The hash `Content` would compute, for comparing against.
+    fn sha256_of(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
     }
 
     #[test]

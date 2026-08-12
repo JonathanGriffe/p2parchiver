@@ -58,7 +58,14 @@ pub mod content;
 pub mod dirname;
 pub mod path;
 pub mod store;
+pub mod sync;
+pub mod wire;
 
 pub use content::{Content, Staged};
 pub use path::{PathError, RelPath};
-pub use store::{FileRow, Files, FilesError, Recorded};
+pub use store::{FileRow, Files, FilesError, Merged, Recorded};
+pub use sync::{FileAction, FileEvent, FileSync, Notice};
+pub use wire::{
+    BLOB_PROTOCOL, BlobReply, BlobRequest, FileHead, MANIFEST_PROTOCOL, ManifestEntry,
+    ManifestRequest, ManifestResponse,
+};

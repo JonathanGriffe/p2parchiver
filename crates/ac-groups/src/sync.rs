@@ -177,9 +177,6 @@ pub struct GroupSync {
     offered: HashMap<PeerId, HashSet<GroupId>>,
     /// Requests left for each peer until the next tick.
     budget: HashMap<PeerId, u32>,
-    /// What we last told peers about each group, so a change made by `ac group add` in another
-    /// process is noticed on the next tick. SQLite is the only channel between them.
-    announced: HashMap<GroupId, (u64, [u8; 32])>,
     /// The wall clock, as of the last tick. The machine reads no clock of its own, so
     /// everything it signs is timestamped from an event and tests stay deterministic.
     now_at: i64,
@@ -196,7 +193,6 @@ impl GroupSync {
             inflight: HashMap::new(),
             offered: HashMap::new(),
             budget: HashMap::new(),
-            announced: HashMap::new(),
             now_at: 0,
         }
     }
@@ -211,6 +207,20 @@ impl GroupSync {
     /// Not how the daemon works: the CLI writes through its *own* handle in another process,
     /// and the machine notices on the next tick. Reaching for this in the daemon would mean
     /// a change nobody announces.
+    /// What we would name to this peer: the groups we share with them.
+    ///
+    /// The one shape an offer comes in, and the only thing allowed to build a head bound for a
+    /// peer. Public because the supervisor decides *when* to offer and this layer decides
+    /// *what* — the same split `ac-files` makes.
+    pub fn heads_for(&self, peer: &PeerId) -> Vec<GroupHead> {
+        self.store
+            .shared_with(peer)
+            .unwrap_or_default()
+            .into_iter()
+            .take(MAX_HEADS_PER_OFFER)
+            .collect()
+    }
+
     pub fn store_mut(&mut self) -> &mut Groups {
         &mut self.store
     }
@@ -258,9 +268,12 @@ impl GroupSync {
     pub fn on(&mut self, event: GroupEvent) -> Vec<GroupAction> {
         match event {
             GroupEvent::PeerVerified { peer } => {
+                // Noted, not acted on. The supervisor decides when to talk to a peer — including
+                // the moment one arrives, where its record for them is empty and therefore
+                // stale. Offering from here as well meant every fresh connection carried a
+                // duplicate of the request it was about to send.
                 self.verified.insert(peer);
-                let heads = self.store.shared_with(&peer).unwrap_or_default();
-                self.offer(peer, heads)
+                Vec::new()
             }
 
             GroupEvent::PeerGone { peer } => {
@@ -411,11 +424,11 @@ impl GroupSync {
         self.report(&mut actions, group, &applied);
         self.ratify(&mut actions, group, &applied, at);
 
-        // Anything new is worth passing on, but never back to whoever just told us.
-        if applied.accepted > 0 {
-            let onward = self.announce(group);
-            actions.extend(onward.into_iter().filter(|a| !targets(a, peer)));
-        }
+        // Nothing is passed onward from here either. Applying entries moves our own head, and
+        // the supervisor's record of what each peer has seen is compared against exactly that —
+        // so every member becomes stale by the same comparison that notices a local change, and
+        // is offered to on the ordinary loop. One mechanism, whether the news was ours or
+        // somebody else's.
         actions
     }
 
@@ -502,19 +515,16 @@ impl GroupSync {
             self.inflight.remove(&group);
         }
 
-        let mut actions = Vec::new();
+        let actions = Vec::new();
 
-        // Pick up whatever the CLI did in another process. Both the head and the standings
-        // digest matter: `ac group add` moves the first, `ac group leave` only the second.
+        // **Nothing is offered from here.** Deciding when to talk to a peer belongs to the
+        // supervisor, which knows who is online, what the relay will allow, and whether a peer
+        // has just declined to discuss a group. This layer knows none of that, and there is no
+        // reason for the chain to spread by a different mechanism than the catalogue: they are
+        // the same question about the same groups, and answering it twice meant two records
+        // that could disagree — this one keyed per *group*, and written when a request was
+        // dispatched rather than when it was answered.
         let rows = self.store.list().unwrap_or_default();
-        for row in &rows {
-            let current = (row.head_seq, row.standings_digest);
-            if self.announced.get(&row.id) != Some(&current) {
-                self.announced.insert(row.id, current);
-                actions.extend(self.announce(row.id));
-            }
-        }
-
         self.expire_pending(&rows, at);
         actions
     }
@@ -534,24 +544,6 @@ impl GroupSync {
                 let _ = self.store.forget(row.id);
             }
         }
-    }
-
-    /// Tell every verified peer that shares this group about our new head.
-    fn announce(&mut self, group: GroupId) -> Vec<GroupAction> {
-        let peers: Vec<PeerId> = self.verified.iter().copied().collect();
-        let mut actions = Vec::new();
-
-        for peer in peers {
-            let heads = self.store.shared_with(&peer).unwrap_or_default();
-            if heads.iter().any(|h| h.group == group) {
-                actions.extend(self.offer(peer, heads));
-            }
-        }
-        actions
-    }
-
-    fn offer(&mut self, peer: PeerId, heads: Vec<GroupHead>) -> Vec<GroupAction> {
-        vec![GroupAction::Offer { peer, heads }]
     }
 
     /// Queue a fetch, unless this group already has an episode running or we are at capacity.
@@ -584,13 +576,5 @@ impl GroupSync {
         }
         *left -= 1;
         true
-    }
-}
-
-/// Whether an action is aimed at a particular peer.
-fn targets(action: &GroupAction, peer: PeerId) -> bool {
-    match action {
-        GroupAction::Offer { peer: p, .. } | GroupAction::Fetch { peer: p, .. } => *p == peer,
-        GroupAction::Note(_) => false,
     }
 }

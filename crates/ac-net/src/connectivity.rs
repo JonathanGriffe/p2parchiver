@@ -59,9 +59,12 @@ pub enum State {
 }
 
 impl State {
-    /// Whether traffic to this peer crosses the relay, and so is subject to its limits —
-    /// 128 KiB per circuit today. The thing a caller has to check before sending anything
-    /// substantial.
+    /// Whether traffic to this peer crosses the relay, and so is subject to its per-circuit
+    /// byte and duration budget rather than the link's own capacity.
+    ///
+    /// A relayed peer is no longer a peer to send nothing substantial to — the relay carries
+    /// content now. It is a peer whose transfers arrive in circuit-sized pieces and must be
+    /// able to resume across them.
     pub fn is_relayed(self) -> bool {
         matches!(self, State::UpgradePending | State::Relayed)
     }
@@ -328,7 +331,7 @@ mod tests {
 
     #[test]
     fn relayed_states_are_flagged_as_relayed() {
-        // What a caller checks before sending anything larger than the circuit's 128 KiB.
+        // What a caller checks before sending anything that may outgrow one circuit.
         assert!(State::UpgradePending.is_relayed());
         assert!(State::Relayed.is_relayed());
         assert!(!State::Direct.is_relayed());

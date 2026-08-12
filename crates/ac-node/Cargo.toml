@@ -12,6 +12,21 @@ path = "src/main.rs"
 ac-net.workspace = true
 ac-groups.workspace = true
 ac-files.workspace = true
+# The supervisor. Nothing else depends on it: it needs to see membership and content at once,
+# so it sits above both and below only this binary.
+ac-peers.workspace = true
+# Free space. `std::fs` has no such call, and `unsafe_code = "forbid"` rules out calling
+# `statvfs` directly, so the one thing this crate needs from it is worth a dependency: without
+# it a mirror can take the last gigabyte of somebody's root disk.
+fs4 = "1"
+# Bulk transfer. Confined to `blob.rs`: this is the only crate here with a runtime, and a
+# file needs one — `ac-files` stays drivable from a test with no socket.
+libp2p-stream = "0.4.0-alpha"
+# For the blob stream: `AsyncRead`/`AsyncWrite`, and the framing around them.
+futures = "0.3"
+serde.workspace = true
+ciborium.workspace = true
+hex.workspace = true
 libp2p.workspace = true
 tokio.workspace = true
 clap.workspace = true

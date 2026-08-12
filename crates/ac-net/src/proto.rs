@@ -23,6 +23,26 @@ pub const ENROLL_PROTOCOL: &str = "/ac/enroll/2.0.0";
 /// runs out.
 pub const ATTEST_PROTOCOL: &str = "/ac/attest/1.0.0";
 
+/// Liveness: a client asks its server which of a set of peers is connected right now.
+///
+/// On the **service** listener beside [`ATTEST_PROTOCOL`], and gated the same way — that
+/// listener admits enrolled peers only, so the connection is the credential and there is no
+/// separate check to write.
+///
+/// # What this discloses, deliberately
+///
+/// Any enrolled client can learn whether any other enrolled client is connected. The server
+/// **cannot** narrow that to a group: groups are peer-to-peer and the server knows nothing
+/// about them, which is the central property of this design and is not worth trading for a
+/// liveness hint. So the bound is enrolment — the operator decides who holds an invite, and
+/// this tells that set who among them is online.
+///
+/// Two things keep it from being worse than it sounds. The query is a *filter*, never a
+/// listing: the answer names only peers the asker already named, so this cannot be used to
+/// enumerate the server's clients. And "connected to this server" is weaker than "online" —
+/// a peer on a LAN with a direct path to its friends may be absent here.
+pub const PRESENCE_PROTOCOL: &str = "/ac/presence/1.0.0";
+
 /// Mutual attestation between two clients.
 ///
 /// Symmetric on purpose: both sides send their own attestation as a *request* and answer
@@ -159,6 +179,33 @@ impl AttestRefusal {
     }
 }
 
+/// Ceiling on how many peers one [`PresenceRequest::Who`] may name.
+///
+/// A supervisor asks about the members of the groups it is in, so this is generous at
+/// friend-and-family scale and still bounds what one request costs the server to answer. A
+/// caller with more to ask about sends more than one request; the server answers whatever it
+/// is given and silently ignores the excess rather than refusing, since a truncated answer
+/// degrades into "assume they are offline", which is safe.
+pub const MAX_PRESENCE_QUERY: usize = 256;
+
+/// "Which of these are connected to you?"
+///
+/// A set rather than a wildcard, so the answer can never be a directory of the server's
+/// clients — see [`PRESENCE_PROTOCOL`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PresenceRequest {
+    Who(Vec<libp2p::PeerId>),
+}
+
+/// The subset that is connected, in no particular order.
+///
+/// A peer absent from `online` was either not connected or beyond [`MAX_PRESENCE_QUERY`];
+/// the two are not distinguished, because the caller does the same thing in both cases.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PresenceResponse {
+    Online(Vec<libp2p::PeerId>),
+}
+
 /// One half of the mutual check: "here is mine".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerAttestRequest {
@@ -245,6 +292,54 @@ mod tests {
         ] {
             assert_eq!(round_trip(&response), response);
         }
+    }
+
+    #[test]
+    fn presence_messages_survive_cbor() {
+        // A `PeerId` has never crossed the wire as itself before — the chain carries base58
+        // text and an attestation carries a signed string — so this checks libp2p's own serde
+        // impl round-trips under ciborium, which is not human-readable and takes the byte path.
+        let peers: Vec<libp2p::PeerId> = (0..3)
+            .map(|_| {
+                libp2p::identity::Keypair::generate_ed25519()
+                    .public()
+                    .to_peer_id()
+            })
+            .collect();
+
+        let request = PresenceRequest::Who(peers.clone());
+        assert_eq!(round_trip(&request), request);
+
+        let response = PresenceResponse::Online(peers[..1].to_vec());
+        assert_eq!(round_trip(&response), response);
+
+        let empty = PresenceResponse::Online(Vec::new());
+        assert_eq!(round_trip(&empty), empty);
+    }
+
+    #[test]
+    fn a_full_presence_query_fits_the_request_ceiling() {
+        // `MAX_PRESENCE_QUERY` and the codec's byte maximum have to agree, and neither is
+        // derivable from the other: a count cap is not a size cap. Measured rather than
+        // assumed, because a peer id encoded as a sequence of integers rather than a byte
+        // string would be nearly twice this and the count cap would not notice.
+        let peers: Vec<libp2p::PeerId> = (0..MAX_PRESENCE_QUERY)
+            .map(|_| {
+                libp2p::identity::Keypair::generate_ed25519()
+                    .public()
+                    .to_peer_id()
+            })
+            .collect();
+
+        let mut buf = Vec::new();
+        ciborium::into_writer(&PresenceRequest::Who(peers), &mut buf).unwrap();
+
+        assert!(
+            (buf.len() as u64) < crate::swarm::MAX_PRESENCE_BYTES,
+            "a full query encodes to {} bytes, over the {} the codec will decode",
+            buf.len(),
+            crate::swarm::MAX_PRESENCE_BYTES
+        );
     }
 
     #[test]

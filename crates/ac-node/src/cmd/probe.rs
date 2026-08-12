@@ -294,8 +294,9 @@ fn report(
 
             if effective.is_relayed() {
                 println!();
-                println!("Traffic to this peer crosses the relay, which caps a circuit at");
-                println!("128 KiB. That is enough to coordinate, not to move media.");
+                println!("Traffic to this peer crosses the relay, which carries it in");
+                println!("circuit-sized pieces rather than one stream. Transfers still work;");
+                println!("they resume across circuits, and a direct connection is faster.");
             }
         }
     }

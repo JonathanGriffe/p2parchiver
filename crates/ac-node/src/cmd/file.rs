@@ -164,6 +164,20 @@ fn add_one(s: &mut Session, src: &Path, dest: &RelPath, force: bool) -> Result<R
         .stage(&s.dir, dest, src)
         .with_context(|| format!("copying {}", src.display()))?;
 
+    // A group keeps one copy of any content, and a fresh add is always the later one, so it
+    // would always lose. Saying so now beats accepting the file and having the next sync
+    // remove it — and it names where the content already is.
+    if let Some(held) = s.files.path_of_hash(s.id, &staged.hash)?
+        && held != *dest
+    {
+        s.content.discard(staged).ok();
+        bail!(
+            "these bytes are already in {}, at {held}\n\
+             Nothing was added: a group keeps one copy of any file.",
+            s.row.name
+        );
+    }
+
     // Decided before committing: overwriting the bytes and *then* refusing to record would
     // destroy content to report a conflict.
     if let Some(existing) = s.files.get(s.id, dest)?
@@ -187,6 +201,10 @@ fn add_one(s: &mut Session, src: &Path, dest: &RelPath, force: bool) -> Result<R
         added_at: now(),
         added_by: s.files.me(),
         removed_at: None,
+        // We are about to put the bytes there ourselves.
+        have: true,
+        // The store assigns the log position; whatever is here is ignored.
+        seen_seq: 0,
     };
 
     s.content
@@ -276,13 +294,25 @@ pub fn list(paths: &Paths, needle: &str, prefix: Option<&str>, removed: bool) ->
         .max()
         .unwrap_or(0);
     for row in &rows {
-        let note = if row.is_removed() { "  (removed)" } else { "" };
+        // What this node actually holds. Once a group is shared this is most of what a
+        // listing is for: the catalogue belongs to everyone, the bytes do not.
+        let held = match (row.is_removed(), row.have) {
+            (true, _) => "removed",
+            (false, true) => "local",
+            (false, false) => "remote",
+        };
         println!(
-            "{:<widest$}  {:>9}  {}{note}",
+            "{:<widest$}  {:>9}  {}  {held}",
             row.path.as_str(),
             human_size(row.size),
             &row.hash[..8.min(row.hash.len())],
         );
+    }
+
+    if rows.iter().any(|r| !r.have && !r.is_removed()) {
+        println!();
+        println!("`remote` means this node knows the file exists but does not hold it.");
+        println!("Fetch one with: ac file get {} <path>", s.row.id.short());
     }
     Ok(())
 }
@@ -323,10 +353,62 @@ pub fn show(paths: &Paths, needle: &str, path: &str) -> Result<()> {
         s.content.locate(&s.dir, &row.path).display()
     );
 
-    if !row.is_removed() && !s.content.exists(&s.dir, &row.path) {
+    println!(
+        "held      {}",
+        if row.have {
+            "yes, on this node"
+        } else {
+            "no — the catalogue knows it, the bytes are elsewhere"
+        }
+    );
+
+    if !row.is_removed() && !row.have {
+        println!();
+        println!("Fetch it with: ac file get {needle} {}", row.path);
+    } else if !row.is_removed() && !s.content.exists(&s.dir, &row.path) {
         println!();
         println!("The bytes are missing. `ac file verify {needle}` checks the whole group.");
     }
+    Ok(())
+}
+
+/// Ask for a file's bytes.
+///
+/// Records the want and returns; it does not transfer anything itself. The running `ac run` is
+/// what has the connections, and SQLite is the only channel between the two processes — the
+/// same arrangement `ac group add` uses. So this works with no daemon running, and the fetch
+/// happens whenever one is next up and a member holding the file is reachable.
+pub fn get(paths: &Paths, needle: &str, path: &str) -> Result<()> {
+    let mut s = session(paths, needle)?;
+    let path = RelPath::parse(path).map_err(|e| anyhow!("{e}"))?;
+
+    let row = s
+        .files
+        .get(s.id, &path)
+        .context("reading the file")?
+        .ok_or_else(|| {
+            anyhow!(
+                "{path} is not in {}; `ac file list {needle}` shows what is",
+                s.row.name
+            )
+        })?;
+
+    if row.is_removed() {
+        bail!("{path} was removed from {}", s.row.name);
+    }
+    if row.have {
+        println!("{path} is already here");
+        println!("  {}", s.content.locate(&s.dir, &path).display());
+        return Ok(());
+    }
+
+    s.files.want(s.id, &path).context("recording the want")?;
+
+    println!("asked for {path} ({})", human_size(row.size));
+    println!();
+    println!("A running `ac run` fetches it from a member who holds it, which may not be");
+    println!("now — nothing here dials, and the file only moves while you are both online.");
+    println!("`ac file list {needle}` shows `local` once it has arrived.");
     Ok(())
 }
 
