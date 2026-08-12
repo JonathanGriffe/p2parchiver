@@ -7,15 +7,35 @@ and its cost is bandwidth, not CPU.
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs fmt, clippy (`-D warnings`) and the test suite on every
-push and pull request. On a push to `main` or a `v*` tag it then builds `deploy/Dockerfile`
-and publishes to Docker Hub as `<user>/ac-server`.
+push and pull request. On a push to `main` it then releases, in three steps:
 
-Two repository secrets are required:
+1. **Version.** `scripts/tag.sh` reads the commits since the last release and bumps
+   accordingly — `BREAKING CHANGE` major, `feat:` minor, anything else patch — then creates
+   and pushes a bare `MAJOR.MINOR.PATCH` tag. Git tags are the only source of truth; nothing
+   is written back to the repository, which is what stops CI triggering itself.
+2. **Publish.** `deploy/Dockerfile` is built and pushed to Docker Hub as
+   `<user>/ac-server:<version>`, plus `latest` and an immutable `sha-<commit>`.
+3. **Deploy.** The `ac-server` chart in `JonathanGriffe/beatguessr-infra` has its
+   `appVersion` set to the new version and the change is committed. Argo CD watches that
+   path with `selfHeal`, so the commit is the deployment.
+
+The scheme is deliberately the same as `clockdata` and `beatguessr`, which deploy into the
+same infra repository — a version means the same thing in all three.
+
+Because the version is decided from commit subjects, **the commit messages are the release
+notes and the version bump**. A `feat:` on main ships a minor release.
+
+Three repository secrets are required:
 
 | Secret | Value |
 | --- | --- |
 | `DOCKERHUB_USERNAME` | your Docker Hub account name |
 | `DOCKERHUB_TOKEN` | an access token — *not* your password |
+| `DEPLOY_PAT` | a personal access token with write on `beatguessr-infra` |
+
+`DEPLOY_PAT` cannot be the built-in `GITHUB_TOKEN`: that one is scoped to this repository
+and the deploy step writes to another. The tag push in step 1 does use `GITHUB_TOKEN`, via
+the workflow's `contents: write` permission.
 
 Create the token at Docker Hub → Account Settings → Personal access tokens, with
 **Read & Write** scope. If you keep them in a local `.env` (git-ignored), push them with:
@@ -30,9 +50,22 @@ GitHub Actions cannot read a `.env` file from the repository — and committing 
 publish the credentials — so secrets are the mechanism regardless of where you keep the
 originals.
 
-Images are tagged `latest` (main), the semver forms of any `v*` tag, and always an
-immutable `sha-<commit>`. Prefer the sha tag when deploying: `latest` moves underneath a
-running server, so a `docker compose pull` can change versions without you choosing to.
+Prefer the version tag when deploying, or the sha tag: `latest` moves underneath a running
+server, so a `docker compose pull` can change versions without you choosing to.
+
+`ac-server --version` reports the version in `Cargo.toml`, which is **not** the release —
+the release is the image tag, and it is also on the image as the standard
+`org.opencontainers.image.version` label:
+
+```bash
+docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+  <user>/ac-server:latest
+```
+
+Writing the release into `Cargo.toml` during the build was the alternative. It would make
+`--version` honest at the cost of a full recompile of the dependency tree on every push,
+since the edit lands in a layer above `cargo build` and invalidates the cache that step
+depends on.
 
 To run a published image, set `image:` in `compose.yaml` instead of `build:`.
 

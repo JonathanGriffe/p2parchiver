@@ -1,17 +1,19 @@
 name: CI
 
+# Tags are no longer a trigger. Releases are decided *by* this workflow — `scripts/tag.sh`
+# reads the commits and creates the tag — so a tag arriving is this workflow's own output
+# rather than an event it should react to. Pushing one with `GITHUB_TOKEN` does not start a
+# new run in any case, which is what keeps release from re-entering itself.
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
 
-# A second push to the same branch makes the first one's result irrelevant. Tags are
-# excluded from cancellation: a release build that loses a race is a missing artefact.
+# A second push to the same branch makes the first one's result irrelevant.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,17 +39,31 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  image:
-    name: image
+  release:
+    name: release
     needs: test
     # Never on pull_request: secrets are not available to forked PRs, so the job could only
-    # fail. Publishing is also not something a PR should be able to do.
+    # fail. Publishing — and tagging — is also not something a PR should be able to do.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # To push the tag. The default token is read-only, and without this `tag.sh` gets as
+      # far as deciding a version and then fails on the push.
+      contents: write
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
     steps:
+      # Full history and every tag: the version is computed from what has happened since the
+      # last one, and a shallow clone would make that the whole history every time.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # After `test`, deliberately. A tag is a claim that this commit is releasable, so
+      # nothing should be tagged that has not passed.
+      - name: Decide the version and tag it
+        id: tag
+        run: ./scripts/tag.sh
 
       - uses: docker/setup-buildx-action@v3
 
@@ -60,14 +76,19 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/ac-server
-          # `latest` tracks main; a v* tag also publishes its semver forms. Every build
-          # additionally gets an immutable sha tag, so a deployment can name an exact
-          # commit rather than a label that moves under it.
+          # The version this run decided, and two labels that move: `latest` for anyone
+          # pulling by hand, and an immutable sha tag for naming an exact commit. The
+          # deployment names the version, which never moves once published.
           tags: |
+            type=raw,value=${{ steps.tag.outputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long
+          # `metadata-action` derives this from the ref, which is a branch here rather than
+          # the tag we just made, so it is given the version instead. This label is how a
+          # running container answers "which release is this" — `ac-server --version`
+          # reports the `Cargo.toml` version, not this one. See `scripts/tag.sh`.
+          labels: |
+            org.opencontainers.image.version=${{ steps.tag.outputs.version }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -77,6 +98,42 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Without a cache every push recompiles the whole dependency tree, which for a
-          # libp2p build is the dominant cost of this workflow.
+          # libp2p build is the dominant cost of this workflow. Nothing above writes the
+          # version into the source, precisely so that this stays warm from build to build.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: deploy
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      # A different repository, so `GITHUB_TOKEN` cannot reach it: `DEPLOY_PAT` is a
+      # personal access token with write on `beatguessr-infra`.
+      - uses: actions/checkout@v4
+        with:
+          repository: JonathanGriffe/beatguessr-infra
+          token: ${{ secrets.DEPLOY_PAT }}
+
+      # Argo CD watches `helm/ac-server/` on that repository's `main` with `selfHeal`, so
+      # this commit *is* the deployment. The chart takes its image tag from `appVersion`,
+      # which is the same shape `clockdata` uses and the reason there is one line to edit.
+      - name: Point the chart at the new image
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          sed -i "s/^appVersion: .*/appVersion: $VERSION/" helm/ac-server/Chart.yaml
+
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add .
+
+          # Nothing to commit is a normal outcome — a re-run of an already released commit
+          # reuses its version — and not an error worth failing a deployment over.
+          if git diff --cached --quiet; then
+            echo "helm/ac-server already points at $VERSION"
+            exit 0
+          fi
+
+          git commit -m "chore: update ac-server Docker image to $VERSION"
+          git push origin main
