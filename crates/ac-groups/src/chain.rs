@@ -45,8 +45,7 @@
 
 use ac_net::PeerId;
 use ac_net::attest::normalise_username;
-use ac_net::identity::public_key_of;
-use libp2p::identity::Keypair;
+use ac_net::identity::{Keypair, public_key_of};
 use serde::{Deserialize, Serialize};
 
 use crate::id::{EntryHash, GroupId, NO_PARENT};
@@ -581,9 +580,24 @@ mod tests {
 
     /// A peer id that hashes its key rather than inlining it — an RSA key, or one from another
     /// implementation. No public key is recoverable, so it can never sign anything we check.
+    ///
+    /// Written as the base58 text rather than built from a multihash, which is both what such a
+    /// peer id looks like arriving over the wire and the reason this file names no libp2p type.
+    /// The leading `Qm` is the giveaway: it is a sha2-256 digest (multihash code `0x12`), not
+    /// the identity hash `0x00` that [`public_key_of`] needs. `an_opaque_peer_yields_no_key`
+    /// below asserts that property rather than trusting the comment.
+    const OPAQUE_PEER: &str = "QmNp5n7FFav5ZDaHAj6HzuhJ8LDbL1N6NRzAgT6piWS2Kx";
+
     fn opaque_peer() -> PeerId {
-        let hashed = libp2p::multihash::Multihash::<64>::wrap(0x12, &[7u8; 32]).unwrap();
-        PeerId::from_multihash(hashed).unwrap()
+        OPAQUE_PEER.parse().unwrap()
+    }
+
+    #[test]
+    fn an_opaque_peer_yields_no_key() {
+        // Guards the constant. If it were mistyped into something whose key *is* recoverable,
+        // every test below that expects a rejection would start passing for the wrong reason —
+        // the entry would be refused on a signature check instead of on the missing key.
+        assert!(public_key_of(&opaque_peer()).is_err());
     }
 
     fn group(admin: &Keypair) -> Chain {

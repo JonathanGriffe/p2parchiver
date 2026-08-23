@@ -13,7 +13,14 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use libp2p::PeerId;
-use libp2p::identity::{Keypair, PublicKey};
+/// The key types this module deals in, re-exported for the same reason as [`crate::PeerId`].
+///
+/// Both are already part of this module's API — [`Identity::keypair`] returns a `Keypair` and
+/// [`public_key_of`] returns a `PublicKey` — so without this a caller cannot name what it is
+/// handed. They are identity, not networking: `ac-groups` signs chain entries and standings
+/// with the keypair loaded here, and taking them from `ac-net` is what confines that crate's
+/// libp2p imports to its `wire.rs` seam, which its `tests/layering.rs` now enforces.
+pub use libp2p::identity::{Keypair, PublicKey};
 
 /// Name of the key file inside the node's data directory.
 pub const KEY_FILENAME: &str = "identity.key";

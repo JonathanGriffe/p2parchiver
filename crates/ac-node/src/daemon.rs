@@ -29,6 +29,8 @@ use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, rendezvous, reques
 use crate::file_link::FileLink;
 use crate::group_link::GroupLink;
 use crate::peer_link::PeerLink;
+use ac_files::wire::{ManifestRequest, ManifestResponse};
+use ac_groups::wire::{GroupRequest, GroupResponse};
 use ac_net::admission::{Admission, AdmissionAction, AdmissionEvent, Notice as AdmissionNotice};
 use ac_net::attest;
 use ac_net::authz::AcceptAnyPeer;
@@ -38,6 +40,7 @@ use ac_net::identity::Identity;
 use ac_net::link::{HOUSEKEEPING_TICK, ServerLink};
 use ac_net::proto::{AttestRequest, PeerAttestRequest, PeerAttestResponse};
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
+use ac_peers::wire::{SessionRequest, SessionResponse};
 
 /// This node's application layer: four protocols in one slot.
 ///
@@ -57,23 +60,83 @@ use ac_net::swarm::{AcBehaviourEvent, Role, build};
 /// `sessions` is the odd one out: it carries no data at all, only the question "are you done
 /// with me too?". It obeys the slot's first rule the same as the rest — it may *ask* to close
 /// a connection and can never refuse one.
+///
+/// # Why the behaviours are built here rather than in those crates
+///
+/// Each of the three used to export its own `Behaviour` alias and constructor, which is what
+/// made `libp2p` a dependency of all three. Now they export the protocol name, the message
+/// types and the size ceilings — facts about the protocol — and this crate turns them into
+/// something mountable. `ac-groups`, `ac-files` and `ac-peers` therefore cannot name a libp2p
+/// type at all, which is a stronger statement than the greps in their `tests/layering.rs`:
+/// the compiler enforces it, because the dependency is gone.
+///
+/// `blobs` has always worked this way — `ac_files::wire::BLOB_PROTOCOL` is a `&str` and the
+/// stream is opened here. This makes the other three consistent with it.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct App {
-    pub groups: ac_groups::wire::Behaviour,
-    pub manifests: ac_files::wire::Behaviour,
+    pub groups: request_response::cbor::Behaviour<GroupRequest, GroupResponse>,
+    pub manifests: request_response::cbor::Behaviour<ManifestRequest, ManifestResponse>,
     pub blobs: libp2p_stream::Behaviour,
-    pub sessions: ac_peers::wire::Behaviour,
+    pub sessions: request_response::cbor::Behaviour<SessionRequest, SessionResponse>,
 }
 
 /// None of these is const-constructible, so this is a function where the `dummy::Behaviour` it
 /// replaced was a `const`.
 pub fn app() -> App {
     App {
-        groups: ac_groups::wire::behaviour(),
-        manifests: ac_files::wire::behaviour(),
+        groups: cbor_behaviour(
+            ac_groups::wire::GROUP_PROTOCOL,
+            ac_groups::wire::MAX_REQUEST_BYTES,
+            ac_groups::wire::MAX_RESPONSE_BYTES,
+        ),
+        manifests: cbor_behaviour(
+            ac_files::wire::MANIFEST_PROTOCOL,
+            ac_files::wire::MAX_REQUEST_BYTES,
+            ac_files::wire::MAX_RESPONSE_BYTES,
+        ),
         blobs: libp2p_stream::Behaviour::new(),
-        sessions: ac_peers::wire::behaviour(),
+        sessions: cbor_behaviour(
+            ac_peers::wire::SESSION_PROTOCOL,
+            ac_peers::wire::MAX_SESSION_BYTES,
+            ac_peers::wire::MAX_SESSION_BYTES,
+        ),
     }
+}
+
+/// One CBOR request-response behaviour, built from what a protocol declares about itself.
+///
+/// The three above were three copies of this function in three crates, identical but for the
+/// names they closed over. They are all [`ProtocolSupport::Full`] because all three exchanges
+/// are symmetric — either side may offer and either may be asked, and on a relayed connection
+/// that DCUtR later upgrades, "who dialled" is not a distinction worth building on. That is the
+/// same reasoning as `/ac/peer-attest/1.0.0` in `ac-net`.
+///
+/// The size maxima are always passed explicitly. libp2p's codec defaults are 1 MiB request and
+/// 10 MiB response, which is a memory budget none of these protocols has any use for, and
+/// `request_response` buffers a whole message before handing it over — so the ceiling is what
+/// bounds what one peer can make this node allocate. Each protocol's own crate holds its number
+/// and has a test proving its largest legal message fits underneath.
+fn cbor_behaviour<Req, Resp>(
+    protocol: &'static str,
+    max_request: u64,
+    max_response: u64,
+) -> request_response::cbor::Behaviour<Req, Resp>
+where
+    Req: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    Resp: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+{
+    let codec = request_response::cbor::codec::Codec::default()
+        .set_request_size_maximum(max_request)
+        .set_response_size_maximum(max_response);
+
+    request_response::cbor::Behaviour::with_codec(
+        codec,
+        [(
+            libp2p::StreamProtocol::new(protocol),
+            request_response::ProtocolSupport::Full,
+        )],
+        request_response::Config::default(),
+    )
 }
 
 /// A convenient alias for the concrete swarm this module drives.

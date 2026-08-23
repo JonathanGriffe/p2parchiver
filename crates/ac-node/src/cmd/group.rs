@@ -160,21 +160,41 @@ pub fn add(paths: &Paths, needle: &str, peer: &PeerId, username: Option<&str>) -
     let (id, row) = resolve(&groups, needle)?;
     require_admin(&row, &identity, "add members")?;
 
-    // Fall back to whatever this node already calls them. It is display text either way, and
-    // making the flag mandatory would mean retyping a name the contact list already holds.
-    let username = match username {
-        Some(name) => name.to_owned(),
-        None => Contacts::open(&paths.db_file())
-            .ok()
-            .and_then(|c| c.get(peer).ok().flatten())
-            .map(|c| c.label)
-            .ok_or_else(|| {
-                anyhow!(
-                    "no name for {peer}; pass --username, or add them first with \
-                     `ac peer add {peer} --label <name>`"
-                )
-            })?,
+    // Fall back to whatever this node already calls them, rather than making the flag
+    // mandatory and retyping a name the contact list already holds.
+    //
+    // **Checked here, before anything is authored.** This is not display text once it is in
+    // the chain: it is signed, replicated and permanent, and `Chain::validate` holds it to
+    // the username rules. Contact labels predating that check can fail them — `pi` is two
+    // characters and a username needs three — and letting one through meant the refusal came
+    // back as `entry 1 carries an unusable username`, which names a chain entry the person
+    // never mentioned and does not say which name was the problem.
+    let (raw, source) = match username {
+        Some(name) => (name.to_owned(), "username"),
+        None => (
+            Contacts::open(&paths.db_file())
+                .ok()
+                .and_then(|c| c.get(peer).ok().flatten())
+                .map(|c| c.label)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no name for {peer}; pass --username, or add them first with \
+                         `ac peer add {peer} --label <name>`"
+                    )
+                })?,
+            "contact label",
+        ),
     };
+
+    // Normalised, not merely accepted, so what lands in the chain is the canonical form —
+    // the same form the server attests. `create` takes its username straight from the
+    // attestation for that reason; this is the other half of it.
+    let username = attest::normalise_username(&raw).map_err(|e| {
+        anyhow!(
+            "unusable {source} {raw:?}: {e}\n\
+             pass --username <name> with a name that fits"
+        )
+    })?;
 
     groups
         .author(

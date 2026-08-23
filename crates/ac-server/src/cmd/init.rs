@@ -104,7 +104,7 @@ mod tests {
         let config: ac_net::config::Config =
             toml::from_str(&starter_config()).expect("starter config must be valid TOML");
 
-        let has_port = |addrs: &[ac_net::Multiaddr], port: u16| {
+        let has_port = |addrs: &[libp2p::Multiaddr], port: u16| {
             addrs
                 .iter()
                 .any(|a| a.to_string().contains(&port.to_string()))

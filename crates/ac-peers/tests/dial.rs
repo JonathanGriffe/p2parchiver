@@ -19,12 +19,12 @@ use ac_groups::id::GroupId;
 use ac_groups::standing::Standing;
 use ac_groups::store::Groups;
 use ac_net::PeerId;
+use ac_net::identity::Keypair;
 use ac_peers::sync::{
     DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_WINDOW, HEARTBEAT, Limits, MAX_TRANSFERS, MIN_BACKOFF,
     Notice, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent, Peers, ROUND_TIMEOUT,
     SHARE_AFTER_IDLE,
 };
-use libp2p::identity::Keypair;
 
 const AT: i64 = 1_000_000;
 

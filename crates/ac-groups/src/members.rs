@@ -99,11 +99,10 @@ impl Members {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ac_net::identity::Keypair;
 
     fn peer() -> PeerId {
-        libp2p::identity::Keypair::generate_ed25519()
-            .public()
-            .to_peer_id()
+        Keypair::generate_ed25519().public().to_peer_id()
     }
 
     #[test]

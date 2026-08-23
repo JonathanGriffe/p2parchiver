@@ -15,7 +15,7 @@ use ac_groups::store::{Groups, State};
 use ac_groups::sync::{GroupAction, GroupEvent, GroupSync, Notice};
 use ac_groups::wire::{GroupHead, GroupRequest, GroupResponse};
 use ac_net::PeerId;
-use libp2p::identity::Keypair;
+use ac_net::identity::Keypair;
 
 const AT: i64 = 1_000_000;
 

@@ -47,8 +47,17 @@
 //!
 //! # Layering
 //!
-//! Nothing here may name a libp2p networking type. `PeerId` is fine. `tests/layering.rs`
-//! enforces it by reading the source, because a reviewer will not catch a re-added `use`.
+//! Nothing here may name a libp2p networking type. `PeerId` is fine, and comes from `ac_net`.
+//! Stated positively: **`libp2p` is named nowhere in this crate**, not even in [`wire`], and it
+//! is not a dependency — so a networking type is unnameable and rustc refuses it. `wire` used to
+//! be the exception, because it declared the manifest `request_response` behaviour; it now
+//! declares the two protocol names, the messages and the size ceilings, and `ac-node` builds
+//! what carries them. That is how [`wire::BLOB_PROTOCOL`] always worked, so the manifest
+//! protocol is simply consistent with the blob one now.
+//!
+//! `tests/layering.rs` still greps the source, but as a second line: the rule that matters is
+//! the absent dependency, which it checks in `Cargo.toml`. A reviewer will not catch a re-added
+//! `use`, and will not catch a re-added dependency either.
 
 // The workspace warns on unwrap/expect because a panic in the event loop takes the whole
 // daemon down. In tests a panic *is* the failure report, so let them through.

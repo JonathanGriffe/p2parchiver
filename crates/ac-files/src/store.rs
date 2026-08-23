@@ -1206,7 +1206,7 @@ pub enum FilesError {
 mod tests {
     use super::*;
     use ac_groups::store::Groups;
-    use libp2p::identity::Keypair;
+    use ac_net::identity::Keypair;
 
     const AT: i64 = 1_000_000;
 

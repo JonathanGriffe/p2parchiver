@@ -89,13 +89,21 @@
 //! # Layering
 //!
 //! Nothing in this crate may name a libp2p networking type. `PeerId`, `Keypair` and
-//! `PublicKey` are fine; `request_response` and `StreamProtocol` are confined to
-//! [`wire`]; `Swarm`, `SwarmEvent`, `NetworkBehaviour`, `ResponseChannel`, request ids and
-//! `Multiaddr` appear nowhere. The sync half is a state machine that consumes events and
-//! returns actions, and `ac-node`'s daemon is the only code that touches both worlds.
+//! `PublicKey` are fine — they are identity rather than networking, and they come from
+//! `ac_net`, which re-exports all three. `Swarm`, `SwarmEvent`, `NetworkBehaviour`,
+//! `ResponseChannel`, request ids and `Multiaddr` appear nowhere. The sync half is a state
+//! machine that consumes events and returns actions, and `ac-node`'s daemon is the only code
+//! that touches both worlds.
 //!
-//! `tests/layering.rs` enforces this by reading the source, because a reviewer will not catch
-//! a re-added `use`.
+//! Stated positively: **`libp2p` is named nowhere in this crate**, not even in [`wire`], and it
+//! is not a dependency — so a networking type is unnameable and rustc refuses it. `wire` used to
+//! be the exception, because it declared the `request_response` behaviour; it now declares the
+//! protocol name, the messages and the size ceilings, and `ac-node` builds what carries them.
+//! That is how `ac_files::wire::BLOB_PROTOCOL` always worked.
+//!
+//! `tests/layering.rs` still greps the source, but as a second line: the rule that matters is
+//! the absent dependency, which it checks in `Cargo.toml`. A reviewer will not catch a re-added
+//! `use`, and will not catch a re-added dependency either.
 //!
 //! # Where to look
 //!

@@ -13,7 +13,7 @@ use ac_net::PeerId;
 use ac_net::attest;
 use ac_net::config::Paths;
 use ac_net::identity::Identity;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::contacts::Contacts;
 use crate::directory::{self, Source};
@@ -32,8 +32,17 @@ fn open(paths: &Paths) -> Result<Contacts> {
 }
 
 pub fn add(paths: &Paths, peer: &PeerId, label: &str) -> Result<()> {
+    // Held to the username rules even though this list is local, because `ac group add`
+    // reuses a label as the username it writes into the group chain when `--username` is
+    // not given. A label that is merely a nice local name there becomes a signed, permanent
+    // record here — and refusing it at that point is refusing it long after it was typed,
+    // in an error about a chain entry the person never mentioned. `pi` is the case that
+    // showed it: a perfectly good label, one character short of a username.
+    let label =
+        attest::normalise_username(label).map_err(|e| anyhow!("unusable label {label:?}: {e}"))?;
+
     let added = open(paths)?
-        .add(peer, label)
+        .add(peer, &label)
         .with_context(|| format!("adding contact {peer}"))?;
 
     if added {

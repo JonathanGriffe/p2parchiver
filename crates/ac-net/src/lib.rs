@@ -20,4 +20,16 @@ pub mod link;
 pub mod proto;
 pub mod swarm;
 
-pub use libp2p::{Multiaddr, PeerId};
+/// The name a node is known by, everywhere above this crate.
+///
+/// Re-exported because a peer id is not really a networking type here: it is the durable
+/// identity a group member, a manifest's owner and the subject of a signed statement are all
+/// named by, and [`identity::public_key_of`] recovers the verification key straight out of it.
+/// So the layers above deal in peer ids constantly while knowing nothing about transports.
+///
+/// `Multiaddr` is deliberately **not** re-exported alongside it. *Where* to reach a peer is
+/// exactly the concern those layers are meant to be free of — `ac-groups`, `ac-files` and
+/// `ac-peers` name it nowhere, and their `tests/layering.rs` fail if that ever changes.
+/// Addresses belong to this crate and to the binaries that own configuration and dialling,
+/// both of which depend on libp2p directly and can say `libp2p::Multiaddr`.
+pub use libp2p::PeerId;

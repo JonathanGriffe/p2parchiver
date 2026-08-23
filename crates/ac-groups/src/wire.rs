@@ -1,11 +1,12 @@
-//! The `/ac/group/3.0.0` protocol.
+//! The `/ac/group/3.0.0` protocol: what is said, not how it is carried.
 //!
-//! The **only** module in this crate permitted to name `libp2p::request_response`. Everything
-//! else — the chain, the standings, the store, the sync machine — is free of networking types,
-//! which is what lets the sync policy be tested without a socket.
+//! The name, the message types and the limits are here; the `request_response` behaviour that
+//! carries them is built by `ac-node`, which is the only crate that mounts anything. That split
+//! is what keeps **this whole crate free of libp2p** — not as a convention a grep polices, but
+//! because libp2p is not a dependency and its types cannot be named. The same arrangement the
+//! blob protocol has always had: `ac_files::wire::BLOB_PROTOCOL` is a string, and `ac-node`
+//! turns it into a stream.
 
-use libp2p::StreamProtocol;
-use libp2p::request_response::{self, ProtocolSupport};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::Entry;
@@ -29,7 +30,10 @@ pub const GROUP_PROTOCOL: &str = "/ac/group/3.0.0";
 pub const MAX_HEADS_PER_OFFER: usize = 128;
 
 /// Largest request we will decode. An `Offer` of 128 heads is ~10 KiB.
-const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+///
+/// Public because `ac-node` builds the codec from it. The number is a fact about this protocol
+/// and belongs beside the messages it bounds, even though the codec it configures is elsewhere.
+pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 /// Largest response we will decode.
 ///
@@ -39,7 +43,9 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// holds one entry per membership change at ~250 bytes, so this ceiling is roughly 4000
 /// entries — a decade of implausible churn. A chain that will not fit is a failure worth
 /// surfacing rather than a case to handle; compaction is the answer if it ever arrives.
-const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+///
+/// Public for the same reason as [`MAX_REQUEST_BYTES`].
+pub const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 /// What a node knows about one group, as offered to a peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,30 +98,12 @@ pub enum GroupResponse {
     Unavailable,
 }
 
-pub type Behaviour = request_response::cbor::Behaviour<GroupRequest, GroupResponse>;
-
-/// Build the behaviour a client mounts in `AcBehaviour`'s app slot.
-///
-/// `ProtocolSupport::Full` because the exchange is symmetric: either side may offer, and
-/// either side may be asked. Size maxima are set explicitly — the codec defaults are 1 MiB
-/// request and 10 MiB response, far more than this protocol should ever accept.
-pub fn behaviour() -> Behaviour {
-    let codec = request_response::cbor::codec::Codec::default()
-        .set_request_size_maximum(MAX_REQUEST_BYTES)
-        .set_response_size_maximum(MAX_RESPONSE_BYTES);
-
-    Behaviour::with_codec(
-        codec,
-        [(StreamProtocol::new(GROUP_PROTOCOL), ProtocolSupport::Full)],
-        request_response::Config::default(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ac_net::identity::Keypair;
+
     use crate::chain::{Chain, Op};
-    use libp2p::identity::Keypair;
 
     const AT: i64 = 1_000_000;
 

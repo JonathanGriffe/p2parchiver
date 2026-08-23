@@ -46,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ac_net::PeerId;
-use libp2p::identity::Keypair;
+use ac_net::identity::Keypair;
 
 use crate::chain::Op;
 use crate::id::GroupId;

@@ -50,8 +50,12 @@ GitHub Actions cannot read a `.env` file from the repository — and committing 
 publish the credentials — so secrets are the mechanism regardless of where you keep the
 originals.
 
-Prefer the version tag when deploying, or the sha tag: `latest` moves underneath a running
-server, so a `docker compose pull` can change versions without you choosing to.
+**Deploy a version, never `latest`.** The Helm chart names `appVersion`, so what is deployed
+is recorded in the infra repository and changes only when a commit says so. `latest` is
+published for pulling by hand, but deploying it means the running server and the chart can
+disagree about what is running — silently, because a pod restarting at 3am picks up whatever
+`latest` pointed to then and nothing writes that down. The sha tag is equally immutable if
+you want to name a commit rather than a release.
 
 `ac-server --version` reports the version in `Cargo.toml`, which is **not** the release —
 the release is the image tag, and it is also on the image as the standard

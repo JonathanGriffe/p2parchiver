@@ -23,7 +23,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use ac_net::PeerId;
-use libp2p::identity::Keypair;
+use ac_net::identity::Keypair;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::chain::{Chain, ChainError, Entry, Op};

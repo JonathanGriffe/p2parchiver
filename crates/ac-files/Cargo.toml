@@ -7,7 +7,6 @@ rust-version.workspace = true
 [dependencies]
 ac-net.workspace = true
 ac-groups.workspace = true
-libp2p.workspace = true
 serde.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
@@ -18,10 +17,14 @@ tracing.workspace = true
 # Deliberately absent: `tokio` (this crate has no async), and `anyhow` (a library returns
 # typed errors; the binaries add context).
 #
-# `libp2p` is here for `wire.rs` only, which declares the protocols. Everything else in this
-# crate stays free of networking types, and `tests/layering.rs` enforces that by reading the
-# source. `libp2p-stream` is deliberately *not* here: moving bytes needs an async runtime and
-# a spawned task, so it lives in `ac-node` and this crate never sees a stream.
+# `libp2p` is deliberately absent too, which is the strongest of these. `wire.rs` once declared
+# the manifest behaviour and needed it; now it declares the protocol *names*, the message types
+# and the size ceilings, and `ac-node` builds what carries them — exactly how `BLOB_PROTOCOL`
+# has always worked. So a networking type is not merely unused here, it is unnameable, and the
+# greps in `tests/layering.rs` are a second line rather than the only one.
+#
+# `libp2p-stream` is absent for a related but separate reason: moving bytes needs an async
+# runtime and a spawned task, so it lives in `ac-node` and this crate never sees a stream.
 
 [dev-dependencies]
 tempfile = "3"

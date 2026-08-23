@@ -21,8 +21,7 @@
 //! write that.
 
 use ac_net::PeerId;
-use ac_net::identity::public_key_of;
-use libp2p::identity::Keypair;
+use ac_net::identity::{Keypair, public_key_of};
 use serde::{Deserialize, Serialize};
 
 use crate::id::GroupId;

@@ -19,7 +19,7 @@ use ac_groups::chain::Op;
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
 use ac_net::PeerId;
-use libp2p::identity::Keypair;
+use ac_net::identity::Keypair;
 
 const AT: i64 = 1_000_000;
 

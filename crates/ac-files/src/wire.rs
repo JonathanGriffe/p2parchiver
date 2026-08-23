@@ -1,8 +1,15 @@
-//! The `/ac/manifest/2.0.0` and `/ac/blob/1.0.0` protocols.
+//! The `/ac/manifest/2.0.0` and `/ac/blob/1.0.0` protocols: what is said, not how it is carried.
 //!
-//! The **only** module in this crate permitted to name `libp2p`. The store, the paths, the
-//! conflict rules and the sync policy are all free of networking types, which is what lets
-//! them be tested against a temp directory with no socket.
+//! Names, message types and limits are here; what carries them is `ac-node`'s, which is the only
+//! crate that mounts anything. That split is what keeps **this whole crate free of libp2p** —
+//! not as a convention a grep polices, but because libp2p is not a dependency and its types
+//! cannot be named. The store, the paths, the conflict rules and the sync policy are therefore
+//! testable against a temp directory with no socket, and provably so.
+//!
+//! The blob protocol has always worked this way — [`BLOB_PROTOCOL`] is a string that `ac-node`
+//! turns into a stream. The manifest protocol used to declare its own `request_response`
+//! behaviour here, which is what made libp2p a dependency; it is now built alongside the blob
+//! stream, from [`MANIFEST_PROTOCOL`] and the two size limits below.
 //!
 //! # Two protocols, because they carry different things
 //!
@@ -16,8 +23,6 @@
 //! live here; the stream itself is `ac-node`'s, because it needs a runtime and a spawned task.
 
 use ac_groups::id::GroupId;
-use libp2p::StreamProtocol;
-use libp2p::request_response::{self, ProtocolSupport};
 use serde::{Deserialize, Serialize};
 
 use crate::path::RelPath;
@@ -65,7 +70,10 @@ pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// A denial-of-service backstop, not a page size: `request_response` buffers whole messages,
 /// so an unbounded response is a memory attack. [`MAX_ENTRIES_PER_RESPONSE`] is what actually
 /// bounds a page, and `a_full_page_fits_in_a_response` checks the two agree.
-const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+///
+/// Public because `ac-node` builds the codec from it. The number is a fact about this protocol
+/// and belongs beside the messages it bounds, even though the codec it configures is elsewhere.
+pub const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 /// What one peer believes about one group's catalogue.
 ///
@@ -214,28 +222,6 @@ pub enum BlobReply {
     Unavailable,
 }
 
-pub type Behaviour = request_response::cbor::Behaviour<ManifestRequest, ManifestResponse>;
-
-/// Build the manifest behaviour that `ac-node` mounts alongside the group one.
-///
-/// `ProtocolSupport::Full` because the exchange is symmetric: either side offers, either side
-/// may be asked. Size maxima are set explicitly — the codec defaults are 1 MiB request and
-/// 10 MiB response, far more than this protocol should accept.
-pub fn behaviour() -> Behaviour {
-    let codec = request_response::cbor::codec::Codec::default()
-        .set_request_size_maximum(MAX_REQUEST_BYTES)
-        .set_response_size_maximum(MAX_RESPONSE_BYTES);
-
-    Behaviour::with_codec(
-        codec,
-        [(
-            StreamProtocol::new(MANIFEST_PROTOCOL),
-            ProtocolSupport::Full,
-        )],
-        request_response::Config::default(),
-    )
-}
-
 impl ManifestEntry {
     /// What we would tell a peer about one of our rows.
     pub fn of(row: &FileRow) -> Option<Self> {
@@ -281,7 +267,7 @@ impl ManifestEntry {
 mod tests {
     use super::*;
     use ac_net::PeerId;
-    use libp2p::identity::Keypair;
+    use ac_net::identity::Keypair;
     use std::str::FromStr;
 
     fn peer() -> PeerId {

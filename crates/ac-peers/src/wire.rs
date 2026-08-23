@@ -1,9 +1,12 @@
-//! The `/ac/session/1.0.0` protocol.
+//! The `/ac/session/1.0.0` protocol: what is said, not how it is carried.
 //!
-//! The **only** module in this crate permitted to name `libp2p::request_response`. Everything
+//! The name, the two message types and the size ceiling are here; the `request_response`
+//! behaviour that carries them is built by `ac-node`, the only crate that mounts anything. That
+//! split is what keeps **this whole crate free of libp2p** — not as a convention a grep
+//! polices, but because libp2p is not a dependency and its types cannot be named. So everything
 //! that decides anything — who to dial, what to ask for, when to hang up — is free of
-//! networking types, which is what lets the whole supervisor be driven from a test with no
-//! socket. `tests/layering.rs` enforces it.
+//! networking types by construction, which is what lets the whole supervisor be driven from a
+//! test with no socket.
 //!
 //! # What it is for
 //!
@@ -30,8 +33,6 @@
 //! `IDLE_CONNECTION_TIMEOUT` instead, which is exactly what happens with a peer running an
 //! older build.
 
-use libp2p::StreamProtocol;
-use libp2p::request_response::{self, ProtocolSupport};
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change to the types below. The version lives in the name because
@@ -45,7 +46,11 @@ pub const SESSION_PROTOCOL: &str = "/ac/session/1.0.0";
 /// codec's 1 MiB request and 10 MiB response, because those are a memory budget this protocol
 /// has no use for: anything larger than this is not a session message and refusing to buffer
 /// it costs nothing.
-const MAX_SESSION_BYTES: u64 = 1024;
+///
+/// Public because `ac-node` builds the codec from it. Deliberately not shared with the group,
+/// manifest or presence ceilings: each is checked against its own protocol's largest legal
+/// message by a test in its own crate, and one number cannot answer to four of those.
+pub const MAX_SESSION_BYTES: u64 = 1024;
 
 /// "I have nothing further for you. Do you have anything further for me?"
 ///
@@ -65,29 +70,6 @@ pub enum SessionResponse {
     /// left alone; whoever is still busy will go quiet eventually and the question is asked
     /// again then.
     Busy,
-}
-
-pub type Behaviour = request_response::cbor::Behaviour<SessionRequest, SessionResponse>;
-
-/// Build the behaviour `ac-node` mounts in `AcBehaviour`'s app slot.
-///
-/// [`ProtocolSupport::Full`] because the exchange is symmetric: either peer may propose and
-/// either may be asked, and which of them dialled is not a useful distinction — a relayed
-/// connection that gets upgraded makes "who dialled" a slippery question anyway, the same
-/// reason `/ac/peer-attest/1.0.0` is symmetric.
-///
-/// Note the app slot's first rule, which this obeys by construction: it may *ask* to close,
-/// never refuse a connection. Admission belongs to `ac_net::authz`.
-pub fn behaviour() -> Behaviour {
-    let codec = request_response::cbor::codec::Codec::default()
-        .set_request_size_maximum(MAX_SESSION_BYTES)
-        .set_response_size_maximum(MAX_SESSION_BYTES);
-
-    Behaviour::with_codec(
-        codec,
-        [(StreamProtocol::new(SESSION_PROTOCOL), ProtocolSupport::Full)],
-        request_response::Config::default(),
-    )
 }
 
 #[cfg(test)]
