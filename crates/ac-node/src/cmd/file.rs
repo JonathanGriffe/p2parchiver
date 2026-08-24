@@ -52,17 +52,8 @@ fn session(paths: &Paths, needle: &str) -> Result<Session> {
 /// Refuse the groups where adding content would be meaningless.
 ///
 /// Not a membership check: this is about whether the group is still a going concern on *this*
-/// node. A quarantined group accepts nothing at all, and one we have left is one we have
-/// stopped taking part in.
+/// node. One we have left is one we have stopped taking part in.
 fn writable(row: &GroupRow) -> Result<()> {
-    if let Some(seq) = row.forked_at {
-        bail!(
-            "{} forked at entry {seq} and is inert; nothing can be added to it. \
-             `ac group show {}` explains why.",
-            row.name,
-            row.id.short()
-        );
-    }
     if row.state == State::Left {
         bail!(
             "you have left {}; rejoin with `ac group accept {}` before adding to it",

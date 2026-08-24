@@ -17,6 +17,7 @@ use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_files::{Content, ManifestEntry};
 use ac_groups::chain::Op;
 use ac_groups::id::GroupId;
+use ac_groups::standing::Position;
 use ac_groups::store::Groups;
 use ac_net::PeerId;
 use ac_net::identity::Keypair;
@@ -111,7 +112,8 @@ impl Node {
 /// Give every node the same group, with all of them as members and locally active.
 ///
 /// The first node is its admin. Membership is what `shared_with` reads, and `shared_with` is
-/// the only thing allowed to name a group to a peer, so without this nothing is exchanged.
+/// the only thing allowed to name a group's content to a peer, so without this nothing is
+/// exchanged.
 fn share_group(nodes: &mut [&mut Node]) -> GroupId {
     let admin_key = nodes[0].key.clone();
     let members: Vec<PeerId> = nodes[1..].iter().map(|n| n.peer()).collect();
@@ -152,7 +154,7 @@ fn share_group(nodes: &mut [&mut Node]) -> GroupId {
         node.sync.groups_mut().adopt(&entries, &[], AT).unwrap();
         node.sync
             .groups_mut()
-            .author_standing(&key, id, true, AT)
+            .author_standing(&key, id, Position::In, AT)
             .unwrap();
     }
     id

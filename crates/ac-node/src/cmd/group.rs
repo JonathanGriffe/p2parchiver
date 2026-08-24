@@ -11,6 +11,7 @@
 //! unseen until someone connects.
 
 use ac_groups::chain::Op;
+use ac_groups::standing::Position;
 use ac_groups::store::{GroupRow, State};
 use ac_net::PeerId;
 use ac_net::attest;
@@ -67,9 +68,7 @@ pub fn list(paths: &Paths) -> Result<()> {
         if row.admin == identity.peer_id() {
             notes.push("admin".to_owned());
         }
-        if row.is_quarantined() {
-            notes.push("FORKED — needs attention".to_owned());
-        } else if !members.contains(&identity.peer_id()) {
+        if !members.contains(&identity.peer_id()) {
             // We hold the group but the chain no longer lists us. Worth saying plainly:
             // `state` is our own consent and does not change when someone removes us.
             notes.push("removed by admin".to_owned());
@@ -111,13 +110,6 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<()> {
     );
     println!("state   {}", state_name(row.state));
     println!("entries {}", row.head_seq);
-    if let Some(seq) = row.forked_at {
-        println!();
-        println!("This group forked at entry {seq}: two different entries claim that position.");
-        println!("Under a single admin that means a restored backup, a copied key, or two");
-        println!("admin processes. It is now inert — no syncing, no serving. Nothing here can");
-        println!("safely pick a winner, so recovery is to create a fresh group.");
-    }
 
     println!();
     println!("members");
@@ -259,7 +251,7 @@ pub fn accept(paths: &Paths, needle: &str) -> Result<()> {
     }
 
     groups
-        .author_standing(identity.keypair(), id, true, now())
+        .author_standing(identity.keypair(), id, Position::In, now())
         .with_context(|| format!("accepting {needle}"))?;
 
     println!("joined {}", row.name);
@@ -283,7 +275,7 @@ pub fn leave(paths: &Paths, needle: &str) -> Result<()> {
     }
 
     groups
-        .author_standing(identity.keypair(), id, false, now())
+        .author_standing(identity.keypair(), id, Position::Out, now())
         .with_context(|| format!("leaving {needle}"))?;
 
     println!("left {}", row.name);

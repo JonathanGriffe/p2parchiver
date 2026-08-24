@@ -176,9 +176,6 @@ mod tests {
 
     #[test]
     fn presence_messages_survive_cbor() {
-        // A `PeerId` has never crossed the wire as itself before — the chain carries base58
-        // text and an attestation carries a signed string — so this checks libp2p's own serde
-        // impl round-trips under ciborium, which is not human-readable and takes the byte path.
         let peers: Vec<libp2p::PeerId> = (0..3)
             .map(|_| {
                 libp2p::identity::Keypair::generate_ed25519()

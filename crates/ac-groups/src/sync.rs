@@ -1,47 +1,3 @@
-//! The sync policy, as a state machine.
-//!
-//! Consumes [`GroupEvent`]s and returns [`GroupAction`]s. It never sees a `Swarm`, a
-//! connection, or a request id — `ac-node`'s daemon translates in both directions and is the
-//! only code that touches both worlds. That is what lets the whole of this file be tested
-//! against an in-memory store with no socket, no tokio, and no timing.
-//!
-//! # The two rules that decide what goes on the wire
-//!
-//! **Offering.** [`crate::store::Groups::shared_with`] is the only thing that may build a
-//! [`GroupHead`] bound for a peer. Nothing here constructs one any other way.
-//!
-//! **Fetching.** We may ask a peer for a group only if either
-//!
-//! 1. they named it to us in an offer, or
-//! 2. we hold it and *our own* copy of its chain names them as a member.
-//!
-//! Rule 2 is what lets a node that has been removed, or that has left, still find out where it
-//! stands: nobody will offer them the group, so they have to ask. It discloses nothing —
-//! the peer being asked already knows they were in it, because their own chain says so.
-//!
-//! # When syncing happens
-//!
-//! On connection, and when our own log changes. **Not** periodically.
-//!
-//! A change made *during* a connection therefore reaches the other side at the next one. That
-//! is deliberate. Enforcement is local and immediate — a node stops serving the moment it
-//! removes someone, and stops participating the moment it leaves, both from its own state with
-//! nothing in flight. What propagation affects is when the two sides agree on the *story*:
-//! whose name shows up in `ac group show`, and when the admin gets round to ratifying a
-//! departure. Paying a message a minute on every idle connection to keep a display fact fresh
-//! is a poor trade, and an earlier draft made it.
-//!
-//! The on-connect exchange covers everything that accumulated while apart, in both directions:
-//! a member added, a member removed (served their own chain up to the entry that removed them,
-//! which is proof and nothing more), a departure to collect, and a standings digest that
-//! drifted with no chain change to hang off.
-//!
-//! # No chunking
-//!
-//! One `Fetch` is answered by one response carrying everything the responder will give. If a
-//! response does not advance our head the episode simply ends; there is no progress flag to
-//! police and so nothing for a peer to lie about.
-
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -50,6 +6,7 @@ use ac_net::identity::Keypair;
 
 use crate::chain::Op;
 use crate::id::GroupId;
+use crate::standing::Position;
 use crate::store::{Applied, GroupRow, Groups, State, StoreError};
 use crate::wire::{GroupHead, GroupRequest, GroupResponse, MAX_HEADS_PER_OFFER};
 
@@ -57,50 +14,47 @@ use crate::wire::{GroupHead, GroupRequest, GroupResponse, MAX_HEADS_PER_OFFER};
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Requests we will *answer* from one peer between ticks.
-///
-/// Inbound only. Outbound work is bounded separately by [`MAX_INFLIGHT`] — sharing one
-/// counter would let a chatty peer starve our own syncing, which is the opposite of what a
-/// rate limit is for.
 const ANSWERS_PER_TICK: u32 = 8;
 
 /// Fetches we will have outstanding at once, across all peers and groups.
-///
-/// One episode per group already caps the common case; this caps the pathological one, where
-/// a peer offers hundreds of groups we have never heard of and we would otherwise chase every
-/// one at once.
 const MAX_INFLIGHT: usize = 8;
 
 /// How long a group we were invited to but never accepted is kept once the chain has stopped
 /// naming us. Long enough that a slow human is not punished for it.
 const PENDING_TTL: i64 = 30 * 24 * 3600;
 
-/// Something worth telling a person. A typed value rather than a string, so tests assert on
-/// meaning and the daemon owns every word the user sees.
+/// Something worth telling a person
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
-    /// We have been added to a group we had not seen. Needs `ac group accept`.
-    Invited { group: GroupId, name: String },
-    /// The admin removed us. Learned by asking, since nobody offers a group to a non-member.
-    RemovedByAdmin { group: GroupId, name: String },
+    Invited {
+        group: GroupId,
+        name: String,
+    },
+    RemovedByAdmin {
+        group: GroupId,
+        name: String,
+    },
     MembershipChanged {
         group: GroupId,
         added: usize,
         removed: usize,
     },
-    /// A member told us they have left. On the admin's node this is followed by `Ratified`.
-    Departed { group: GroupId, peer: PeerId },
-    /// We are the admin and have written the `Remove` that makes a departure official.
-    Ratified { group: GroupId, peer: PeerId },
-    /// Two entries claim one position. The group is now inert and needs a human.
-    Forked { group: GroupId, seq: u64 },
-    /// A peer sent something that did not check out.
+    Departed {
+        group: GroupId,
+        peer: PeerId,
+    },
+    Ratified {
+        group: GroupId,
+        peer: PeerId,
+    },
     Rejected {
         group: GroupId,
         peer: PeerId,
         why: String,
     },
-    /// Something failed that is nobody's fault and needs no action.
-    Trouble { why: String },
+    Trouble {
+        why: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,14 +161,14 @@ impl GroupSync {
     /// Not how the daemon works: the CLI writes through its *own* handle in another process,
     /// and the machine notices on the next tick. Reaching for this in the daemon would mean
     /// a change nobody announces.
-    /// What we would name to this peer: the groups we share with them.
+    /// What we would name to this peer: every group whose log we will discuss with them,
+    /// including ones we have been invited to and not yet accepted.
     ///
-    /// The one shape an offer comes in, and the only thing allowed to build a head bound for a
-    /// peer. Public because the supervisor decides *when* to offer and this layer decides
-    /// *what* — the same split `ac-files` makes.
+    /// The one shape an offer comes in. Public because the supervisor decides *when* to offer
+    /// and this layer decides *what* — the same split `ac-files` makes.
     pub fn heads_for(&self, peer: &PeerId) -> Vec<GroupHead> {
         self.store
-            .shared_with(peer)
+            .log_shared_with(peer)
             .unwrap_or_default()
             .into_iter()
             .take(MAX_HEADS_PER_OFFER)
@@ -244,7 +198,7 @@ impl GroupSync {
             GroupRequest::Offer(heads) => {
                 // Answer with our own view, then act on theirs. A store error yields an empty
                 // offer rather than `Unavailable`, which would imply a group-specific refusal.
-                let ours = self.store.shared_with(&peer).unwrap_or_default();
+                let ours = self.store.log_shared_with(&peer).unwrap_or_default();
                 let actions = self.on_heads(peer, heads);
                 (GroupResponse::Offer(ours), actions)
             }
@@ -325,7 +279,6 @@ impl GroupSync {
                 // A group we have never seen. Take it from the top; `adopt` decides whether
                 // it is one we are entitled to keep.
                 Ok(None) => self.fetch(&mut actions, peer, head.group, 0),
-                Ok(Some(row)) if row.is_quarantined() => {}
                 Ok(Some(row)) => {
                     // Behind on entries, or holding a different set of standings. The digest
                     // is what catches the second case: heads can match exactly while one side
@@ -361,7 +314,7 @@ impl GroupSync {
             return Vec::new();
         };
         rows.into_iter()
-            .filter(|row| !row.is_quarantined() && !named.contains(&row.id))
+            .filter(|row| !named.contains(&row.id))
             .filter(|row| {
                 self.store
                     .members(row.id)
@@ -402,10 +355,6 @@ impl GroupSync {
         let mut actions = Vec::new();
         let applied = match outcome {
             Ok(applied) => applied,
-            Err(StoreError::Fork { seq, .. }) => {
-                actions.push(GroupAction::Note(Notice::Forked { group, seq }));
-                return actions;
-            }
             Err(StoreError::Gap { want, .. }) => {
                 // Our head moved between asking and answering. Ask again from where we are.
                 self.fetch(&mut actions, peer, group, want);
@@ -422,6 +371,7 @@ impl GroupSync {
         };
 
         self.report(&mut actions, group, &applied);
+        self.answer_invitation(&mut actions, group, at);
         self.ratify(&mut actions, group, &applied, at);
 
         // Nothing is passed onward from here either. Applying entries moves our own head, and
@@ -466,12 +416,35 @@ impl GroupSync {
         }
     }
 
-    /// If we admin this group, make a departure official.
+    /// Say once, in writing, that we hold an invitation we have not answered.
     ///
-    /// A departure is only ever a signal: it says what a member wants, and a `Remove` is what
-    /// makes every other member agree. Guarded on the peer still being in the fold, so
-    /// re-ingesting the same standing — from a restart, a re-offer, or a digest repair —
-    /// writes exactly one `Remove` per departure rather than one per delivery.
+    /// A pending node that says nothing is indistinguishable from one that never received the
+    /// chain at all, so every other member goes on treating the invitation as undelivered and
+    /// re-offering it on every discovery hint — forever, since nothing else ever changes.
+    /// `Unanswered` is the smallest true thing we can say, it is self-signed like any other
+    /// standing, and it travels the same way: the digest moves, so the next exchange carries it
+    /// and it spreads through the group.
+    ///
+    /// Only once. A standing of our own already on file means we have spoken — whether to say
+    /// this, to accept, or to leave — and re-authoring would spend a seq per sync.
+    fn answer_invitation(&mut self, actions: &mut Vec<GroupAction>, group: GroupId, at: i64) {
+        let pending = matches!(self.store.get(group), Ok(Some(row)) if row.state == State::Pending);
+        let named = matches!(self.store.members(group), Ok(m) if m.contains(&self.me));
+        let spoken = matches!(self.store.my_standing_seq(group), Ok(Some(_)));
+        if !pending || !named || spoken {
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .author_standing(&self.key, group, Position::Unanswered, at)
+        {
+            actions.push(GroupAction::Note(Notice::Trouble {
+                why: format!("could not record an unanswered invitation: {e}"),
+            }));
+        }
+    }
+
+    /// If we admin this group, make a departure official.
     fn ratify(
         &mut self,
         actions: &mut Vec<GroupAction>,

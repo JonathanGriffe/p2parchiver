@@ -19,9 +19,11 @@ use crate::standing::Standing;
 ///
 /// `2.0.0` moved the hashes below from CBOR integer arrays to byte strings; `3.0.0` did the
 /// same for the bodies and signatures inside `Entry` and `Standing`, which dominated the cost.
+/// `4.0.0` replaced a standing's `in_group` flag with a three-way `Position`, so that holding an
+/// invitation and having answered it stopped being the same statement.
 /// Both are changes of encoding, not of meaning, so an older peer would decode them as garbage
 /// rather than fail — exactly what a version in the name exists to prevent.
-pub const GROUP_PROTOCOL: &str = "/ac/group/3.0.0";
+pub const GROUP_PROTOCOL: &str = "/ac/group/4.0.0";
 
 /// Ceiling on how many groups one `Offer` may name.
 ///
@@ -101,6 +103,7 @@ pub enum GroupResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::standing::Position;
     use ac_net::identity::Keypair;
 
     use crate::chain::{Chain, Op};
@@ -131,7 +134,7 @@ mod tests {
                 AT,
             )
             .unwrap();
-        let standing = Standing::author(&bob, chain.id(), 1, false, AT).unwrap();
+        let standing = Standing::author(&bob, chain.id(), 1, Position::Out, AT).unwrap();
         (chain, standing)
     }
 

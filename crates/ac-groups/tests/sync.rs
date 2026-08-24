@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use ac_groups::chain::{Entry, Op};
 use ac_groups::id::GroupId;
+use ac_groups::standing::Position;
 use ac_groups::store::{Groups, State};
 use ac_groups::sync::{GroupAction, GroupEvent, GroupSync, Notice};
 use ac_groups::wire::{GroupHead, GroupRequest, GroupResponse};
@@ -256,7 +257,7 @@ fn join(admin: &mut Node, member: &mut Node, id: GroupId) {
     member
         .sync
         .store_mut()
-        .author_standing(&member.key, id, true, AT)
+        .author_standing(&member.key, id, Position::In, AT)
         .unwrap();
 }
 
@@ -303,6 +304,47 @@ fn a_new_member_learns_the_whole_group() {
     assert!(
         notes.iter().any(|n| matches!(n, Notice::Invited { .. })),
         "and are told, so they can accept: {notes:?}"
+    );
+}
+
+#[test]
+fn receiving_an_invitation_is_answered_in_writing_and_only_once() {
+    // A pending node that says nothing is indistinguishable from one that never got the chain,
+    // so every member goes on re-offering the invitation on every discovery hint. `Unanswered`
+    // is the smallest true thing it can say, and saying it is what stops the dialling.
+    let (mut admin, mut member, id) = admin_and_member();
+    connect(&mut admin, &mut member);
+
+    assert_eq!(
+        member.sync.store().get(id).unwrap().unwrap().state,
+        State::Pending,
+        "still not accepted"
+    );
+    let standings = member.sync.store().standings(id).unwrap();
+    assert_eq!(standings.len(), 1, "it has spoken for itself, once");
+    let body = standings[0].verify(id).unwrap();
+    assert_eq!(body.peer, member.peer().to_base58());
+    assert_eq!(body.position, Position::Unanswered);
+    assert_eq!(body.seq, 1);
+
+    // Syncing again must not spend another seq: having spoken at all is the condition.
+    connect(&mut admin, &mut member);
+    let after = member.sync.store().standings(id).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].verify(id).unwrap().seq, 1);
+
+    // And it reaches the admin, which is the whole point — without ratifying anything.
+    let seen = admin.sync.store().standings(id).unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].verify(id).unwrap().position, Position::Unanswered);
+    assert!(
+        admin.sync.store().departed(id).unwrap().is_empty(),
+        "an unanswered invitation is not a departure"
+    );
+    assert_eq!(
+        admin.sync.store().chain(id).unwrap().len(),
+        2,
+        "and nothing was ratified against them"
     );
 }
 
@@ -468,7 +510,7 @@ fn the_admin_ratifies_a_departure_exactly_once() {
     member
         .sync
         .store_mut()
-        .author_standing(&member.key, id, false, AT)
+        .author_standing(&member.key, id, Position::Out, AT)
         .unwrap();
 
     // Three reconnections, as a restart or a digest repair would produce.
@@ -511,7 +553,7 @@ fn a_non_admin_notes_a_departure_but_does_not_ratify_it() {
 
     bob.sync
         .store_mut()
-        .author_standing(&bob.key, id, false, AT)
+        .author_standing(&bob.key, id, Position::Out, AT)
         .unwrap();
 
     let head_before = carol.sync.store().get(id).unwrap().unwrap().head_seq;
@@ -543,7 +585,7 @@ fn a_node_that_has_left_still_answers_so_its_departure_can_travel() {
     member
         .sync
         .store_mut()
-        .author_standing(&member.key, id, false, AT)
+        .author_standing(&member.key, id, Position::Out, AT)
         .unwrap();
 
     assert_eq!(

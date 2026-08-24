@@ -1,48 +1,3 @@
-//! The membership log: an append-only chain of entries signed by one admin.
-//!
-//! Mirrors [`ac_net::attest`] in every structural respect, and for the same reasons. A body is
-//! defined by its *encoding*: it travels as verbatim CBOR bytes, and the signature is checked
-//! over those bytes exactly as received rather than over a re-encoding of a decoded value.
-//! Re-encoding would make every signature depend on the serializer producing byte-identical
-//! output forever, across library versions and field reorderings.
-//!
-//! # Why [`Chain`] is the only way in
-//!
-//! An [`Entry`] on its own is untrusted bytes. Every rule — signature, authorship, linkage,
-//! and the preconditions of each operation — lives in [`Chain::extend`], and a `Chain` value
-//! can only be produced by passing them. That is the same shape as `Attestation::verify` being
-//! the sole path to a trusted `Statement`: it makes "did anyone check this?" a question the
-//! type system answers.
-//!
-//! # One writer
-//!
-//! Only the group's admin may append. A hash chain therefore cannot legitimately fork, which
-//! is what lets merging be "extend the prefix we hold" rather than a conflict-resolution
-//! algorithm. Two validly-signed entries at one position mean a restored backup, a copied key,
-//! or two admin processes — all of which want a human, so the store quarantines rather than
-//! guessing (see `store::put`).
-//!
-//! Members cannot write here. A member's own position is a [`crate::standing::Standing`],
-//! which lives beside the chain in its own sequence space precisely so that "anyone may remove
-//! themselves" does not make the chain multi-writer.
-//!
-//! # If compaction is ever added, it must carry tombstones
-//!
-//! There is no compaction today and no pressing need for one: a chain holds one entry per
-//! *membership change*, so a group is tens of entries — single-digit kilobytes over its whole
-//! life. The wire cap is a denial-of-service backstop, not a size someone will reach.
-//!
-//! Should an `Op::Snapshot` ever replace a prefix, note that [`Chain::departure_seq`] finds a
-//! removal by **scanning for the `Remove` entry**, and that is what tells a removed peer they
-//! were removed (see [`crate::store::Groups::serve_up_to`]). Pruning that entry would make a
-//! long-removed peer indistinguishable from a stranger, silently restoring the failure that
-//! mechanism exists to prevent: nobody offers them the group, so nobody answers them, and
-//! their own node claims they still belong forever.
-//!
-//! So a snapshot must carry a **tombstone list** — the peers removed at or before it, with the
-//! seq. That is bounded by how many people have ever been removed rather than by how much has
-//! happened, so it compacts nearly as well while keeping the property intact.
-
 use ac_net::PeerId;
 use ac_net::attest::normalise_username;
 use ac_net::identity::{Keypair, public_key_of};
@@ -51,41 +6,24 @@ use serde::{Deserialize, Serialize};
 use crate::id::{EntryHash, GroupId, NO_PARENT};
 use crate::members::Members;
 
-/// Ceiling on one entry, checked before the bytes are parsed.
-///
-/// An honest entry is ~250 bytes: two base58 peer ids, a username, and a signature. The
-/// margin is generous because the cost of being wrong is refusing a legitimate entry forever,
-/// while the cost of being generous is bounded by the per-response cap in `wire`.
+/// Ceiling on one entry
 pub const MAX_ENTRY_BYTES: usize = 4096;
 
 /// Ceiling on a group's display name.
 pub const MAX_NAME_LEN: usize = 64;
 
 /// What one entry asserts.
-///
-/// Peer ids are base58 `String`s rather than [`PeerId`], because this type is defined by its
-/// encoding — it is what gets signed and hashed — and a textual peer id is stable in a way a
-/// library type's serde representation is not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryBody {
-    /// The group this belongs to. [`GroupId::ZERO`] in the genesis entry, whose hash *is* the
-    /// group id — the field cannot name a value derived from itself.
     pub group: GroupId,
     pub seq: u64,
-    /// Hash of the previous entry's body; [`NO_PARENT`] at the genesis.
     pub prev: EntryHash,
-    /// Advisory. **Never** validated and never used for ordering — see the module docs on
-    /// clocks in [`Chain::extend`].
     pub at: i64,
     pub op: Op,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Op {
-    /// Creates the group and names its one permanent writer.
-    ///
-    /// `nonce` is 16 random bytes. Without it, two groups of the same name created by the same
-    /// admin in the same second would hash to one id and silently merge into one chain.
     Create {
         admin: String,
         username: String,
@@ -94,8 +32,6 @@ pub enum Op {
     },
     Add {
         peer: String,
-        /// Advisory display text chosen by the admin. Never used for authorization; the
-        /// authoritative name is what a peer's own attestation asserts at connection time.
         username: String,
     },
     Remove {
@@ -103,14 +39,8 @@ pub enum Op {
     },
 }
 
-/// An [`EntryBody`] and the admin's signature over its encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
-    /// CBOR encoding of an [`EntryBody`], signed and verified as these exact bytes.
-    ///
-    /// The `with` attribute frames it as a CBOR byte string on the wire. That changes nothing
-    /// about what was signed — these bytes are opaque here and are verified as they arrive —
-    /// and nothing about storage, which is a SQLite `BLOB`. See [`crate::bytes`].
     #[serde(with = "crate::bytes::blob")]
     pub body: Vec<u8>,
     #[serde(with = "crate::bytes::blob")]
@@ -118,17 +48,11 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// Hash of the signed bytes. This is the `prev` of the next entry, and at the genesis it
-    /// is what the group id is derived from.
     pub fn hash(&self) -> EntryHash {
         EntryHash::of_body(&self.body)
     }
 
     /// Decode without checking anything.
-    ///
-    /// For logging and for inspecting an entry that has already been through [`Chain`]. Never
-    /// use it to decide anything — that is what [`Chain::extend`] is for, and the difference
-    /// is the whole point of the type.
     pub fn body(&self) -> Result<EntryBody, ChainError> {
         ciborium::from_reader(self.body.as_slice()).map_err(|_| ChainError::Malformed)
     }
@@ -165,9 +89,6 @@ struct Verified {
 }
 
 /// A validated membership log.
-///
-/// Holds no invalid state: every entry has been checked against its predecessor, so there is
-/// no fork and no gap inside a `Chain`.
 #[derive(Debug, Clone)]
 pub struct Chain {
     id: GroupId,
@@ -217,18 +138,9 @@ impl Chain {
     }
 
     /// Append a batch, or change nothing.
-    ///
-    /// All-or-nothing on purpose: a partially-applied batch would leave the caller unable to
-    /// say what it holds, and the store's fork check depends on knowing that every entry
-    /// below the head was accepted under the same rules.
-    ///
-    /// `entries` must start at [`Self::len`] and link to [`Self::head`].
     pub fn extend(&mut self, entries: &[Entry]) -> Result<usize, ChainError> {
         let mut staged = Vec::with_capacity(entries.len());
 
-        // Validated against a running view so that an entry can be checked against the state
-        // its predecessors in the *same* batch produce — otherwise `Remove` of someone added
-        // two entries earlier in the batch would be refused.
         let mut view = self.clone();
 
         for entry in entries {
@@ -268,7 +180,6 @@ impl Chain {
         self.admin
     }
 
-    /// The number of entries, which is also the seq the next entry must carry.
     pub fn len(&self) -> u64 {
         self.entries.len() as u64
     }
@@ -281,16 +192,10 @@ impl Chain {
         self.entries.last().map(|e| e.hash).unwrap_or(NO_PARENT)
     }
 
-    /// The hash at `seq`, for the store's fork check.
     pub fn hash_at(&self, seq: u64) -> Option<EntryHash> {
         self.entries.get(seq as usize).map(|e| e.hash)
     }
 
-    /// The name the genesis gave, which is the only name this group ever has.
-    ///
-    /// There is no rename: a group's name is fixed at creation. It is display text that also
-    /// names a directory on disk, and a name that could change would leave every holder's
-    /// storage layout to be reconciled against an entry arriving from the network.
     pub fn name(&self) -> &str {
         self.entries
             .first()
@@ -321,18 +226,6 @@ impl Chain {
     }
 
     /// The seq of the **most recent** entry that removed `peer`, if they are out now.
-    ///
-    /// This is what lets a removed peer be told *why* they stopped hearing from anyone.
-    /// Everything up to and including that entry happened while they were still a member, so
-    /// serving it discloses nothing they were not already entitled to — and without it a
-    /// removal is silent, permanent, and leaves their own node claiming they still belong.
-    ///
-    /// Scans the whole chain rather than stopping at the first `Remove`, because membership
-    /// can cycle: added, removed, added, removed again. The answer must be the last removal,
-    /// or a peer who rejoined and left again would be served a stale prefix.
-    ///
-    /// `None` if they are a **current** member — including one re-added after their last
-    /// removal, who is entitled to the whole log — or if the chain has never mentioned them.
     pub fn departure_seq(&self, peer: &PeerId) -> Option<u64> {
         let wanted = peer.to_base58();
         let mut removed_at = None;
@@ -355,19 +248,18 @@ impl Chain {
     /// is what stops it participating.
     pub fn fold(&self) -> Members {
         let mut members = Members::default();
-        for (seq, e) in self.entries.iter().enumerate() {
-            let seq = seq as u64;
+        for e in self.entries.iter() {
             match &e.body.op {
                 Op::Create {
                     admin, username, ..
                 } => {
                     if let Ok(peer) = admin.parse() {
-                        members.insert(peer, username.clone(), seq, true);
+                        members.insert(peer, username.clone(), true);
                     }
                 }
                 Op::Add { peer, username } => {
                     if let Ok(peer) = peer.parse() {
-                        members.insert(peer, username.clone(), seq, false);
+                        members.insert(peer, username.clone(), false);
                     }
                 }
                 Op::Remove { peer } => {
@@ -578,14 +470,6 @@ mod tests {
         key().public().to_peer_id()
     }
 
-    /// A peer id that hashes its key rather than inlining it — an RSA key, or one from another
-    /// implementation. No public key is recoverable, so it can never sign anything we check.
-    ///
-    /// Written as the base58 text rather than built from a multihash, which is both what such a
-    /// peer id looks like arriving over the wire and the reason this file names no libp2p type.
-    /// The leading `Qm` is the giveaway: it is a sha2-256 digest (multihash code `0x12`), not
-    /// the identity hash `0x00` that [`public_key_of`] needs. `an_opaque_peer_yields_no_key`
-    /// below asserts that property rather than trusting the comment.
     const OPAQUE_PEER: &str = "QmNp5n7FFav5ZDaHAj6HzuhJ8LDbL1N6NRzAgT6piWS2Kx";
 
     fn opaque_peer() -> PeerId {
@@ -594,9 +478,6 @@ mod tests {
 
     #[test]
     fn an_opaque_peer_yields_no_key() {
-        // Guards the constant. If it were mistyped into something whose key *is* recoverable,
-        // every test below that expects a rejection would start passing for the wrong reason —
-        // the entry would be refused on a signature check instead of on the missing key.
         assert!(public_key_of(&opaque_peer()).is_err());
     }
 
@@ -604,8 +485,6 @@ mod tests {
         Chain::create(admin, "family", "alice", [1u8; 16], AT).unwrap()
     }
 
-    /// A valid entry for tests about chaining itself, where which op it carries is beside the
-    /// point. Each call names a fresh peer, so repeated fillers are distinct entries.
     fn filler() -> Op {
         Op::Add {
             peer: peer().to_base58(),
@@ -627,8 +506,6 @@ mod tests {
 
     #[test]
     fn the_nonce_keeps_two_identical_creations_apart() {
-        // Same admin, same name, same second. Without the nonce these would hash to one id and
-        // silently merge into a single chain.
         let admin = key();
         let a = Chain::create(&admin, "family", "alice", [1u8; 16], AT).unwrap();
         let b = Chain::create(&admin, "family", "alice", [2u8; 16], AT).unwrap();
@@ -926,7 +803,7 @@ mod tests {
     #[test]
     fn a_bad_entry_leaves_the_chain_untouched() {
         // `extend` is all-or-nothing: a caller that saw an error must still know exactly what
-        // it holds, and the store's fork check depends on every entry below the head having
+        // it holds, and the store's overlap check depends on every entry below the head having
         // passed the same rules.
         let admin = key();
         let mut chain = group(&admin);

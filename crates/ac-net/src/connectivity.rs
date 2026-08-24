@@ -305,9 +305,6 @@ mod tests {
 
     #[test]
     fn a_pending_upgrade_settles_on_relayed_once_it_times_out() {
-        // The responder in a DCUtR exchange is never told the outcome — only the peer
-        // that received the relayed connection gets the result event. Without this, it
-        // would report "still trying" forever after a failure it never heard about.
         let mut c = Connectivity::default();
         let p = peer();
         c.connected(p, true);

@@ -1,25 +1,3 @@
-//! A member's statement about its own membership.
-//!
-//! A member cannot write to the admin's chain — that is what keeps the chain single-writer and
-//! fork-free. But **removing yourself needs no authority**, so a member signs its own position
-//! and that statement travels beside the chain in its own per-member sequence space, where it
-//! commutes with everything the admin does.
-//!
-//! # Self-only by construction
-//!
-//! [`Standing::verify`] deliberately takes **no subject parameter**, unlike
-//! `ac_net::attest::Attestation::verify`. It reads the peer out of the signed body and
-//! recovers the verifying key from *that*, so a standing can only ever speak for whoever
-//! signed it. A caller cannot forget to bind the two, because there is nothing to bind.
-//!
-//! # What it does and does not do
-//!
-//! A standing is **advisory**. It does not change membership: the fold is over the admin's
-//! chain alone. Its job is to reach the admin, who ratifies it with a `Remove` — and to be
-//! visible in `ac group show` in the meantime. The leaver does not depend on any of that:
-//! their own local state stops them participating the instant they leave, and nobody else can
-//! write that.
-
 use ac_net::PeerId;
 use ac_net::identity::{Keypair, public_key_of};
 use serde::{Deserialize, Serialize};
@@ -29,16 +7,47 @@ use crate::id::GroupId;
 /// Ceiling on one standing, checked before the bytes are parsed.
 pub const MAX_STANDING_BYTES: usize = 1024;
 
+/// Where a member says it stands. Signed, so it can only ever be their own word.
+///
+/// `Unanswered` is what makes an invitation *answerable without accepting it*. Without a way to
+/// say "I have this and have not decided", silence is the only signal, and silence is
+/// indistinguishable from never having received it — so every other member goes on treating the
+/// invitation as undelivered and re-offering it on every discovery hint, forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Position {
+    /// We hold the chain that names us and have not decided yet.
+    Unanswered,
+    /// Taking part.
+    In,
+    /// Left, of our own accord.
+    Out,
+}
+
+impl Position {
+    /// A stable byte for the standings digest. Two nodes must agree on it exactly, so it is
+    /// written down rather than derived from the variant order.
+    pub fn tag(self) -> u8 {
+        match self {
+            Position::Unanswered => 0,
+            Position::In => 1,
+            Position::Out => 2,
+        }
+    }
+
+    /// Whether this is a departure. Only `Out` is — an unanswered invitation is not a refusal,
+    /// and treating it as one would have the admin ratify a `Remove` against someone who has
+    /// merely not replied yet.
+    pub fn is_departure(self) -> bool {
+        matches!(self, Position::Out)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandingBody {
     pub group: GroupId,
-    /// The subject, who is also necessarily the signer.
     pub peer: String,
-    /// A per-(group, peer) counter starting at 1. Unrelated to the chain's seq: the two
-    /// advance independently, which is exactly why a standing cannot fork the chain.
     pub seq: u64,
-    pub in_group: bool,
-    /// Advisory. Never validated, never used for ordering.
+    pub position: Position,
     pub at: i64,
 }
 
@@ -63,14 +72,14 @@ impl Standing {
         key: &Keypair,
         group: GroupId,
         seq: u64,
-        in_group: bool,
+        position: Position,
         at: i64,
     ) -> Result<Self, StandingError> {
         let body = StandingBody {
             group,
             peer: key.public().to_peer_id().to_base58(),
             seq,
-            in_group,
+            position,
             at,
         };
         let mut bytes = Vec::new();
@@ -95,9 +104,6 @@ impl Standing {
 
     /// Check everything and return what was asserted.
     ///
-    /// No subject parameter: the subject comes out of the signed body and the key is recovered
-    /// from it. That is what makes "it can only speak for its signer" a property of the
-    /// function rather than of every call site.
     pub fn verify(&self, group: GroupId) -> Result<StandingBody, StandingError> {
         if self.wire_len() > MAX_STANDING_BYTES {
             return Err(StandingError::TooLarge {
@@ -133,24 +139,26 @@ impl Standing {
     pub fn wire_len(&self) -> usize {
         self.body.len() + self.signature.len()
     }
+}
 
-    /// Whether `self` should replace `other` as the latest statement by this subject.
-    ///
-    /// Higher seq wins. On a tie the lexicographically smaller body wins — which is arbitrary
-    /// but **deterministic**, so every node converges on the same winner without coordinating.
-    /// A tie means the subject equivocated (two statements at one seq), which under one key
-    /// means a restored backup; since standings are advisory the consequence is a display
-    /// discrepancy and a delayed ratification, never a wrong authorization.
-    pub fn supersedes(&self, other: &Standing) -> bool {
-        let (Ok(mine), Ok(theirs)) = (self.body(), other.body()) else {
-            return false;
-        };
-        match mine.seq.cmp(&theirs.seq) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => self.body < other.body,
-        }
+/// The ordering rule
+/// Higher seq wins. On a tie the lexicographically smaller body wins, which is arbitrary
+/// but deterministic, so every node converges on the same winner without coordinating.
+fn wins(mine: (u64, &[u8]), theirs: (u64, &[u8])) -> bool {
+    match mine.0.cmp(&theirs.0) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => mine.1 < theirs.1,
     }
+}
+
+/// One statement, kept beside what its body decoded to so reads never re-decode. The same
+/// shape as `chain::Verified`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Held {
+    standing: Standing,
+    seq: u64,
+    position: Position,
 }
 
 /// The latest position each member has claimed for itself.
@@ -158,30 +166,44 @@ impl Standing {
 /// One entry per peer — an earlier statement is superseded, never accumulated — so this is
 /// bounded by the membership rather than by how often people change their minds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StandingSet(std::collections::BTreeMap<PeerId, (u64, bool)>);
+pub struct StandingSet(std::collections::BTreeMap<PeerId, Held>);
 
 impl StandingSet {
-    /// Record a position, keeping whichever statement wins under [`Standing::supersedes`].
-    pub fn insert(&mut self, peer: PeerId, seq: u64, in_group: bool) {
-        let entry = self.0.entry(peer).or_insert((seq, in_group));
-        if seq >= entry.0 {
-            *entry = (seq, in_group);
+    /// Record a position, keeping whichever statement wins under [`wins`].
+    pub fn insert(
+        &mut self,
+        peer: PeerId,
+        standing: Standing,
+        seq: u64,
+        position: Position,
+    ) -> bool {
+        if let Some(held) = self.0.get(&peer)
+            && !wins((seq, &standing.body), (held.seq, &held.standing.body))
+        {
+            return false;
         }
+        self.0.insert(
+            peer,
+            Held {
+                standing,
+                seq,
+                position,
+            },
+        );
+        true
     }
 
-    pub fn latest(&self, peer: &PeerId) -> Option<(u64, bool)> {
-        self.0.get(peer).copied()
+    pub fn latest(&self, peer: &PeerId) -> Option<(u64, Position)> {
+        self.0.get(peer).map(|h| (h.seq, h.position))
     }
 
     /// Whether this peer's own latest word is that it has left.
     pub fn departed(&self, peer: &PeerId) -> bool {
-        matches!(self.0.get(peer), Some((_, false)))
+        matches!(self.0.get(peer), Some(h) if h.position.is_departure())
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&PeerId, u64, bool)> {
-        self.0
-            .iter()
-            .map(|(p, (seq, in_group))| (p, *seq, *in_group))
+    pub fn iter(&self) -> impl Iterator<Item = (&PeerId, u64, Position)> {
+        self.0.iter().map(|(p, h)| (p, h.seq, h.position))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -238,11 +260,11 @@ mod tests {
     #[test]
     fn a_standing_verifies_and_reports_what_was_asserted() {
         let bob = key();
-        let s = Standing::author(&bob, group(), 1, false, AT).unwrap();
+        let s = Standing::author(&bob, group(), 1, Position::Out, AT).unwrap();
 
         let body = s.verify(group()).unwrap();
         assert_eq!(body.peer, bob.public().to_peer_id().to_base58());
-        assert!(!body.in_group);
+        assert_eq!(body.position, Position::Out);
         assert_eq!(body.seq, 1);
     }
 
@@ -259,7 +281,7 @@ mod tests {
                 group: group(),
                 peer: bob.public().to_peer_id().to_base58(),
                 seq: 1,
-                in_group: false,
+                position: Position::Out,
                 at: AT,
             },
         );
@@ -270,7 +292,7 @@ mod tests {
     #[test]
     fn a_standing_for_another_group_is_refused() {
         let bob = key();
-        let s = Standing::author(&bob, group(), 1, false, AT).unwrap();
+        let s = Standing::author(&bob, group(), 1, Position::Out, AT).unwrap();
         let elsewhere = GroupId::of_genesis(b"a different group");
 
         assert!(matches!(
@@ -282,7 +304,7 @@ mod tests {
     #[test]
     fn a_standing_survives_cbor_and_still_verifies() {
         let bob = key();
-        let s = Standing::author(&bob, group(), 1, false, AT).unwrap();
+        let s = Standing::author(&bob, group(), 1, Position::Out, AT).unwrap();
 
         let mut buf = Vec::new();
         ciborium::into_writer(&s, &mut buf).unwrap();
@@ -294,11 +316,21 @@ mod tests {
     #[test]
     fn a_higher_seq_supersedes() {
         let bob = key();
-        let first = Standing::author(&bob, group(), 1, false, AT).unwrap();
-        let second = Standing::author(&bob, group(), 2, true, AT).unwrap();
+        let first = Standing::author(&bob, group(), 1, Position::Out, AT).unwrap();
+        let second = Standing::author(&bob, group(), 2, Position::In, AT).unwrap();
 
-        assert!(second.supersedes(&first));
-        assert!(!first.supersedes(&second));
+        let (Ok(first_body), Ok(second_body)) = (first.body(), second.body()) else {
+            panic!("failed to parse body");
+        };
+
+        assert!(wins(
+            (second_body.seq, &second.body),
+            (first_body.seq, &first.body)
+        ));
+        assert!(!wins(
+            (first_body.seq, &first.body),
+            (second_body.seq, &second.body)
+        ));
     }
 
     #[test]
@@ -307,12 +339,24 @@ mod tests {
         // converge without coordinating, so the rule is deterministic rather than
         // arrival-ordered.
         let bob = key();
-        let a = Standing::author(&bob, group(), 1, true, AT).unwrap();
-        let b = Standing::author(&bob, group(), 1, false, AT + 1).unwrap();
+        let a = Standing::author(&bob, group(), 1, Position::In, AT).unwrap();
+        let b = Standing::author(&bob, group(), 1, Position::Out, AT + 1).unwrap();
         assert_ne!(a.body, b.body);
 
-        let winner_ab = if b.supersedes(&a) { &b } else { &a };
-        let winner_ba = if a.supersedes(&b) { &a } else { &b };
+        let (Ok(a_body), Ok(b_body)) = (a.body(), b.body()) else {
+            panic!("failed to parse body");
+        };
+
+        let winner_ab = if wins((a_body.seq, &a.body), (b_body.seq, &b.body)) {
+            &b
+        } else {
+            &a
+        };
+        let winner_ba = if wins((b_body.seq, &b.body), (a_body.seq, &a.body)) {
+            &a
+        } else {
+            &b
+        };
         assert_eq!(winner_ab.body, winner_ba.body);
     }
 
@@ -326,6 +370,22 @@ mod tests {
             s.verify(group()),
             Err(StandingError::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn a_set_refuses_a_statement_it_has_already_bettered() {
+        let bob = key();
+        let bob_peer = bob.public().to_peer_id();
+        let old = Standing::author(&bob, group(), 1, Position::In, AT).unwrap();
+        let new = Standing::author(&bob, group(), 2, Position::Out, AT).unwrap();
+
+        let mut set = StandingSet::default();
+        assert!(set.insert(bob_peer, new, 2, Position::Out));
+        assert!(
+            !set.insert(bob_peer, old, 1, Position::In),
+            "a rollback must not take"
+        );
+        assert_eq!(set.latest(&bob_peer), Some((2, Position::Out)));
     }
 
     #[test]

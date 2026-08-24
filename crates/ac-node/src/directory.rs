@@ -51,7 +51,7 @@ pub struct Known {
 /// Excludes this node itself: it appears in the fold of every group it belongs to, and is not
 /// something a person wants listed among their contacts.
 ///
-/// Only groups we actually take part in contribute — `Active`, not quarantined, and naming us.
+/// Only groups we actually take part in contribute — `Active`, and naming us.
 /// A group we left or were removed from would otherwise keep injecting people we no longer
 /// share anything with, which is the opposite of what leaving means.
 pub fn everyone(contacts: &Contacts, groups: &Groups, me: PeerId) -> Result<Vec<Known>> {
@@ -59,7 +59,7 @@ pub fn everyone(contacts: &Contacts, groups: &Groups, me: PeerId) -> Result<Vec<
 
     // Groups first, so the contact pass below can overwrite rather than check.
     for row in groups.list().context("listing groups")? {
-        if row.state != State::Active || row.is_quarantined() {
+        if row.state != State::Active {
             continue;
         }
         let members = groups

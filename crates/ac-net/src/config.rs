@@ -51,10 +51,6 @@ pub struct Paths {
 
 impl Paths {
     /// Locate a node's directory, per-OS.
-    ///
-    /// `env_override` names an environment variable that, when set, replaces it. Running
-    /// several nodes on one machine depends on that — both the two-process dial test and the
-    /// netns lab set it per node, and the Docker image sets it to `/data`.
     pub fn discover(app_name: &str, env_override: &str) -> Result<Self, ConfigError> {
         if let Some(root) = std::env::var_os(env_override) {
             return Ok(Self::rooted_at(PathBuf::from(root)));
@@ -114,14 +110,6 @@ pub struct Config {
 
     /// Stop mirroring once this node holds this many bytes. Absent means no ceiling beyond
     /// the free-space floor the node keeps regardless.
-    ///
-    /// A plain byte count, zeros and all. It was briefly a human string — `"200 GiB"` — with a
-    /// parser behind it, which bought nothing: the value is written once and read by a machine,
-    /// and the parser was a second way for `config.toml` to be wrong.
-    ///
-    /// Reaching it stops *fetching* and deletes nothing. Files stay listed as remote and arrive
-    /// if the limit is raised or something is removed, so hitting it is legible in
-    /// `ac file list` rather than surfacing as an I/O error inside a transfer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_max: Option<u64>,
 }
@@ -197,10 +185,6 @@ impl Config {
 }
 
 /// QUIC and TCP, IPv4 and IPv6, all on ephemeral ports.
-///
-/// IPv6 is listed because a node with a routable v6 address skips NAT traversal
-/// entirely, which is the cheapest possible path. Binding it fails harmlessly on hosts
-/// without IPv6 — the swarm reports the failure per-address and keeps the rest.
 fn default_listen_addrs() -> Vec<Multiaddr> {
     [
         "/ip4/0.0.0.0/udp/0/quic-v1",
@@ -371,9 +355,6 @@ mod tests {
 
     #[test]
     fn a_ceiling_survives_the_round_trip_as_a_number() {
-        // TOML integers are i64, and a plausible ceiling is well inside that — but a `u64`
-        // field deserialised from a signed literal is exactly the kind of thing that works for
-        // 200 GiB and stops working for a value nobody tests with.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CONFIG_FILENAME);
 

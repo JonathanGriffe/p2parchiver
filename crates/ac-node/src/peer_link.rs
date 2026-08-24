@@ -742,6 +742,7 @@ mod tests {
     use ac_files::path::RelPath;
     use ac_files::store::FileRow;
     use ac_groups::chain::Op;
+    use ac_groups::standing::Position;
     use ac_groups::id::GroupId;
 
     use crate::daemon::{App, AppEvent, app, track};
@@ -1056,7 +1057,7 @@ mod tests {
         let member_key = member.key();
         let store = member.link.sync().groups_mut();
         store.adopt(&entries, &[], AT).unwrap();
-        store.author_standing(&member_key, id, true, AT).unwrap();
+        store.author_standing(&member_key, id, Position::In, AT).unwrap();
         id
     }
 

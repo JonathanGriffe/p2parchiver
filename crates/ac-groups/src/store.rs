@@ -1,24 +1,3 @@
-//! Persistence for groups, in the node's existing `state.sqlite`.
-//!
-//! Signed bytes are the truth; every other table is a cache rebuilt inside the same
-//! transaction that writes them, so it can never be stale against the log it summarises.
-//!
-//! # Why the daemon and the CLI can both write this
-//!
-//! `ac group add` runs in a different process from `ac run`, and the daemon must see the new
-//! entry without being restarted. WAL makes that work, but only with two disciplines that
-//! `contacts.rs` did not need when it was CLI-only:
-//!
-//! - **`BEGIN IMMEDIATE`, not deferred.** [`Groups::put`] reads the head, verifies a batch
-//!   against it, then writes. A deferred transaction takes its read snapshot first and can
-//!   fail to upgrade *after* all the verification work; an immediate one takes the write lock
-//!   up front.
-//! - **A `busy_timeout`.** Without one, two processes writing at the same moment produce an
-//!   immediate `SQLITE_BUSY` rather than a short wait.
-//!
-//! Every write is also a compare-and-swap on `head_seq`, so a lost race is reported as
-//! [`StoreError::Raced`] rather than silently clobbering the winner.
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -29,21 +8,17 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::chain::{Chain, ChainError, Entry, Op};
 use crate::id::{EntryHash, GroupId};
 use crate::members::Members;
-use crate::standing::{Standing, StandingError, StandingSet};
+use crate::standing::{Position, Standing, StandingError, StandingSet};
 use crate::wire::GroupHead;
 
 /// How long to wait for another process's write lock before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// This node's consent for one group. Written only by us, and only from a local command.
+/// This node's consent for one group. Written only by us
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// The chain names us, but we have not agreed to take part. We sync the log so we can see
-    /// who else is in it; we do not serve it.
     Pending,
     Active,
-    /// We authored a departure. **This is what makes leaving stick**: it is local, so no
-    /// re-add by the admin can overturn it — only `ac group accept` can.
     Left,
 }
 
@@ -60,8 +35,6 @@ impl State {
         match raw {
             "active" => State::Active,
             "left" => State::Left,
-            // An unrecognised value is treated as the least-privileged state rather than
-            // failing the read: a row we cannot interpret must not start serving.
             _ => State::Pending,
         }
     }
@@ -77,18 +50,11 @@ pub struct GroupRow {
     pub head_seq: u64,
     pub head_hash: EntryHash,
     pub standings_digest: [u8; 32],
-    /// Set once two different entries have claimed one position. The group is then inert:
-    /// no offers, no fetches, no serving, and no further writes.
-    pub forked_at: Option<u64>,
     pub first_seen: i64,
     pub last_synced: i64,
 }
 
 impl GroupRow {
-    pub fn is_quarantined(&self) -> bool {
-        self.forked_at.is_some()
-    }
-
     pub fn head(&self) -> GroupHead {
         GroupHead {
             group: self.id,
@@ -108,10 +74,6 @@ pub struct Applied {
     pub removed: Vec<PeerId>,
     pub we_joined: bool,
     pub we_lost: bool,
-    /// Peers whose newly-ingested standing says they have left, and who the chain still lists.
-    ///
-    /// The trigger for admin ratification, acted on by the **caller after the commit** — never
-    /// inside `put`, which must not author into the transaction it is already holding.
     pub departed: Vec<PeerId>,
 }
 
@@ -122,9 +84,6 @@ pub struct Groups {
 
 impl Groups {
     /// Open (creating if absent) the group tables at `path`.
-    ///
-    /// Takes a plain path rather than `ac_net::config::Paths` so this crate stays independent
-    /// of how a node lays out its directories; `ac-node` passes `paths.db_file()`.
     pub fn open(path: &Path, me: PeerId) -> Result<Self, StoreError> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -151,7 +110,6 @@ impl Groups {
                  head_seq         INTEGER NOT NULL,
                  head_hash        TEXT NOT NULL,
                  standings_digest TEXT NOT NULL,
-                 forked_at        INTEGER,
                  first_seen       INTEGER NOT NULL,
                  last_synced      INTEGER NOT NULL
              );
@@ -167,7 +125,7 @@ impl Groups {
                  group_id  TEXT NOT NULL,
                  peer      TEXT NOT NULL,
                  seq       INTEGER NOT NULL,
-                 in_group  INTEGER NOT NULL,
+                 position  TEXT NOT NULL,
                  body      BLOB NOT NULL,
                  signature BLOB NOT NULL,
                  PRIMARY KEY (group_id, peer)
@@ -176,7 +134,6 @@ impl Groups {
                  group_id  TEXT NOT NULL,
                  peer      TEXT NOT NULL,
                  username  TEXT NOT NULL,
-                 since_seq INTEGER NOT NULL,
                  is_admin  INTEGER NOT NULL,
                  PRIMARY KEY (group_id, peer)
              );
@@ -195,7 +152,7 @@ impl Groups {
         self.db
             .query_row(
                 "SELECT group_id, name, admin, state, head_seq, head_hash, standings_digest,
-                        forked_at, first_seen, last_synced
+                        first_seen, last_synced
                  FROM groups WHERE group_id = ?1",
                 params![group.to_string()],
                 row_to_group,
@@ -211,7 +168,7 @@ impl Groups {
     pub fn list(&self) -> Result<Vec<GroupRow>, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT group_id, name, admin, state, head_seq, head_hash, standings_digest,
-                    forked_at, first_seen, last_synced
+                    first_seen, last_synced
              FROM groups ORDER BY name, group_id",
         )?;
         let rows = stmt.query_map([], row_to_group)?;
@@ -229,18 +186,6 @@ impl Groups {
     }
 
     /// Load and re-verify the whole chain.
-    ///
-    /// Verification on every read is deliberate: it means a chain that was corrupted on disk,
-    /// or written by an older version with weaker rules, cannot quietly become authoritative.
-    ///
-    /// # Cost
-    ///
-    /// One signature check per entry, and [`Self::author`] calls this before every append —
-    /// so appending n entries one at a time is O(n²) checks. At the scale this targets that
-    /// is nothing: a group holds one entry per membership change, so tens of entries, and a
-    /// single `ac group add` costs a few milliseconds. It is worth knowing before anyone
-    /// writes a loop that appends thousands, which should build a [`Chain`] in memory and
-    /// hand the batch to [`Self::put`] instead — O(n) rather than O(n²).
     pub fn chain(&self, group: GroupId) -> Result<Chain, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT body, signature FROM group_entries WHERE group_id = ?1 ORDER BY seq",
@@ -276,51 +221,64 @@ impl Groups {
     }
 
     /// Membership from the cache, which `put` keeps in step with the chain.
-    ///
-    /// The cache carries every field of [`Member`](crate::members::Member), not just the peer ids, so a value read
-    /// back here means exactly what the same value folded from the chain would. A cache that
-    /// filled the rest with defaults would be a quiet trap for the next caller.
     pub fn members(&self, group: GroupId) -> Result<Members, StoreError> {
-        let mut stmt = self.db.prepare(
-            "SELECT peer, username, since_seq, is_admin FROM group_members WHERE group_id = ?1",
-        )?;
+        let mut stmt = self
+            .db
+            .prepare("SELECT peer, username, is_admin FROM group_members WHERE group_id = ?1")?;
         let rows = stmt.query_map(params![group.to_string()], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
             ))
         })?;
 
         let mut members = Members::default();
         for row in rows {
-            let (peer, username, since_seq, is_admin) = row?;
+            let (peer, username, is_admin) = row?;
             if let Ok(peer) = peer.parse() {
-                members.insert(peer, username, since_seq as u64, is_admin != 0);
+                members.insert(peer, username, is_admin != 0);
             }
         }
         Ok(members)
     }
 
-    /// **The only function permitted to name a group to a peer.**
-    ///
-    /// Everything an `Offer` carries comes from here, and nothing may build a [`GroupHead`]
-    /// bound for a peer any other way — that is what makes "never name a group to someone who
-    /// is not in it" checkable rather than a convention.
-    ///
-    /// Offering is for **current** members only. Answering a `Fetch` is slightly wider, and
-    /// deliberately so — see [`Self::serve_up_to`].
+    /// **Groups whose content we share with `peer`.** Active only: naming a group here is what
+    /// lets its files be offered, and that needs our consent.
     pub fn shared_with(&self, peer: &PeerId) -> Result<Vec<GroupHead>, StoreError> {
-        let mut stmt = self.db.prepare(
+        self.heads_shared(peer, "'active'")
+    }
+
+    /// **Groups whose membership log we will discuss with `peer`**, which includes ones we have
+    /// been invited to and not yet accepted.
+    ///
+    /// Wider than [`Self::shared_with`] for the reason [`Self::serve_up_to`] gives at length:
+    /// the log is not data, it is the record of who may have data, and both parties are already
+    /// in it. `peer` cannot learn anything from being named a group they are a member of.
+    ///
+    /// Leaving it out is what made an unaccepted invitation cost traffic forever. Our silence
+    /// about a group is indistinguishable from having been removed, so the inviter treats every
+    /// exchange as a refusal, keeps us owed the news, and asks again on the next connection —
+    /// the backoff that covers this lives in `ac-peers` and does not survive a disconnect.
+    /// Naming it lets them see our head match theirs and stop.
+    ///
+    /// `left` is still excluded: a departure is a decision, not a delay.
+    pub fn log_shared_with(&self, peer: &PeerId) -> Result<Vec<GroupHead>, StoreError> {
+        self.heads_shared(peer, "'active', 'pending'")
+    }
+
+    /// The one query behind both, so the membership rule — the group names *them* and it names
+    /// *us* — cannot drift between the two. `states` is a literal fragment, never user input.
+    fn heads_shared(&self, peer: &PeerId, states: &str) -> Result<Vec<GroupHead>, StoreError> {
+        let mut stmt = self.db.prepare(&format!(
             "SELECT g.group_id, g.name, g.admin, g.state, g.head_seq, g.head_hash,
-                    g.standings_digest, g.forked_at, g.first_seen, g.last_synced
+                    g.standings_digest, g.first_seen, g.last_synced
              FROM groups g
              JOIN group_members them ON them.group_id = g.group_id AND them.peer = ?1
              JOIN group_members us   ON us.group_id   = g.group_id AND us.peer   = ?2
-             WHERE g.state = 'active' AND g.forked_at IS NULL
-             ORDER BY g.group_id",
-        )?;
+             WHERE g.state IN ({states})
+             ORDER BY g.group_id"
+        ))?;
         let rows = stmt.query_map(params![peer.to_base58(), self.me.to_base58()], row_to_group)?;
 
         let mut out = Vec::new();
@@ -334,41 +292,10 @@ impl Groups {
 
     /// How much of a group we may serve `peer`, if any. `Some(limit)` means entries
     /// `0..limit`.
-    ///
-    /// # Why this is wider than [`Self::shared_with`]
-    ///
-    /// A current member gets everything. A peer the admin has **removed** gets the chain up to
-    /// and including the entry that removed them — and nothing after.
-    ///
-    /// Without that, removal is silent and permanent: nobody offers a removed peer the group,
-    /// so nobody answers them either, and their own node goes on claiming they belong while
-    /// quietly receiving nothing. They would have no way to ever find out.
-    ///
-    /// Serving that prefix leaks nothing. Every entry up to their removal happened while they
-    /// were a member, so they were already entitled to all of it; the one entry they were not
-    /// present for is the one that concerns only them. Someone the chain has never mentioned
-    /// gets `None`, so guessing a group id still reveals nothing.
-    ///
-    /// Once they apply that prefix their own fold excludes them, so they stop offering and
-    /// stop serving, and `ac group list` can say plainly that they were removed.
-    ///
-    /// # Why our own [`State`] is not consulted
-    ///
-    /// Offering is gated on `Active`; answering is not. Consent governs what we *advertise*
-    /// and, later, what data we hand over — but the membership log is not data, it is the
-    /// record of who may have data, and both parties here are already in it.
-    ///
-    /// Gating this on `Active` would also strand every departure. A node that has just left
-    /// holds the one copy of its own standing; if it refused to answer, nobody could ever
-    /// collect that standing, the admin would never ratify, and leaving would be invisible to
-    /// everyone but the leaver.
     pub fn serve_up_to(&self, group: GroupId, peer: &PeerId) -> Result<Option<u64>, StoreError> {
         let Some(row) = self.get(group)? else {
             return Ok(None);
         };
-        if row.is_quarantined() {
-            return Ok(None);
-        }
         // A group we are not in ourselves is not ours to serve.
         let members = self.members(group)?;
         if !members.contains(&self.me) {
@@ -391,8 +318,6 @@ impl Groups {
     }
 
     /// The entries to send in answer to `Fetch { group, from }`, or `None` to refuse.
-    ///
-    /// The single place the serving bound is applied, so no caller can read past it.
     pub fn entries_for(
         &self,
         group: GroupId,
@@ -411,13 +336,6 @@ impl Groups {
     }
 
     /// Resolve a full id, a unique hex prefix, or an exact name.
-    ///
-    /// Ambiguity fails closed — two matches are an error, never a guess — which is what makes
-    /// matching on a prefix or on an attacker-chosen name safe. The empty needle is the one
-    /// input that dodges that check: `starts_with("")` matches *every* group, so on a node
-    /// holding exactly one it collapses to a single hit and resolves. A command whose argument
-    /// went missing — an unexpanded shell variable, a dropped `$1` — would then act on the
-    /// only group rather than failing, and `remove` is among the callers.
     pub fn resolve(&self, needle: &str) -> Result<Resolved, StoreError> {
         if needle.trim().is_empty() {
             return Ok(Resolved::None);
@@ -441,14 +359,10 @@ impl Groups {
     }
 
     /// Peers whose own latest statement is that they have left.
-    ///
-    /// Advisory: they remain members until the admin writes a `Remove`. Surfaced so
-    /// `ac group show` can distinguish "still listed but on their way out" from "gone", and so
-    /// an admin can see a departure they have not yet ratified.
     pub fn departed(&self, group: GroupId) -> Result<Vec<PeerId>, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT peer FROM group_standings
-             WHERE group_id = ?1 AND in_group = 0 ORDER BY peer",
+             WHERE group_id = ?1 AND position = 'out' ORDER BY peer",
         )?;
         let rows = stmt.query_map(params![group.to_string()], |r| r.get::<_, String>(0))?;
 
@@ -498,8 +412,8 @@ impl Groups {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO groups (group_id, name, admin, state, head_seq, head_hash,
-                                 standings_digest, forked_at, first_seen, last_synced)
-             VALUES (?1, ?2, ?3, 'active', 0, ?4, ?5, NULL, ?6, ?6)",
+                                 standings_digest, first_seen, last_synced)
+             VALUES (?1, ?2, ?3, 'active', 0, ?4, ?5, ?6, ?6)",
             params![
                 id.to_string(),
                 chain.name(),
@@ -517,9 +431,6 @@ impl Groups {
     }
 
     /// Ingest a batch of entries and standings.
-    ///
-    /// `from` is the seq the responder was asked for; a mismatch with `entries[0]` is a
-    /// protocol violation caught before anything is verified.
     pub fn put(
         &mut self,
         group: GroupId,
@@ -528,25 +439,17 @@ impl Groups {
         standings: &[Standing],
         now: i64,
     ) -> Result<Applied, StoreError> {
-        let before = self.require(group)?;
-        if let Some(seq) = before.forked_at {
-            return Err(StoreError::Quarantined { group, seq });
-        }
+        self.require(group)?; // refuse a group we do not hold, before any verification work
         let mut chain = self.chain(group)?;
         let members_before = chain.fold();
         let head_seq = chain.len();
 
-        // Overlap: entries we already hold. A hash mismatch there is a fork — two validly
-        // signed entries claiming one position — which under a single admin means a restored
-        // backup, a copied key, or two admin processes. All three want a human, so nothing is
-        // written and the group is quarantined rather than merged.
         let overlap = head_seq.saturating_sub(from).min(entries.len() as u64);
         for i in 0..overlap {
             let seq = from + i;
             let theirs = entries[i as usize].hash();
             if chain.hash_at(seq) != Some(theirs) {
-                self.mark_forked(group, seq)?;
-                return Err(StoreError::Fork { group, seq });
+                return Err(StoreError::Diverged { group, seq });
             }
         }
         if from > head_seq {
@@ -569,16 +472,11 @@ impl Groups {
 
         if accepted > 0 {
             write_entries(&tx, group, head_seq, fresh.iter())?;
-            // Compare-and-swap: the invariant lives in the statement rather than resting on
-            // isolation, so a concurrent writer is reported rather than clobbered.
             if set_head(&tx, group, head_seq, chain.len(), chain.head())? == 0 {
                 return Err(StoreError::Raced { group });
             }
         }
 
-        // Entries before standings, so a standing for someone added in this very batch is
-        // evaluated against the post-insert chain. That removes the intra-batch ordering race
-        // entirely rather than handling it.
         let members_after = chain.fold();
         let mut set = load_standings(&tx, group)?;
         let mut departed = Vec::new();
@@ -590,34 +488,31 @@ impl Groups {
             let Ok(peer) = body.peer.parse::<PeerId>() else {
                 continue;
             };
-            // Bounded by the chain: a peer could otherwise grow our database with standings
-            // for peer ids nobody has ever mentioned. Wider than current membership on
-            // purpose, so a departed member's own statement survives their removal.
             if !ever_mentioned(&chain, &peer) {
                 continue;
             }
-            // Already holding this position, or a later one.
-            if matches!(set.latest(&peer), Some((seq, _)) if seq >= body.seq) {
+            if !set.insert(peer, standing.clone(), body.seq, body.position) {
                 continue;
             }
             tx.execute(
-                "INSERT INTO group_standings (group_id, peer, seq, in_group, body, signature)
+                "INSERT INTO group_standings (group_id, peer, seq, position, body, signature)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(group_id, peer) DO UPDATE SET
-                     seq = excluded.seq, in_group = excluded.in_group,
+                     seq = excluded.seq, position = excluded.position,
                      body = excluded.body, signature = excluded.signature",
                 params![
                     group.to_string(),
                     peer.to_base58(),
                     body.seq as i64,
-                    i64::from(body.in_group),
+                    position_str(body.position),
                     standing.body,
                     standing.signature,
                 ],
             )?;
-            set.insert(peer, body.seq, body.in_group);
 
-            if !body.in_group && members_after.contains(&peer) {
+            // Only a departure. An unanswered invitation is not one, and ratifying it would
+            // write a `Remove` against someone who has merely not replied yet.
+            if body.position.is_departure() && members_after.contains(&peer) {
                 departed.push(peer);
             }
         }
@@ -648,10 +543,7 @@ impl Groups {
         op: Op,
         at: i64,
     ) -> Result<Entry, StoreError> {
-        let row = self.require(group)?;
-        if let Some(seq) = row.forked_at {
-            return Err(StoreError::Quarantined { group, seq });
-        }
+        self.require(group)?;
         let mut chain = self.chain(group)?;
         let head_seq = chain.len();
         let entry = chain.author(key, op, at)?;
@@ -678,32 +570,36 @@ impl Groups {
         &mut self,
         key: &Keypair,
         group: GroupId,
-        in_group: bool,
+        position: Position,
         at: i64,
     ) -> Result<Standing, StoreError> {
         let seq = Standing::next_seq(self.my_standing_seq(group)?);
-        let standing = Standing::author(key, group, seq, in_group, at)?;
+        let standing = Standing::author(key, group, seq, position, at)?;
         let body = standing.verify(group)?;
 
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT INTO group_standings (group_id, peer, seq, in_group, body, signature)
+            "INSERT INTO group_standings (group_id, peer, seq, position, body, signature)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(group_id, peer) DO UPDATE SET
-                 seq = excluded.seq, in_group = excluded.in_group,
+                 seq = excluded.seq, position = excluded.position,
                  body = excluded.body, signature = excluded.signature",
             params![
                 group.to_string(),
                 self.me.to_base58(),
                 body.seq as i64,
-                i64::from(in_group),
+                position_str(position),
                 standing.body,
                 standing.signature,
             ],
         )?;
-        let state = if in_group { State::Active } else { State::Left };
+        let state = match position {
+            Position::Unanswered => State::Pending,
+            Position::In => State::Active,
+            Position::Out => State::Left,
+        };
         tx.execute(
             "UPDATE groups SET state = ?2 WHERE group_id = ?1",
             params![group.to_string(), state.as_str()],
@@ -719,20 +615,6 @@ impl Groups {
         self.db.execute(
             "UPDATE groups SET state = ?2 WHERE group_id = ?1",
             params![group.to_string(), state.as_str()],
-        )?;
-        Ok(())
-    }
-
-    /// Record that this group forked and stop all traffic for it.
-    pub fn mark_forked(&mut self, group: GroupId, seq: u64) -> Result<(), StoreError> {
-        tracing::error!(
-            %group, seq,
-            "two different entries claim one position; quarantining. Under a single admin this \
-             means a restored backup, a copied key, or two admin processes"
-        );
-        self.db.execute(
-            "UPDATE groups SET forked_at = ?2 WHERE group_id = ?1 AND forked_at IS NULL",
-            params![group.to_string(), seq as i64],
         )?;
         Ok(())
     }
@@ -775,8 +657,8 @@ impl Groups {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO groups (group_id, name, admin, state, head_seq, head_hash,
-                                 standings_digest, forked_at, first_seen, last_synced)
-             VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?5, NULL, ?6, ?6)",
+                                 standings_digest, first_seen, last_synced)
+             VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?5, ?6, ?6)",
             params![
                 id.to_string(),
                 chain.name(),
@@ -791,8 +673,6 @@ impl Groups {
         rebuild_caches(&tx, id, &chain, &StandingSet::default())?;
         tx.commit()?;
 
-        // Standings ride the same response; apply them through the ordinary path so they get
-        // the same bounds checks.
         let mut applied = self.put(id, chain.len(), &[], standings, now)?;
         applied.head_seq = chain.len();
         applied.accepted = chain.len() as usize;
@@ -813,9 +693,6 @@ impl Groups {
 }
 
 /// Whether a peer is named by any `Add` anywhere in the chain.
-///
-/// The bound on which standings we will store: wider than current membership, so a departed
-/// member's own statement survives their removal, but still finite.
 fn ever_mentioned(chain: &Chain, peer: &PeerId) -> bool {
     if chain.admin() == *peer {
         return true;
@@ -879,21 +756,29 @@ fn load_standings(
     tx: &rusqlite::Transaction<'_>,
     group: GroupId,
 ) -> Result<StandingSet, StoreError> {
-    let mut stmt =
-        tx.prepare("SELECT peer, seq, in_group FROM group_standings WHERE group_id = ?1")?;
+    let mut stmt = tx.prepare(
+        "SELECT peer, seq, position, body, signature FROM group_standings WHERE group_id = ?1",
+    )?;
     let rows = stmt.query_map(params![group.to_string()], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Vec<u8>>(3)?,
+            r.get::<_, Vec<u8>>(4)?,
         ))
     })?;
 
     let mut set = StandingSet::default();
     for row in rows {
-        let (peer, seq, in_group) = row?;
+        let (peer, seq, position, body, signature) = row?;
         if let Ok(peer) = peer.parse() {
-            set.insert(peer, seq as u64, in_group != 0);
+            set.insert(
+                peer,
+                Standing { body, signature },
+                seq as u64,
+                position_of(&position),
+            );
         }
     }
     Ok(set)
@@ -914,13 +799,12 @@ fn rebuild_caches(
     )?;
     for member in members.iter() {
         tx.execute(
-            "INSERT INTO group_members (group_id, peer, username, since_seq, is_admin)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO group_members (group_id, peer, username, is_admin)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 group.to_string(),
                 member.peer.to_base58(),
                 member.username,
-                member.since_seq as i64,
                 i64::from(member.is_admin),
             ],
         )?;
@@ -933,6 +817,26 @@ fn rebuild_caches(
         ],
     )?;
     Ok(())
+}
+
+/// How a [`Position`] is written to its column. Text rather than an integer so the table reads
+/// like `groups.state` does, and so an unknown value is obvious rather than plausible.
+fn position_str(position: Position) -> &'static str {
+    match position {
+        Position::Unanswered => "unanswered",
+        Position::In => "in",
+        Position::Out => "out",
+    }
+}
+
+/// An unreadable value is treated as `Unanswered` — the position that claims least and lets no
+/// ratification fire, the same instinct as [`State::parse`].
+fn position_of(raw: &str) -> Position {
+    match raw {
+        "in" => Position::In,
+        "out" => Position::Out,
+        _ => Position::Unanswered,
+    }
 }
 
 type RowResult = Result<GroupRow, StoreError>;
@@ -960,9 +864,8 @@ fn row_to_group(r: &rusqlite::Row<'_>) -> rusqlite::Result<RowResult> {
                 .parse()
                 .map_err(|_| StoreError::CorruptRow)?,
             standings_digest: digest,
-            forked_at: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-            first_seen: r.get(8)?,
-            last_synced: r.get(9)?,
+            first_seen: r.get(7)?,
+            last_synced: r.get(8)?,
         })
     };
     Ok(parse())
@@ -994,10 +897,8 @@ pub enum StoreError {
     Duplicate { group: GroupId },
     #[error("entries start at {got}, but {want} is needed to continue")]
     Gap { want: u64, got: u64 },
-    #[error("group {group} forked at entry {seq}: two different entries claim that position")]
-    Fork { group: GroupId, seq: u64 },
-    #[error("group {group} is quarantined by a fork at entry {seq}")]
-    Quarantined { group: GroupId, seq: u64 },
+    #[error("group {group} disagrees with us at entry {seq}; the batch was refused")]
+    Diverged { group: GroupId, seq: u64 },
     #[error("another writer moved the head of {group} mid-batch")]
     Raced { group: GroupId },
 }
@@ -1100,9 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fork_writes_nothing_and_quarantines_the_group() {
-        // Two validly-signed entries claiming one position. Under a single admin this means a
-        // restored backup or a copied key, so the honest response is to stop, not to merge.
+    fn a_divergent_batch_is_refused_and_writes_nothing() {
         let (mut store, admin, id) = admin_store();
         add(&mut store, &admin, id, peer_of(&key()), "bob");
 
@@ -1123,47 +1022,11 @@ mod tests {
         let before = store.chain(id).unwrap();
         assert!(matches!(
             store.put(id, 1, &[other], &[], AT),
-            Err(StoreError::Fork { seq: 1, .. })
+            Err(StoreError::Diverged { seq: 1, .. })
         ));
 
         let after = store.chain(id).unwrap();
         assert_eq!(after.head(), before.head(), "nothing was written");
-        assert_eq!(store.get(id).unwrap().unwrap().forked_at, Some(1));
-    }
-
-    #[test]
-    fn a_quarantined_group_accepts_no_further_writes() {
-        let (mut store, admin, id) = admin_store();
-        store.mark_forked(id, 1).unwrap();
-
-        assert!(matches!(
-            store.put(id, 1, &[], &[], AT),
-            Err(StoreError::Quarantined { .. })
-        ));
-        assert!(matches!(
-            store.author(
-                &admin,
-                id,
-                Op::Add {
-                    peer: peer_of(&key()).to_base58(),
-                    username: "x".into(),
-                },
-                AT
-            ),
-            Err(StoreError::Quarantined { .. })
-        ));
-    }
-
-    #[test]
-    fn a_quarantined_group_is_offered_to_nobody() {
-        let (mut store, admin, id) = admin_store();
-        let bob = key();
-        add(&mut store, &admin, id, peer_of(&bob), "bob");
-        assert_eq!(store.shared_with(&peer_of(&bob)).unwrap().len(), 1);
-
-        store.mark_forked(id, 1).unwrap();
-        assert!(store.shared_with(&peer_of(&bob)).unwrap().is_empty());
-        assert!(!store.serves(id, &peer_of(&bob)).unwrap());
     }
 
     #[test]
@@ -1183,8 +1046,6 @@ mod tests {
 
     #[test]
     fn a_removed_member_is_not_offered_but_may_still_learn_they_were_removed() {
-        // Without this, removal is silent and permanent: nobody offers them the group, so
-        // nobody answers them either, and their node claims they belong forever.
         let (mut store, admin, id) = admin_store();
         let bob = key();
         add(&mut store, &admin, id, peer_of(&bob), "bob");
@@ -1296,16 +1157,34 @@ mod tests {
         assert_eq!(mine.get(id).unwrap().unwrap().state, State::Pending);
         assert!(
             mine.shared_with(&peer_of(&admin)).unwrap().is_empty(),
-            "we do not advertise a group we have not accepted"
+            "we do not advertise the content of a group we have not accepted"
+        );
+        assert_eq!(
+            mine.log_shared_with(&peer_of(&admin)).unwrap().len(),
+            1,
+            "but we do name its log, or our silence reads as a refusal forever"
         );
         assert!(
             mine.serves(id, &peer_of(&admin)).unwrap(),
-            "but we still answer a member asking for the log, which is not data"
+            "and we still answer a member asking for the log, which is not data"
         );
 
-        mine.author_standing(&me, id, true, AT).unwrap();
+        mine.author_standing(&me, id, Position::In, AT).unwrap();
         assert_eq!(mine.get(id).unwrap().unwrap().state, State::Active);
         assert_eq!(mine.shared_with(&peer_of(&admin)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_group_we_have_left_is_named_to_nobody() {
+        // The boundary of `log_shared_with`: pending is a delay, left is a decision.
+        let (mut store, admin, id) = admin_store();
+        let bob = key();
+        add(&mut store, &admin, id, peer_of(&bob), "bob");
+        assert_eq!(store.log_shared_with(&peer_of(&bob)).unwrap().len(), 1);
+
+        store.set_state(id, State::Left).unwrap();
+        assert!(store.log_shared_with(&peer_of(&bob)).unwrap().is_empty());
+        assert!(store.shared_with(&peer_of(&bob)).unwrap().is_empty());
     }
 
     #[test]
@@ -1329,8 +1208,8 @@ mod tests {
             AT,
         )
         .unwrap();
-        mine.author_standing(&me, id, true, AT).unwrap();
-        mine.author_standing(&me, id, false, AT).unwrap();
+        mine.author_standing(&me, id, Position::In, AT).unwrap();
+        mine.author_standing(&me, id, Position::Out, AT).unwrap();
         assert_eq!(mine.get(id).unwrap().unwrap().state, State::Left);
 
         // The admin removes and re-adds us; we ingest both.
@@ -1370,7 +1249,7 @@ mod tests {
         let bob = key();
         add(&mut store, &admin, id, peer_of(&bob), "bob");
 
-        let standing = Standing::author(&bob, id, 1, false, AT).unwrap();
+        let standing = Standing::author(&bob, id, 1, Position::Out, AT).unwrap();
         let first = store
             .put(id, 2, &[], std::slice::from_ref(&standing), AT)
             .unwrap();
@@ -1402,7 +1281,7 @@ mod tests {
         // Otherwise an enrolled peer could grow our database with statements about strangers.
         let (mut store, _admin, id) = admin_store();
         let stranger = key();
-        let junk = Standing::author(&stranger, id, 1, false, AT).unwrap();
+        let junk = Standing::author(&stranger, id, 1, Position::Out, AT).unwrap();
 
         store.put(id, 1, &[], &[junk], AT).unwrap();
         assert!(store.standings(id).unwrap().is_empty());
@@ -1414,7 +1293,7 @@ mod tests {
         // Dropped now, healed later — which is what the digest in `GroupHead` exists for.
         let (mut store, admin, id) = admin_store();
         let bob = key();
-        let early = Standing::author(&bob, id, 1, false, AT).unwrap();
+        let early = Standing::author(&bob, id, 1, Position::Out, AT).unwrap();
 
         store
             .put(id, 1, &[], std::slice::from_ref(&early), AT)
@@ -1446,7 +1325,7 @@ mod tests {
             .unwrap();
 
         // Every field, not just the peer ids: a cache that defaulted the rest would be a
-        // quiet trap for whoever reads `is_admin` or `since_seq` back.
+        // quiet trap for whoever reads `is_admin` back.
         assert_eq!(store.members(id).unwrap(), store.chain(id).unwrap().fold());
         assert_eq!(store.members(id).unwrap().len(), 5); // admin + 5 added - 1 removed
 
@@ -1468,7 +1347,7 @@ mod tests {
         add(&mut store, &admin, id, peer_of(&bob), "bob");
         let before = store.get(id).unwrap().unwrap().standings_digest;
 
-        let standing = Standing::author(&bob, id, 1, false, AT).unwrap();
+        let standing = Standing::author(&bob, id, 1, Position::Out, AT).unwrap();
         store.put(id, 2, &[], &[standing], AT).unwrap();
 
         assert_ne!(store.get(id).unwrap().unwrap().standings_digest, before);
@@ -1526,9 +1405,9 @@ mod tests {
         let (mut store, admin, id) = admin_store();
         assert_eq!(store.my_standing_seq(id).unwrap(), None);
 
-        store.author_standing(&admin, id, false, AT).unwrap();
+        store.author_standing(&admin, id, Position::Out, AT).unwrap();
         assert_eq!(store.my_standing_seq(id).unwrap(), Some(1));
-        store.author_standing(&admin, id, true, AT).unwrap();
+        store.author_standing(&admin, id, Position::In, AT).unwrap();
         assert_eq!(store.my_standing_seq(id).unwrap(), Some(2));
     }
 

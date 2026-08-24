@@ -16,7 +16,7 @@ use ac_files::path::RelPath;
 use ac_files::store::{FileRow, Files};
 use ac_groups::chain::Op;
 use ac_groups::id::GroupId;
-use ac_groups::standing::Standing;
+use ac_groups::standing::{Position, Standing};
 use ac_groups::store::Groups;
 use ac_net::PeerId;
 use ac_net::identity::Keypair;
@@ -151,7 +151,7 @@ impl Node {
     ///
     /// Signed by them, so it cannot be faked with `author_standing` — that one writes *our* row.
     fn accept_invite(&mut self, group: GroupId, key: &Keypair) {
-        let standing = Standing::author(key, group, 1, true, AT).unwrap();
+        let standing = Standing::author(key, group, 1, Position::In, AT).unwrap();
         let entries: Vec<_> = self
             .peers
             .groups_mut()
@@ -909,7 +909,7 @@ fn someone_who_joins_while_already_connected_still_gets_the_catalogue() {
     let key = node.key.clone();
     node.peers
         .groups_mut()
-        .author_standing(&key, id, true, AT)
+        .author_standing(&key, id, Position::In, AT)
         .unwrap();
 
     let actions = node.tick(settled + 1);

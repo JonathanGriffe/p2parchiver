@@ -564,8 +564,8 @@ struct PeerState {
     /// nothing, deliberately, since telling "never heard of it" from "you are not a member"
     /// would make a group id guessable into a membership oracle. So the silence covers six
     /// different situations at once: invited and not yet accepted, or the chain that adds us
-    /// not arrived, both of which resolve in seconds; and left, removed, quarantined or
-    /// forgotten, none of which ever will.
+    /// not arrived, both of which resolve in seconds; and left, removed or forgotten, none of
+    /// which ever will.
     ///
     /// Since the wire cannot say which, the answer is to record neither agreement nor defeat:
     /// do not mark them told, do not ask again immediately, and widen the gap each time.
@@ -587,8 +587,8 @@ struct PeerState {
 
 pub struct Peers {
     files: Files,
-    /// Never written. Held so `shared_with` — the one function allowed to name a group to a
-    /// peer — is applied inside the policy, where a test can reach it.
+    /// Never written. Held so the namers — `shared_with` for content, `log_shared_with` for
+    /// the chain — are applied inside the policy, where a test can reach them.
     groups: Groups,
     me: PeerId,
 
@@ -1067,7 +1067,7 @@ impl Peers {
             .list()
             .unwrap_or_default()
             .into_iter()
-            .filter(|row| !row.is_quarantined() && row.state == State::Active)
+            .filter(|row| row.state == State::Active)
             .map(|row| row.id)
             .collect();
 
@@ -1372,9 +1372,14 @@ impl Peers {
     /// them all, so they are all told, and recording anything less would leave the supervisor
     /// believing it still owes news it has already delivered.
     fn offer(&mut self, peer: PeerId, offering: Offering) -> PeerAction {
-        let carried = self
-            .groups
-            .shared_with(&peer)
+        // The same set the layer being offered will actually put on the wire, or the
+        // supervisor would go on believing it still owed news it has already delivered. The
+        // chain half discusses invitations too; the catalogue half needs our consent.
+        let named = match offering {
+            Offering::Chain => self.groups.log_shared_with(&peer),
+            Offering::Catalogue => self.groups.shared_with(&peer),
+        };
+        let carried = named
             .unwrap_or_default()
             .into_iter()
             .filter_map(|head| Some((head.group, self.current(head.group).ok()?)))
@@ -1769,7 +1774,7 @@ impl Peers {
             .list()
             .unwrap_or_default()
             .into_iter()
-            .filter(|row| !row.is_quarantined() && row.state == State::Active)
+            .filter(|row| row.state == State::Active)
             .map(|row| {
                 let state = self.state.get(&row.id);
                 GroupStatus {
@@ -1842,6 +1847,11 @@ impl Peers {
     ///
     /// Read from the chain rather than remembered, so nothing has to be kept in step: the moment
     /// their standing arrives, they stop counting as a stranger everywhere at once.
+    ///
+    /// **Any** standing counts, `Position::Unanswered` included. Answering is about whether they
+    /// have the chain, not about what they decided — a node that holds an invitation and has not
+    /// made up its mind has still received everything we were trying to deliver, and dialling it
+    /// again every five minutes until a human clicks accept is work with no possible outcome.
     fn answered_invite(&self, group: GroupId) -> HashSet<PeerId> {
         self.groups
             .standings(group)
@@ -1857,7 +1867,7 @@ impl Peers {
             .list()
             .unwrap_or_default()
             .into_iter()
-            .filter(|row| !row.is_quarantined() && row.state == State::Active)
+            .filter(|row| row.state == State::Active)
             .map(|row| row.id)
             .filter(|group| {
                 self.members_of(*group).contains(peer)
@@ -2146,7 +2156,7 @@ impl Peers {
     fn members_of_shared_groups(&self) -> Vec<PeerId> {
         let mut out = HashSet::new();
         for row in self.groups.list().unwrap_or_default() {
-            if row.is_quarantined() || row.state != State::Active {
+            if row.state != State::Active {
                 continue;
             }
             if let Ok(members) = self.groups.members(row.id) {

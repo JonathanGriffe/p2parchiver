@@ -1,9 +1,3 @@
-//! The result of folding a chain: who belongs, right now.
-//!
-//! Deliberately a plain value with no I/O and no libp2p beyond [`PeerId`], so the fold can be
-//! driven from a scripted sequence in a unit test — the same shape as
-//! `ac_net::connectivity`.
-
 use std::collections::BTreeMap;
 
 use ac_net::PeerId;
@@ -15,19 +9,11 @@ use crate::standing::StandingSet;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     pub peer: PeerId,
-    /// Advisory display text chosen by the admin.
-    ///
-    /// **Never** compared for authorization. The authoritative name for a peer is what its own
-    /// server-signed attestation asserts when it connects; this is what the admin typed, and
-    /// the two can legitimately disagree if someone re-enrolled under a new name.
     pub username: String,
-    /// The entry that added them. Survives a username change.
-    pub since_seq: u64,
     pub is_admin: bool,
 }
 
 /// Membership as of some point in the chain.
-///
 /// `BTreeMap` rather than `HashMap` so iteration order is deterministic: the standings digest
 /// is computed over members in order, and two nodes must agree on it byte for byte.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -37,18 +23,13 @@ pub struct Members {
 
 impl Members {
     /// Add a member, or update the advisory username of one already present.
-    ///
-    /// Re-adding is valid and means "correct the username". Treating it as an error would turn
-    /// a harmless duplicate into a permanently frozen group, and it cannot corrupt the fold.
-    /// `since_seq` is kept from the original add, because that is when they joined.
-    pub fn insert(&mut self, peer: PeerId, username: String, seq: u64, is_admin: bool) {
+    pub fn insert(&mut self, peer: PeerId, username: String, is_admin: bool) {
         self.by_peer
             .entry(peer)
             .and_modify(|m| m.username = username.clone())
             .or_insert(Member {
                 peer,
                 username,
-                since_seq: seq,
                 is_admin,
             });
     }
@@ -78,18 +59,14 @@ impl Members {
     }
 
     /// A digest of what each member has said about itself, for `GroupHead.standings`.
-    ///
-    /// Folded over **members only**, in peer-id order, so two nodes holding the same chain
-    /// converge on the same value even if one is also carrying standings for peers the other
-    /// has never heard of. Without that restriction a node could never stop re-syncing.
     pub fn standings_digest(&self, standings: &StandingSet) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update([0x02]); // domain separation from the id and entry-hash tags
         for member in self.iter() {
-            if let Some((seq, in_group)) = standings.latest(&member.peer) {
+            if let Some((seq, position)) = standings.latest(&member.peer) {
                 hasher.update(member.peer.to_bytes());
                 hasher.update(seq.to_le_bytes());
-                hasher.update([u8::from(in_group)]);
+                hasher.update([position.tag()]);
             }
         }
         hasher.finalize().into()
@@ -99,22 +76,36 @@ impl Members {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::standing::Position;
     use ac_net::identity::Keypair;
 
     fn peer() -> PeerId {
         Keypair::generate_ed25519().public().to_peer_id()
     }
 
+    fn standing(seq: u64, position: Position) -> crate::standing::Standing {
+        crate::standing::Standing::author(
+            &Keypair::generate_ed25519(),
+            crate::id::GroupId::ZERO,
+            seq,
+            position,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn pos(yes: bool) -> Position {
+        if yes { Position::In } else { Position::Out }
+    }
+
     #[test]
-    fn re_adding_updates_the_name_and_keeps_the_join_point() {
+    fn re_adding_updates_the_name_rather_than_duplicating_the_member() {
         let mut m = Members::default();
         let p = peer();
-        m.insert(p, "alice".into(), 3, false);
-        m.insert(p, "alice-laptop".into(), 9, false);
+        m.insert(p, "alice".into(), false);
+        m.insert(p, "alice-laptop".into(), false);
 
-        let member = m.get(&p).unwrap();
-        assert_eq!(member.username, "alice-laptop");
-        assert_eq!(member.since_seq, 3, "they joined at 3, not 9");
+        assert_eq!(m.get(&p).unwrap().username, "alice-laptop");
         assert_eq!(m.len(), 1);
     }
 
@@ -123,7 +114,7 @@ mod tests {
         let mut m = Members::default();
         let p = peer();
         assert!(!m.remove(&p));
-        m.insert(p, "alice".into(), 0, false);
+        m.insert(p, "alice".into(), false);
         assert!(m.remove(&p));
         assert!(!m.contains(&p));
     }
@@ -137,19 +128,19 @@ mod tests {
         let mut forwards = Members::default();
         let mut backwards = Members::default();
         for (i, p) in peers.iter().enumerate() {
-            forwards.insert(*p, format!("u{i}"), i as u64, false);
+            forwards.insert(*p, format!("u{i}"), false);
         }
         for (i, p) in peers.iter().enumerate().rev() {
-            backwards.insert(*p, format!("u{i}"), i as u64, false);
+            backwards.insert(*p, format!("u{i}"), false);
         }
 
         let mut a = StandingSet::default();
         let mut b = StandingSet::default();
         for (i, p) in peers.iter().enumerate() {
-            a.insert(*p, 1, i % 2 == 0);
+            a.insert(*p, standing(1, pos(i % 2 == 0)), 1, pos(i % 2 == 0));
         }
         for (i, p) in peers.iter().enumerate().rev() {
-            b.insert(*p, 1, i % 2 == 0);
+            b.insert(*p, standing(1, pos(i % 2 == 0)), 1, pos(i % 2 == 0));
         }
 
         assert_eq!(
@@ -163,14 +154,14 @@ mod tests {
         // Junk one node happens to hold must not keep the two of them re-syncing forever.
         let mut members = Members::default();
         let alice = peer();
-        members.insert(alice, "alice".into(), 0, true);
+        members.insert(alice, "alice".into(), true);
 
         let mut lean = StandingSet::default();
-        lean.insert(alice, 1, true);
+        lean.insert(alice, standing(1, Position::In), 1, Position::In);
 
         let mut cluttered = lean.clone();
-        cluttered.insert(peer(), 4, false);
-        cluttered.insert(peer(), 9, true);
+        cluttered.insert(peer(), standing(4, Position::Out), 4, Position::Out);
+        cluttered.insert(peer(), standing(9, Position::In), 9, Position::In);
 
         assert_eq!(
             members.standings_digest(&lean),
@@ -182,12 +173,12 @@ mod tests {
     fn the_standings_digest_notices_a_changed_position() {
         let mut members = Members::default();
         let alice = peer();
-        members.insert(alice, "alice".into(), 0, true);
+        members.insert(alice, "alice".into(), true);
 
         let mut before = StandingSet::default();
-        before.insert(alice, 1, true);
+        before.insert(alice, standing(1, Position::In), 1, Position::In);
         let mut after = StandingSet::default();
-        after.insert(alice, 2, false);
+        after.insert(alice, standing(2, Position::Out), 2, Position::Out);
 
         assert_ne!(
             members.standings_digest(&before),
@@ -202,7 +193,7 @@ mod tests {
         let mut m = Members::default();
         let peers: Vec<_> = (0..8).map(|_| peer()).collect();
         for (i, p) in peers.iter().enumerate() {
-            m.insert(*p, format!("user{i}"), i as u64, false);
+            m.insert(*p, format!("user{i}"), false);
         }
 
         let seen: Vec<_> = m.iter().map(|x| x.peer).collect();

@@ -32,7 +32,7 @@ pub enum AdmissionAction {
         peer: PeerId,
         why: String,
     },
-    /// Both halves passed. Emitted exactly once per handshake — this is the signal the app
+    /// Both halves passed. Emitted exactly once per handshake, this is the signal the app
     /// layer waits on.
     Admitted {
         peer: PeerId,
@@ -218,7 +218,7 @@ impl Admission {
     ///
     /// Total and infallible: exactly one response, always. The daemon holds the
     /// `ResponseChannel` across this call, so no action needs to carry it and a channel can
-    /// never be stranded — the same arrangement as `ac_groups::sync::GroupSync::on_request`.
+    /// never be stranded, the same arrangement as `ac_groups::sync::GroupSync::on_request`.
     pub fn on_request(
         &mut self,
         peer: PeerId,
@@ -449,12 +449,6 @@ mod tests {
     }
 
     /// A writable path for an [`Admission`]'s attestation cache.
-    ///
-    /// A relative path here would be written **into the source tree**: renewal calls
-    /// `attest::save`, and `cargo test` runs with the working directory set to the crate
-    /// root. One shared directory for the whole test binary, rather than one per helper,
-    /// because [`Admission`] is returned by value and a per-call `TempDir` would be dropped —
-    /// deleting the directory — before the test ever ran.
     fn scratch() -> PathBuf {
         static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -558,9 +552,6 @@ mod tests {
 
     #[test]
     fn a_reconnecting_peer_is_announced_again() {
-        // The latch belongs to the handshake, not to the peer. Disconnecting drops the entry,
-        // so the next connection is a fresh exchange and genuinely worth reporting — a
-        // per-peer latch would silence it forever.
         let mut a = admission();
         let p = peer();
         a.peers.insert(p, complete_handshake(Instant::now()));
@@ -586,12 +577,6 @@ mod tests {
 
     #[test]
     fn a_reconnecting_peer_is_sent_our_attestation_again() {
-        // Regression. A peer that dies without closing cleanly leaves a connection the swarm
-        // still believes in until the transport's idle timeout. When it restarts and dials
-        // back, the new connection arrives while the corpse of the old one is still counted,
-        // so a guard that skipped peers whose handshake was already complete never sent our
-        // half — and the peer closed us for timing out. Nothing distinguishes that from a
-        // relayed-plus-direct upgrade by peer id alone, so the exchange is simply re-run.
         let (mut a, _server) = enrolled();
         let p = peer();
 
@@ -674,8 +659,6 @@ mod tests {
 
     #[test]
     fn the_server_is_never_closed() {
-        // Closing it would take down renewal, the relay reservation and the registry in one
-        // go — and it proved itself by holding the key for the peer id pinned at enrolment.
         let (mut a, server_key) = enrolled();
         let server = server_key.public().to_peer_id();
 
@@ -749,11 +732,6 @@ mod tests {
 
     #[test]
     fn an_outbound_failure_retries_rather_than_closing_the_peer() {
-        // Regression. `send_request` addresses a peer, not a connection; with a dead
-        // connection still counted alongside a fresh one, libp2p can route our attestation
-        // into the corpse and report `connection lost`. Closing on that killed the healthy
-        // connection too — a restarted peer could never recover, and saw itself refused for
-        // something it had not done.
         let (mut a, _server) = enrolled();
         let p = peer();
         let start = Instant::now();
@@ -823,13 +801,6 @@ mod tests {
 
     #[test]
     fn a_second_connection_gets_its_own_deadline() {
-        // `connected` clears `sent` on a surviving entry but leaves `deadline` where the
-        // first connection put it. A relayed connection that sat unproven for most of its
-        // window hands the direct upgrade whatever is left — here, one second.
-        //
-        // That matters because `close` is peer-wide: the daemon turns it into
-        // `disconnect_peer_id`, so firing on the stale connection's clock takes down the
-        // fresh one that never had a chance to finish.
         let (mut a, _server) = enrolled();
         let p = peer();
         let start = Instant::now();
@@ -852,13 +823,6 @@ mod tests {
 
     #[test]
     fn a_redial_is_not_closed_by_an_expired_deadline() {
-        // The restart case. A peer dies mid-exchange without closing cleanly, so the entry
-        // survives — `Disconnected` only removes it once the last connection is gone, and
-        // the corpse still counts. By the time the peer restarts and dials back, the
-        // deadline it left behind is already in the past.
-        //
-        // The redial is then closed on the very next tick for something the previous
-        // connection did, and since the peer redials again, this does not settle on its own.
         let (mut a, _server) = enrolled();
         let p = peer();
         let start = Instant::now();

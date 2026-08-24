@@ -1,18 +1,3 @@
-//! Ping, mounted on the connections that need it and nowhere else.
-//!
-//! Ping feeds no decision here — both binaries only log its results. What it actually does
-//! is open a stream every [`crate::swarm::PING_INTERVAL`], which has two side effects:
-//! it refreshes a NAT mapping, and it resets the swarm's idle timer.
-//!
-//! The second is unwanted between peers. A quiet peer connection should lapse and be
-//! redialled when something needs it, rather than being held open by traffic that exists
-//! only to hold it open.
-//!
-//! The server connection is the exception, because a node's reachability is *passive*: it
-//! holds a relay reservation and a rendezvous registration, and inbound circuits arrive
-//! unprompted. Let that mapping expire and the node becomes undialable without ever
-//! noticing — nothing it does would fail.
-
 use std::task::{Context, Poll};
 
 use either::Either;
@@ -175,8 +160,6 @@ mod tests {
 
     #[test]
     fn an_inbound_connection_is_judged_the_same_way() {
-        // Direction says nothing about whether a mapping needs refreshing, and the server
-        // connection may be either — a redial is outbound, a relayed circuit is not.
         let server = peer();
         let mut b = behaviour(Some(server));
 
@@ -199,8 +182,6 @@ mod tests {
 
     #[test]
     fn a_node_with_no_server_pings_nobody() {
-        // A server is publicly reachable and holds no reservation anywhere, so it has no
-        // mapping to keep open — and its clients ping it, not the other way round.
         let mut b = behaviour(None);
         assert!(!is_pinged(&mut b, peer()));
     }

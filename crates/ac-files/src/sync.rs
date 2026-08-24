@@ -10,8 +10,9 @@
 //!
 //! # What decides what goes on the wire
 //!
-//! `ac_groups::store::Groups::shared_with` is the only thing that may name a group to a peer,
-//! here exactly as there. That is why this machine holds a `Groups` handle it never writes:
+//! `ac_groups::store::Groups::shared_with` is the only thing that may name a group's *content*
+//! to a peer — the chain layer has its own, wider namer for the log alone. That is why this
+//! machine holds a `Groups` handle it never writes:
 //! the gate belongs inside the policy, where a test can reach it, rather than in the daemon
 //! where it would be a rule someone could forget.
 //!
@@ -217,8 +218,8 @@ struct InFlight {
 
 pub struct FileSync {
     files: Files,
-    /// Never written. Held so `shared_with` — the one function allowed to name a group to a
-    /// peer — is applied inside the policy rather than by the caller.
+    /// Never written. Held so `shared_with` — the one function allowed to name a group's
+    /// content to a peer — is applied inside the policy rather than by the caller.
     groups: Groups,
     content: Content,
     /// The group directory names, resolved once each and then reused.
@@ -641,7 +642,7 @@ impl FileSync {
             .collect()
     }
 
-    /// Whether `shared_with` names this group for this peer — the one gate.
+    /// Whether `shared_with` names this group for this peer — the one content gate.
     fn shares(&self, peer: &PeerId, group: GroupId) -> bool {
         self.groups
             .shared_with(peer)

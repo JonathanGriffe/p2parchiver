@@ -66,10 +66,6 @@ pub enum UsernameError {
 }
 
 /// What the server asserts about a client.
-///
-/// Peer ids are held as their base58 text rather than as [`PeerId`], because this type is
-/// defined by its encoding — it is what gets signed — and a textual peer id is stable in a
-/// way that a library type's serde representation is not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Statement {
     pub peer: String,

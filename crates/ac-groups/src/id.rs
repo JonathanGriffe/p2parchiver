@@ -1,9 +1,3 @@
-//! Content-addressed identifiers for groups and entries.
-//!
-//! Both are sha-256 over signed bytes, and both are domain-separated by a leading tag byte so
-//! a group id can never be mistaken for an entry hash even though the two are the same width
-//! and both derived from the same genesis body.
-
 use std::fmt;
 use std::str::FromStr;
 
@@ -18,18 +12,10 @@ const TAG_GROUP: u8 = 0x01;
 const TAG_ENTRY: u8 = 0x00;
 
 /// A group's permanent name.
-///
-/// `sha256(0x01 || <genesis body bytes>)`. The genesis body carries the admin's peer id and 16
-/// random bytes, so the id **commits to its admin** and cannot be squatted: a hostile peer
-/// cannot offer a different genesis under the same id, because the id is a function of that
-/// genesis. Recomputable by anyone holding the first entry, so it needs no registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GroupId([u8; 32]);
 
 /// The hash of one entry's body.
-///
-/// Over the **body only**, never the signature, so it stays a pure function of the bytes that
-/// were signed — the same reason `ac_net::attest` carries its statement verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EntryHash([u8; 32]);
 
@@ -53,7 +39,6 @@ impl GroupId {
         &self.0
     }
 
-    /// For [`crate::bytes`], which reconstructs one from a CBOR byte string.
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -74,7 +59,6 @@ impl EntryHash {
         &self.0
     }
 
-    /// For [`crate::bytes`], which reconstructs one from a CBOR byte string.
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -87,8 +71,6 @@ fn tagged(tag: u8, bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Both types are 32 bytes of hex in every human-facing surface: the CLI, logs, and the
-/// database. On the wire they travel as bytes, which is what the `Serialize` derive gives.
 macro_rules! hex_repr {
     ($t:ty, $what:literal) => {
         impl fmt::Display for $t {

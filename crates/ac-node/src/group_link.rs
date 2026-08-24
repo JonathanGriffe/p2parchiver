@@ -348,18 +348,6 @@ fn report(notice: &Notice) {
         Notice::Ratified { group, peer } => {
             tracing::info!(%group, %peer, "recorded a member's departure");
         }
-        Notice::Forked { group, seq } => {
-            // Loud on purpose: the group is now inert and only a person can resolve it.
-            println!(
-                "group {} FORKED at entry {seq} and is now inactive",
-                group.short()
-            );
-            tracing::error!(
-                %group, seq,
-                "two different entries claim one position; under a single admin this means a \
-                 restored backup, a copied key, or two admin processes"
-            );
-        }
         Notice::Rejected { group, peer, why } => {
             tracing::warn!(%group, %peer, why, "refused a peer's group data");
         }
@@ -392,6 +380,7 @@ mod tests {
     // rewriting its dispatch in the test would prove only that the copy works.
 
     use ac_groups::chain::Op;
+    use ac_groups::standing::Position;
     use ac_groups::id::GroupId;
     use ac_groups::wire::{GroupRequest, GroupResponse};
     use ac_net::config::Config;
@@ -680,8 +669,8 @@ mod tests {
             .unwrap()
             .0;
         let store = bob.link.sync.store_mut();
-        store.author_standing(key.keypair(), id, true, AT).unwrap();
-        store.author_standing(key.keypair(), id, false, AT).unwrap();
+        store.author_standing(key.keypair(), id, Position::In, AT).unwrap();
+        store.author_standing(key.keypair(), id, Position::Out, AT).unwrap();
         assert!(
             alice
                 .link
