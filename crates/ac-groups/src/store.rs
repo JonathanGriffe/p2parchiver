@@ -249,26 +249,10 @@ impl Groups {
         self.heads_shared(peer, "'active'")
     }
 
-    /// **Groups whose membership log we will discuss with `peer`**, which includes ones we have
-    /// been invited to and not yet accepted.
-    ///
-    /// Wider than [`Self::shared_with`] for the reason [`Self::serve_up_to`] gives at length:
-    /// the log is not data, it is the record of who may have data, and both parties are already
-    /// in it. `peer` cannot learn anything from being named a group they are a member of.
-    ///
-    /// Leaving it out is what made an unaccepted invitation cost traffic forever. Our silence
-    /// about a group is indistinguishable from having been removed, so the inviter treats every
-    /// exchange as a refusal, keeps us owed the news, and asks again on the next connection —
-    /// the backoff that covers this lives in `ac-peers` and does not survive a disconnect.
-    /// Naming it lets them see our head match theirs and stop.
-    ///
-    /// `left` is still excluded: a departure is a decision, not a delay.
     pub fn log_shared_with(&self, peer: &PeerId) -> Result<Vec<GroupHead>, StoreError> {
         self.heads_shared(peer, "'active', 'pending'")
     }
 
-    /// The one query behind both, so the membership rule — the group names *them* and it names
-    /// *us* — cannot drift between the two. `states` is a literal fragment, never user input.
     fn heads_shared(&self, peer: &PeerId, states: &str) -> Result<Vec<GroupHead>, StoreError> {
         let mut stmt = self.db.prepare(&format!(
             "SELECT g.group_id, g.name, g.admin, g.state, g.head_seq, g.head_hash,
@@ -810,6 +794,12 @@ fn rebuild_caches(
         )?;
     }
     tx.execute(
+        "DELETE FROM group_standings
+          WHERE group_id = ?1
+            AND peer NOT IN (SELECT peer FROM group_members WHERE group_id = ?1)",
+        params![group.to_string()],
+    )?;
+    tx.execute(
         "UPDATE groups SET standings_digest = ?2 WHERE group_id = ?1",
         params![
             group.to_string(),
@@ -829,8 +819,6 @@ fn position_str(position: Position) -> &'static str {
     }
 }
 
-/// An unreadable value is treated as `Unanswered` — the position that claims least and lets no
-/// ratification fire, the same instinct as [`State::parse`].
 fn position_of(raw: &str) -> Position {
     match raw {
         "in" => Position::In,
@@ -1242,6 +1230,43 @@ mod tests {
     }
 
     #[test]
+    fn a_standing_survives_until_ratified_and_no_longer() {
+        // The window it exists for is exactly "they said so, the admin has not acted yet". While
+        // the chain still lists them the statement has work to do; once the `Remove` lands the
+        // entry is the record, and a stale `Out` at some high seq would beat the seq-1 standing
+        // of the same peer re-added after an `ac group forget`.
+        let (mut store, admin, id) = admin_store();
+        let bob = key();
+        add(&mut store, &admin, id, peer_of(&bob), "bob");
+
+        let leaving = Standing::author(&bob, id, 1, Position::Out, AT).unwrap();
+        store.put(id, 1, &[], &[leaving], AT).unwrap();
+        assert_eq!(
+            store.standings(id).unwrap().len(),
+            1,
+            "still a member, so their word still travels"
+        );
+        assert_eq!(store.departed(id).unwrap(), vec![peer_of(&bob)]);
+
+        store
+            .author(
+                &admin,
+                id,
+                Op::Remove {
+                    peer: peer_of(&bob).to_base58(),
+                },
+                AT,
+            )
+            .unwrap();
+
+        assert!(
+            store.standings(id).unwrap().is_empty(),
+            "ratified, so the entry is the record and the standing is dropped"
+        );
+        assert!(store.departed(id).unwrap().is_empty());
+    }
+
+    #[test]
     fn a_departure_is_reported_to_the_admin_once_per_departure() {
         // The trigger for ratification. Re-ingesting the same standing must not report it
         // again, or the admin appends a `Remove` per delivery and the chain grows without end.
@@ -1289,8 +1314,6 @@ mod tests {
 
     #[test]
     fn a_standing_arriving_before_its_add_is_accepted_afterwards() {
-        // The cross-response race: a standing rides ahead of the entry that makes it relevant.
-        // Dropped now, healed later — which is what the digest in `GroupHead` exists for.
         let (mut store, admin, id) = admin_store();
         let bob = key();
         let early = Standing::author(&bob, id, 1, Position::Out, AT).unwrap();
@@ -1405,7 +1428,9 @@ mod tests {
         let (mut store, admin, id) = admin_store();
         assert_eq!(store.my_standing_seq(id).unwrap(), None);
 
-        store.author_standing(&admin, id, Position::Out, AT).unwrap();
+        store
+            .author_standing(&admin, id, Position::Out, AT)
+            .unwrap();
         assert_eq!(store.my_standing_seq(id).unwrap(), Some(1));
         store.author_standing(&admin, id, Position::In, AT).unwrap();
         assert_eq!(store.my_standing_seq(id).unwrap(), Some(2));
@@ -1413,8 +1438,6 @@ mod tests {
 
     #[test]
     fn two_connections_to_one_file_see_each_others_writes() {
-        // `ac group add` and `ac run` are different processes. Without this the daemon would
-        // need restarting after every CLI change — the property `contacts.rs` also depends on.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let admin = key();

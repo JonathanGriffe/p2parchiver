@@ -41,14 +41,9 @@ use crate::daemon::ClientSwarm;
 
 /// What we asked a peer, kept so a bare reply can be matched back to it.
 enum Outbound {
-    /// Every group we share with them. The only kind of offer there is: an offer names every
-    /// shared group and is answered with every shared group, so there was never anything a
-    /// single-group variant could ask that this does not.
-    ///
-    /// The groups it named are kept, because the answer may name fewer — a peer that has been
-    /// invited and not accepted, or that has left, simply does not mention them. Those groups
-    /// reconcile nothing and would otherwise never be reported as finished.
-    Offer { groups: Vec<GroupId> },
+    /// "Which catalogues do you believe we share?" Carries nothing, so there is nothing to
+    /// remember about it beyond who was asked.
+    Ask,
     /// `after` is kept because the machine re-checks it before applying a page: a peer does
     /// not get to decide what we asked for.
     Changes { group: GroupId, after: u64 },
@@ -67,14 +62,11 @@ pub enum RoundOutcome {
         peer: PeerId,
         group: GroupId,
     },
-    /// They answered, and left this group out of it — so they do not believe we share it.
-    ///
-    /// Distinct from `Settled`, which means the two of us reconciled and there is nothing left
-    /// to say. Reporting silence as agreement would record a peer as holding a catalogue it
-    /// declined to discuss, and nothing afterwards would correct that.
-    Declined {
+    /// We asked this peer what they have, and the question is now answered — whatever the
+    /// answer was. Under a pull that is the whole of what the supervisor needs: it decides when
+    /// to ask again from the clock, not from what came back.
+    Asked {
         peer: PeerId,
-        group: GroupId,
     },
     Failed {
         peer: PeerId,
@@ -145,21 +137,16 @@ impl FileLink {
     /// Answers whether anything went out. `false` means we share no group with them at all, in
     /// which case there is nothing to wait for and the caller should not pretend otherwise.
     ///
-    /// The same request `FileSync` sends of its own accord when a peer is verified — there is
-    /// one kind of offer, and the supervisor's only contribution is choosing the moment.
-    pub fn offer(&mut self, swarm: &mut ClientSwarm, peer: PeerId) -> bool {
-        let heads = self.sync.heads_for(&peer);
-        if heads.is_empty() {
-            return false;
-        }
-        let groups = heads.iter().map(|h| h.group).collect();
+    /// Ask this peer which catalogues they believe we share.
+    ///
+    /// Always goes out: the request carries nothing, so there is no "we had nothing to say" case.
+    pub fn ask(&mut self, swarm: &mut ClientSwarm, peer: PeerId) {
         let id = swarm
             .behaviour_mut()
             .app
             .manifests
-            .send_request(&peer, ManifestRequest::Offer(heads));
-        self.outbound.insert(id, (peer, Outbound::Offer { groups }));
-        true
+            .send_request(&peer, ManifestRequest::Ask);
+        self.outbound.insert(id, (peer, Outbound::Ask));
     }
 
     /// Ask a peer which of these paths it holds. Correlated here, dispatched by the supervisor.
@@ -282,24 +269,16 @@ impl FileLink {
                 }
 
                 match (what, response) {
-                    (Outbound::Offer { groups }, ManifestResponse::Offer(heads)) => {
-                        // Whatever they did not mention, they will not discuss: they have not
-                        // accepted the group, have not yet learned we are a member, or have
-                        // left. The exchange for that group is over either way — the supervisor
-                        // must not wait on it — but it delivered nothing, and `Declined` is
-                        // what keeps those two facts apart.
-                        for group in groups {
-                            if !heads.iter().any(|h| h.group == group) {
-                                self.rounds.push(RoundOutcome::Declined { peer, group });
-                            }
-                        }
-                        self.sync.on(FileEvent::Offered { peer, heads })
+                    (Outbound::Ask, ManifestResponse::Heads(heads)) => {
+                        self.rounds.push(RoundOutcome::Asked { peer });
+                        self.sync.on(FileEvent::Heads { peer, heads })
                     }
-                    // An offer answered with anything else — a refusal, or a reply to a question
-                    // we did not ask — failed for every group it named. `FileSync` sees such an
-                    // answer as nothing at all, so without this the exchange would stay
-                    // outstanding for ever and take a slot with it.
-                    (Outbound::Offer { .. }, _) => {
+                    // An ask answered with anything else — a refusal, or a reply to a question
+                    // we did not put — reconciled nothing. `FileSync` sees such an answer as
+                    // nothing at all, so without this the exchange would stay outstanding for
+                    // ever and take a slot with it.
+                    (Outbound::Ask, _) => {
+                        self.rounds.push(RoundOutcome::Asked { peer });
                         self.rounds.push(RoundOutcome::Failed { peer });
                         return;
                     }
@@ -335,9 +314,8 @@ impl FileLink {
             } => {
                 let group = match self.outbound.remove(&request_id) {
                     Some((_, Outbound::Changes { group, .. })) => Some(group),
-                    Some((_, Outbound::Offer { .. })) => {
-                        // Failed for every group it named at once, which is why the outcome
-                        // names none of them.
+                    Some((_, Outbound::Ask)) => {
+                        self.rounds.push(RoundOutcome::Asked { peer });
                         self.rounds.push(RoundOutcome::Failed { peer });
                         None
                     }
@@ -382,15 +360,6 @@ impl FileLink {
     fn dispatch(&mut self, swarm: &mut ClientSwarm, actions: Vec<FileAction>) {
         for action in actions {
             match action {
-                FileAction::Offer { peer, heads } => {
-                    let groups = heads.iter().map(|h| h.group).collect();
-                    let id = swarm
-                        .behaviour_mut()
-                        .app
-                        .manifests
-                        .send_request(&peer, ManifestRequest::Offer(heads));
-                    self.outbound.insert(id, (peer, Outbound::Offer { groups }));
-                }
 
                 FileAction::FetchChanges { peer, group, after } => {
                     let id = swarm

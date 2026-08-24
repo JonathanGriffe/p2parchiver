@@ -66,7 +66,7 @@ use crate::content::Content;
 use crate::path::RelPath;
 use crate::store::{FileRow, Files, Merged};
 use crate::wire::{
-    FileHead, MAX_ENTRIES_PER_RESPONSE, MAX_HEADS_PER_OFFER, MAX_HOLDINGS_QUERY, ManifestEntry,
+    FileHead, MAX_ENTRIES_PER_RESPONSE, MAX_HEADS_PER_ANSWER, MAX_HOLDINGS_QUERY, ManifestEntry,
     ManifestRequest, ManifestResponse,
 };
 
@@ -110,10 +110,6 @@ pub enum Notice {
 /// What the machine wants done. The daemon is the only thing that can do any of it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileAction {
-    Offer {
-        peer: PeerId,
-        heads: Vec<FileHead>,
-    },
     FetchChanges {
         peer: PeerId,
         group: GroupId,
@@ -148,7 +144,7 @@ pub enum FileEvent {
         peer: PeerId,
     },
     /// Catalogues a peer named to us, from an offer they sent **as a response**.
-    Offered {
+    Heads {
         peer: PeerId,
         heads: Vec<FileHead>,
     },
@@ -294,12 +290,12 @@ impl FileSync {
         }
 
         match request {
-            ManifestRequest::Offer(theirs) => {
-                // Ours is built first, from our own view. A store error yields an empty offer
-                // rather than `Unavailable`, which would imply a group-specific refusal.
-                let ours = self.heads_for(&peer);
-                let actions = self.on_heads(peer, theirs);
-                (ManifestResponse::Offer(ours), actions)
+            ManifestRequest::Ask => {
+                // Our own view and nothing more. We learn nothing from being asked, so there is
+                // nothing to record about whether this peer has been told. A store error yields
+                // an empty list rather than `Unavailable`, which would imply a group-specific
+                // refusal.
+                (ManifestResponse::Heads(self.heads_for(&peer)), Vec::new())
             }
 
             ManifestRequest::Changes { group, after } => {
@@ -366,7 +362,7 @@ impl FileSync {
 
             // An offer *response*. Provokes reads only — answering an offer with an offer
             // would have two peers volleying for ever.
-            FileEvent::Offered { peer, heads } => {
+            FileEvent::Heads { peer, heads } => {
                 if !self.verified.contains(&peer) {
                     return Vec::new();
                 }
@@ -412,7 +408,7 @@ impl FileSync {
     fn on_heads(&mut self, peer: PeerId, heads: Vec<FileHead>) -> Vec<FileAction> {
         let mut actions = Vec::new();
 
-        for head in heads.into_iter().take(MAX_HEADS_PER_OFFER) {
+        for head in heads.into_iter().take(MAX_HEADS_PER_ANSWER) {
             // Only groups we agree we share. A peer naming a group we do not share with them
             // learns nothing by it.
             if !self.shares(&peer, head.group) {
@@ -631,7 +627,7 @@ impl FileSync {
         let shared = self.groups.shared_with(peer).unwrap_or_default();
         shared
             .into_iter()
-            .take(MAX_HEADS_PER_OFFER)
+            .take(MAX_HEADS_PER_ANSWER)
             .filter_map(|head| {
                 Some(FileHead {
                     group: head.group,

@@ -42,12 +42,8 @@ use crate::file_link::RoundOutcome;
 /// map here rather than in `ac-groups` is what keeps `OutboundRequestId` — a libp2p type — out
 /// of that crate.
 enum Outbound {
-    /// The groups it named are kept, because the answer may name fewer — see
-    /// [`crate::file_link::RoundOutcome::Declined`], which the catalogue side reports for the
-    /// same reason.
-    Offer {
+    Ask {
         peer: PeerId,
-        groups: Vec<GroupId>,
     },
     Fetch {
         peer: PeerId,
@@ -102,17 +98,18 @@ impl GroupLink {
         std::mem::take(&mut self.rounds)
     }
 
-    /// Offer this peer our heads for every group we share with them, because the supervisor
-    /// decided it was time.
+    /// Ask this peer which groups they believe we share, because the supervisor decided it was
+    /// time.
     ///
-    /// Answers whether anything went out. `false` means we share no group with them at all.
-    pub fn offer(&mut self, swarm: &mut ClientSwarm, peer: PeerId) -> bool {
-        let heads = self.sync.heads_for(&peer);
-        if heads.is_empty() {
-            return false;
-        }
-        self.dispatch(swarm, vec![GroupAction::Offer { peer, heads }]);
-        true
+    /// Always goes out: the request carries nothing, and what we would have said is exactly what
+    /// we cannot know until they answer.
+    pub fn ask(&mut self, swarm: &mut ClientSwarm, peer: PeerId) {
+        let id = swarm
+            .behaviour_mut()
+            .app
+            .groups
+            .send_request(&peer, GroupRequest::Ask);
+        self.outbound.insert(id, Outbound::Ask { peer });
     }
 
     /// A peer completed mutual attestation. It is not usable to the group layer yet.
@@ -129,7 +126,7 @@ impl GroupLink {
     pub fn busy_with(&self, peer: &PeerId) -> bool {
         self.settling.contains(peer)
             || self.outbound.values().any(|out| match out {
-                Outbound::Offer { peer: p, .. } | Outbound::Fetch { peer: p, .. } => p == peer,
+                Outbound::Ask { peer: p } | Outbound::Fetch { peer: p, .. } => p == peer,
             })
     }
 
@@ -220,17 +217,9 @@ impl GroupLink {
                     },
                 ..
             } => match (self.outbound.remove(&request_id), response) {
-                (Some(Outbound::Offer { groups, .. }), GroupResponse::Offer(heads)) => {
-                    // Whatever they did not mention, they will not discuss — they have not
-                    // accepted the group, have not learned we are a member, or have left.
-                    for group in groups {
-                        if heads.iter().any(|h| h.group == group) {
-                            self.rounds.push(RoundOutcome::Settled { peer, group });
-                        } else {
-                            self.rounds.push(RoundOutcome::Declined { peer, group });
-                        }
-                    }
-                    self.sync.on(GroupEvent::Offered { peer, heads })
+                (Some(Outbound::Ask { .. }), GroupResponse::Heads(heads)) => {
+                    self.rounds.push(RoundOutcome::Asked { peer });
+                    self.sync.on(GroupEvent::Heads { peer, heads })
                 }
                 (
                     Some(Outbound::Fetch { group, .. }),
@@ -260,9 +249,10 @@ impl GroupLink {
                 Some(Outbound::Fetch { peer, group }) => {
                     self.sync.on(GroupEvent::FetchFailed { peer, group })
                 }
-                Some(Outbound::Offer { peer, .. }) => {
+                Some(Outbound::Ask { peer }) => {
+                    self.rounds.push(RoundOutcome::Asked { peer });
                     self.rounds.push(RoundOutcome::Failed { peer });
-                    self.sync.on(GroupEvent::OfferFailed { peer })
+                    self.sync.on(GroupEvent::AskFailed { peer })
                 }
                 None => return,
             },
@@ -282,15 +272,6 @@ impl GroupLink {
     fn dispatch(&mut self, swarm: &mut ClientSwarm, actions: Vec<GroupAction>) {
         for action in actions {
             match action {
-                GroupAction::Offer { peer, heads } => {
-                    let groups = heads.iter().map(|h| h.group).collect();
-                    let id = swarm
-                        .behaviour_mut()
-                        .app
-                        .groups
-                        .send_request(&peer, GroupRequest::Offer(heads));
-                    self.outbound.insert(id, Outbound::Offer { peer, groups });
-                }
                 GroupAction::Fetch { peer, group, from } => {
                     let id = swarm
                         .behaviour_mut()
@@ -476,7 +457,7 @@ mod tests {
             let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
             for peer in peers {
                 if !self.link.busy_with(&peer) {
-                    self.link.offer(&mut self.swarm, peer);
+                    self.link.ask(&mut self.swarm, peer);
                 }
             }
         }
@@ -734,7 +715,7 @@ mod tests {
             .behaviour_mut()
             .app
             .groups
-            .send_request(&alice_peer, GroupRequest::Offer(Vec::new()));
+            .send_request(&alice_peer, GroupRequest::Ask);
         carol
             .swarm
             .behaviour_mut()
@@ -748,7 +729,7 @@ mod tests {
         run_until(&mut alice, &mut carol, |_, c| {
             c.seen
                 .iter()
-                .any(|r| matches!(r, GroupResponse::Offer(h) if h.is_empty()))
+                .any(|r| matches!(r, GroupResponse::Heads(h) if h.is_empty()))
                 && c.seen
                     .iter()
                     .any(|r| matches!(r, GroupResponse::Unavailable))
@@ -759,7 +740,7 @@ mod tests {
             carol
                 .seen
                 .iter()
-                .any(|r| matches!(r, GroupResponse::Offer(h) if h.is_empty())),
+                .any(|r| matches!(r, GroupResponse::Heads(h) if h.is_empty())),
             "an offer to a non-member names no group: {:?}",
             carol.seen
         );

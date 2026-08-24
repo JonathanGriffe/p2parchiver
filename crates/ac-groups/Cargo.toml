@@ -15,16 +15,6 @@ getrandom.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-# Deliberately absent: `tokio` (this crate has no async), and `anyhow` (a library returns
-# typed errors; the binaries add context).
-#
-# `libp2p` is absent too, which is the strongest of these. `wire.rs` once declared the group
-# behaviour and needed it; now it declares `/ac/group/3.0.0`, the message types and the size
-# ceilings, and `ac-node` builds what carries them — exactly how `ac_files::wire::BLOB_PROTOCOL`
-# has always worked. Peers and keys come from `ac-net`, which re-exports `PeerId`, `Keypair` and
-# `PublicKey`. So a networking type is not merely unused here, it is unnameable, and the greps
-# in `tests/layering.rs` are a second line rather than the only one.
-
 [dev-dependencies]
 tempfile = "3"
 

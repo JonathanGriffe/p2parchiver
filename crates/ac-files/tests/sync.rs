@@ -160,7 +160,14 @@ fn share_group(nodes: &mut [&mut Node]) -> GroupId {
     id
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
+enum Step {
+    /// The question the supervisor would put; which peers is decided by `Side`.
+    Ask,
+    Act(FileAction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
     A,
     B,
@@ -181,7 +188,7 @@ impl Side {
 /// responder produces while answering — a harness that quietly dropped one would leave a read
 /// in flight, blocking that group until it timed out, and tests would then fail for reasons
 /// unrelated to what they check.
-fn settle(a: &mut Node, b: &mut Node, seed: Vec<(Side, FileAction)>) -> Vec<Notice> {
+fn settle(a: &mut Node, b: &mut Node, seed: Vec<(Side, Step)>) -> Vec<Notice> {
     let mut queue = seed;
     let mut notes = Vec::new();
 
@@ -201,37 +208,37 @@ fn step(
     sender: &mut Node,
     receiver: &mut Node,
     side: Side,
-    action: FileAction,
-    queue: &mut Vec<(Side, FileAction)>,
+    action: Step,
+    queue: &mut Vec<(Side, Step)>,
     notes: &mut Vec<Notice>,
 ) {
     match action {
-        FileAction::Note(note) => notes.push(note),
+        Step::Act(FileAction::Note(note)) => notes.push(note),
 
         // A report, not an instruction. `ac-node` turns it into the supervisor's round
         // bookkeeping; here it only has to not be work.
-        FileAction::Settled { .. } => {}
+        Step::Act(FileAction::Settled { .. }) => {}
 
-        FileAction::Offer { heads, .. } => {
+        Step::Ask => {
             let (response, theirs) = receiver
                 .sync
-                .on_request(sender.peer(), ManifestRequest::Offer(heads));
-            queue.extend(theirs.into_iter().map(|x| (side.other(), x)));
+                .on_request(sender.peer(), ManifestRequest::Ask);
+            queue.extend(theirs.into_iter().map(|x| (side.other(), Step::Act(x))));
 
-            if let ManifestResponse::Offer(heads) = response {
-                let mine = sender.sync.on(FileEvent::Offered {
+            if let ManifestResponse::Heads(heads) = response {
+                let mine = sender.sync.on(FileEvent::Heads {
                     peer: receiver.peer(),
                     heads,
                 });
-                queue.extend(mine.into_iter().map(|x| (side, x)));
+                queue.extend(mine.into_iter().map(|x| (side, Step::Act(x))));
             }
         }
 
-        FileAction::FetchChanges { group, after, .. } => {
+        Step::Act(FileAction::FetchChanges { group, after, .. }) => {
             let (response, theirs) = receiver
                 .sync
                 .on_request(sender.peer(), ManifestRequest::Changes { group, after });
-            queue.extend(theirs.into_iter().map(|x| (side.other(), x)));
+            queue.extend(theirs.into_iter().map(|x| (side.other(), Step::Act(x))));
 
             let event = match response {
                 ManifestResponse::Changes {
@@ -255,7 +262,7 @@ fn step(
                 },
             };
             let mine = sender.sync.on(event);
-            queue.extend(mine.into_iter().map(|x| (side, x)));
+            queue.extend(mine.into_iter().map(|x| (side, Step::Act(x))));
         }
     }
 }
@@ -270,22 +277,9 @@ fn connect(a: &mut Node, b: &mut Node) -> Vec<Notice> {
     a.verify(b.peer());
     b.verify(a.peer());
 
-    let (peer_a, peer_b) = (a.peer(), b.peer());
     let seed = vec![
-        (
-            Side::A,
-            FileAction::Offer {
-                peer: peer_b,
-                heads: a.sync.heads_for(&peer_b),
-            },
-        ),
-        (
-            Side::B,
-            FileAction::Offer {
-                peer: peer_a,
-                heads: b.sync.heads_for(&peer_a),
-            },
-        ),
+        (Side::A, Step::Ask),
+        (Side::B, Step::Ask),
     ];
     settle(a, b, seed)
 }
@@ -361,13 +355,12 @@ fn a_catalogue_that_already_matches_costs_nothing() {
     disconnect(&mut alice, &mut bob);
 
     // Reconnecting with equal digests must exchange no rows at all.
-    let from_a = alice.verify(bob.peer());
-    let from_b = bob.verify(alice.peer());
-    let seed = from_a
-        .into_iter()
-        .map(|x| (Side::A, x))
-        .chain(from_b.into_iter().map(|x| (Side::B, x)))
-        .collect();
+    alice.verify(bob.peer());
+    bob.verify(alice.peer());
+    let seed = vec![
+        (Side::A, Step::Ask),
+        (Side::B, Step::Ask),
+    ];
     let notes = settle(&mut alice, &mut bob, seed);
 
     assert!(
@@ -408,8 +401,8 @@ fn a_non_member_is_told_nothing_however_it_asks() {
 
     let (offer, _) = alice
         .sync
-        .on_request(stranger.peer(), ManifestRequest::Offer(Vec::new()));
-    assert_eq!(offer, ManifestResponse::Offer(Vec::new()));
+        .on_request(stranger.peer(), ManifestRequest::Ask);
+    assert_eq!(offer, ManifestResponse::Heads(Vec::new()));
 
     // Even naming the group id exactly — which a stranger should not know — reveals nothing.
     let (changes, _) = alice.sync.on_request(
@@ -593,16 +586,13 @@ fn agreeing_about_a_group_is_reported_as_settled() {
     alice.add(id, "beach.jpg", b"a photograph", AT);
     connect(&mut alice, &mut bob);
 
-    // They now agree. Another offer should settle immediately, reading nothing.
-    let heads = alice.sync.heads_for(&bob.peer());
-    let (response, _) = bob
-        .sync
-        .on_request(alice.peer(), ManifestRequest::Offer(heads));
-    let ManifestResponse::Offer(theirs) = response else {
-        panic!("expected an offer back");
+    // They now agree. Asking again should settle immediately, reading nothing.
+    let (response, _) = bob.sync.on_request(alice.peer(), ManifestRequest::Ask);
+    let ManifestResponse::Heads(theirs) = response else {
+        panic!("expected heads back");
     };
 
-    let actions = alice.sync.on(FileEvent::Offered {
+    let actions = alice.sync.on(FileEvent::Heads {
         peer: bob.peer(),
         heads: theirs,
     });
@@ -633,16 +623,13 @@ fn a_round_that_had_to_read_pages_settles_when_it_runs_out() {
 
     connect(&mut alice, &mut bob);
 
-    // Bob learned the file, which means he read at least one page. Re-running the exchange
-    // from a fresh offer proves the settle arrives on the reading path too.
-    let heads = bob.sync.heads_for(&alice.peer());
-    let (response, _) = alice
-        .sync
-        .on_request(bob.peer(), ManifestRequest::Offer(heads));
-    let ManifestResponse::Offer(theirs) = response else {
-        panic!("expected an offer back");
+    // Bob learned the file, which means he read at least one page. Asking again proves the
+    // settle arrives on the reading path too.
+    let (response, _) = alice.sync.on_request(bob.peer(), ManifestRequest::Ask);
+    let ManifestResponse::Heads(theirs) = response else {
+        panic!("expected heads back");
     };
-    let actions = bob.sync.on(FileEvent::Offered {
+    let actions = bob.sync.on(FileEvent::Heads {
         peer: alice.peer(),
         heads: theirs,
     });

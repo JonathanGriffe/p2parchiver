@@ -1,4 +1,4 @@
-//! The `/ac/manifest/2.0.0` and `/ac/blob/1.0.0` protocols: what is said, not how it is carried.
+//! The `/ac/manifest/3.0.0` and `/ac/blob/1.0.0` protocols: what is said, not how it is carried.
 //!
 //! Names, message types and limits are here; what carries them is `ac-node`'s, which is the only
 //! crate that mounts anything. That split is what keeps **this whole crate free of libp2p** —
@@ -35,17 +35,19 @@ use crate::store::FileRow;
 /// `2.0.0` added [`ManifestRequest::Holdings`]. Adding a request variant is not backward
 /// compatible — an older peer cannot decode it — so the name carries the bump rather than a
 /// feature flag, and an old peer fails at negotiation instead of on a message it cannot read.
-pub const MANIFEST_PROTOCOL: &str = "/ac/manifest/2.0.0";
+/// `3.0.0` replaced the offer with [`ManifestRequest::Ask`], turning the exchange from a push
+/// into a pull.
+pub const MANIFEST_PROTOCOL: &str = "/ac/manifest/3.0.0";
 
 /// Versioned separately from the manifest: the two change for different reasons, and a peer
 /// that cannot exchange catalogues has no use for a blob stream either way.
 pub const BLOB_PROTOCOL: &str = "/ac/blob/1.0.0";
 
-/// Ceiling on how many groups one `Offer` may name.
+/// Ceiling on how many groups one answer may name.
 ///
-/// Matches `ac_groups::wire`, and for the same reason: without a cap an offer is an unbounded
+/// Matches `ac_groups::wire`, and for the same reason: without a cap it is an unbounded
 /// allocation on the receiving side.
-pub const MAX_HEADS_PER_OFFER: usize = 128;
+pub const MAX_HEADS_PER_ANSWER: usize = 128;
 
 /// Rows one `Changes` response may carry.
 ///
@@ -62,7 +64,7 @@ pub const MAX_ENTRIES_PER_RESPONSE: usize = 2048;
 /// wherever the bytes happened to run out.
 pub const MAX_HOLDINGS_QUERY: usize = 512;
 
-/// Largest request we will decode. An `Offer` of 128 heads is ~7 KiB.
+/// Largest request we will decode. A `Holdings` query of 512 paths dominates it.
 pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 /// Largest response we will decode.
@@ -111,10 +113,12 @@ pub struct ManifestEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManifestRequest {
-    /// "These are the catalogues I believe we share." Built only from
-    /// `ac_groups::store::Groups::shared_with`, which is the one thing allowed to name a group
-    /// to a peer.
-    Offer(Vec<FileHead>),
+    /// "Tell me the catalogues you believe we share."
+    ///
+    /// Carries nothing: syncing is a pull, exactly as `ac_groups::wire::GroupRequest::Ask` is.
+    /// What comes back is built only from `ac_groups::store::Groups::shared_with`, the one thing
+    /// allowed to name a group's content to a peer.
+    Ask,
     /// Everything past our position in *this peer's own* change log.
     ///
     /// `after` is a position the peer itself reported, never a timestamp and never a number we
@@ -140,7 +144,8 @@ pub enum ManifestRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManifestResponse {
-    Offer(Vec<FileHead>),
+    /// The responder's view of what the two share, in answer to [`ManifestRequest::Ask`].
+    Heads(Vec<FileHead>),
     Changes {
         group: GroupId,
         entries: Vec<ManifestEntry>,
@@ -405,7 +410,7 @@ mod tests {
 
     #[test]
     fn an_offer_of_the_maximum_fits_in_a_request() {
-        let heads: Vec<_> = (0..MAX_HEADS_PER_OFFER)
+        let heads: Vec<_> = (0..MAX_HEADS_PER_ANSWER)
             .map(|i| FileHead {
                 group: GroupId::from_str(&hex::encode([i as u8; 32])).unwrap(),
                 digest: [200u8; 32],
@@ -413,8 +418,8 @@ mod tests {
             })
             .collect();
 
-        let size = encoded(&ManifestRequest::Offer(heads)).len() as u64;
-        assert!(size < MAX_REQUEST_BYTES, "an offer is {size} bytes");
+        let size = encoded(&ManifestResponse::Heads(heads)).len() as u64;
+        assert!(size < MAX_RESPONSE_BYTES, "an answer is {size} bytes");
     }
 
     #[test]
@@ -489,7 +494,7 @@ mod tests {
         };
 
         for request in [
-            ManifestRequest::Offer(vec![head.clone()]),
+            ManifestRequest::Ask,
             ManifestRequest::Changes { group, after: 412 },
         ] {
             let bytes = encoded(&request);
@@ -498,7 +503,7 @@ mod tests {
         }
 
         for response in [
-            ManifestResponse::Offer(vec![head]),
+            ManifestResponse::Heads(vec![head]),
             ManifestResponse::Changes {
                 group,
                 entries: vec![entry("a.jpg")],

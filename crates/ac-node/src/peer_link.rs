@@ -251,8 +251,8 @@ impl PeerLink {
                     group,
                     offering,
                 },
-                RoundOutcome::Declined { peer, group } => PeerEvent::Declined { peer, group },
-                RoundOutcome::Failed { peer } => PeerEvent::OfferFailed { peer },
+                RoundOutcome::Asked { peer } => PeerEvent::Asked { peer, offering },
+                RoundOutcome::Failed { peer } => PeerEvent::AskFailed { peer },
             };
             let actions = self.peers.on(event);
             self.dispatch(swarm, files, groups, actions);
@@ -535,7 +535,7 @@ impl PeerLink {
                     }
                 }
 
-                PeerAction::Offer { peer, offering } => {
+                PeerAction::Ask { peer, offering } => {
                     // **After the chain, not beside it.** A catalogue offer is gated on
                     // membership the other side may not have yet: a newly added member answers
                     // our file heads before the op that adds us has arrived, omits the group,
@@ -546,20 +546,16 @@ impl PeerLink {
                     // Deferring while the group layer is mid-exchange covers the rest: its own
                     // on-connect announce, and any fetch it started off the back of one.
                     if groups.busy_with(&peer) {
-                        let actions = self.peers.on(PeerEvent::OfferDeferred { peer });
+                        let actions = self.peers.on(PeerEvent::AskDeferred { peer });
                         self.dispatch(swarm, files, groups, actions);
                         continue;
                     }
                     // Each layer knows what to say; the supervisor decided when and which. If
                     // we share no group with them at all the offer never happened, and saying
                     // so keeps the record honest.
-                    let sent = match offering {
-                        Offering::Chain => groups.offer(swarm, peer),
-                        Offering::Catalogue => files.offer(swarm, peer),
-                    };
-                    if !sent {
-                        let actions = self.peers.on(PeerEvent::OfferFailed { peer });
-                        self.dispatch(swarm, files, groups, actions);
+                    match offering {
+                        Offering::Chain => groups.ask(swarm, peer),
+                        Offering::Catalogue => files.ask(swarm, peer),
                     }
                 }
 

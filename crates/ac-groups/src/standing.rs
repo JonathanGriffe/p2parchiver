@@ -8,18 +8,11 @@ use crate::id::GroupId;
 pub const MAX_STANDING_BYTES: usize = 1024;
 
 /// Where a member says it stands. Signed, so it can only ever be their own word.
-///
-/// `Unanswered` is what makes an invitation *answerable without accepting it*. Without a way to
-/// say "I have this and have not decided", silence is the only signal, and silence is
-/// indistinguishable from never having received it — so every other member goes on treating the
-/// invitation as undelivered and re-offering it on every discovery hint, forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Position {
     /// We hold the chain that names us and have not decided yet.
     Unanswered,
-    /// Taking part.
     In,
-    /// Left, of our own accord.
     Out,
 }
 
@@ -34,9 +27,6 @@ impl Position {
         }
     }
 
-    /// Whether this is a departure. Only `Out` is — an unanswered invitation is not a refusal,
-    /// and treating it as one would have the admin ratify a `Remove` against someone who has
-    /// merely not replied yet.
     pub fn is_departure(self) -> bool {
         matches!(self, Position::Out)
     }
@@ -64,10 +54,6 @@ pub struct Standing {
 
 impl Standing {
     /// Sign a statement about the signer's own position.
-    ///
-    /// `seq` must exceed every seq this node has ever authored **or ingested** for itself —
-    /// see [`Self::next_seq`]. Without that, a node restored from a backup equivocates against
-    /// its own earlier statement.
     pub fn author(
         key: &Keypair,
         group: GroupId,
@@ -152,8 +138,7 @@ fn wins(mine: (u64, &[u8]), theirs: (u64, &[u8])) -> bool {
     }
 }
 
-/// One statement, kept beside what its body decoded to so reads never re-decode. The same
-/// shape as `chain::Verified`.
+/// One statement, kept beside what its body decoded to so reads never re-decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Held {
     standing: Standing,
@@ -162,9 +147,6 @@ struct Held {
 }
 
 /// The latest position each member has claimed for itself.
-///
-/// One entry per peer — an earlier statement is superseded, never accumulated — so this is
-/// bounded by the membership rather than by how often people change their minds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StandingSet(std::collections::BTreeMap<PeerId, Held>);
 
@@ -270,10 +252,6 @@ mod tests {
 
     #[test]
     fn a_standing_can_only_speak_for_its_signer() {
-        // The central security property. Alice signs a statement claiming Bob has left.
-        // `verify` recovers the key from the peer named *in the body*, so Alice's signature
-        // is checked against Bob's key and fails — and no call site can forget to bind them,
-        // because there is no subject parameter to pass wrongly.
         let (alice, bob) = (key(), key());
         let forged = forge(
             &alice,

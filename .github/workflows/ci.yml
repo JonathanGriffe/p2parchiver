@@ -1,9 +1,5 @@
 name: CI
 
-# Tags are no longer a trigger. Releases are decided *by* this workflow — `scripts/tag.sh`
-# reads the commits and creates the tag — so a tag arriving is this workflow's own output
-# rather than an event it should react to. Pushing one with `GITHUB_TOKEN` does not start a
-# new run in any case, which is what keeps release from re-entering itself.
 on:
   push:
     branches: [main]
@@ -42,8 +38,6 @@ jobs:
   release:
     name: release
     needs: test
-    # Never on pull_request: secrets are not available to forked PRs, so the job could only
-    # fail. Publishing — and tagging — is also not something a PR should be able to do.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -83,10 +77,6 @@ jobs:
             type=raw,value=${{ steps.tag.outputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=long
-          # `metadata-action` derives this from the ref, which is a branch here rather than
-          # the tag we just made, so it is given the version instead. This label is how a
-          # running container answers "which release is this" — `ac-server --version`
-          # reports the `Cargo.toml` version, not this one. See `scripts/tag.sh`.
           labels: |
             org.opencontainers.image.version=${{ steps.tag.outputs.version }}
 
@@ -128,8 +118,6 @@ jobs:
           git config user.name "GitHub Actions"
           git add .
 
-          # Nothing to commit is a normal outcome — a re-run of an already released commit
-          # reuses its version — and not an error worth failing a deployment over.
           if git diff --cached --quiet; then
             echo "helm/ac-server already points at $VERSION"
             exit 0

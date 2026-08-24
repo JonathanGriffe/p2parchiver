@@ -48,13 +48,6 @@ use crate::missing::{PeersError, next_missing};
 // Members who are offline are not chased; they catch up by offering to everyone they meet when
 // they return, since nothing about a round is remembered across a restart.
 
-/// How long a group may go with nothing exchanged before it is worth a round on its own.
-///
-/// The only timer that provokes a dial, and it exists for one case: a peer that can accept our
-/// dial but whose own never land, whose removals would otherwise never reach us. Everything
-/// else is covered by an exact signal, so this is hours.
-pub const HEARTBEAT: i64 = 4 * 3600;
-
 /// How often to ask the server who is actually online.
 ///
 /// Matched to `ServerLink`'s discovery interval: presence is no more useful than discovery is
@@ -65,6 +58,18 @@ pub const HEARTBEAT: i64 = 4 * 3600;
 /// urgent, off-interval re-ask go: every question that existed to answer promptly is now
 /// answered by dialling instead of by asking.
 pub const PRESENCE_INTERVAL: i64 = 300;
+
+/// How long a group may go without asking anybody what they have.
+///
+/// Syncing is a pull, so this is the only thing that decides when we talk to a group at all: a
+/// local change enqueues nobody, and a peer learns our state by asking for it. Hours rather
+/// than minutes because membership changes are rare and nothing here is urgent.
+///
+/// **One member per interval, not all of them.** Any member who is up to date can answer for
+/// the whole group, and every other member is doing this too — so news spreads between them
+/// rather than each node collecting it from everybody itself. What is needed is to hear from
+/// *the group* on a timer, and the rotation is what stops that always meaning the same peer.
+pub const HEARTBEAT: i64 = 4 * 3600;
 
 /// Per-peer dial backoff.
 ///
@@ -109,6 +114,9 @@ pub const MAX_CONTENT_BACKOFF: i64 = 30 * 60;
 // both of which bound the thing that is actually scarce.
 
 /// Changes to a group's catalogue that will be shared without waiting for a pause.
+///
+/// Unused since syncing became a pull: nothing waits for the catalogue to be still, because
+/// nothing pushes it. Kept because `ac file` still paces its own reporting by it.
 ///
 /// The other half of [`SHARE_AFTER_IDLE`]: a safety valve so a long unbroken stream of edits
 /// cannot sit unshared indefinitely.
@@ -172,10 +180,10 @@ pub const DIALS_PER_WINDOW: usize = 16;
 /// The window [`DIALS_PER_WINDOW`] is measured over. Matches the server's, deliberately.
 pub const DIAL_WINDOW: i64 = 60;
 
-/// How long an offer may be outstanding before it is written off.
+/// How long a question may be outstanding before it is written off.
 ///
 /// With no global cap left, this no longer guards a scarce slot — it guards the *peer*. A peer
-/// may have one offer in flight, and until it ends that peer is neither offered to again nor
+/// may have one question in flight, and until it ends that peer is neither asked again nor
 /// counted as drained, so an exchange that finishes without saying so would hold one member out
 /// of the rotation and one connection open indefinitely. Expiry is the only ending that cannot
 /// be forgotten, which is why it exists at all: the paths that report an ending have been wrong
@@ -266,18 +274,16 @@ pub enum PeerAction {
     AskPresence {
         peers: Vec<PeerId>,
     },
-    /// Exchange catalogues with this peer, for **every group we share with them**.
+    /// Ask this peer what they have, for **every group we share with them**.
     ///
-    /// Peer-shaped because the message is: an offer names every shared group, and the answer
-    /// does too, so a request about one group and a request about all of them cost exactly the
-    /// same. The earlier single-group variant named one and was answered with all of them
-    /// anyway — the only difference was that the supervisor counted one group and quietly
-    /// received the rest, which is where its accounting drifted from what the wire did.
+    /// Peer-shaped because the message is. The question carries nothing at all, and the answer
+    /// names every group the responder shares with us — so there is nothing a single-group
+    /// variant could ask that this does not, and the supervisor cannot count one group and
+    /// quietly receive the rest, which is where its accounting used to drift from the wire.
     ///
-    /// A node is expected to be in a few groups and unlikely to exceed twenty, so an offer
-    /// never approaches `MAX_HEADS_PER_OFFER` and there is no case where naming one group is
-    /// the only way to be sure it is named.
-    Offer {
+    /// A node is expected to be in a few groups and unlikely to exceed twenty, so an answer
+    /// never approaches `MAX_HEADS_PER_ANSWER`.
+    Ask {
         peer: PeerId,
         offering: Offering,
     },
@@ -341,24 +347,28 @@ pub enum PeerEvent {
         group: GroupId,
         offering: Offering,
     },
-    /// A peer left this group out of its answer. See `PeerState::declined`.
-    Declined {
+    /// We asked this peer what they have and the question is answered, whatever came back.
+    ///
+    /// The pull's only bookkeeping: it stamps the clock that decides when to ask again, and
+    /// clears that half of what we still meant to ask them. Nothing records what *they* now
+    /// know, because under a pull that is not ours to track.
+    Asked {
         peer: PeerId,
-        group: GroupId,
+        offering: Offering,
     },
-    /// The offer was never sent, because the group layer was still talking to this peer.
+    /// The question was never put, because the group layer was still talking to this peer.
     ///
     /// Not a failure and not a refusal: nothing went out, so nothing is recorded either way and
     /// the ordinary loop tries again on the next tick.
-    OfferDeferred {
+    AskDeferred {
         peer: PeerId,
     },
-    /// An offer failed outright, so the slot is free but nothing was learned.
+    /// A question failed outright, so the slot is free but nothing was learned.
     ///
-    /// Peer-shaped like the offer itself: a request that never arrived, or was answered with a
-    /// refusal, failed for every group it named at once. There is no such thing as one group of
-    /// an offer failing.
-    OfferFailed {
+    /// Peer-shaped like the question itself: one that never arrived, or was answered with a
+    /// refusal, told us nothing about any shared group. There is no such thing as one group of
+    /// a question failing.
+    AskFailed {
         peer: PeerId,
     },
     /// Their answer to a holdings query, in the order asked.
@@ -436,7 +446,7 @@ pub struct GroupStatus {
     /// Content pulling for this group is suspended until here, after a rotation in which no
     /// member could help. Unix seconds; zero means not suspended.
     pub content_until: i64,
-    /// When this group next owes a round on the timer alone. Unix seconds.
+    /// When this group next asks somebody on the timer alone. Unix seconds.
     pub heartbeat_at: i64,
 }
 
@@ -460,7 +470,7 @@ pub struct PeerStatus {
 struct GroupState {
     /// Counter, head and standings as of our last completed round.
     sent: Snapshot,
-    /// When the heartbeat is next due. Absolute, and already jittered.
+    /// When this group next asks somebody. Absolute, and already jittered.
     heartbeat_at: i64,
     /// Cursor into the member list.
     rotation: usize,
@@ -474,13 +484,16 @@ struct GroupState {
 }
 
 impl GroupState {
-    fn new(at: i64, jitter: i64) -> Self {
+    fn new(at: i64) -> Self {
         Self {
             // Zeroed, so a group nothing is known about reports news on the first tick. That
             // is what makes a node returning after a week sync at once, despite an unchanged
             // catalogue and nothing missing that it knows of.
             sent: Snapshot::default(),
-            heartbeat_at: at + jitter,
+            // Due at once. Under the push a fresh group was picked up by change detection on
+            // the first tick; that has gone, so the timer has to start due rather than in four
+            // hours or a group would be silent for its first interval.
+            heartbeat_at: at,
             rotation: 0,
             source: None,
             spent: HashSet::new(),
@@ -490,11 +503,12 @@ impl GroupState {
     }
 }
 
-/// Which of the two catalogues an offer is about.
+/// Which of the two a question is about.
 ///
 /// The membership chain and the file catalogue spread by the same mechanism and are decided by
-/// the same record — but they are two protocols and two messages, and the chain must go first:
-/// a peer cannot be offered a catalogue for a group it does not yet know it belongs to.
+/// the same record — but they are two protocols and two messages, and the chain goes first: a
+/// peer's catalogue answer omits a group it does not yet know it belongs to, so asking early
+/// costs a round trip that learns nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Offering {
     /// `/ac/group/…` — who is in the group.
@@ -503,11 +517,11 @@ pub enum Offering {
     Catalogue,
 }
 
-/// What a peer has yet to be told about one group.
+/// What we have yet to ask this peer about one group.
 ///
-/// Both may be owed at once — a new member is owed the chain and everything in it — and the
-/// chain is always sent first, since a catalogue cannot be offered to somebody the group does
-/// not yet say is a member.
+/// Both may be outstanding at once — a peer we have never spoken to owes us neither half yet —
+/// and the chain goes first, since a catalogue answer omits a group the responder does not yet
+/// say we are a member of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Owed {
     chain: bool,
@@ -538,7 +552,7 @@ struct Snapshot {
     standings: [u8; 32],
 }
 
-/// An offer we asked for: what it carried, per group, and when it went out.
+/// A question we put: what our state was per group when it went out, and when that was.
 ///
 /// One entry per peer rather than per group, because one request is what went out. Groups drop
 /// out of `carried` as they settle, and the entry is done when it empties — or when the deadline
@@ -558,20 +572,19 @@ struct PeerState {
     /// backoff is: a dial whose failure is never reported must still be paid for. Reset by
     /// [`PeerEvent::Verified`], and by giving up — see [`DIAL_ATTEMPTS`].
     attempts: usize,
-    /// Groups this peer would not discuss, and when it is worth asking again.
+    /// Groups whose last exchange with this peer failed, and when to try again.
     ///
-    /// A peer that does not share a group simply leaves it out of its answer — refusals explain
-    /// nothing, deliberately, since telling "never heard of it" from "you are not a member"
-    /// would make a group id guessable into a membership oracle. So the silence covers six
-    /// different situations at once: invited and not yet accepted, or the chain that adds us
-    /// not arrived, both of which resolve in seconds; and left, removed or forgotten, none of
-    /// which ever will.
+    /// Nothing *declines* under a pull: a question carries nothing, so there is nothing for a
+    /// peer to refuse — what they do not share is simply absent from their answer, and an answer
+    /// is a complete one either way. This is the failure case only: the question went out and
+    /// nothing came back.
     ///
-    /// Since the wire cannot say which, the answer is to record neither agreement nor defeat:
-    /// do not mark them told, do not ask again immediately, and widen the gap each time.
-    /// Keyed by group: when to ask again, the gap to use next, and the chain head we held when
-    /// they refused — so a membership change since then retires the refusal at once.
-    declined: HashMap<GroupId, (i64, i64, u64)>,
+    /// Paced rather than retried at once, because the commonest cause is a connection that has
+    /// just broken, and hammering a member through that is the opposite of useful. The dial
+    /// backoff paces the reconnection; this paces the retry once reconnected.
+    ///
+    /// Keyed by group: when to ask again, and the gap to use next.
+    failed: HashMap<GroupId, (i64, i64)>,
     /// Transfers outstanding with this peer, half of "is it drained". The other half — whether
     /// an offer is open — is read from `started` rather than counted here, because a count that
     /// can drift from the thing it counts is precisely what went wrong before.
@@ -605,12 +618,12 @@ pub struct Peers {
     /// and the only way to discharge it is to call them. Gating that on this set is what silenced
     /// nodes in the lab, since a member the registry left out was never called at all.
     online: HashSet<PeerId>,
-    /// Offers this node asked for, by peer, against what each carried.
+    /// Questions this node has outstanding, by peer, against our state when each went out.
     ///
-    /// Two jobs, both learned from the lab. Its presence is the initiator's half of the gossip
-    /// rule: settling is reported for both sides of an exchange and only ours may spend the
-    /// news, see [`PeerEvent::Synced`]. Its contents are what the offer actually put on the
-    /// wire, captured when it was sent rather than read back when it settles.
+    /// Two jobs, both learned from the lab. Its presence is what marks the peer busy, so one
+    /// question is in flight at a time and a finished one frees the slot — see
+    /// [`PeerEvent::Asked`]. Its contents are what our state was when the question was sent,
+    /// captured then rather than read back when it settles.
     started: HashMap<PeerId, InFlight>,
     /// Who we still owe news to, per group. **The whole of the propagation state.**
     ///
@@ -620,7 +633,7 @@ pub struct Peers {
     /// a peer ever enqueues anybody.
     ///
     /// A peer leaves the list when an exchange with them settles — proof they have it — and is
-    /// left in it, behind a backoff, when one fails or is declined. Empty everywhere means this
+    /// left in it, behind a backoff, when one fails. Empty everywhere means this
     /// node has nothing to say to anybody, which is the whole of the quiescence condition.
     pending: HashMap<GroupId, HashMap<PeerId, Owed>>,
     /// Each group as of the last state we have accounted for, either by enqueueing it or by
@@ -779,6 +792,30 @@ impl Peers {
                 state.retry_at = 0;
                 state.backoff = MIN_BACKOFF;
                 state.attempts = 0;
+
+                // **Ask whoever we are now connected to.** Under a pull this is what makes
+                // somebody else's dial worth their trouble: they called because they have news,
+                // and the only way it reaches us is if we put the question. It is also why a
+                // change of ours enqueues the whole group — we knock, and they pull.
+                let groups: Vec<GroupId> = self
+                    .groups
+                    .list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|row| row.state == State::Active)
+                    .map(|row| row.id)
+                    .collect();
+                for group in groups {
+                    if self.members_of(group).contains(&peer) {
+                        self.pending.entry(group).or_default().insert(
+                            peer,
+                            Owed {
+                                chain: true,
+                                catalogue: true,
+                            },
+                        );
+                    }
+                }
                 Vec::new()
             }
 
@@ -825,25 +862,10 @@ impl Peers {
                 group,
                 offering,
             } => {
-                // An exchange settled, so this peer has seen our heads for that group — whether
-                // we asked or they did, since our answer carries them either way. Only the half
-                // that was on the wire is discharged: a chain exchange says nothing about the
-                // file heads, which were not in the message.
-                if let Some(owed) = self.pending.get_mut(&group) {
-                    if let Some(entry) = owed.get_mut(&peer) {
-                        match offering {
-                            Offering::Chain => entry.chain = false,
-                            Offering::Catalogue => entry.catalogue = false,
-                        }
-                        if entry.nothing() {
-                            owed.remove(&peer);
-                        }
-                    }
-                    if owed.is_empty() {
-                        self.pending.remove(&group);
-                    }
-                }
-
+                // What is still outstanding is discharged by `Asked` alone, which arrives for
+                // every question however it turned out. This records the other half: what our
+                // state was when we last dialled the group about it.
+                //
                 // An exchange we asked for is done when the last group it named has settled, and
                 // what it *carried* for that group is taken with it — see below.
                 let mut carried = None;
@@ -857,8 +879,8 @@ impl Peers {
                 }
 
                 if let Some(state) = self.peers.get_mut(&peer) {
-                    // They discussed it, so whatever they would not discuss before is settled.
-                    state.declined.remove(&group);
+                    // It worked this time, so whatever failed before is behind us.
+                    state.failed.remove(&group);
                 }
                 // What was on the wire is no longer news: `seen` moves with it so this exchange
                 // is not mistaken for a local change on the next tick.
@@ -893,40 +915,37 @@ impl Peers {
                 Vec::new()
             }
 
-            PeerEvent::Declined { peer, group } => {
-                // They answered, and left this group out. The exchange is over for that group —
-                // free it so the offer can complete — but nothing was delivered, so nothing is
-                // recorded as delivered. See `PeerState::declined` for what the silence covers.
-                if let Some(flight) = self.started.get_mut(&peer) {
-                    flight.carried.remove(&group);
-                    if flight.carried.is_empty() {
-                        self.started.remove(&peer);
+            PeerEvent::Asked { peer, offering } => {
+                // Asked and answered. The clock is what brings them back round, so the only
+                // things recorded are when we asked and which half is no longer outstanding.
+                // The answer *is* the exchange finishing. Leaving it open would have every ask
+                // swept as a failure once `ROUND_TIMEOUT` passed, which arms a backoff and
+                // pushes the next one out — and would block the peer being chosen again in the
+                // meantime, since `start_rounds` skips anyone with a question outstanding.
+                self.started.remove(&peer);
+                self.pending.retain(|_, owed| {
+                    if let Some(entry) = owed.get_mut(&peer) {
+                        match offering {
+                            Offering::Chain => entry.chain = false,
+                            Offering::Catalogue => entry.catalogue = false,
+                        }
+                        if entry.nothing() {
+                            owed.remove(&peer);
+                        }
                     }
-                }
-
-                let now = self.now;
-                let head = self.head_of(group);
-                let state = self.peers.entry(peer).or_default();
-                let (_, backoff, _) =
-                    state
-                        .declined
-                        .get(&group)
-                        .copied()
-                        .unwrap_or((0, MIN_BACKOFF, head));
-                state
-                    .declined
-                    .insert(group, (now + backoff, (backoff * 2).min(MAX_BACKOFF), head));
+                    !owed.is_empty()
+                });
                 Vec::new()
             }
 
-            PeerEvent::OfferDeferred { peer } => {
+            PeerEvent::AskDeferred { peer } => {
                 // Nothing went out, so nothing is owed and nothing is known. The offer is simply
                 // forgotten and the next tick decides afresh.
                 self.started.remove(&peer);
                 Vec::new()
             }
 
-            PeerEvent::OfferFailed { peer } => {
+            PeerEvent::AskFailed { peer } => {
                 let Some(flight) = self.started.remove(&peer) else {
                     return Vec::new();
                 };
@@ -935,22 +954,17 @@ impl Peers {
                 // whose connection has just broken. The dial backoff paces the reconnection,
                 // and the decline backoff paces the retry once reconnected.
                 let now = self.now;
-                let heads: Vec<(GroupId, u64)> = flight
-                    .carried
-                    .keys()
-                    .map(|group| (*group, self.head_of(*group)))
-                    .collect();
+                let groups: Vec<GroupId> = flight.carried.keys().copied().collect();
                 let state = self.peers.entry(peer).or_default();
-                for (group, head) in heads {
-                    let (_, backoff, _) =
-                        state
-                            .declined
-                            .get(&group)
-                            .copied()
-                            .unwrap_or((0, MIN_BACKOFF, head));
+                for group in groups {
+                    let (_, backoff) = state
+                        .failed
+                        .get(&group)
+                        .copied()
+                        .unwrap_or((0, MIN_BACKOFF));
                     state
-                        .declined
-                        .insert(group, (now + backoff, (backoff * 2).min(MAX_BACKOFF), head));
+                        .failed
+                        .insert(group, (now + backoff, (backoff * 2).min(MAX_BACKOFF)));
                 }
                 Vec::new()
             }
@@ -1074,7 +1088,7 @@ impl Peers {
         for group in &groups {
             self.arm(*group, at);
         }
-        actions.extend(self.catalogue_rounds(&groups));
+        actions.extend(self.start_rounds(&groups));
 
         // Catalogues are exchanged whatever the disk looks like: knowing what exists costs
         // kilobytes, and a node that stopped syncing its index when it ran out of room would
@@ -1143,11 +1157,10 @@ impl Peers {
         let Ok(current) = self.current(group) else {
             return;
         };
-        let jitter = jitter_for(HEARTBEAT);
         let state = self
             .state
             .entry(group)
-            .or_insert_with(|| GroupState::new(at, jitter));
+            .or_insert_with(|| GroupState::new(at));
 
         // News also retires the content backoff. "Nobody had anything for us" was a conclusion
         // about a catalogue that has since moved, and the rows that moved it are exactly the
@@ -1163,6 +1176,12 @@ impl Peers {
             state.spent.clear();
         }
 
+        // **This decides who to dial, not what to say.** The pull governs what crosses a
+        // connection: a question carries nothing, so asking a peer delivers nothing *to* them —
+        // they learn our state by asking for it themselves. What is still ours to decide is
+        // whose door to knock on, and a change of ours is exactly the reason to knock. Without
+        // this the author does nothing at all, and the change reaches the group only when other
+        // nodes' heartbeats happen to pick us out of the rotation.
         // What is ours to tell, and what we have merely received.
         let seen = self.seen.get(&group).copied();
         let membership_moved =
@@ -1212,32 +1231,14 @@ impl Peers {
             self.seen.insert(group, recorded);
         }
 
-        // Membership moved since they refused, so the refusal may no longer stand: a peer that
-        // had not yet learned we are a member may have learned it since. Compared against the
-        // head *they* refused under, not against our last successful exchange — the latter does
-        // not advance while they keep refusing, which would retire the backoff every tick and
-        // hammer them.
-        for peer in self.peers.values_mut() {
-            if peer
-                .declined
-                .get(&group)
-                .is_some_and(|(_, _, head)| *head != current.head)
-            {
-                peer.declined.remove(&group);
-            }
-        }
-
-        // The heartbeat is the one timer, and it exists for a case no exact signal covers: a
-        // peer that can accept our dial but whose own never land, and — since only the author
-        // propagates — a member the author never reached.
-        //
         // **One peer, not everybody.** It is a check that we are not adrift, not a broadcast:
         // an exchange with any one member reconciles both directions, so if we are missing
-        // something they have it comes back on the same round trip. And because an offer names
+        // something they have it comes back on the same round trip. And because a question names
         // every group we share with that peer, a peer already queued for another group settles
         // this one too — so a node in six groups with the same five people spends one exchange
         // on all six, not six.
         if at >= self.state[&group].heartbeat_at {
+            let jitter = jitter_for(HEARTBEAT);
             if let Some(state) = self.state.get_mut(&group) {
                 state.heartbeat_at = at + jitter;
             }
@@ -1289,22 +1290,27 @@ impl Peers {
         }
     }
 
-    /// Decide per group who still needs telling, then send **one offer per peer**.
+    /// Decide per group who to talk to, then put **one question per peer**.
     ///
-    /// The decision stays group-shaped: each group asks who has not heard its news. The sending
-    /// does not, because an offer carries every shared group — so three groups that all choose
-    /// the same member cost one request between them, and every group riding along is genuinely
-    /// told rather than merely reconciled by accident.
+    /// Both protocols, despite what this used to be called: membership and the catalogue are
+    /// separate exchanges over the same connections, and choosing between them is part of the
+    /// decision rather than a separate loop. The chain goes first while any group still owes
+    /// this peer it, since a catalogue answer is gated on membership they may not hold yet.
+    ///
+    /// The decision stays group-shaped: each group picks whose turn it is. The sending does not,
+    /// because one question covers every group we share with that peer — so three groups that
+    /// all choose the same member cost one request between them.
     ///
     /// The queue is drained one peer per tick per group, and a group with an empty queue is
     /// quiet. Nothing is compared and nothing is counted — being on the list *is* the obligation.
-    fn catalogue_rounds(&mut self, groups: &[GroupId]) -> Vec<PeerAction> {
+    fn start_rounds(&mut self, groups: &[GroupId]) -> Vec<PeerAction> {
         let mut chosen: Vec<PeerId> = Vec::new();
         let mut actions = Vec::new();
 
         for group in groups {
             // Everyone on the list except those we agreed to leave alone for a while: a peer
-            // that declined stays owed, but is not asked again until its backoff expires.
+            // whose last exchange failed stays owed, but is not asked again until its backoff
+            // expires.
             let waiting: Vec<PeerId> = self
                 .pending
                 .get(group)
@@ -1319,9 +1325,9 @@ impl Peers {
                 .filter(|p| {
                     !waiting.contains(p)
                         || self.peers.get(p).is_some_and(|s| {
-                            s.declined
+                            s.failed
                                 .get(group)
-                                .is_some_and(|(until, _, _)| self.now < *until)
+                                .is_some_and(|(until, _)| self.now < *until)
                         })
                 })
                 .collect();
@@ -1345,7 +1351,7 @@ impl Peers {
         }
 
         for peer in chosen {
-            // **Membership before contents.** A catalogue offer is gated on membership the
+            // **Membership before contents. A catalogue offer is gated on membership the
             // other side may not have yet, so while anything about who is in a group is stale
             // for this peer, that is what goes — and the file heads follow on a later tick, by
             // which time they know who we are.
@@ -1354,7 +1360,7 @@ impl Peers {
             } else {
                 Offering::Catalogue
             };
-            actions.push(self.offer(peer, offering));
+            actions.push(self.ask(peer, offering));
         }
         actions
     }
@@ -1371,7 +1377,7 @@ impl Peers {
     /// Every group shared with them, not merely the group that prompted it: the request names
     /// them all, so they are all told, and recording anything less would leave the supervisor
     /// believing it still owes news it has already delivered.
-    fn offer(&mut self, peer: PeerId, offering: Offering) -> PeerAction {
+    fn ask(&mut self, peer: PeerId, offering: Offering) -> PeerAction {
         // The same set the layer being offered will actually put on the wire, or the
         // supervisor would go on believing it still owed news it has already delivered. The
         // chain half discusses invitations too; the catalogue half needs our consent.
@@ -1393,7 +1399,7 @@ impl Peers {
                 offering,
             },
         );
-        PeerAction::Offer { peer, offering }
+        PeerAction::Ask { peer, offering }
     }
 
     fn content_pulls(&mut self, groups: &[GroupId], at: i64) -> Vec<PeerAction> {
@@ -1884,7 +1890,7 @@ impl Peers {
     /// our three attempts they have already dropped off the list. Being seen is the whole signal.
     ///
     /// **Both halves.** The chain is what they are missing and the catalogue is what is useless
-    /// to them until they have it. Ordering is not at risk — `catalogue_rounds` sends the chain
+    /// to them until they have it. Ordering is not at risk — `start_rounds` sends the chain
     /// first while any is owed.
     fn owe_invitation(&mut self, peer: PeerId) {
         for group in self.unanswered_invites(&peer) {
@@ -1956,7 +1962,7 @@ impl Peers {
             .collect();
 
         for peer in stale {
-            self.on(PeerEvent::OfferFailed { peer });
+            self.on(PeerEvent::AskFailed { peer });
         }
     }
 
@@ -2184,20 +2190,6 @@ impl Peers {
             head: row.as_ref().map(|r| r.head_seq).unwrap_or(0),
             standings: row.map(|r| r.standings_digest).unwrap_or([0u8; 32]),
         })
-    }
-
-    /// The group's chain head, without the catalogue digest that comes with a whole snapshot.
-    ///
-    /// The head lives in `ac-groups` and has nothing to do with the file catalogue, so reading it
-    /// through `current` meant hashing every row in the group to fetch one integer out of another
-    /// store. The backoff bookkeeping that wants it runs on every decline and every failed offer.
-    fn head_of(&self, group: GroupId) -> u64 {
-        self.groups
-            .get(group)
-            .ok()
-            .flatten()
-            .map(|r| r.head_seq)
-            .unwrap_or(0)
     }
 
     /// Whether an offer we sent this peer is still outstanding.

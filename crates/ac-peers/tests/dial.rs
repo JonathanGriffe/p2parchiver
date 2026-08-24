@@ -20,8 +20,8 @@ use ac_groups::standing::{Position, Standing};
 use ac_groups::store::Groups;
 use ac_net::PeerId;
 use ac_net::identity::Keypair;
-use ac_peers::sync::{
-    DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_WINDOW, HEARTBEAT, Limits, MAX_TRANSFERS, MIN_BACKOFF,
+use ac_peers::sync::{HEARTBEAT, 
+    DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_WINDOW, Limits, MAX_TRANSFERS, MIN_BACKOFF,
     Notice, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent, Peers, ROUND_TIMEOUT,
     SHARE_AFTER_IDLE,
 };
@@ -194,23 +194,31 @@ fn answered(node: &mut Node, at: i64, group: GroupId) -> Vec<PeerAction> {
     actions
 }
 
-/// Answer every offer the way the daemon would, with the protocol it was sent on.
+/// Answer every question the way the daemon would, on the protocol it was put on.
 ///
-/// Membership and the catalogue are two exchanges, so a member is told in two steps; answering
-/// both as though they were the second leaves the first outstanding for ever.
+/// Two events, because the links report two facts. `Asked` is the pull's own: the question was
+/// answered, so the exchange is over and the clock decides when to come back. `Synced` is what
+/// the reading side reports per group once there is nothing further to read from them.
+///
+/// Membership and the catalogue are separate exchanges, so a peer is reconciled in two steps;
+/// answering both as though they were the second leaves the first outstanding for ever.
 fn settle_offers(node: &mut Node, actions: &[PeerAction], group: GroupId) -> Vec<PeerId> {
-    let mut told = Vec::new();
+    let mut asked = Vec::new();
     for action in actions {
-        if let PeerAction::Offer { peer, offering } = action {
+        if let PeerAction::Ask { peer, offering } = action {
             node.peers.on(PeerEvent::Synced {
                 peer: *peer,
                 group,
                 offering: *offering,
             });
-            told.push(*peer);
+            node.peers.on(PeerEvent::Asked {
+                peer: *peer,
+                offering: *offering,
+            });
+            asked.push(*peer);
         }
     }
-    told
+    asked
 }
 
 /// Tick once to notice an edit, and answer when the pause it must wait out has elapsed.
@@ -273,7 +281,7 @@ fn step(node: &mut Node, at: i64, holds: bool) -> Vec<PeerAction> {
             // so answering one means answering for all of them, as the daemon does. Whether it
             // was the chain or the catalogue is the supervisor's business: it recorded which,
             // and settles the matching half.
-            PeerAction::Offer { peer, offering } => {
+            PeerAction::Ask { peer, offering } => {
                 for group in node.shared_groups() {
                     queue.extend(node.peers.on(PeerEvent::Synced {
                         peer: *peer,
@@ -281,6 +289,12 @@ fn step(node: &mut Node, at: i64, holds: bool) -> Vec<PeerAction> {
                         offering: *offering,
                     }));
                 }
+                // The question is answered, whatever the answer was. Without this the exchange
+                // stays open, is swept as a failure, and the node never goes quiet.
+                queue.extend(node.peers.on(PeerEvent::Asked {
+                    peer: *peer,
+                    offering: *offering,
+                }));
             }
             PeerAction::AskHoldings { peer, group, paths } => {
                 queue.extend(node.peers.on(PeerEvent::Holdings {
@@ -310,7 +324,7 @@ fn settle(node: &mut Node, from: i64) -> (i64, Vec<PeerAction>) {
         let busy = actions.iter().any(|a| {
             matches!(
                 a,
-                PeerAction::Offer { .. } | PeerAction::AskHoldings { .. } | PeerAction::Dial { .. }
+                PeerAction::Ask { .. } | PeerAction::AskHoldings { .. } | PeerAction::Dial { .. }
             )
         });
         seen.extend(actions);
@@ -331,7 +345,7 @@ fn rounds(actions: &[PeerAction]) -> Vec<PeerId> {
     actions
         .iter()
         .filter_map(|a| match a {
-            PeerAction::Offer { peer, .. } => Some(*peer),
+            PeerAction::Ask { peer, .. } => Some(*peer),
             _ => None,
         })
         .collect()
@@ -623,90 +637,45 @@ fn a_member_already_connected_is_asked_before_one_that_needs_a_circuit() {
     assert!(
         actions.iter().any(|a| matches!(
             a,
-            PeerAction::AskHoldings { peer, .. } | PeerAction::Offer { peer, .. } if *peer == held
+            PeerAction::AskHoldings { peer, .. } | PeerAction::Ask { peer, .. } if *peer == held
         )),
         "the peer we are already talking to is the one asked: {actions:?}"
     );
 }
 
 #[test]
-fn news_goes_to_each_member_once_not_to_one_member_repeatedly() {
-    // Telling everyone is a claim about *members*, not about how many requests went out, and
-    // the difference only shows when the members are not equally callable. A peer we already
+fn every_member_is_asked_once_not_one_member_repeatedly() {
+    // Coming round to a group is a claim about *members*, not about how many requests went out,
+    // and the difference only shows when the members are not equally callable. A peer we already
     // hold a connection to always is; the rest need a relay circuit this node may not be allowed
-    // to open yet. Counting sends rather than recipients spent the whole round of propagation on
-    // the peer that already knew — which looks like healthy traffic in the log and leaves the
-    // group as uninformed as if nothing had been sent at all.
+    // to open yet. Counting sends rather than recipients spent the whole rotation on the peer
+    // that was easiest to reach and left the rest unasked.
     let mut node = Node::new();
     let members = peers(3);
     let id = node.group_with(&members);
     node.all_up(&members);
-    let (settled, _) = settle(&mut node, AT);
 
-    node.add_file(id, "new.jpg");
-
-    let at = after_editing_pause(&mut node, settled + 1);
-    let mut told: Vec<PeerId> = Vec::new();
+    let mut asked: Vec<PeerId> = Vec::new();
     for k in 0..12 {
-        let actions = node.tick(at + k);
-        told.extend(settle_offers(&mut node, &actions, id));
+        let actions = node.tick(AT + k);
+        asked.extend(settle_offers(&mut node, &actions, id));
     }
 
-    let distinct: HashSet<PeerId> = told.iter().copied().collect();
+    let distinct: HashSet<PeerId> = asked.iter().copied().collect();
     assert_eq!(
         distinct.len(),
         members.len(),
-        "every member is told: {distinct:?}"
+        "every member is asked: {distinct:?}"
     );
-    assert_eq!(
-        told.len(),
-        distinct.len(),
-        "and none of them twice for the same news: {told:?}"
-    );
-}
-
-#[test]
-fn a_change_made_during_a_round_is_not_recorded_as_sent() {
-    // A round carries what the store held when the request went out. Recording what it holds
-    // when the answer comes back looks equivalent and is not: anything changed in between was
-    // never on the wire, and marking it sent retires news nobody has heard.
-    //
-    // The lab found this as a member added while a round was in flight: the group recorded the
-    // post-change head, `News` never armed, and the node sat silent until its four-hour
-    // heartbeat having told nobody the member existed. Everything else about it looked healthy —
-    // it had asked the registry, been told the newcomer was online, and simply never called.
-    let mut node = Node::new();
-    let members = peers(1);
-    let id = node.group_with(&members);
-    node.add_file(id, "a.jpg");
-    node.all_up(&members);
-    let (settled, _) = settle(&mut node, AT);
-
-    // A round goes out...
-    node.add_file(id, "b.jpg");
-    let at = after_editing_pause(&mut node, settled + 1);
-    let actions = node.tick(at);
-    let asked = rounds(&actions);
-    assert!(!asked.is_empty(), "the new file is news: {actions:?}");
-
-    // ...and the catalogue moves again before it settles.
-    node.add_file(id, "c.jpg");
-    for peer in asked {
-        node.peers.on(PeerEvent::Synced {
-            peer,
-            group: id,
-            offering: Offering::Catalogue,
-        });
+    // Twice each and no more: membership and the catalogue are separate exchanges, so a peer
+    // is reconciled in two, and the interval then holds them off.
+    for peer in &distinct {
+        assert_eq!(
+            asked.iter().filter(|p| *p == peer).count(),
+            2,
+            "one chain round and one catalogue round, no repeats: {asked:?}"
+        );
     }
-
-    // `c.jpg` waits out its own pause like any other edit; what must not happen is that it was
-    // written off as delivered by the round that could not have carried it.
-    let at = after_editing_pause(&mut node, at + 1);
-    let actions = node.tick(at);
-    assert!(
-        !rounds(&actions).is_empty() || !dials(&actions).is_empty(),
-        "the file added mid-round was never on the wire and is still news: {actions:?}"
-    );
 }
 
 #[test]
@@ -726,8 +695,8 @@ fn membership_is_offered_before_the_catalogue() {
     let first = node.tick(AT);
     assert!(
         matches!(
-            first.iter().find(|a| matches!(a, PeerAction::Offer { .. })),
-            Some(PeerAction::Offer {
+            first.iter().find(|a| matches!(a, PeerAction::Ask { .. })),
+            Some(PeerAction::Ask {
                 offering: Offering::Chain,
                 ..
             })
@@ -735,7 +704,8 @@ fn membership_is_offered_before_the_catalogue() {
         "membership goes first: {first:?}"
     );
 
-    // Answered, so the chain half of the record is now theirs.
+    // Answered, so the chain half of the record is now theirs. `Asked` is what discharges it —
+    // one question covers every shared group, so answering it settles that half for all of them.
     for group in node.shared_groups() {
         node.peers.on(PeerEvent::Synced {
             peer: members[0],
@@ -743,14 +713,18 @@ fn membership_is_offered_before_the_catalogue() {
             offering: Offering::Chain,
         });
     }
+    node.peers.on(PeerEvent::Asked {
+        peer: members[0],
+        offering: Offering::Chain,
+    });
 
     let second = node.tick(AT + 1);
     assert!(
         matches!(
             second
                 .iter()
-                .find(|a| matches!(a, PeerAction::Offer { .. })),
-            Some(PeerAction::Offer {
+                .find(|a| matches!(a, PeerAction::Ask { .. })),
+            Some(PeerAction::Ask {
                 offering: Offering::Catalogue,
                 ..
             })
@@ -760,102 +734,40 @@ fn membership_is_offered_before_the_catalogue() {
 }
 
 #[test]
-fn restarting_the_daemon_does_not_restart_the_editing_pause() {
-    // The pause is measured from a stamp in the store rather than from anything the supervisor
-    // remembers, so that a node two seconds from telling the group about an afternoon's work
-    // does not go quiet for another two minutes because it was restarted. Held in memory this
-    // was unobservable in every test here, because every test here has one supervisor.
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("node.db");
-    let key = Keypair::generate_ed25519();
-    let me = key.public().to_peer_id();
-    let members = peers(1);
-
-    let supervisor = || {
-        Peers::new(
-            Files::open(&db, me).unwrap(),
-            Groups::open(&db, me).unwrap(),
-        )
-    };
-
-    let mut node = Node {
-        peers: supervisor(),
-        key: key.clone(),
-        me,
-    };
-    let id = node.group_with(&members);
-    node.all_up(&members);
-    let (settled, _) = settle(&mut node, AT);
-
-    // An edit, and one tick to notice it. The pause starts here.
-    node.add_file(id, "a.jpg");
-    node.tick(settled + 1);
-
-    // The daemon goes away and comes back, most of the pause having elapsed while it was down.
-    let mut node = Node {
-        peers: supervisor(),
-        key,
-        me,
-    };
-    // Connected, but with no presence answer — that enqueues the unanswered invitation and
-    // would send a round whatever the pause said.
-    node.peers.on(PeerEvent::Verified { peer: members[0] });
-
-    // Membership *is* re-told: who has heard what is in memory, so a restarted node cannot know
-    // it already said it, and saying it again is exempt from the pause. Let that finish.
-    settle(&mut node, settled + 2);
-
-    // The catalogue is not, and is still inside a pause counted from the edit — not from when
-    // this process happened to start.
-    assert!(
-        rounds(&node.tick(settled + 1 + SHARE_AFTER_IDLE - 10)).is_empty(),
-        "the pause is still running, so the restart did not skip it either"
-    );
-
-    let at = settled + 1 + SHARE_AFTER_IDLE + 1;
-    assert_eq!(
-        rounds(&answered(&mut node, at, id)),
-        members,
-        "the pause is up, and it was up whether or not we were running for it"
-    );
-}
-
-#[test]
 fn a_settled_membership_round_does_not_write_off_the_catalogue() {
     // Two exchanges, two records. A chain round carries who is in the group and not one file
-    // head, so it may discharge the membership and nothing else — but `seen` was moved wholesale
-    // by either kind, and `seen` is also what decides whether there is anything left to say.
-    //
-    // So a member added and a file added in the same minute got the membership and never the
-    // file: by the time the editing pause elapsed, our digest already matched what we believed
-    // they held, and nothing afterwards disagreed. It took the four-hour heartbeat to notice.
+    // head, so it may discharge the membership and nothing else. Under the push this was easy
+    // to get wrong, because `seen` moved wholesale by either kind; the pull has no `seen`, but
+    // the two halves of what is outstanding are still separate and must stay so.
     let mut node = Node::new();
-    let id = node.group_with(&[]);
-    let (settled, _) = settle(&mut node, AT);
-
-    // A member and a file, in the same minute.
-    let newcomer = peers(1)[0];
-    node.add_member(id, newcomer);
+    let members = peers(1);
+    let id = node.group_with(&members);
     node.add_file(id, "a.jpg");
-    // Connected, but with no presence answer: that path enqueues an unanswered invitation of its
-    // own accord, which would supply the catalogue this test is checking arrives by itself.
-    node.peers.on(PeerEvent::Verified { peer: newcomer });
+    node.all_up(&members);
 
-    // Membership is exempt from the pause and goes at once. Answered as the chain, because that
-    // is what was sent.
-    let first = node.tick(settled + 1);
-    assert_eq!(
-        settle_offers(&mut node, &first, id),
-        vec![newcomer],
-        "the chain round goes first"
-    );
+    // The first round of a fresh group goes at once.
+    let first = node.tick(AT);
+    assert_eq!(rounds(&first), members, "the chain round goes first");
 
-    // The file waited behind it, and is still owed once its pause elapses.
-    let at = after_editing_pause(&mut node, settled + 2);
+    // Answer only the chain half, exactly as a chain exchange would.
+    for peer in rounds(&first) {
+        node.peers.on(PeerEvent::Synced {
+            peer,
+            group: id,
+            offering: Offering::Chain,
+        });
+        node.peers.on(PeerEvent::Asked {
+            peer,
+            offering: Offering::Chain,
+        });
+    }
+
+    // The catalogue half was never on the wire, so it is still outstanding, and follows on the
+    // next tick rather than waiting for the group's next heartbeat.
     assert_eq!(
-        rounds(&answered(&mut node, at, id)),
-        vec![newcomer],
-        "the file was never on the wire, so it is still news"
+        rounds(&node.tick(AT + 1)),
+        members,
+        "settling the chain must not write off the catalogue"
     );
 }
 
@@ -886,79 +798,56 @@ fn a_change_made_by_the_cli_in_another_process_is_offered_once() {
 }
 
 #[test]
-fn someone_who_joins_while_already_connected_still_gets_the_catalogue() {
-    // The ordinary way a group grows, and the case that announces itself least: we are already
-    // connected when they accept the invitation. Our catalogue has not changed, and neither has
-    // the chain — *they* signed a standing, which the admin's log knows nothing about. Watching
-    // the digest and the head alone finds nothing to say, and they sit with an empty catalogue
-    // until we happen to add a file.
-    //
-    // Which is why what a peer must match includes the standings digest.
+fn a_member_we_have_never_asked_is_due_at_once() {
+    // A peer with no schedule of its own is due immediately, which is what makes a newly added
+    // member reachable without waiting out an interval they were never part of. Under the push
+    // this was the moment we had to *tell* them; now it is the moment they first count as
+    // somebody worth asking.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
-    node.add_file(id, "a.jpg");
     node.all_up(&members);
-    let (settled, _) = settle(&mut node, AT);
-    assert!(
-        rounds(&node.tick(settled)).is_empty(),
-        "quiet before they join"
-    );
 
-    // Their standing changes; no file moves and the chain does not advance.
-    let key = node.key.clone();
-    node.peers
-        .groups_mut()
-        .author_standing(&key, id, Position::In, AT)
-        .unwrap();
-
-    let actions = node.tick(settled + 1);
     assert_eq!(
-        rounds(&actions),
+        rounds(&node.tick(AT)),
         members,
-        "joining is enough; we should not have to add a file for them to hear: {actions:?}"
+        "never asked, so due on the first tick"
     );
+    let _ = id;
 }
 
 #[test]
-fn a_group_left_out_of_the_answer_is_not_recorded_as_delivered() {
-    // A peer that does not believe it shares a group simply omits it — refusals explain nothing,
-    // so the silence covers both "invited and has not accepted yet" and "left months ago".
-    // Treating it as a finished exchange records them as holding a catalogue they refused to
-    // discuss, and nothing afterwards corrects that: our digest has not moved, so the ordinary
-    // loop sees them as up to date and says nothing more until the four-hour heartbeat.
-    //
-    // The newly added member is exactly this case, since the op that adds us may still be in
-    // flight when our file heads arrive.
+fn a_quiet_group_waits_for_its_heartbeat() {
+    // The two triggers are separate and this pins the second. A change of ours dials the group
+    // at once — that is `a_change_made_by_the_cli_in_another_process_is_offered_once`. With
+    // nothing of ours to say, the only thing left is the timer, and it is hours away rather
+    // than the next tick. This replaced a test about declines, which described a refusal the
+    // pull has no notion of: a question carries nothing, so there is nothing to refuse.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
     node.add_file(id, "a.jpg");
     node.all_up(&members);
 
-    let offered = node.tick(AT);
-    assert_eq!(rounds(&offered), members, "the member is offered to");
-
-    node.peers.on(PeerEvent::Declined {
-        peer: members[0],
-        group: id,
-    });
-    assert_eq!(
-        node.peers.status().groups[0].unheard,
-        1,
-        "they refused to discuss it, so they have not been told"
-    );
-
-    // Not hammered either: the retry waits rather than going out on the very next tick.
+    // Everything outstanding, dealt with.
+    let (settled, _) = settle(&mut node, AT);
     assert!(
-        rounds(&node.tick(AT + 1)).is_empty(),
-        "a decline is not retried immediately"
+        rounds(&node.tick(settled + 1)).is_empty(),
+        "nothing of ours left to say"
+    );
+
+    // The jitter puts the heartbeat between three quarters and one and a quarter of the
+    // interval, so these are the bounds that hold whatever the roll was.
+    assert!(
+        rounds(&node.tick(settled + HEARTBEAT / 2)).is_empty(),
+        "still inside the interval"
     );
     assert_eq!(
-        rounds(&node.tick(AT + MIN_BACKOFF + 1)),
+        rounds(&node.tick(settled + 2 * HEARTBEAT)),
         members,
-        "but it is retried, because the reason may have been a chain still in flight"
+        "and the group comes round once it has elapsed"
     );
+    let _ = id;
 }
 
 #[test]
@@ -1010,28 +899,20 @@ fn what_we_learn_from_a_peer_is_not_re_told_to_the_group() {
 }
 
 #[test]
-fn a_member_added_a_moment_ago_is_called_without_waiting_to_be_told_they_are_there() {
-    // A member added a moment ago has never appeared in a presence answer, because nobody had
-    // asked about them yet — and the registry is the wrong thing to wait for. Holding the news
-    // behind an answer cost the whole interval when the answer said they were away, and cost it
-    // *for ever* when the query never went out at all, which is what a group whose other members
-    // are all connected looks like: `presence` skips those, finds nobody to ask, and the answer
-    // that would have released the news never comes.
+fn a_member_added_a_moment_ago_is_called_as_soon_as_they_are_seen() {
+    // Under the push, adding a member armed the news and the dial followed on that tick, with
+    // nothing having vouched for the newcomer. Pull gives that up: the chain moving enqueues
+    // nobody, and the group's own timer is hours away.
     //
-    // So the chain is enqueued the moment it moves and the dial follows on that tick. Nothing
-    // has vouched for the newcomer and that is precisely the point.
-    //
-    // Deliberately unlike `adding_a_member_provokes_a_round_although_no_file_changed`, which
-    // hand-feeds `Presence` and `Verified` for the newcomer and so proves only that the news is
-    // armed. Nothing here mentions them to us at all.
+    // What reaches them instead is the invitation rule — we hold no standing of theirs in a
+    // group our chain says they are in, so the moment anything reveals they exist we call them.
+    // Being *seen* is the whole signal, and discovery supplies it within minutes.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
     node.add_file(id, "a.jpg");
     node.all_up(&members);
     let (settled, _) = settle(&mut node, AT);
-    // Someone we have actually exchanged a catalogue with, so the newcomer is the only stranger
-    // and the rotation's preference for strangers is unambiguous.
     node.peers
         .files_mut()
         .set_cursor(id, &members[0], 1)
@@ -1040,14 +921,16 @@ fn a_member_added_a_moment_ago_is_called_without_waiting_to_be_told_they_are_the
     let newcomer = peers(1)[0];
     node.add_member(id, newcomer);
 
-    // Within a few ticks rather than on the first: a member we already hold a connection to is
-    // always served before one that needs a circuit, so the newcomer's dial waits for the
-    // settled member's offer and not for anybody's answer about where they are.
-    // Nothing in this test ever delivers a `Presence`, so a dial here happened on no evidence
-    // whatever — which is the assertion. Asking about them at the same time is not waiting on
-    // the answer, and the two going out on one tick is the shape being pinned.
+    // Nothing yet: the chain moved, and under a pull that is not news we owe anybody.
+    assert!(
+        !dials(&answered(&mut node, settled + 1, id)).contains(&newcomer),
+        "adding them is not by itself a reason to call"
+    );
+
+    // Now the registry mentions them, which is all it takes.
+    node.peers.on(PeerEvent::Discovered { peer: newcomer });
     let mut called = None;
-    for k in 1..6 {
+    for k in 2..8 {
         let actions = answered(&mut node, settled + k, id);
         if dials(&actions).contains(&newcomer) {
             called = Some(k);
@@ -1056,7 +939,7 @@ fn a_member_added_a_moment_ago_is_called_without_waiting_to_be_told_they_are_the
     }
     assert!(
         called.is_some(),
-        "the member who was just added is called, not asked about first"
+        "a member with no standing of their own is called once we know they are there"
     );
 }
 
@@ -1327,19 +1210,19 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
         at - AT
     );
 
-    // Not a verdict about them: the next thing we have to say puts them back on the list.
+    // Not a verdict about them: the clock puts them back on the list. Under the push it was
+    // the next thing we had to say that did, which is the half that changed — there is no
+    // longer any such thing.
     node.add_file(id, "b.jpg");
-    let mut told = false;
-    for k in 0..(SHARE_AFTER_IDLE + 2) {
-        if node.peers.status().groups[0].unheard > 0 {
-            told = true;
-            break;
-        }
-        node.tick(at + k);
-    }
+    assert_eq!(
+        node.peers.status().groups[0].unheard,
+        0,
+        "a change of ours does not undo the giving up"
+    );
+    node.tick(at + 2 * HEARTBEAT);
     assert!(
-        told,
-        "giving up is not a memory, it is the end of one attempt"
+        node.peers.status().groups[0].unheard > 0,
+        "but the interval does: giving up is the end of one attempt, not a memory"
     );
 }
 
@@ -1429,12 +1312,12 @@ fn a_stranger_is_called_before_a_familiar_member() {
 
 #[test]
 fn heartbeats_do_not_line_up() {
-    // Fifty members who joined a group together would otherwise fire within seconds of each
-    // other for ever.
+    // Fifty members who joined a group together would otherwise ask within seconds of each
+    // other for ever, spending the whole dial budget at once and then going silent for hours.
     //
-    // Each node is settled first, which is what makes this measure the heartbeat rather than
-    // the round a fresh group arms immediately: after settling there is nothing left to say,
-    // so the next thing the node does is the heartbeat and nothing else. Sampling every ten
+    // Each node is settled first, which is what makes this measure the schedule rather than the
+    // first ask a fresh group makes immediately: after settling there is nothing left to do, so
+    // the next thing the node does is come round again and nothing else. Sampling every ten
     // minutes over the jittered window is enough to tell the schedules apart — the ±25% spread
     // is two hours wide — and keeps the test to a few dozen ticks per node.
     const SAMPLE: i64 = 600;
@@ -1447,8 +1330,8 @@ fn heartbeats_do_not_line_up() {
         node.all_up(&members);
         let (settled, _) = settle(&mut node, AT);
 
-        // The jitter puts the first heartbeat somewhere in 0.75–1.25 × HEARTBEAT, so walk a
-        // little past the far end.
+        // The jitter puts the next ask somewhere in 0.75–1.25 × HEARTBEAT, so walk a little
+        // past the far end.
         let last = (HEARTBEAT * 5 / 4) / SAMPLE + 2;
         for k in 1..=last {
             let at = settled + k * SAMPLE;
@@ -1599,7 +1482,7 @@ fn a_settled_node_goes_quiet() {
         .filter(|a| {
             matches!(
                 a,
-                PeerAction::Dial { .. } | PeerAction::Offer { .. } | PeerAction::AskHoldings { .. }
+                PeerAction::Dial { .. } | PeerAction::Ask { .. } | PeerAction::AskHoldings { .. }
             )
         })
         .collect();
@@ -1763,28 +1646,36 @@ fn a_presence_answer_says_nothing_about_peers_it_was_not_asked_about() {
         online: Vec::new(),
     });
 
-    // Fresh work, so "nothing happened" cannot be mistaken for "nothing was left to do".
-    node.learn_file(id, "later.bin");
-    let at = after_editing_pause(&mut node, AT + 1);
-    let actions = step(&mut node, at, true);
-    let worked_with: Vec<PeerId> = actions
-        .iter()
-        .filter_map(|a| match a {
-            PeerAction::Offer { peer, .. }
-            | PeerAction::AskHoldings { peer, .. }
-            | PeerAction::FetchBlob { peer, .. } => Some(*peer),
-            _ => None,
-        })
-        .collect();
+    // Read straight off the state rather than inferred from what the node happened to do this
+    // tick: the bug was that the answer was applied as a *replacement*, so the peer it said
+    // nothing about vanished from the online set. Under a pull nothing schedules a round off the
+    // back of an edit, so there is no traffic to read it from — and the state is the truth
+    // anyway.
+    let status = node.peers.status();
+    let online = |peer: &PeerId| {
+        status
+            .peers
+            .iter()
+            .find(|p| p.peer == *peer)
+            .is_some_and(|p| p.online)
+    };
 
     assert!(
-        worked_with.contains(&members[0]),
-        "the connected peer is still worth talking to: {actions:?}"
+        online(&members[0]),
+        "the connected peer was never asked about, so nothing was said about them"
+    );
+    assert!(
+        !online(&members[1]),
+        "and the one the answer did cover is taken at its word"
     );
 
-    // The absent one is still *called* — we may owe them news, and an answer this old is not
-    // grounds for leaving a member untold. What it does decide is that they are not asked to
-    // supply anything: choosing a source is the one judgement presence is still trusted with.
+    // Which is the judgement presence is still trusted with: the absent one is not made a
+    // content source, while the connected one remains a candidate.
+    node.learn_file(id, "later.bin");
+    let mut actions = Vec::new();
+    for k in 1..6 {
+        actions.extend(step(&mut node, AT + k, true));
+    }
     assert!(
         !actions
             .iter()

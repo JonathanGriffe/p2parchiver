@@ -16,7 +16,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 ac-net = { path = "crates/ac-net" }
-# The application layer. Depends on `ac-net`, never the reverse — which is what lets the
+# The application layer. Depends on `ac-net`, never the reverse, which is what lets the
 # group protocol live outside the networking crate and keeps `ac-server` free of it.
 ac-groups = { path = "crates/ac-groups" }
 # Content. Depends on `ac-groups` for the group id it files things under, never the reverse:
@@ -28,32 +28,13 @@ ac-peers = { path = "crates/ac-peers" }
 
 libp2p = { version = "0.56", features = [
     "ed25519", "serde", "macros", "tokio",
-    # QUIC is the primary transport: it carries its own TLS, and its single UDP
-    # flow is what makes hole punching viable later. TCP+noise+yamux is the
-    # fallback for networks that block or mangle UDP.
     "quic", "tcp", "noise", "yamux", "dns",
     "identify", "ping",
-    # `/ac/enroll/1.0.0`. CBOR because the types are ours and change with
-    # the protocol version, so a self-describing binary format costs
-    # nothing and reads better in a packet capture than raw protobuf.
     "request-response", "cbor",
-    # Stage 6 server services. The relay's per-circuit budget is set
-    # explicitly in `ac_net::swarm` rather than inherited: it started at
-    # libp2p's 128 KiB default, rose to 1 MiB to fit a group chain, and
-    # now carries content for peers that can never hole-punch.
     "relay", "rendezvous", "autonat",
-    # Stage 7 client reachability. UPnP is the cheapest possible outcome:
-    # a mapped port means no relay and no hole punch at all.
     "upnp",
-    # Stage 9: upgrade a relayed connection to a direct one. Needs the relay
-    # to exist first — the punch is coordinated over it.
     "dcutr",
-    # Stage 10: the one discovery path needing no infrastructure, and the
-    # one that keeps two devices on the same wifi off a distant relay.
     "mdns",
-    # Resource caps: what protects a node from an unknown peer, since clients
-    # authorize data rather than connections. `connection_limits` needs no
-    # feature — it ships unconditionally.
     "memory-connection-limits",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

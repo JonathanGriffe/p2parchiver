@@ -8,7 +8,7 @@ use crate::chain::Op;
 use crate::id::GroupId;
 use crate::standing::Position;
 use crate::store::{Applied, GroupRow, Groups, State, StoreError};
-use crate::wire::{GroupHead, GroupRequest, GroupResponse, MAX_HEADS_PER_OFFER};
+use crate::wire::{GroupHead, GroupRequest, GroupResponse, MAX_HEADS_PER_ANSWER};
 
 /// How long a fetch may be outstanding before the episode is abandoned.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -23,7 +23,6 @@ const MAX_INFLIGHT: usize = 8;
 /// naming us. Long enough that a slow human is not punished for it.
 const PENDING_TTL: i64 = 30 * 24 * 3600;
 
-/// Something worth telling a person
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
     Invited {
@@ -59,15 +58,13 @@ pub enum Notice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupEvent {
-    /// A peer completed mutual attestation *and* its connection settled — see the daemon.
     PeerVerified {
         peer: PeerId,
     },
     PeerGone {
         peer: PeerId,
     },
-    /// Heads a peer named to us, from an offer they sent as a response.
-    Offered {
+    Heads {
         peer: PeerId,
         heads: Vec<GroupHead>,
     },
@@ -86,13 +83,9 @@ pub enum GroupEvent {
         peer: PeerId,
         group: GroupId,
     },
-    OfferFailed {
+    AskFailed {
         peer: PeerId,
     },
-    /// The only clock this machine has. `now` sweeps deadlines; `at` timestamps what we sign.
-    ///
-    /// It picks up changes *we* made — including from the CLI in another process — and clears
-    /// stalled episodes. It never polls a peer: see "When syncing happens" above.
     Tick {
         now: Instant,
         at: i64,
@@ -101,10 +94,6 @@ pub enum GroupEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupAction {
-    Offer {
-        peer: PeerId,
-        heads: Vec<GroupHead>,
-    },
     Fetch {
         peer: PeerId,
         group: GroupId,
@@ -127,12 +116,8 @@ pub struct GroupSync {
     key: Keypair,
     verified: HashSet<PeerId>,
     inflight: HashMap<GroupId, InFlight>,
-    /// Which groups each peer has named to us this connection — fetch rule 1.
     offered: HashMap<PeerId, HashSet<GroupId>>,
-    /// Requests left for each peer until the next tick.
     budget: HashMap<PeerId, u32>,
-    /// The wall clock, as of the last tick. The machine reads no clock of its own, so
-    /// everything it signs is timestamped from an event and tests stay deterministic.
     now_at: i64,
 }
 
@@ -156,35 +141,11 @@ impl GroupSync {
         &self.store
     }
 
-    /// Write access, for setting up a scenario in tests.
-    ///
-    /// Not how the daemon works: the CLI writes through its *own* handle in another process,
-    /// and the machine notices on the next tick. Reaching for this in the daemon would mean
-    /// a change nobody announces.
-    /// What we would name to this peer: every group whose log we will discuss with them,
-    /// including ones we have been invited to and not yet accepted.
-    ///
-    /// The one shape an offer comes in. Public because the supervisor decides *when* to offer
-    /// and this layer decides *what* — the same split `ac-files` makes.
-    pub fn heads_for(&self, peer: &PeerId) -> Vec<GroupHead> {
-        self.store
-            .log_shared_with(peer)
-            .unwrap_or_default()
-            .into_iter()
-            .take(MAX_HEADS_PER_OFFER)
-            .collect()
-    }
-
     pub fn store_mut(&mut self) -> &mut Groups {
         &mut self.store
     }
 
     /// Answer an inbound request.
-    ///
-    /// Total: **exactly one response, always**. That is why [`GroupAction`] has no `Respond`
-    /// variant — the daemon holds the channel across this call and consumes it here, so a
-    /// channel can never be stranded and there is no "wanted to answer nothing" case to
-    /// handle. Every refusal collapses into [`GroupResponse::Unavailable`].
     pub fn on_request(
         &mut self,
         peer: PeerId,
@@ -195,12 +156,15 @@ impl GroupSync {
         }
 
         match request {
-            GroupRequest::Offer(heads) => {
-                // Answer with our own view, then act on theirs. A store error yields an empty
-                // offer rather than `Unavailable`, which would imply a group-specific refusal.
-                let ours = self.store.log_shared_with(&peer).unwrap_or_default();
-                let actions = self.on_heads(peer, heads);
-                (GroupResponse::Offer(ours), actions)
+            GroupRequest::Ask => {
+                let ours = self
+                    .store
+                    .log_shared_with(&peer)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(MAX_HEADS_PER_ANSWER)
+                    .collect();
+                (GroupResponse::Heads(ours), Vec::new())
             }
             GroupRequest::Fetch { group, from } => {
                 let response = match self.store.entries_for(group, &peer, from) {
@@ -210,8 +174,6 @@ impl GroupSync {
                         entries,
                         standings: self.store.standings(group).unwrap_or_default(),
                     },
-                    // Refused and unknown are the same answer on purpose: telling them apart
-                    // would turn a guessed group id into a membership oracle.
                     _ => GroupResponse::Unavailable,
                 };
                 (response, Vec::new())
@@ -222,10 +184,6 @@ impl GroupSync {
     pub fn on(&mut self, event: GroupEvent) -> Vec<GroupAction> {
         match event {
             GroupEvent::PeerVerified { peer } => {
-                // Noted, not acted on. The supervisor decides when to talk to a peer — including
-                // the moment one arrives, where its record for them is empty and therefore
-                // stale. Offering from here as well meant every fresh connection carried a
-                // duplicate of the request it was about to send.
                 self.verified.insert(peer);
                 Vec::new()
             }
@@ -238,9 +196,7 @@ impl GroupSync {
                 Vec::new()
             }
 
-            // An offer *response*. Provokes fetches only — answering an offer with an offer
-            // would have two peers volleying forever.
-            GroupEvent::Offered { peer, heads } => {
+            GroupEvent::Heads { peer, heads } => {
                 if !self.verified.contains(&peer) {
                     return Vec::new();
                 }
@@ -260,7 +216,7 @@ impl GroupSync {
                 Vec::new()
             }
 
-            GroupEvent::OfferFailed { .. } => Vec::new(),
+            GroupEvent::AskFailed { .. } => Vec::new(),
 
             GroupEvent::Tick { now, at } => self.tick(now, at),
         }
@@ -268,7 +224,7 @@ impl GroupSync {
 
     /// Decide what to fetch from the heads a peer named, and from what they left out.
     fn on_heads(&mut self, peer: PeerId, heads: Vec<GroupHead>) -> Vec<GroupAction> {
-        let heads: Vec<GroupHead> = heads.into_iter().take(MAX_HEADS_PER_OFFER).collect();
+        let heads: Vec<GroupHead> = heads.into_iter().take(MAX_HEADS_PER_ANSWER).collect();
         let named: HashSet<GroupId> = heads.iter().map(|h| h.group).collect();
         self.offered.entry(peer).or_default().extend(named.iter());
 
@@ -291,7 +247,7 @@ impl GroupSync {
             }
         }
 
-        // Fetch rule 2. A group we hold that names this peer, which they did not mention, is
+        // A group we hold that names this peer, which they did not mention, is
         // a discrepancy worth one question: either they removed us, or they have left it
         // themselves. Either way we only learn by asking, since nobody offers a group to
         // someone the offerer no longer counts as a member.
@@ -374,11 +330,6 @@ impl GroupSync {
         self.answer_invitation(&mut actions, group, at);
         self.ratify(&mut actions, group, &applied, at);
 
-        // Nothing is passed onward from here either. Applying entries moves our own head, and
-        // the supervisor's record of what each peer has seen is compared against exactly that —
-        // so every member becomes stale by the same comparison that notices a local change, and
-        // is offered to on the ordinary loop. One mechanism, whether the news was ours or
-        // somebody else's.
         actions
     }
 
@@ -416,17 +367,7 @@ impl GroupSync {
         }
     }
 
-    /// Say once, in writing, that we hold an invitation we have not answered.
-    ///
-    /// A pending node that says nothing is indistinguishable from one that never received the
-    /// chain at all, so every other member goes on treating the invitation as undelivered and
-    /// re-offering it on every discovery hint — forever, since nothing else ever changes.
-    /// `Unanswered` is the smallest true thing we can say, it is self-signed like any other
-    /// standing, and it travels the same way: the digest moves, so the next exchange carries it
-    /// and it spreads through the group.
-    ///
-    /// Only once. A standing of our own already on file means we have spoken — whether to say
-    /// this, to accept, or to leave — and re-authoring would spend a seq per sync.
+    /// Author a "pending" invitation to mark we have received an invitation to a group.
     fn answer_invitation(&mut self, actions: &mut Vec<GroupAction>, group: GroupId, at: i64) {
         let pending = matches!(self.store.get(group), Ok(Some(row)) if row.state == State::Pending);
         let named = matches!(self.store.members(group), Ok(m) if m.contains(&self.me));
@@ -490,13 +431,6 @@ impl GroupSync {
 
         let actions = Vec::new();
 
-        // **Nothing is offered from here.** Deciding when to talk to a peer belongs to the
-        // supervisor, which knows who is online, what the relay will allow, and whether a peer
-        // has just declined to discuss a group. This layer knows none of that, and there is no
-        // reason for the chain to spread by a different mechanism than the catalogue: they are
-        // the same question about the same groups, and answering it twice meant two records
-        // that could disagree — this one keyed per *group*, and written when a request was
-        // dispatched rather than when it was answered.
         let rows = self.store.list().unwrap_or_default();
         self.expire_pending(&rows, at);
         actions

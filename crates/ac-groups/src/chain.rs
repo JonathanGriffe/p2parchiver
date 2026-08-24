@@ -154,8 +154,6 @@ impl Chain {
         Ok(applied)
     }
 
-    /// Sign and append, in that order — so a node can only author chains it would itself
-    /// accept. Admin only.
     pub fn author(&mut self, key: &Keypair, op: Op, at: i64) -> Result<Entry, ChainError> {
         if key.public().to_peer_id() != self.admin {
             return Err(ChainError::NotAdmin);
@@ -304,9 +302,6 @@ impl Chain {
         check_name(name, 0)?;
         check_username(username, 0)?;
 
-        // Decoding before verifying is safe: the key we check against comes out of the body,
-        // and the id is a hash of that same body — so a forged genesis produces a *different*
-        // group, and cannot impersonate an existing one.
         let admin: PeerId = admin.parse().map_err(|_| ChainError::UnparseablePeer {
             seq: 0,
             peer: admin.clone(),
@@ -771,8 +766,6 @@ mod tests {
 
     #[test]
     fn a_clock_running_backwards_does_not_reorder_membership() {
-        // `at` is advisory and never validated, so a skewed clock on the admin's laptop must
-        // not be able to change what the chain means — or to brick a group.
         let admin = key();
         let bob = peer();
         let mut chain = group(&admin);

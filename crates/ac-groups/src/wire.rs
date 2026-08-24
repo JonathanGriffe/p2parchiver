@@ -1,52 +1,17 @@
-//! The `/ac/group/3.0.0` protocol: what is said, not how it is carried.
-//!
-//! The name, the message types and the limits are here; the `request_response` behaviour that
-//! carries them is built by `ac-node`, which is the only crate that mounts anything. That split
-//! is what keeps **this whole crate free of libp2p** — not as a convention a grep polices, but
-//! because libp2p is not a dependency and its types cannot be named. The same arrangement the
-//! blob protocol has always had: `ac_files::wire::BLOB_PROTOCOL` is a string, and `ac-node`
-//! turns it into a stream.
-
 use serde::{Deserialize, Serialize};
 
 use crate::chain::Entry;
 use crate::id::{EntryHash, GroupId};
 use crate::standing::Standing;
 
-/// Bumped on any incompatible change to the types below. The version lives in the name because
-/// multistream-select negotiates on it, so an incompatible peer fails cleanly at negotiation
-/// rather than misreading a message — the same convention as `ac_net::proto`.
-///
-/// `2.0.0` moved the hashes below from CBOR integer arrays to byte strings; `3.0.0` did the
-/// same for the bodies and signatures inside `Entry` and `Standing`, which dominated the cost.
-/// `4.0.0` replaced a standing's `in_group` flag with a three-way `Position`, so that holding an
-/// invitation and having answered it stopped being the same statement.
-/// Both are changes of encoding, not of meaning, so an older peer would decode them as garbage
-/// rather than fail — exactly what a version in the name exists to prevent.
-pub const GROUP_PROTOCOL: &str = "/ac/group/4.0.0";
+pub const GROUP_PROTOCOL: &str = "/ac/group/5.0.0";
 
-/// Ceiling on how many groups one `Offer` may name.
-///
-/// A peer genuinely in more than this many groups is beyond what this milestone targets, and
-/// without a cap an `Offer` is an unbounded allocation on the receiving side.
-pub const MAX_HEADS_PER_OFFER: usize = 128;
+pub const MAX_HEADS_PER_ANSWER: usize = 128;
 
 /// Largest request we will decode. An `Offer` of 128 heads is ~10 KiB.
-///
-/// Public because `ac-node` builds the codec from it. The number is a fact about this protocol
-/// and belongs beside the messages it bounds, even though the codec it configures is elsewhere.
 pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 /// Largest response we will decode.
-///
-/// A **denial-of-service backstop, not a chunk boundary.** `request_response` buffers whole
-/// messages in memory, so an unbounded response is a memory attack. There is no chunking: one
-/// `Fetch` is answered by one response carrying everything from `from` to the head. A chain
-/// holds one entry per membership change at ~250 bytes, so this ceiling is roughly 4000
-/// entries — a decade of implausible churn. A chain that will not fit is a failure worth
-/// surfacing rather than a case to handle; compaction is the answer if it ever arrives.
-///
-/// Public for the same reason as [`MAX_REQUEST_BYTES`].
 pub const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 /// What a node knows about one group, as offered to a peer.
@@ -54,27 +19,16 @@ pub const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 pub struct GroupHead {
     #[serde(with = "crate::bytes::group_id")]
     pub group: GroupId,
-    /// Number of entries held, so `head_seq - 1` is the last entry's seq.
     pub head_seq: u64,
     #[serde(with = "crate::bytes::entry_hash")]
     pub head_hash: EntryHash,
-    /// Digest over the standings we hold for this group's members.
-    ///
-    /// **This is the only way a dropped standing heals.** Two nodes can agree on the chain
-    /// exactly and still disagree on standings — a standing arrives for a peer we had not yet
-    /// added, and is refused. Without something to compare, that difference would persist
-    /// until the next chain append, which may be never. An equal head with a differing digest
-    /// triggers a fetch that returns no entries and the full standing set.
     #[serde(with = "crate::bytes::digest")]
     pub standings: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupRequest {
-    /// "These are the groups I believe we share." Filtered by the *sender's* own view.
-    Offer(Vec<GroupHead>),
-    /// Everything from `from` to the head. `from` makes the transfer incremental; it is not a
-    /// chunk offset, and one response carries the whole tail.
+    Ask,
     Fetch {
         #[serde(with = "crate::bytes::group_id")]
         group: GroupId,
@@ -84,7 +38,7 @@ pub enum GroupRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupResponse {
-    Offer(Vec<GroupHead>),
+    Heads(Vec<GroupHead>),
     Entries {
         #[serde(with = "crate::bytes::group_id")]
         group: GroupId,
@@ -92,11 +46,6 @@ pub enum GroupResponse {
         entries: Vec<Entry>,
         standings: Vec<Standing>,
     },
-    /// Refused, with **no reason given, deliberately**.
-    ///
-    /// Distinguishing "I have never heard of that group" from "you are not a member of it"
-    /// would turn guessing a `GroupId` into a membership oracle. One variant means a stranger
-    /// learns nothing from asking.
     Unavailable,
 }
 
@@ -140,14 +89,6 @@ mod tests {
 
     #[test]
     fn a_head_does_not_pay_double_for_its_hashes() {
-        // A `GroupHead` is 104 bytes of fact: three 32-byte hashes and a u64. serde encodes
-        // `[u8; 32]` as a sequence of 32 integers, and CBOR spends two bytes on any integer
-        // above 23 — so a random hash cost close to 64 bytes, and a head came to 194.
-        //
-        // The three hashes now go as CBOR byte strings. What remains is the field-name map
-        // keys, which are legible and cheap by comparison. Asserted as a ceiling rather than
-        // an exact width so a new field is not a test failure, but a regression to
-        // integer-array encoding is.
         let (chain, _) = sample();
         let head = GroupHead {
             group: chain.id(),
@@ -169,18 +110,6 @@ mod tests {
 
     #[test]
     fn a_chain_transfers_at_a_size_that_leaves_room_for_real_history() {
-        // Entries are the bulk of everything that crosses the wire, and the chain never
-        // shrinks — there is no compaction — so the per-entry cost sets how long a group can
-        // live.
-        //
-        // `MAX_RESPONSE_BYTES` (1 MiB) is now the only ceiling: a chain past it cannot
-        // transfer to anyone. The relay used to be the tighter one and no longer is — a
-        // circuit carries 64 MiB, so a chain that fits in a response fits in a circuit with
-        // room to spare. That ordering is worth re-checking rather than assuming if either
-        // number moves again.
-        //
-        // Measured, not assumed: an earlier plan put an entry at ~250 bytes when it was 590,
-        // and drew the ceiling 8x too high as a result.
         let admin = Keypair::generate_ed25519();
         let mut chain = Chain::create(&admin, "family", "alice", [1u8; 16], AT).unwrap();
 
@@ -231,7 +160,7 @@ mod tests {
         assert_eq!(round_trip(&head), head);
 
         for request in [
-            GroupRequest::Offer(vec![head.clone()]),
+            GroupRequest::Ask,
             GroupRequest::Fetch {
                 group: chain.id(),
                 from: 3,
@@ -241,7 +170,7 @@ mod tests {
         }
 
         for response in [
-            GroupResponse::Offer(vec![head]),
+            GroupResponse::Heads(vec![head]),
             GroupResponse::Entries {
                 group: chain.id(),
                 from: 0,
