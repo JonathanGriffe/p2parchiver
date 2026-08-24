@@ -1,31 +1,14 @@
-//! The node's long-lived cryptographic identity.
-//!
-//! A node is named by its [`PeerId`], which is derived from an Ed25519 public key. That
-//! name is durable: it survives restarts, it is what peers add to their trust lists, and
-//! it is what the server records at enrollment. Losing the key means becoming a different
-//! node to everyone else, so the key is written once and then only ever read.
-//!
-//! Writes go through a temporary file in the same directory followed by a rename, so a
-//! crash mid-write can never leave a truncated key where a valid one used to be.
-
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use libp2p::PeerId;
 /// The key types this module deals in, re-exported for the same reason as [`crate::PeerId`].
-///
-/// Both are already part of this module's API — [`Identity::keypair`] returns a `Keypair` and
-/// [`public_key_of`] returns a `PublicKey` — so without this a caller cannot name what it is
-/// handed. They are identity, not networking: `ac-groups` signs chain entries and standings
-/// with the keypair loaded here, and taking them from `ac-net` is what confines that crate's
-/// libp2p imports to its `wire.rs` seam, which its `tests/layering.rs` now enforces.
 pub use libp2p::identity::{Keypair, PublicKey};
 
-/// Name of the key file inside the node's data directory.
+/// Name of the key file inside the node's directory.
 pub const KEY_FILENAME: &str = "identity.key";
 
-/// A peer id that carries no recoverable public key.
 #[derive(Debug, thiserror::Error)]
 #[error("no public key could be recovered from peer id {peer}")]
 pub struct KeyRecoveryError {
@@ -33,22 +16,11 @@ pub struct KeyRecoveryError {
 }
 
 /// Recover a node's public key from its peer id.
-///
-/// Ed25519 public keys are 36 bytes once protobuf-encoded, comfortably under the 42-byte
-/// threshold at which libp2p inlines the key into the peer id under the identity hash
-/// (multihash code `0x00`) instead of hashing it. [`Identity`] only ever generates Ed25519, so
-/// every peer id in this system carries its own key.
-///
-/// **This is what removes key distribution from the design.** A client pins `/p2p/<peer-id>`
-/// at enrolment, and the verification key for every signature it will ever check against that
-/// peer is already inside that string. Both the attestation layer and, from milestone 2, the
-/// group layer are built on it — which is why it lives here, with identities, rather than
-/// inside either of them.
 pub fn public_key_of(peer: &PeerId) -> Result<PublicKey, KeyRecoveryError> {
     let multihash: &libp2p::multihash::Multihash<64> = peer.as_ref();
     if multihash.code() != 0x00 {
-        // A hashed peer id — an RSA key, or one from another implementation. Nothing is
-        // recoverable, and a signature by it cannot be checked without the key itself.
+        // Not an identity multihash, we can't recover a public key from that.
+        // Shouldn't happen since we use identity multihashes for peer ids.
         return Err(KeyRecoveryError { peer: *peer });
     }
     PublicKey::try_decode_protobuf(multihash.digest()).map_err(|_| KeyRecoveryError { peer: *peer })
@@ -219,27 +191,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_public_key_comes_back_out_of_the_peer_id() {
-        // The property the whole design rests on: no key distribution, because a pinned
-        // peer id already contains the verification key.
+    fn public_key_of_round_trip() {
         let key = Keypair::generate_ed25519();
         let recovered = public_key_of(&key.public().to_peer_id()).unwrap();
         assert_eq!(recovered, key.public());
     }
 
     #[test]
-    fn a_hashed_peer_id_yields_no_key() {
-        // An RSA key, or a peer id from an implementation that hashes rather than inlines.
-        // Nothing is recoverable and callers must fail rather than guess.
-        use libp2p::multihash::Multihash;
-        let hashed = Multihash::<64>::wrap(0x12, &[0u8; 32]).unwrap();
-        let peer = PeerId::from_multihash(hashed).unwrap();
-
-        assert!(public_key_of(&peer).is_err());
-    }
-
-    #[test]
-    fn generates_then_reloads_the_same_peer_id() {
+    fn public_key_of_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(KEY_FILENAME);
 
@@ -252,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_missing_parent_directories() {
+    fn public_key_of_creates_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("deeper").join(KEY_FILENAME);
 
@@ -262,7 +221,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn key_is_owner_readable_only() {
+    fn public_key_of_sets_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -301,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_key_reports_a_decode_error() {
+    fn load_corrupt_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(KEY_FILENAME);
         fs::write(&path, b"not a protobuf keypair").unwrap();

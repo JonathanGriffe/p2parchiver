@@ -119,19 +119,12 @@ impl PeerLink {
         let root = config.storage_root(paths);
         let content = Content::new(root.clone());
 
-        // A budget we cannot parse is a warning, not a refusal to start: the node still has
-        // its free-space floor, and a typo in `config.toml` should not take a daemon down.
-        let storage_max = match config.storage_max_bytes() {
-            Ok(max) => max,
-            Err(e) => {
-                tracing::warn!(error = %e, "ignoring storage_max; the free-space floor still applies");
-                None
-            }
-        };
-
         Ok(Self {
+            // `storage_max` is a byte count in the file, so there is nothing to parse and no
+            // way for it to be malformed without `Config::load` having already refused it.
+            // `None` means no ceiling beyond the free-space floor `Limits::default` carries.
             peers: Peers::new(files, groups).with_limits(Limits {
-                storage_max,
+                storage_max: config.storage_max,
                 ..Limits::default()
             }),
             transfers: Transfers::new(path.clone(), me),

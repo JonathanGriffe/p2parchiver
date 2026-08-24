@@ -1,32 +1,3 @@
-//! Admission: who may stay on a connection, as a state machine.
-//!
-//! Consumes [`AdmissionEvent`]s and returns [`AdmissionAction`]s. It never sees a `Swarm`, so
-//! the whole of the policy here — verification, deadlines, who gets closed, when to renew — is
-//! exercisable with no socket and no tokio. That is the point: this code decides who is let in,
-//! and it previously could not be tested at all without standing up two real nodes.
-//!
-//! `ac-node`'s daemon translates in both directions and is the only thing that touches both
-//! worlds, exactly as it does for `ac_groups::sync`.
-//!
-//! # Why both directions
-//!
-//! Verifying only the peer that dialled would leave the dialer talking to anyone. Both sides
-//! send their own attestation and answer the other's, and a peer counts as admitted only when
-//! *both* halves have passed. The two halves are tracked separately because they are two
-//! independent request-response exchanges that can land in either order.
-//!
-//! # Why the server is exempt
-//!
-//! The server does not speak `/ac/peer-attest/1.0.0` — it has no attestation of its own to
-//! present, and needs none, since a client pinned its peer id at enrolment and the connection
-//! handshake already proved it. Demanding one would close the very connection renewal depends
-//! on, and with it the relay reservation and the registry.
-//!
-//! # The clock is an input
-//!
-//! Nothing here calls `now()`. `Instant` deadlines and the unix `at` used for verification both
-//! arrive on [`AdmissionEvent::Tick`], so a test can drive an expiry without sleeping.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -37,46 +8,36 @@ use crate::attest::{self, Attestation};
 use crate::proto::{AttestResponse, PeerAttestResponse};
 
 /// How long a peer has to complete the exchange before it is closed.
-///
-/// Swept on the housekeeping tick, so the real deadline is this plus up to one tick. Sized for
-/// a relayed round trip on a slow link, not for a hole punch — nothing here waits on DCUtR,
-/// because the exchange runs over whatever connection already exists.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Something worth telling the operator about, for the caller to word.
-///
-/// A typed enum rather than a formatted string, so tests can assert on it and the binary keeps
-/// ownership of the wording — the same split `ac_groups::sync::Notice` uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
-    /// A fresh attestation was issued and stored.
     Attested { username: String, hours: i64 },
-    /// The server declined to issue one.
     RenewalRefused { reason: String },
-    /// The server issued one this node cannot use. Its fault, not ours.
     IssuedUnusable { error: String },
-    /// The attestation could not be cached. Not fatal: it works for this run.
     NotCached { path: PathBuf, error: String },
-    /// This node has never enrolled, so it can neither prove nor verify anything.
     NotEnrolled,
 }
 
-/// What the machine wants done. The daemon is the only thing that can do any of it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdmissionAction {
-    /// Put our attestation on the wire to this peer.
     Send {
         peer: PeerId,
         attestation: Box<Attestation>,
     },
-    /// Ask the server for a fresh attestation.
-    Renew { server: PeerId },
-    /// Close this peer. It failed the check, or ran out of time.
-    Close { peer: PeerId, why: String },
+    Renew {
+        server: PeerId,
+    },
+    Close {
+        peer: PeerId,
+        why: String,
+    },
     /// Both halves passed. Emitted exactly once per handshake — this is the signal the app
     /// layer waits on.
-    Admitted { peer: PeerId, username: String },
-    /// Something to report.
+    Admitted {
+        peer: PeerId,
+        username: String,
+    },
     Note(Notice),
 }
 
@@ -88,23 +49,29 @@ pub enum Renewal {
     Failed { error: String },
 }
 
-/// Everything the machine reacts to.
 #[derive(Debug, Clone)]
 pub enum AdmissionEvent {
-    /// A connection to this peer was established. `now` starts its deadline.
-    Connected { peer: PeerId, now: Instant },
-    /// A connection closed. `still_connected` is whether the swarm holds another to this peer.
-    Disconnected { peer: PeerId, still_connected: bool },
-    /// They accepted the attestation we sent.
-    Accepted { peer: PeerId },
-    /// They rejected it.
-    Rejected { peer: PeerId, why: String },
-    /// Our request to them produced no usable answer.
-    ExchangeFailed { peer: PeerId, error: String },
-    /// The server answered — or failed to answer — a renewal.
+    Connected {
+        peer: PeerId,
+        now: Instant,
+    },
+    /// A connection closed. `still_connected` is whether the swarm holds another connection to this peer.
+    Disconnected {
+        peer: PeerId,
+        still_connected: bool,
+    },
+    Accepted {
+        peer: PeerId,
+    },
+    Rejected {
+        peer: PeerId,
+        why: String,
+    },
+    ExchangeFailed {
+        peer: PeerId,
+        error: String,
+    },
     Renewed(Renewal),
-    /// The only clock. `now` sweeps deadlines, `at` is unix seconds for verification, and
-    /// `server_connected` is asked here rather than of a swarm so this stays testable.
     Tick {
         now: Instant,
         at: i64,
@@ -115,21 +82,13 @@ pub enum AdmissionEvent {
 /// One peer's progress through the exchange.
 #[derive(Debug)]
 struct Handshake {
-    /// Whether our attestation has been put on the wire since the last connection opened.
-    /// False when the peer connected before this node had one.
     sent: bool,
-    /// Their username, set once *their* attestation verified. `Some` is "they passed".
     username: Option<String>,
-    /// Whether they accepted ours.
     we_passed: bool,
     /// Whether completion has already been reported.
-    ///
     /// [`Handshake::complete`] stays true for the life of the entry, so it cannot on its own
-    /// tell "just completed" from "completed a while ago". Nothing stops a peer sending a
-    /// second attestation on the same connection, and each one re-runs the verification path
-    /// — so without this latch the announcement would repeat as often as the *peer* chose.
+    /// tell "just completed" from "completed a while ago"
     announced: bool,
-    /// When to give up and close.
     deadline: Instant,
 }
 
@@ -151,31 +110,16 @@ impl Handshake {
 
 /// The mutual attestation check, and the credential it is built on.
 pub struct Admission {
-    /// Where our attestation is cached between runs.
     path: PathBuf,
-    /// This node, for verifying that a renewal really is about us.
     me: PeerId,
-    /// The only signer whose attestations mean anything here.
-    ///
-    /// `None` on a node that has never enrolled. Nothing can be checked without it — not a
-    /// peer's attestation and not our own — so every peer connection is closed on sight. That
-    /// is the honest reading of "verify before talking": a node that cannot verify does not get
-    /// to talk.
     server: Option<PeerId>,
-    /// `None` until the server issues one. A node in that state is admitted by nobody.
     mine: Option<Attestation>,
-    /// Set while a renewal is in flight, so the tick does not queue a second one.
     renewing: bool,
-    /// Per-peer exchange state. An absent entry means the exchange has not started.
     peers: HashMap<PeerId, Handshake>,
 }
 
 impl Admission {
     /// Load the cached attestation, discarding one that is no longer usable.
-    ///
-    /// Verified against this node's own peer id and its server, not merely decoded: a file
-    /// copied from another node, or left over from a different server, has to be thrown away
-    /// rather than presented and rejected by every peer in turn.
     pub fn load(path: &Path, me: PeerId, server: Option<PeerId>, at: i64) -> (Self, Vec<Notice>) {
         let path = path.to_path_buf();
         let mut notes = Vec::new();
@@ -228,7 +172,6 @@ impl Admission {
         )
     }
 
-    /// The server this node trusts, if it has enrolled.
     pub fn server(&self) -> Option<PeerId> {
         self.server
     }
@@ -314,46 +257,25 @@ impl Admission {
     }
 
     /// A peer connected: begin the exchange, unless it is the server.
-    ///
-    /// # Why this always restarts the exchange
-    ///
-    /// An earlier version skipped a peer whose handshake was already complete, reasoning that a
-    /// peer legitimately holds a relayed *and* a direct connection while an upgrade settles and
-    /// the second proves nothing new. That is true of an upgrade and wrong of a **restart**: a
-    /// peer that dies without closing cleanly leaves a connection the swarm still believes in
-    /// for as long as the transport's idle timeout, and when the restarted node dials back, its
-    /// brand-new connection was matched against the corpse of the old one. We skipped, never
-    /// sent our half, and the peer closed us for timing out — the exchange could not complete
-    /// until the dead connection was reaped. It cost a real reconnection every time.
-    ///
-    /// Nothing can distinguish the two cases from the peer id alone, because in both there is
-    /// an existing connection the swarm considers live. So the exchange is simply re-run. The
-    /// cost is one extra ~2 KiB message in the upgrade case; `announced` keeps the *result*
-    /// from being reported twice, which is the part that ever mattered.
     fn connected(&mut self, peer: PeerId, now: Instant) -> Vec<AdmissionAction> {
         let Some(server) = self.server else {
-            // Nothing to check against, and nothing to offer. Closed immediately rather than
-            // left to time out, so the peer gets a reason instead of a dead socket.
             return self.close(peer, "this node has not enrolled with a server".to_owned());
         };
         if peer == server {
             return Vec::new();
         }
 
-        // The entry is what `send_ours` writes through, so it has to exist first. Clearing
-        // `sent` on an entry that survived is what re-runs the exchange; see above.
         self.peers
             .entry(peer)
-            .and_modify(|handshake| handshake.sent = false)
+            .and_modify(|handshake| {
+                handshake.sent = false;
+                handshake.deadline = now + HANDSHAKE_TIMEOUT;
+            })
             .or_insert_with(|| Handshake::new(now));
         self.send_ours(peer)
     }
 
     /// Put our attestation on the wire, if we have one and have not already sent it.
-    ///
-    /// Yields nothing when this node has no attestation yet. That is not a failure path: the
-    /// peer's deadline is already running, so the exchange either completes when a renewal
-    /// lands or the connection is closed for not completing.
     fn send_ours(&mut self, peer: PeerId) -> Vec<AdmissionAction> {
         let Some(mine) = self.mine.clone() else {
             return Vec::new();
@@ -373,24 +295,6 @@ impl Admission {
     }
 
     /// Our request to a peer produced no usable answer.
-    ///
-    /// # Why this retries instead of closing
-    ///
-    /// It is tempting to read a failed request as "this peer cannot be admitted, and waiting
-    /// for the deadline would only delay it". That is wrong whenever more than one connection
-    /// to the peer exists, which is routine: a relayed and a direct one while an upgrade
-    /// settles, or — the case that bit — a dead connection the transport has not yet reaped
-    /// sitting alongside the fresh one a restarted peer just dialled.
-    ///
-    /// `send_request` addresses a *peer*, not a connection, and libp2p picks. Pick the corpse
-    /// and the request dies with `connection lost` through no fault of the peer. Closing on
-    /// that then tore down the healthy connection too, because disconnecting is per-peer as
-    /// well — so a restart could not recover until the stale connection timed out, and the
-    /// peer saw itself refused for something it never did.
-    ///
-    /// So a failure only clears `sent`, and the next tick tries again. Nothing is weakened:
-    /// the deadline still closes a peer that genuinely never completes, which is the check
-    /// that was doing the real work all along.
     fn exchange_failed(&mut self, peer: PeerId, error: &str) -> Vec<AdmissionAction> {
         let Some(handshake) = self.peers.get_mut(&peer) else {
             return Vec::new();
@@ -401,15 +305,6 @@ impl Admission {
     }
 
     /// Announce a peer once both halves have passed.
-    ///
-    /// Called from both completion paths, and latches on `announced` so it fires exactly once
-    /// per handshake. Completion alone is not enough to decide that: it stays true afterwards,
-    /// and a peer may send a second attestation on the same connection, which re-runs the
-    /// verification path and calls back in here. Guarding on `complete()` alone let a peer
-    /// choose how often it was announced.
-    ///
-    /// The latch lives on the handshake rather than on the peer, so a genuine reconnection —
-    /// where the entry has been dropped — is announced again.
     fn settle(&mut self, peer: PeerId) -> Option<AdmissionAction> {
         let handshake = self.peers.get_mut(&peer)?;
         if !handshake.complete() || handshake.announced {
@@ -424,9 +319,6 @@ impl Admission {
 
     /// Close a peer that failed the check.
     fn close(&mut self, peer: PeerId, why: String) -> Vec<AdmissionAction> {
-        // The server is never subject to this. Closing it would take down renewal, the relay
-        // reservation and the registry in one go — and it has already proven itself by holding
-        // the key for the peer id pinned at enrolment.
         if Some(peer) == self.server {
             return Vec::new();
         }
@@ -482,19 +374,11 @@ impl Admission {
         self.renewing = false;
 
         let Some(server) = self.server else {
-            // Unreachable: a request is only ever sent to a known server.
             return Vec::new();
         };
 
         match renewal {
             Renewal::Issued(attestation) => {
-                // Checked before it is stored or presented, so a server that hands out
-                // something unusable is caught here rather than as an unexplained refusal from
-                // every peer.
-                //
-                // `at` is the attestation's own issue time rather than a tick's: verifying a
-                // just-issued credential against a stale tick would reject it for being from
-                // the future on a node whose clock runs slow.
                 let at = attest::now();
                 match attestation.verify(&self.me, &server, at) {
                     Ok(statement) => {
@@ -535,8 +419,6 @@ impl Admission {
                 vec![AdmissionAction::Note(Notice::RenewalRefused { reason })]
             }
 
-            // The server link has its own reconnect schedule, and this rides on whatever it
-            // recovers; `renewing` is already cleared, so the next tick tries again.
             Renewal::Failed { error } => {
                 tracing::warn!(%error, "could not renew the attestation");
                 Vec::new()
@@ -545,10 +427,6 @@ impl Admission {
     }
 }
 
-/// Turn the server's reply into a [`Renewal`].
-///
-/// Here rather than in the daemon so that the mapping from wire type to event lives beside the
-/// machine that consumes it.
 pub fn renewal_of(response: AttestResponse) -> Renewal {
     match response {
         AttestResponse::Issued(attestation) => Renewal::Issued(Box::new(attestation)),
@@ -933,6 +811,74 @@ mod tests {
                 AdmissionAction::Close { peer, .. } if *peer == p
             )),
             "the deadline is what closes an unproven peer, and it still does"
+        );
+    }
+
+    fn closed(actions: &[AdmissionAction]) -> Option<PeerId> {
+        actions.iter().find_map(|a| match a {
+            AdmissionAction::Close { peer, .. } => Some(*peer),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_second_connection_gets_its_own_deadline() {
+        // `connected` clears `sent` on a surviving entry but leaves `deadline` where the
+        // first connection put it. A relayed connection that sat unproven for most of its
+        // window hands the direct upgrade whatever is left — here, one second.
+        //
+        // That matters because `close` is peer-wide: the daemon turns it into
+        // `disconnect_peer_id`, so firing on the stale connection's clock takes down the
+        // fresh one that never had a chance to finish.
+        let (mut a, _server) = enrolled();
+        let p = peer();
+        let start = Instant::now();
+
+        a.on(AdmissionEvent::Connected {
+            peer: p,
+            now: start,
+        });
+        a.on(AdmissionEvent::Connected {
+            peer: p,
+            now: start + HANDSHAKE_TIMEOUT - Duration::from_secs(1),
+        });
+
+        assert_eq!(
+            closed(&a.tick(start + HANDSHAKE_TIMEOUT, AT, true)),
+            None,
+            "the upgrade inherited the first connection's clock"
+        );
+    }
+
+    #[test]
+    fn a_redial_is_not_closed_by_an_expired_deadline() {
+        // The restart case. A peer dies mid-exchange without closing cleanly, so the entry
+        // survives — `Disconnected` only removes it once the last connection is gone, and
+        // the corpse still counts. By the time the peer restarts and dials back, the
+        // deadline it left behind is already in the past.
+        //
+        // The redial is then closed on the very next tick for something the previous
+        // connection did, and since the peer redials again, this does not settle on its own.
+        let (mut a, _server) = enrolled();
+        let p = peer();
+        let start = Instant::now();
+
+        a.on(AdmissionEvent::Connected {
+            peer: p,
+            now: start,
+        });
+
+        // No `Disconnected`: the transport has not reaped the dead connection yet.
+        let redial = start + HANDSHAKE_TIMEOUT + Duration::from_secs(30);
+        a.on(AdmissionEvent::Connected {
+            peer: p,
+            now: redial,
+        });
+
+        assert_eq!(
+            closed(&a.tick(redial, AT, true)),
+            None,
+            "a peer that just dialled has not failed anything yet"
         );
     }
 }

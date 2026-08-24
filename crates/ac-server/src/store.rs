@@ -350,12 +350,7 @@ impl Store {
     }
 }
 
-/// The service listener's policy: **enrolled peers only**.
-///
-/// This is the gate that could not exist while one listener served both enrolment and
-/// services — a stranger refused here could never have enrolled. With enrolment on its own
-/// listener, the two policies stop contradicting each other, and everything the service
-/// listener speaks is behind this one check rather than being gated protocol by protocol.
+/// The service listener's policy: enrolled peers only.
 pub struct Enrolled(pub Store);
 
 impl PeerAuthorizer for Enrolled {
@@ -366,12 +361,7 @@ impl PeerAuthorizer for Enrolled {
 }
 
 impl PeerAuthorizer for Store {
-    /// Refuse only peers that were explicitly revoked — see the module docs for why this
-    /// is not "is enrolled".
-    ///
-    /// A database error reads as "not revoked". Failing open is deliberate: a corrupt or
-    /// locked database should degrade the server to an open relay, not silently cut off
-    /// every legitimate client, and the service-level checks in stage 6 still apply.
+    /// Policy for the enrollment listener: refuse only peers that were explicitly revoked
     fn is_allowed(&self, peer: &PeerId) -> bool {
         !self.is_revoked(peer)
     }

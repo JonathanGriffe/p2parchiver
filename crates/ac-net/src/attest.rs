@@ -1,31 +1,3 @@
-//! Attestations: the server-signed credential one peer shows another.
-//!
-//! # Why this is not a trust list
-//!
-//! [`crate::authz`] explains at length why a peer must not decide who to talk to from a
-//! list it holds locally: membership changes while someone is offline, and the peer that
-//! could vouch for a newcomer is exactly the one being refused. An attestation has the
-//! opposite shape. It is **self-authenticating** — the holder presents it, and the verifier
-//! checks it against the server's public key alone, with no prior knowledge of the holder.
-//! A member who enrolled five minutes ago is admissible by a peer that has been offline for
-//! a week, because nothing about the check consults what the verifier already knew.
-//!
-//! # What binds it to its holder
-//!
-//! The statement names a peer id, and the verifier compares that against the peer id libp2p
-//! authenticated during the connection handshake. So a stolen attestation is inert: using
-//! it means also holding the private key it names, and a peer that holds that key *is* the
-//! subject. There is no bearer property to steal.
-//!
-//! # Why the signed bytes are carried verbatim
-//!
-//! [`Attestation::statement`] is the CBOR encoding of a [`Statement`], not a `Statement`.
-//! The signature covers those exact bytes, and verification checks them as received rather
-//! than re-encoding a decoded value. Re-encoding would make every signature depend on the
-//! serializer producing byte-identical output forever — across ciborium versions, field
-//! reorderings, and integer width choices. Carrying the bytes makes the signature depend on
-//! nothing but itself.
-
 use std::path::Path;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,25 +7,13 @@ use libp2p::identity::Keypair;
 use serde::{Deserialize, Serialize};
 
 /// How long a freshly issued attestation is valid.
-///
-/// This is the ceiling on how long a revoked peer stays admissible to other *peers*. The
-/// server itself refuses them immediately — a revoked client cannot open a connection to
-/// the service listener, so it cannot renew — but an attestation already in hand keeps
-/// working until it expires.
 pub const LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Renew once less than this remains.
-///
-/// The gap between this and [`LIFETIME`] is the outage budget: 18 hours in which the server
-/// can be unreachable while every peer connection keeps working. The daemon retries on its
-/// housekeeping tick, so a server that comes back within that window costs nothing at all.
 pub const RENEW_WHEN_REMAINING: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Tolerance for clock skew between the issuing server and a verifying peer.
-///
-/// Applied to `issued_at` only. Expiry is deliberately *not* given the same grace: being
-/// generous about the start of a validity window costs nothing, while being generous about
-/// its end extends exactly the interval revocation depends on.
+/// Applied to `issued_at` only. Expiry is deliberately *not* given the same grace.
 const CLOCK_SKEW: i64 = 300;
 
 /// Unix seconds. Mirrors the server's own clock helper so both sides agree on the unit.
@@ -64,20 +24,13 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Filename inside the node's data directory.
+/// Filename inside the node's directory.
 pub const ATTESTATION_FILENAME: &str = "attestation.cbor";
 
-/// Bounds on a username. Long enough to be a real name, short enough that it cannot be
-/// used to bloat every attestation on the wire.
 pub const USERNAME_MIN_LEN: usize = 3;
 pub const USERNAME_MAX_LEN: usize = 32;
 
 /// Normalise a username, or explain why it is not one.
-///
-/// Lowercased and trimmed before validation, so `  Alice ` and `alice` are the same name
-/// rather than two accounts that look identical in every list that shows them. The
-/// character set is deliberately narrow: these are compared for equality by machines and
-/// read aloud by people, and both go wrong with Unicode that renders identically.
 pub fn normalise_username(raw: &str) -> Result<String, UsernameError> {
     let name = raw.trim().to_lowercase();
 
@@ -93,8 +46,6 @@ pub fn normalise_username(raw: &str) -> Result<String, UsernameError> {
     {
         return Err(UsernameError::BadCharacter);
     }
-    // A leading `-` or `_` reads as a flag or as padding in most of the places a username
-    // is printed, and gains nothing.
     if !name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
         return Err(UsernameError::BadStart);
     }
@@ -121,27 +72,21 @@ pub enum UsernameError {
 /// way that a library type's serde representation is not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Statement {
-    /// The peer this attestation is about.
     pub peer: String,
     pub username: String,
-    /// The server that issued it. Checked by the verifier against its *own* server, so an
-    /// attestation from one deployment cannot be presented on another.
     pub server: String,
     pub issued_at: i64,
     pub expires_at: i64,
 }
 
 impl Statement {
-    /// The subject, if it parses.
     pub fn peer_id(&self) -> Option<PeerId> {
         self.peer.parse().ok()
     }
 }
 
-/// A [`Statement`] and the server's signature over its encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attestation {
-    /// CBOR encoding of a [`Statement`], signed and verified as these exact bytes.
     pub statement: Vec<u8>,
     pub signature: Vec<u8>,
 }
@@ -197,21 +142,12 @@ impl Attestation {
         })
     }
 
-    /// Decode the statement without checking anything about it.
-    ///
-    /// For logging and for reading our *own* attestation's expiry. Never use it to decide
-    /// whether to trust a peer — that is [`Self::verify`], and the difference is the whole
-    /// point of the type.
+    /// Decode the statement without verification..
     pub fn statement(&self) -> Result<Statement, AttestError> {
         ciborium::from_reader(self.statement.as_slice()).map_err(|_| AttestError::Malformed)
     }
 
     /// Check everything, and return what was asserted.
-    ///
-    /// `subject` is the peer id libp2p authenticated on the connection this arrived over,
-    /// and `server` is the peer id this node pinned at enrolment. Both are compared against
-    /// the signed statement, so a valid signature alone is never enough: the attestation
-    /// must also be about the peer presenting it, and from the server we answer to.
     pub fn verify(
         &self,
         subject: &PeerId,
@@ -220,8 +156,6 @@ impl Attestation {
     ) -> Result<Statement, AttestError> {
         let statement = self.statement()?;
 
-        // Checked before the signature so that an attestation from another deployment is
-        // reported as such, rather than as a signature failure that looks like tampering.
         if statement.server != server.to_base58() {
             return Err(AttestError::WrongServer {
                 issuer: statement.server,
@@ -233,7 +167,6 @@ impl Attestation {
             return Err(AttestError::BadSignature);
         }
 
-        // Everything below is now known to be what the server signed.
         if statement.peer != subject.to_base58() {
             return Err(AttestError::WrongPeer {
                 subject: statement.peer,
@@ -272,11 +205,6 @@ impl Attestation {
 }
 
 /// Read the attestation stored at `path`.
-///
-/// A missing file is `Ok(None)`: a node that has not enrolled has no attestation, and that
-/// is a state to report rather than an error to propagate. A file that will not decode is
-/// also `Ok(None)` — it is replaced on the next renewal, and refusing to start over a
-/// corrupt cache would be worse than fetching a new one.
 pub fn load(path: &Path) -> std::io::Result<Option<Attestation>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,

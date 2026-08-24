@@ -42,9 +42,9 @@
 //! # Restraint is most of the design
 //!
 //! This is the first component here that spends someone else's bandwidth on a schedule, and
-//! two ceilings bound it. `ac_net::swarm` allows a client **two relayed circuits per minute**,
-//! server-enforced, which is the real budget — not the connection limits. And the relay allows
-//! sixteen circuits across all clients at once.
+//! two ceilings bound it. `ac_net::limits` allows a client **sixteen relayed circuits per
+//! minute**, server-enforced, which is the real budget — not the connection limits. And the
+//! relay allows sixty-four circuits across all clients at once.
 //!
 //! What makes that affordable is that having news is **level-triggered, not edge-triggered per
 //! change**: what is compared is where the catalogue is now against where it was when the group
@@ -56,7 +56,7 @@
 //!
 //! Auto-mirror over a relay means the server carries one full copy of every file, for every
 //! member that cannot hole-punch. A 4 GiB file in a twenty-member group is ~76 GiB through the
-//! server, and for each receiving node it is 64 circuits at `MAX_CIRCUIT_BYTES`, which the
+//! server, and for each receiving node it is 512 circuits at `MAX_CIRCUIT_BYTES`, which the
 //! rate limit stretches to roughly half an hour — bound by the limit, not by bandwidth.
 //!
 //! That is accepted, not mitigated. The caps mean the relay can be made slow but never

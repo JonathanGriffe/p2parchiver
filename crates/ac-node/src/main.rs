@@ -25,10 +25,10 @@ use libp2p::{Multiaddr, PeerId};
 
 use ac_net::config::Paths;
 
-/// Application name used for the per-OS config and data directories.
+/// Application name used for the per-OS data directory, which is a node's whole home.
 const APP: &str = "archiverclient";
 
-/// Set this to a directory to override both, which is how several nodes run on one host.
+/// Set this to a directory to override it, which is how several nodes run on one host.
 const HOME_ENV: &str = "AC_HOME";
 
 #[derive(Parser)]

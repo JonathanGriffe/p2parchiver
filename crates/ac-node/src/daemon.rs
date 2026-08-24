@@ -509,7 +509,6 @@ fn dispatch_admission(
     }
 }
 
-/// The binary owns the wording; the machine owns the facts.
 fn report_admission(note: &AdmissionNotice) {
     match note {
         AdmissionNotice::Attested { username, hours } => {

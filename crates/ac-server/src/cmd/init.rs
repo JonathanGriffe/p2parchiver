@@ -74,7 +74,7 @@ pub fn run(paths: &Paths) -> Result<()> {
         Origin::Loaded => println!("server already initialised"),
     }
     println!("peer   {}", identity.peer_id());
-    println!("data   {}", paths.data_dir.display());
+    println!("data   {}", paths.root.display());
     println!(
         "config {}{}",
         config_path.display(),

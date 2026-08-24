@@ -15,6 +15,7 @@ pub mod authz;
 pub mod config;
 pub mod connectivity;
 pub mod identity;
+pub mod keepalive;
 pub mod limits;
 pub mod link;
 pub mod proto;

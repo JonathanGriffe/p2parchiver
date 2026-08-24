@@ -77,6 +77,8 @@ hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+# Ping is mounted per connection via `Either`; see `ac_net::keepalive`.
+either = "1"
 anyhow = "1"
 
 [workspace.lints.rust]
