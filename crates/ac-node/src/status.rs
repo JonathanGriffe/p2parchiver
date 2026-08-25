@@ -61,7 +61,7 @@ impl Published {
              CREATE TABLE IF NOT EXISTS supervisor_groups (
                  group_id         TEXT PRIMARY KEY,
                  missing          INTEGER NOT NULL,
-                 unheard          INTEGER NOT NULL,
+                 owed          INTEGER NOT NULL,
                  next_peer        TEXT,
                  source           TEXT,
                  content_until    INTEGER NOT NULL,
@@ -96,13 +96,13 @@ impl Published {
         for group in &status.groups {
             tx.execute(
                 "INSERT INTO supervisor_groups
-                     (group_id, missing, unheard, next_peer, source,
+                     (group_id, missing, owed, next_peer, source,
                       content_until, heartbeat_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     group.group.to_string(),
                     group.missing as i64,
-                    group.unheard as i64,
+                    group.owed as i64,
                     group.next.map(|p| p.to_base58()),
                     group.source.map(|p| p.to_base58()),
                     group.content_until,
@@ -150,7 +150,7 @@ impl Published {
             .optional()?;
 
         let mut groups = self.db.prepare(
-            "SELECT group_id, missing, unheard, next_peer, source,
+            "SELECT group_id, missing, owed, next_peer, source,
                     content_until, heartbeat_at
              FROM supervisor_groups ORDER BY group_id",
         )?;
@@ -167,13 +167,13 @@ impl Published {
                 ))
             })?
             .filter_map(|row| {
-                let (id, missing, unheard, next, source, content_until, heartbeat_at) = row.ok()?;
+                let (id, missing, owed, next, source, content_until, heartbeat_at) = row.ok()?;
                 Some(GroupStatus {
                     group: GroupId::from_str(&id).ok()?,
                     // SQLite has one integer type and it is signed, so the counts round-trip
                     // through `i64`. A negative one is a corrupt row, not a small number.
                     missing: u64::try_from(missing).ok()?,
-                    unheard: usize::try_from(unheard).ok()?,
+                    owed: usize::try_from(owed).ok()?,
                     next: next.and_then(|p| p.parse().ok()),
                     source: source.and_then(|p| p.parse().ok()),
                     content_until,
@@ -237,7 +237,7 @@ mod tests {
             groups: vec![GroupStatus {
                 group,
                 missing: 7,
-                unheard: 2,
+                owed: 2,
                 next: Some(next),
                 source: None,
                 content_until: 1_000_030,

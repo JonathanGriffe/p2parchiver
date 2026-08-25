@@ -21,9 +21,9 @@ use ac_groups::store::Groups;
 use ac_net::PeerId;
 use ac_net::identity::Keypair;
 use ac_peers::sync::{
-    DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_WINDOW, HEARTBEAT, Limits, MAX_TRANSFERS, MIN_BACKOFF,
-    NoRoom, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent, Peers, ROUND_TIMEOUT,
-    SHARE_AFTER_IDLE,
+    DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_ROUND, DIALS_PER_WINDOW, HEARTBEAT, Limits,
+    MAX_TRANSFERS, MIN_BACKOFF, NoRoom, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent, Peers,
+    ROUND_TIMEOUT, SHARE_AFTER_IDLE,
 };
 
 const AT: i64 = 1_000_000;
@@ -356,21 +356,26 @@ fn rounds(actions: &[PeerAction]) -> Vec<PeerId> {
 #[test]
 fn one_change_in_a_fifty_member_group_is_not_fifty_dials() {
     // The mistake the whole design corrects. Iterating peers and asking "is there work with
-    // them" answers the same for every member under auto-mirror, so all forty-nine look
-    // equally worth dialling — ~2,450 dials per interval across the group to discover nothing
-    // changed. The loop iterates groups instead.
+    // them" answers the same for every member under auto-mirror, so all forty-nine look equally
+    // worth dialling — ~2,450 circuits per interval to discover nothing changed.
+    //
+    // **Circuits, specifically.** Reaching a member we are already connected to costs none, and
+    // telling everyone we can already reach is the point; what has to be paced is opening new
+    // ones, which `DIALS_PER_ROUND` does. So the members here are *online* and not connected,
+    // which is the state that used to produce a dial each.
     let mut node = Node::new();
     let members = peers(49);
     let id = node.group_with(&members);
-    node.all_up(&members);
+    node.peers.on(PeerEvent::Presence {
+        asked: members.clone(),
+        online: members.clone(),
+    });
     node.add_file(id, "new.jpg");
 
-    let actions = node.tick(AT);
-    let contacted = rounds(&actions).len() + dials(&actions).len();
-
+    let opened = dials(&node.tick(AT)).len();
     assert!(
-        contacted <= 2,
-        "one change produced {contacted} contacts in a fifty-member group"
+        opened <= DIALS_PER_ROUND,
+        "one change opened {opened} circuits in a fifty-member group"
     );
 }
 
@@ -488,9 +493,17 @@ fn a_round_nobody_answers_does_not_wedge_the_node() {
         "the slots are full while they are outstanding"
     );
 
-    // Past the timeout they are written off, and the node can work again.
+    // Past the timeout they are written off. Rounds go to every connected member at once now,
+    // so one stall pauses them all together — and writing one off arms the retry backoff, which
+    // is why detecting the failure and acting on it are two different ticks.
     node.add_file(id, "b.jpg");
-    let actions = node.tick(AT + ROUND_TIMEOUT + 6);
+    let swept = node.tick(AT + ROUND_TIMEOUT + 1);
+    assert!(
+        rounds(&swept).is_empty(),
+        "the tick that writes them off does not immediately re-ask: {swept:?}"
+    );
+
+    let actions = node.tick(AT + ROUND_TIMEOUT + MIN_BACKOFF + 2);
     assert!(
         !rounds(&actions).is_empty() || !dials(&actions).is_empty(),
         "a round nobody answered must not cost the slot for ever: {actions:?}"
@@ -969,7 +982,7 @@ fn a_member_who_has_never_answered_the_invitation_is_told_again_when_the_server_
         }
     }
     assert_eq!(
-        node.peers.status().groups[0].unheard,
+        node.peers.status().groups[0].owed,
         0,
         "after {DIAL_ATTEMPTS} attempts the group stops counting them as owed"
     );
@@ -981,9 +994,9 @@ fn a_member_who_has_never_answered_the_invitation_is_told_again_when_the_server_
         online: members.clone(),
     });
     assert_eq!(
-        node.peers.status().groups[0].unheard,
+        node.peers.status().groups[0].owed,
         1,
-        "somebody who never answered the invitation is told again"
+        "somebody who never answered the invitation goes back on the list"
     );
 }
 
@@ -1191,7 +1204,7 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
             attempts += 1;
             node.peers.on(PeerEvent::DialFailed { peer });
         }
-        if node.peers.status().groups[0].unheard == 0 {
+        if node.peers.status().groups[0].owed == 0 {
             break;
         }
         at += 1;
@@ -1202,7 +1215,7 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
         "three tries, not one and not for ever"
     );
     assert_eq!(
-        node.peers.status().groups[0].unheard,
+        node.peers.status().groups[0].owed,
         0,
         "and then the group stops counting them as owed"
     );
@@ -1217,13 +1230,13 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
     // longer any such thing.
     node.add_file(id, "b.jpg");
     assert_eq!(
-        node.peers.status().groups[0].unheard,
+        node.peers.status().groups[0].owed,
         0,
         "a change of ours does not undo the giving up"
     );
     node.tick(at + 2 * HEARTBEAT);
     assert!(
-        node.peers.status().groups[0].unheard > 0,
+        node.peers.status().groups[0].owed > 0,
         "but the interval does: giving up is the end of one attempt, not a memory"
     );
 }
@@ -1498,10 +1511,6 @@ fn a_settled_node_goes_quiet() {
 // ---- disk limits ----
 
 /// A node with a budget, two members, and a disk report to go with it.
-///
-/// The floor is 1000 bytes rather than the real two gigabytes so the arithmetic can be written
-/// down: a row in these tests is one byte, so "one more file would breach the floor" is a
-/// number a reader can check.
 fn cramped(storage_max: Option<u64>, free: u64, held: u64) -> (Node, GroupId) {
     let mut node = Node::with_limits(Limits {
         min_free: 1_000,

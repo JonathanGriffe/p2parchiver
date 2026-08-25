@@ -154,12 +154,15 @@ pub fn status(paths: &Paths) -> Result<()> {
 
         println!("{label} ({})", group.group.short());
         println!("  missing   {}", group.missing);
+        // Deliberately not "everyone has it": the count is who this node still means to call,
+        // and it reaches zero both by calling everybody and by giving up on somebody
+        // unreachable. Which of those happened is answered by the per-peer rows below.
         println!(
             "  news      {}",
-            match group.unheard {
-                0 => "everyone has it".to_owned(),
-                1 => "1 member still to tell".to_owned(),
-                n => format!("{n} members still to tell"),
+            match group.owed {
+                0 => "nobody left to call".to_owned(),
+                1 => "1 member to call".to_owned(),
+                n => format!("{n} members to call"),
             }
         );
         match group.source {

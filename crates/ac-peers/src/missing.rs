@@ -66,7 +66,6 @@ mod tests {
             self.record(group, path, true);
         }
 
-        /// A row we know about and do not hold — what a catalogue sync leaves behind.
         fn learn(&mut self, group: GroupId, path: &str) {
             self.record(group, path, false);
         }

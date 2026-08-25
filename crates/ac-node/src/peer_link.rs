@@ -1,33 +1,3 @@
-//! Where the swarm and `ac-peers` meet.
-//!
-//! The third and last of the adapters, and the one with the widest reach: the supervisor
-//! decides *who to call*, so this is the only module that turns a decision into a `dial`.
-//!
-//! `ac-peers` names no address, no connection and no request id — it does not depend on libp2p,
-//! so the compiler enforces it — which is what lets a fifty-member group, a week-long absence
-//! or a peer that never answers be set up in a test in microseconds. The price is that everything libp2p
-//! knows and the policy does not has to be supplied here:
-//!
-//! - **How to reach a peer.** [`PeerAction::Dial`] carries only a peer id. Most nodes publish
-//!   nothing but a circuit address, so the default is `config.server + /p2p-circuit + /p2p/…`,
-//!   built exactly as `cmd::probe` builds it and — per that module's note — **without waiting
-//!   on our own relay reservation**, which makes *us* reachable and has nothing to do with
-//!   dialling out. A direct address is used only when discovery has offered a non-circuit one
-//!   this session.
-//! - **Request correlation**, for holdings queries, presence and close proposals alike.
-//! - **Every word a person reads**, so `ac-peers` returns a typed `Notice` and its tests
-//!   assert on meaning rather than phrasing.
-//!
-//! Waiting for a connection to settle is *not* among them any more: that is
-//! [`ac_net::roster::Roster`]'s, which every layer asks rather than tracking for itself.
-//!
-//! # Two behaviours, three owners
-//!
-//! Holdings queries go over the *manifest* protocol, which [`crate::file_link`] also uses. Both
-//! send through the same behaviour, so request ids are unique across the pair; the daemon
-//! offers each manifest event here first and passes on whatever this does not claim. Rounds go
-//! the other way — the supervisor decides *when*, and `FileLink` knows *what* to say.
-
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -210,9 +180,6 @@ impl PeerLink {
         roster: &Roster,
         at: i64,
     ) {
-        // Transfers run in their own tasks, so their outcomes arrive on a channel rather than
-        // as swarm events. Drained before the tick so a finished download frees its slot in
-        // the same turn.
         for outcome in self.transfers.collect() {
             let actions = self.peers.on(outcome);
             self.dispatch(swarm, files, groups, roster, actions);
@@ -959,7 +926,7 @@ mod tests {
                 status
                     .groups
                     .iter()
-                    .map(|g| (g.missing, g.unheard, g.next, g.heartbeat_at))
+                    .map(|g| (g.missing, g.owed, g.next, g.heartbeat_at))
                     .collect::<Vec<_>>(),
                 status
                     .peers
