@@ -151,9 +151,6 @@ async fn two_nodes_connect_and_report_observed_addresses() {
         "a should be observed at the address b dialled"
     );
 
-    // b is seen at its ephemeral source port, which is not its listen address and cannot
-    // be predicted. All that can be asserted is that it is a real loopback QUIC address —
-    // which is precisely the kind of address a NATed node has to learn about itself.
     assert!(
         b_self_addr.iter().any(|p| matches!(p, Protocol::QuicV1)),
         "expected a QUIC address, got {b_self_addr}"

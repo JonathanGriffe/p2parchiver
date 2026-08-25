@@ -1,11 +1,3 @@
-//! The file sync policy, driven by hand.
-//!
-//! Every test here feeds [`FileEvent`]s to a [`FileSync`] backed by in-memory stores and a
-//! temp directory, and asserts on the [`FileAction`]s that come back. No swarm, no socket, no
-//! tokio, no sleeping — which is the whole point of the machine returning actions instead of
-//! performing them.
-
-// An integration test is its own crate, so the library's test-only allow does not reach here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Instant;
@@ -20,7 +12,9 @@ use ac_groups::id::GroupId;
 use ac_groups::standing::Position;
 use ac_groups::store::Groups;
 use ac_net::PeerId;
+use ac_net::connectivity::Connectivity;
 use ac_net::identity::Keypair;
+use ac_net::roster::Roster;
 
 const AT: i64 = 1_000_000;
 
@@ -31,6 +25,7 @@ fn peer_of(k: &Keypair) -> PeerId {
 /// Everything one side needs to be driven, plus the temp directory its content lives in.
 struct Node {
     key: Keypair,
+    roster: Roster,
     sync: FileSync,
     _dir: tempfile::TempDir,
 }
@@ -47,6 +42,7 @@ impl Node {
         );
         Self {
             key,
+            roster: Roster::default(),
             sync,
             _dir: dir,
         }
@@ -56,12 +52,41 @@ impl Node {
         peer_of(&self.key)
     }
 
+    /// Admit a peer and promote them, as the daemon's roster would.
+    ///
+    /// An empty `Connectivity` promotes everyone: `settled` is false only while a hole punch
+    /// is still in flight, and these tests have no connections at all.
     fn verify(&mut self, other: PeerId) -> Vec<FileAction> {
-        self.sync.on(FileEvent::PeerVerified { peer: other })
+        self.roster.admitted(other);
+        self.roster.promote(&Connectivity::default());
+        Vec::new()
+    }
+
+    /// Every call into the machine carries the roster, so who is admitted is asked rather
+    /// than remembered.
+    fn sync_on(&mut self, event: FileEvent) -> Vec<FileAction> {
+        self.sync.on(event, &self.roster)
+    }
+
+    fn sync_on_request(
+        &mut self,
+        peer: PeerId,
+        request: ManifestRequest,
+    ) -> (ManifestResponse, Vec<FileAction>) {
+        self.sync.on_request(peer, request, &self.roster)
+    }
+
+    fn sync_may_serve(&mut self, peer: PeerId, group: GroupId, path: &RelPath) -> Option<u64> {
+        self.sync.may_serve(peer, group, path, &self.roster)
+    }
+
+    /// A peer that has gone. The roster forgets them; nothing else needs telling.
+    fn forget(&mut self, other: PeerId) {
+        self.roster.disconnected(&other, false);
     }
 
     fn tick(&mut self) -> Vec<FileAction> {
-        self.sync.on(FileEvent::Tick {
+        self.sync_on(FileEvent::Tick {
             now: Instant::now(),
             at: AT,
         })
@@ -183,11 +208,6 @@ impl Side {
 }
 
 /// Dispatch actions between two nodes until nothing is left to send.
-///
-/// This is what the daemon does. **Every** action is dispatched, including the ones a
-/// responder produces while answering — a harness that quietly dropped one would leave a read
-/// in flight, blocking that group until it timed out, and tests would then fail for reasons
-/// unrelated to what they check.
 fn settle(a: &mut Node, b: &mut Node, seed: Vec<(Side, Step)>) -> Vec<Notice> {
     let mut queue = seed;
     let mut notes = Vec::new();
@@ -220,13 +240,11 @@ fn step(
         Step::Act(FileAction::Settled { .. }) => {}
 
         Step::Ask => {
-            let (response, theirs) = receiver
-                .sync
-                .on_request(sender.peer(), ManifestRequest::Ask);
+            let (response, theirs) = receiver.sync_on_request(sender.peer(), ManifestRequest::Ask);
             queue.extend(theirs.into_iter().map(|x| (side.other(), Step::Act(x))));
 
             if let ManifestResponse::Heads(heads) = response {
-                let mine = sender.sync.on(FileEvent::Heads {
+                let mine = sender.sync_on(FileEvent::Heads {
                     peer: receiver.peer(),
                     heads,
                 });
@@ -235,9 +253,8 @@ fn step(
         }
 
         Step::Act(FileAction::FetchChanges { group, after, .. }) => {
-            let (response, theirs) = receiver
-                .sync
-                .on_request(sender.peer(), ManifestRequest::Changes { group, after });
+            let (response, theirs) =
+                receiver.sync_on_request(sender.peer(), ManifestRequest::Changes { group, after });
             queue.extend(theirs.into_iter().map(|x| (side.other(), Step::Act(x))));
 
             let event = match response {
@@ -261,7 +278,7 @@ fn step(
                     group,
                 },
             };
-            let mine = sender.sync.on(event);
+            let mine = sender.sync_on(event);
             queue.extend(mine.into_iter().map(|x| (side, Step::Act(x))));
         }
     }
@@ -269,24 +286,18 @@ fn step(
 
 /// Connect two nodes and let them sync to quiescence. `a` is [`Side::A`].
 /// Verify both ways and let each side offer, as the supervisor does on a fresh connection.
-///
-/// The offer is seeded here rather than produced by `PeerVerified`, because deciding *when* to
-/// talk to a peer belongs to `ac-peers` — this machine only decides what to say. Playing that
-/// part explicitly is what keeps these tests about the merge rules.
 fn connect(a: &mut Node, b: &mut Node) -> Vec<Notice> {
     a.verify(b.peer());
     b.verify(a.peer());
 
-    let seed = vec![
-        (Side::A, Step::Ask),
-        (Side::B, Step::Ask),
-    ];
+    let seed = vec![(Side::A, Step::Ask), (Side::B, Step::Ask)];
     settle(a, b, seed)
 }
 
 fn disconnect(a: &mut Node, b: &mut Node) {
-    a.sync.on(FileEvent::PeerGone { peer: b.peer() });
-    b.sync.on(FileEvent::PeerGone { peer: a.peer() });
+    let (ap, bp) = (a.peer(), b.peer());
+    a.forget(bp);
+    b.forget(ap);
 }
 
 // ---- the regression this design exists for ----
@@ -357,10 +368,7 @@ fn a_catalogue_that_already_matches_costs_nothing() {
     // Reconnecting with equal digests must exchange no rows at all.
     alice.verify(bob.peer());
     bob.verify(alice.peer());
-    let seed = vec![
-        (Side::A, Step::Ask),
-        (Side::B, Step::Ask),
-    ];
+    let seed = vec![(Side::A, Step::Ask), (Side::B, Step::Ask)];
     let notes = settle(&mut alice, &mut bob, seed);
 
     assert!(
@@ -399,13 +407,10 @@ fn a_non_member_is_told_nothing_however_it_asks() {
     alice.verify(stranger.peer());
     stranger.verify(alice.peer());
 
-    let (offer, _) = alice
-        .sync
-        .on_request(stranger.peer(), ManifestRequest::Ask);
+    let (offer, _) = alice.sync_on_request(stranger.peer(), ManifestRequest::Ask);
     assert_eq!(offer, ManifestResponse::Heads(Vec::new()));
 
-    // Even naming the group id exactly — which a stranger should not know — reveals nothing.
-    let (changes, _) = alice.sync.on_request(
+    let (changes, _) = alice.sync_on_request(
         stranger.peer(),
         ManifestRequest::Changes {
             group: id,
@@ -416,7 +421,7 @@ fn a_non_member_is_told_nothing_however_it_asks() {
 
     let path = RelPath::parse("secret.jpg").unwrap();
     assert_eq!(
-        alice.sync.may_serve(stranger.peer(), id, &path),
+        alice.sync_may_serve(stranger.peer(), id, &path),
         None,
         "and no bytes either"
     );
@@ -428,7 +433,7 @@ fn an_unverified_peer_is_answered_nothing() {
     let id = share_group(&mut [&mut alice, &mut bob]);
 
     // Bob is a member but has not completed attestation.
-    let (response, _) = alice.sync.on_request(
+    let (response, _) = alice.sync_on_request(
         bob.peer(),
         ManifestRequest::Changes {
             group: id,
@@ -448,8 +453,8 @@ fn bytes_are_not_served_for_a_file_we_do_not_hold() {
     // Bob knows the file exists but has not downloaded it.
     let path = RelPath::parse("a.jpg").unwrap();
     assert!(!bob.sync.row(id, &path).unwrap().have);
-    assert_eq!(bob.sync.may_serve(alice.peer(), id, &path), None);
-    assert!(alice.sync.may_serve(bob.peer(), id, &path).is_some());
+    assert_eq!(bob.sync_may_serve(alice.peer(), id, &path), None);
+    assert!(alice.sync_may_serve(bob.peer(), id, &path).is_some());
 }
 
 #[test]
@@ -459,15 +464,14 @@ fn a_flood_of_requests_is_refused_and_refills_on_the_tick() {
     alice.verify(bob.peer());
 
     let ask = |a: &mut Node| {
-        a.sync
-            .on_request(
-                bob.peer(),
-                ManifestRequest::Changes {
-                    group: id,
-                    after: 0,
-                },
-            )
-            .0
+        a.sync_on_request(
+            bob.peer(),
+            ManifestRequest::Changes {
+                group: id,
+                after: 0,
+            },
+        )
+        .0
     };
 
     let refused = (0..40)
@@ -496,7 +500,7 @@ fn a_holdings_query_answers_only_for_what_is_actually_held() {
         "never-existed.jpg".to_owned(),
         "../escape".to_owned(),
     ];
-    let (response, _) = alice.sync.on_request(
+    let (response, _) = alice.sync_on_request(
         bob.peer(),
         ManifestRequest::Holdings {
             group: id,
@@ -531,7 +535,7 @@ fn a_holdings_query_from_a_non_member_is_refused() {
     let stranger = Node::new();
     alice.verify(stranger.peer());
 
-    let (response, _) = alice.sync.on_request(
+    let (response, _) = alice.sync_on_request(
         stranger.peer(),
         ManifestRequest::Holdings {
             group: id,
@@ -543,9 +547,6 @@ fn a_holdings_query_from_a_non_member_is_refused() {
 
 #[test]
 fn a_peer_that_knows_a_file_but_lacks_it_says_so() {
-    // The case the query exists for: identical catalogues, different holdings. Bob has
-    // alice's catalogue entry but not her bytes, so his answer must be honest about that —
-    // otherwise alice would open a stream for a file he cannot serve.
     let (mut alice, mut bob) = (Node::new(), Node::new());
     let id = share_group(&mut [&mut alice, &mut bob]);
     alice.add(id, "big.bin", b"contents", AT);
@@ -557,7 +558,7 @@ fn a_peer_that_knows_a_file_but_lacks_it_says_so() {
         "catalogues agree, which is why no entries would be exchanged"
     );
 
-    let (response, _) = bob.sync.on_request(
+    let (response, _) = bob.sync_on_request(
         alice.peer(),
         ManifestRequest::Holdings {
             group: id,
@@ -577,22 +578,18 @@ fn a_peer_that_knows_a_file_but_lacks_it_says_so() {
 
 #[test]
 fn agreeing_about_a_group_is_reported_as_settled() {
-    // The cheapest and commonest outcome under auto-mirror: two members already agree, so the
-    // exchange transfers nothing. Without saying so, that is indistinguishable from a round
-    // that never happened — and the supervisor above would hold the connection open waiting
-    // for news that had already arrived.
     let (mut alice, mut bob) = (Node::new(), Node::new());
     let id = share_group(&mut [&mut alice, &mut bob]);
     alice.add(id, "beach.jpg", b"a photograph", AT);
     connect(&mut alice, &mut bob);
 
     // They now agree. Asking again should settle immediately, reading nothing.
-    let (response, _) = bob.sync.on_request(alice.peer(), ManifestRequest::Ask);
+    let (response, _) = bob.sync_on_request(alice.peer(), ManifestRequest::Ask);
     let ManifestResponse::Heads(theirs) = response else {
         panic!("expected heads back");
     };
 
-    let actions = alice.sync.on(FileEvent::Heads {
+    let actions = alice.sync_on(FileEvent::Heads {
         peer: bob.peer(),
         heads: theirs,
     });
@@ -625,11 +622,11 @@ fn a_round_that_had_to_read_pages_settles_when_it_runs_out() {
 
     // Bob learned the file, which means he read at least one page. Asking again proves the
     // settle arrives on the reading path too.
-    let (response, _) = alice.sync.on_request(bob.peer(), ManifestRequest::Ask);
+    let (response, _) = alice.sync_on_request(bob.peer(), ManifestRequest::Ask);
     let ManifestResponse::Heads(theirs) = response else {
         panic!("expected heads back");
     };
-    let actions = bob.sync.on(FileEvent::Heads {
+    let actions = bob.sync_on(FileEvent::Heads {
         peer: alice.peer(),
         heads: theirs,
     });
@@ -647,15 +644,6 @@ fn a_round_that_had_to_read_pages_settles_when_it_runs_out() {
 
 #[test]
 fn a_sync_moves_no_bytes_and_leaves_the_wanted_set_alone() {
-    // The boundary this crate is now on the far side of. Deciding *what to download* moved to
-    // `ac_peers::sync`, which is the only place that can see who is online, who holds what,
-    // and what a peer has already failed to deliver — this machine used to guess at all three
-    // and retry for ever when it guessed wrong.
-    //
-    // `FileAction` no longer has a variant that could fetch, so half of this is checked by the
-    // compiler. What still needs asserting is the other half: that a full catalogue sync
-    // leaves the bytes alone and leaves `file_wants` exactly as it found it, rather than
-    // quietly satisfying or clearing it.
     let (mut alice, mut bob) = (Node::new(), Node::new());
     let id = share_group(&mut [&mut alice, &mut bob]);
     alice.add(id, "big.bin", b"a large file", AT);
@@ -824,7 +812,7 @@ fn an_unsolicited_page_is_ignored() {
         have: false,
         seen_seq: 0,
     };
-    let actions = bob.sync.on(FileEvent::Changes {
+    let actions = bob.sync_on(FileEvent::Changes {
         peer: alice.peer(),
         group: id,
         after: 0,
@@ -843,16 +831,11 @@ fn an_unsolicited_page_is_ignored() {
 
 #[test]
 fn a_refused_reading_still_reports_the_round_as_over() {
-    // `Settled` is the one fact the supervisor cannot work out for itself, and a refusal ends a
-    // round exactly as agreement does. Clearing the busy flag without saying so left the round
-    // outstanding for ever: since only two may run at once, two refusals — which is what a
-    // member who has not accepted the group yet answers — stopped the node gossiping at all,
-    // with nothing in its logs to say why.
     let (mut alice, mut bob) = (Node::new(), Node::new());
     let id = share_group(&mut [&mut alice, &mut bob]);
     connect(&mut alice, &mut bob);
 
-    let refused = alice.sync.on(FileEvent::Unavailable {
+    let refused = alice.sync_on(FileEvent::Unavailable {
         peer: bob.peer(),
         group: id,
     });
@@ -863,7 +846,7 @@ fn a_refused_reading_still_reports_the_round_as_over() {
         "a refusal ends the round: {refused:?}"
     );
 
-    let failed = alice.sync.on(FileEvent::RequestFailed {
+    let failed = alice.sync_on(FileEvent::RequestFailed {
         peer: bob.peer(),
         group: Some(id),
     });
@@ -883,7 +866,7 @@ fn a_peer_that_disconnects_is_forgotten() {
     connect(&mut alice, &mut bob);
     disconnect(&mut alice, &mut bob);
 
-    let (response, _) = alice.sync.on_request(
+    let (response, _) = alice.sync_on_request(
         bob.peer(),
         ManifestRequest::Changes {
             group: id,

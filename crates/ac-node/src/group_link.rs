@@ -10,22 +10,22 @@
 //! - **Request correlation.** A bare `Unavailable` names no group and an `OutboundFailure`
 //!   carries nothing but a request id, so without a map from id to what we asked, the group
 //!   layer could not be told *what* failed.
-//! - **Waiting for connectivity to settle.** Admission runs the moment a connection exists,
-//!   relayed or not, and must not wait. Group sync does wait, so a transfer is not started
-//!   over a relay about to be replaced by a direct connection.
+//!
+//! Who is admitted and settled it does *not* own: that is `ac_net::roster::Roster`, borrowed
+//! on every call rather than mirrored here.
 //!
 //! The wording of everything a person reads about groups is also here, so `ac-groups` can
 //! return a typed `Notice` and its own tests assert on meaning rather than on phrasing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use libp2p::{PeerId, request_response};
 
 use ac_net::config::Paths;
-use ac_net::connectivity::{Connectivity, State as ConnState};
 use ac_net::identity::Identity;
+use ac_net::roster::Roster;
 
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
@@ -42,13 +42,8 @@ use crate::file_link::RoundOutcome;
 /// map here rather than in `ac-groups` is what keeps `OutboundRequestId` — a libp2p type — out
 /// of that crate.
 enum Outbound {
-    Ask {
-        peer: PeerId,
-    },
-    Fetch {
-        peer: PeerId,
-        group: GroupId,
-    },
+    Ask { peer: PeerId },
+    Fetch { peer: PeerId, group: GroupId },
 }
 
 /// The only place a swarm and `ac-groups` are named together.
@@ -65,17 +60,6 @@ pub struct GroupLink {
     /// talk to a peer, and the one thing it cannot work out for itself is whether a given
     /// exchange delivered anything.
     rounds: Vec<RoundOutcome>,
-    /// Peers that passed attestation but whose connection has not settled yet.
-    ///
-    /// Attestation finishes in about a second, over whatever connection exists — often a
-    /// relayed one with a hole punch still in flight. Syncing then would compete with the
-    /// DCUtR coordination on that same circuit and, if the punch lands moments later, would
-    /// have used the slow path for nothing. So they wait here until the shape of the
-    /// connection has stopped changing.
-    settling: HashSet<PeerId>,
-    /// Peers the group layer has been told about, so a `PeerGone` only ever follows a
-    /// `PeerVerified` it actually saw.
-    announced: HashSet<PeerId>,
 }
 
 impl GroupLink {
@@ -88,8 +72,6 @@ impl GroupLink {
             sync: GroupSync::new(store, identity.keypair().clone()),
             outbound: HashMap::new(),
             rounds: Vec::new(),
-            settling: HashSet::new(),
-            announced: HashSet::new(),
         })
     }
 
@@ -112,76 +94,40 @@ impl GroupLink {
         self.outbound.insert(id, Outbound::Ask { peer });
     }
 
-    /// A peer completed mutual attestation. It is not usable to the group layer yet.
-    pub fn attested(&mut self, peer: PeerId) {
-        self.settling.insert(peer);
-    }
-
     /// Whether a chain exchange with this peer is still outstanding.
     ///
     /// Asked by the supervisor before it hangs up. Membership arrives over *this* protocol, and
     /// nothing about it is visible to `ac-peers` — so without this a freshly connected peer
     /// looks idle the instant it is verified and is closed a few milliseconds later, before the
     /// group it was about to be told about has reached it.
-    pub fn busy_with(&self, peer: &PeerId) -> bool {
-        self.settling.contains(peer)
-            || self.outbound.values().any(|out| match out {
-                Outbound::Ask { peer: p } | Outbound::Fetch { peer: p, .. } => p == peer,
-            })
-    }
-
-    /// Whether the group layer has been told about this peer.
     ///
-    /// A connection is not the same thing: a peer stays in `settling` until its connection
-    /// stops changing shape, and until then every request from it is refused. Tests that mean
-    /// "ready to talk" have to wait on this rather than on `is_connected`, or they race the
-    /// promotion and read a refusal as if it were the answer.
-    #[cfg(test)]
-    pub(crate) fn knows(&self, peer: &PeerId) -> bool {
-        self.announced.contains(peer)
+    /// The other half of that — a peer admitted but not yet settled — is the roster's answer
+    /// now, and `PeerLink::drained` asks it there.
+    pub fn busy_with(&self, peer: &PeerId) -> bool {
+        self.outbound.values().any(|out| match out {
+            Outbound::Ask { peer: p } | Outbound::Fetch { peer: p, .. } => p == peer,
+        })
     }
 
-    pub fn on_disconnected(&mut self, swarm: &mut ClientSwarm, peer: PeerId) {
-        self.settling.remove(&peer);
-        if self.announced.remove(&peer) {
-            let actions = self.sync.on(GroupEvent::PeerGone { peer });
-            self.dispatch(swarm, actions);
-        }
-    }
-
-    /// Promote peers whose connection has settled, then drive the machine's clock.
+    /// Drive the machine's clock.
     ///
     /// `now` is passed in rather than read here, so the group layer's schedules can be driven
     /// deterministically from a test — the same reason its `Tick` carries a clock at all.
     pub fn housekeeping(
         &mut self,
         swarm: &mut ClientSwarm,
-        connectivity: &Connectivity,
+        roster: &Roster,
         now: Instant,
         at: i64,
     ) {
-        let ready: Vec<PeerId> = self
-            .settling
-            .iter()
-            .copied()
-            .filter(|peer| settled(connectivity, peer))
-            .collect();
-
-        for peer in ready {
-            self.settling.remove(&peer);
-            if self.announced.insert(peer) {
-                let actions = self.sync.on(GroupEvent::PeerVerified { peer });
-                self.dispatch(swarm, actions);
-            }
-        }
-
-        let actions = self.sync.on(GroupEvent::Tick { now, at });
+        let actions = self.sync.on(GroupEvent::Tick { now, at }, roster);
         self.dispatch(swarm, actions);
     }
 
     pub fn on_event(
         &mut self,
         swarm: &mut ClientSwarm,
+        roster: &Roster,
         event: request_response::Event<GroupRequest, GroupResponse>,
     ) {
         use request_response::{Event, Message};
@@ -199,7 +145,7 @@ impl GroupLink {
                 // `on_request` is total — always exactly one response — so the channel is
                 // always consumed and can never be stranded. That is why `GroupAction` has
                 // no `Respond` variant to defer.
-                let (response, actions) = self.sync.on_request(peer, request);
+                let (response, actions) = self.sync.on_request(peer, request, roster);
                 let _ = swarm
                     .behaviour_mut()
                     .app
@@ -219,7 +165,7 @@ impl GroupLink {
             } => match (self.outbound.remove(&request_id), response) {
                 (Some(Outbound::Ask { .. }), GroupResponse::Heads(heads)) => {
                     self.rounds.push(RoundOutcome::Asked { peer });
-                    self.sync.on(GroupEvent::Heads { peer, heads })
+                    self.sync.on(GroupEvent::Heads { peer, heads }, roster)
                 }
                 (
                     Some(Outbound::Fetch { group, .. }),
@@ -229,16 +175,19 @@ impl GroupLink {
                         entries,
                         standings,
                     },
-                ) if answered == group => self.sync.on(GroupEvent::Entries {
-                    peer,
-                    group,
-                    from,
-                    entries,
-                    standings,
-                }),
-                (Some(Outbound::Fetch { group, .. }), GroupResponse::Unavailable) => {
-                    self.sync.on(GroupEvent::Unavailable { peer, group })
-                }
+                ) if answered == group => self.sync.on(
+                    GroupEvent::Entries {
+                        peer,
+                        group,
+                        from,
+                        entries,
+                        standings,
+                    },
+                    roster,
+                ),
+                (Some(Outbound::Fetch { group, .. }), GroupResponse::Unavailable) => self
+                    .sync
+                    .on(GroupEvent::Unavailable { peer, group }, roster),
                 // A reply of the wrong shape for what we asked, or about a different group.
                 // Dropped rather than guessed at: the arms above are the only pairings the
                 // protocol defines, and a peer does not get to choose what we asked.
@@ -246,13 +195,13 @@ impl GroupLink {
             },
 
             Event::OutboundFailure { request_id, .. } => match self.outbound.remove(&request_id) {
-                Some(Outbound::Fetch { peer, group }) => {
-                    self.sync.on(GroupEvent::FetchFailed { peer, group })
-                }
+                Some(Outbound::Fetch { peer, group }) => self
+                    .sync
+                    .on(GroupEvent::FetchFailed { peer, group }, roster),
                 Some(Outbound::Ask { peer }) => {
                     self.rounds.push(RoundOutcome::Asked { peer });
                     self.rounds.push(RoundOutcome::Failed { peer });
-                    self.sync.on(GroupEvent::AskFailed { peer })
+                    self.sync.on(GroupEvent::AskFailed { peer }, roster)
                 }
                 None => return,
             },
@@ -284,20 +233,6 @@ impl GroupLink {
             }
         }
     }
-}
-
-/// Whether a peer's connection has stopped changing shape.
-///
-/// [`ac_net::connectivity::PeerState::effective_state`], not the raw state: only DCUtR's
-/// initiator is told when a punch fails, so the other side would wait on the raw value
-/// forever. `effective_state` turns a pending upgrade older than `UPGRADE_TIMEOUT` into a
-/// settled `Relayed`, which is the honest verdict for a pair that cannot punch at all — and
-/// `connectivity.rs` is explicit that relayed is a correct final answer, not a degraded one.
-pub(crate) fn settled(connectivity: &Connectivity, peer: &PeerId) -> bool {
-    !matches!(
-        connectivity.get(peer).map(|s| s.effective_state()),
-        Some(ConnState::UpgradePending)
-    )
 }
 
 /// Put a group-layer notice in front of a person.
@@ -361,10 +296,12 @@ mod tests {
     // rewriting its dispatch in the test would prove only that the copy works.
 
     use ac_groups::chain::Op;
-    use ac_groups::standing::Position;
     use ac_groups::id::GroupId;
+    use ac_groups::standing::Position;
     use ac_groups::wire::{GroupRequest, GroupResponse};
     use ac_net::config::Config;
+    use ac_net::connectivity::Connectivity;
+    use ac_net::roster::Roster;
     use libp2p::futures::StreamExt;
 
     const WIRE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -375,6 +312,7 @@ mod tests {
         swarm: ClientSwarm,
         link: GroupLink,
         conn: Connectivity,
+        roster: Roster,
         peer: PeerId,
         /// Replies observed on the wire, for assertions the adapter would otherwise swallow.
         seen: Vec<GroupResponse>,
@@ -401,6 +339,7 @@ mod tests {
                 swarm: build(&identity, &config, Role::Client, AcceptAnyPeer, app()).unwrap(),
                 link: GroupLink::open(&paths, &identity).unwrap(),
                 conn: Connectivity::default(),
+                roster: Roster::default(),
                 peer: identity.peer_id(),
                 seen: Vec::new(),
                 _dir: dir,
@@ -409,20 +348,21 @@ mod tests {
 
         /// The daemon's own routing, minus admission.
         ///
-        /// Attestation is bypassed — `attested` is called straight off the connection — so
-        /// these tests exercise the group path without also standing up a server to issue
-        /// credentials. Admission has its own tests above and in `ac-net`.
+        /// Attestation is bypassed — the peer is put in the roster straight off the
+        /// connection — so these tests exercise the group path without also standing up a
+        /// server to issue credentials. Admission has its own tests above and in `ac-net`.
         fn step(&mut self, event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
             track(&mut self.conn, &self.swarm, &event);
 
             match &event {
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => self.link.attested(*peer_id),
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    self.roster.admitted(*peer_id);
+                }
                 // A peer legitimately holds two connections while an upgrade settles, so
                 // one closing is not the peer leaving.
-                SwarmEvent::ConnectionClosed { peer_id, .. }
-                    if !self.swarm.is_connected(peer_id) =>
-                {
-                    self.link.on_disconnected(&mut self.swarm, *peer_id);
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    let still = self.swarm.is_connected(peer_id);
+                    self.roster.disconnected(peer_id, still);
                 }
                 _ => {}
             }
@@ -440,7 +380,7 @@ mod tests {
                 {
                     self.seen.push(response.clone());
                 }
-                self.link.on_event(&mut self.swarm, event);
+                self.link.on_event(&mut self.swarm, &self.roster, event);
             }
         }
 
@@ -451,8 +391,9 @@ mod tests {
         /// wasteful and exactly right here: it is what a supervisor with no record of the peer
         /// would do, and it lets the exchange start as soon as the connection settles.
         fn tick(&mut self) {
+            self.roster.promote(&self.conn);
             self.link
-                .housekeeping(&mut self.swarm, &self.conn, Instant::now(), AT);
+                .housekeeping(&mut self.swarm, &self.roster, Instant::now(), AT);
 
             let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
             for peer in peers {
@@ -650,8 +591,12 @@ mod tests {
             .unwrap()
             .0;
         let store = bob.link.sync.store_mut();
-        store.author_standing(key.keypair(), id, Position::In, AT).unwrap();
-        store.author_standing(key.keypair(), id, Position::Out, AT).unwrap();
+        store
+            .author_standing(key.keypair(), id, Position::In, AT)
+            .unwrap();
+        store
+            .author_standing(key.keypair(), id, Position::Out, AT)
+            .unwrap();
         assert!(
             alice
                 .link
@@ -704,7 +649,7 @@ mod tests {
             // `settling`, so asking before she has promoted carol would test that refusal
             // instead of the membership one — and carol never re-asks, so the exchange would
             // then simply never produce the answer under test.
-            a.link.knows(&carol_peer) && c.link.knows(&alice_peer)
+            a.roster.is_ready(&carol_peer) && c.roster.is_ready(&alice_peer)
         })
         .await;
 

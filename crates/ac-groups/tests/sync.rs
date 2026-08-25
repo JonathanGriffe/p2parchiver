@@ -1,10 +1,3 @@
-//! The sync policy, driven by hand.
-//!
-//! Every test here feeds [`GroupEvent`]s to a [`GroupSync`] backed by an in-memory store and
-//! asserts on the [`GroupAction`]s that come back. No swarm, no socket, no tokio, no sleeping
-//! — which is the whole point of the machine returning actions instead of performing them.
-
-// An integration test is its own crate, so the library's test-only allow does not reach here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Instant;
@@ -16,7 +9,9 @@ use ac_groups::store::{Groups, State};
 use ac_groups::sync::{GroupAction, GroupEvent, GroupSync, Notice};
 use ac_groups::wire::{GroupHead, GroupRequest, GroupResponse};
 use ac_net::PeerId;
+use ac_net::connectivity::Connectivity;
 use ac_net::identity::Keypair;
+use ac_net::roster::Roster;
 
 const AT: i64 = 1_000_000;
 
@@ -35,6 +30,7 @@ fn sync_for(k: &Keypair) -> GroupSync {
 /// Everything one side needs to be driven: its machine and its own key.
 struct Node {
     key: Keypair,
+    roster: Roster,
     sync: GroupSync,
 }
 
@@ -43,6 +39,7 @@ impl Node {
         let key = key();
         Self {
             sync: sync_for(&key),
+            roster: Roster::default(),
             key,
         }
     }
@@ -51,12 +48,37 @@ impl Node {
         peer_of(&self.key)
     }
 
+    /// Admit a peer and promote them, as the daemon's roster would.
+    ///
+    /// An empty `Connectivity` promotes everyone: `settled` is false only while a hole punch
+    /// is still in flight, and these tests have no connections at all.
     fn verify(&mut self, other: PeerId) -> Vec<GroupAction> {
-        self.sync.on(GroupEvent::PeerVerified { peer: other })
+        self.roster.admitted(other);
+        self.roster.promote(&Connectivity::default());
+        Vec::new()
+    }
+
+    /// Every call into the machine carries the roster, so who is admitted is asked rather
+    /// than remembered.
+    fn sync_on(&mut self, event: GroupEvent) -> Vec<GroupAction> {
+        self.sync.on(event, &self.roster)
+    }
+
+    fn sync_on_request(
+        &mut self,
+        peer: PeerId,
+        request: GroupRequest,
+    ) -> (GroupResponse, Vec<GroupAction>) {
+        self.sync.on_request(peer, request, &self.roster)
+    }
+
+    /// A peer that has gone. The roster forgets them; nothing else needs telling.
+    fn forget(&mut self, other: PeerId) {
+        self.roster.disconnected(&other, false);
     }
 
     fn tick(&mut self) -> Vec<GroupAction> {
-        self.sync.on(GroupEvent::Tick {
+        self.sync_on(GroupEvent::Tick {
             now: Instant::now(),
             at: AT,
         })
@@ -71,9 +93,8 @@ enum Step {
     Act(GroupAction),
 }
 
-/// The groups `node` would name to `peer` if asked — the pull's whole outbound surface.
 fn asked(node: &mut Node, peer: PeerId) -> Vec<GroupId> {
-    match node.sync.on_request(peer, GroupRequest::Ask).0 {
+    match node.sync_on_request(peer, GroupRequest::Ask).0 {
         GroupResponse::Heads(heads) => heads.into_iter().map(|h| h.group).collect(),
         other => panic!("expected heads, got {other:?}"),
     }
@@ -90,12 +111,6 @@ fn fetches(actions: &[GroupAction]) -> Vec<(PeerId, GroupId, u64)> {
 }
 
 /// Dispatch actions between two nodes until nothing is left to send.
-///
-/// This is what the daemon does, and the reason the tests use it rather than hand-carrying
-/// one message: **every** action is dispatched, including the ones a responder produces while
-/// answering. A harness that quietly drops an action leaves a fetch in flight, which blocks
-/// that group until it times out — and then tests fail for reasons that have nothing to do
-/// with what they are checking.
 fn settle(a: &mut Node, b: &mut Node, seed: Vec<(Side, Step)>) -> Vec<Notice> {
     let mut queue = seed;
     let mut notes = Vec::new();
@@ -139,17 +154,11 @@ fn step(
         Step::Act(GroupAction::Note(n)) => notes.push(n),
 
         Step::Ask => {
-            let (response, theirs) = receiver
-                .sync
-                .on_request(sender.peer(), GroupRequest::Ask);
-            queue.extend(
-                theirs
-                    .into_iter()
-                    .map(|x| (side.other(), Step::Act(x))),
-            );
+            let (response, theirs) = receiver.sync_on_request(sender.peer(), GroupRequest::Ask);
+            queue.extend(theirs.into_iter().map(|x| (side.other(), Step::Act(x))));
 
             if let GroupResponse::Heads(heads) = response {
-                let back = sender.sync.on(GroupEvent::Heads {
+                let back = sender.sync_on(GroupEvent::Heads {
                     peer: receiver.peer(),
                     heads,
                 });
@@ -158,14 +167,9 @@ fn step(
         }
 
         Step::Act(GroupAction::Fetch { group, from, .. }) => {
-            let (response, theirs) = receiver
-                .sync
-                .on_request(sender.peer(), GroupRequest::Fetch { group, from });
-            queue.extend(
-                theirs
-                    .into_iter()
-                    .map(|x| (side.other(), Step::Act(x))),
-            );
+            let (response, theirs) =
+                receiver.sync_on_request(sender.peer(), GroupRequest::Fetch { group, from });
+            queue.extend(theirs.into_iter().map(|x| (side.other(), Step::Act(x))));
 
             let event = match response {
                 GroupResponse::Entries {
@@ -185,7 +189,7 @@ fn step(
                     group,
                 },
             };
-            let back = sender.sync.on(event);
+            let back = sender.sync_on(event);
             queue.extend(back.into_iter().map(|x| (side, Step::Act(x))));
         }
     }
@@ -193,18 +197,11 @@ fn step(
 
 /// Connect two nodes and let them sync to quiescence. `a` is [`Side::A`].
 /// Verify both ways and let each side offer, as the supervisor does on a fresh connection.
-///
-/// The offer is seeded here rather than produced by `PeerVerified`, because deciding *when* to
-/// talk to a peer belongs to `ac-peers` — this machine only decides what to say. Playing that
-/// part explicitly is what keeps these tests about the chain rules.
 fn connect(a: &mut Node, b: &mut Node) -> Vec<Notice> {
     a.verify(b.peer());
     b.verify(a.peer());
 
-    let seed = vec![
-        (Side::A, Step::Ask),
-        (Side::B, Step::Ask),
-    ];
+    let seed = vec![(Side::A, Step::Ask), (Side::B, Step::Ask)];
     settle(a, b, seed)
 }
 
@@ -250,7 +247,6 @@ fn add(admin: &mut Node, id: GroupId, peer: PeerId, name: &str) {
         .unwrap();
 }
 
-/// Connect, sync, and accept — a member fully joined and participating.
 fn join(admin: &mut Node, member: &mut Node, id: GroupId) {
     connect(admin, member);
     member
@@ -262,18 +258,12 @@ fn join(admin: &mut Node, member: &mut Node, id: GroupId) {
 
 #[test]
 fn an_answer_names_exactly_the_shared_groups() {
-    // `log_shared_with` is the only thing allowed to build a head bound for a peer, and this is
-    // what it comes to: a member is named the group, a stranger is named nothing at all — not
-    // even that it exists.
     let (mut admin, member, id) = admin_and_member();
     let stranger = Node::new();
     admin.verify(member.peer());
     admin.verify(stranger.peer());
 
-    assert_eq!(
-        asked(&mut admin, member.peer()),
-        vec![id]
-    );
+    assert_eq!(asked(&mut admin, member.peer()), vec![id]);
     assert!(asked(&mut admin, stranger.peer()).is_empty());
 }
 
@@ -329,7 +319,6 @@ fn receiving_an_invitation_is_answered_in_writing_and_only_once() {
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].verify(id).unwrap().seq, 1);
 
-    // And it reaches the admin, which is the whole point — without ratifying anything.
     let seen = admin.sync.store().standings(id).unwrap();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].verify(id).unwrap().position, Position::Unanswered);
@@ -352,7 +341,7 @@ fn an_answer_never_provokes_another_question() {
     admin.verify(member.peer());
     member.verify(admin.peer());
 
-    let actions = member.sync.on(GroupEvent::Heads {
+    let actions = member.sync_on(GroupEvent::Heads {
         peer: admin.peer(),
         heads: Vec::new(),
     });
@@ -370,15 +359,11 @@ fn a_non_member_is_told_nothing_however_it_asks() {
     let stranger = Node::new();
     admin.verify(stranger.peer());
 
-    let (offer, _) = admin
-        .sync
-        .on_request(stranger.peer(), GroupRequest::Ask);
+    let (offer, _) = admin.sync_on_request(stranger.peer(), GroupRequest::Ask);
     assert_eq!(offer, GroupResponse::Heads(Vec::new()));
 
-    // Even naming the group id exactly — which a stranger should not know — reveals nothing.
-    let (fetch, _) = admin
-        .sync
-        .on_request(stranger.peer(), GroupRequest::Fetch { group: id, from: 0 });
+    let (fetch, _) =
+        admin.sync_on_request(stranger.peer(), GroupRequest::Fetch { group: id, from: 0 });
     assert_eq!(fetch, GroupResponse::Unavailable);
 }
 
@@ -387,14 +372,11 @@ fn an_unverified_peer_is_answered_nothing() {
     let (mut admin, _member, id) = admin_and_member();
     let unknown = Node::new();
 
-    let (offer, _) = admin
-        .sync
-        .on_request(unknown.peer(), GroupRequest::Ask);
+    let (offer, _) = admin.sync_on_request(unknown.peer(), GroupRequest::Ask);
     assert_eq!(offer, GroupResponse::Unavailable);
 
-    let (fetch, _) = admin
-        .sync
-        .on_request(unknown.peer(), GroupRequest::Fetch { group: id, from: 0 });
+    let (fetch, _) =
+        admin.sync_on_request(unknown.peer(), GroupRequest::Fetch { group: id, from: 0 });
     assert_eq!(fetch, GroupResponse::Unavailable);
 }
 
@@ -414,7 +396,7 @@ fn a_late_or_unsolicited_response_is_ignored() {
         .cloned()
         .collect();
 
-    let actions = member.sync.on(GroupEvent::Entries {
+    let actions = member.sync_on(GroupEvent::Entries {
         peer: admin.peer(),
         group: id,
         from: 0,
@@ -437,11 +419,11 @@ fn two_offers_for_one_group_produce_a_single_fetch() {
     member.verify(other.peer());
 
     let head = admin.sync.store().get(id).unwrap().unwrap().head();
-    let first = member.sync.on(GroupEvent::Heads {
+    let first = member.sync_on(GroupEvent::Heads {
         peer: admin.peer(),
         heads: vec![head.clone()],
     });
-    let second = member.sync.on(GroupEvent::Heads {
+    let second = member.sync_on(GroupEvent::Heads {
         peer: other.peer(),
         heads: vec![head],
     });
@@ -606,9 +588,8 @@ fn a_node_that_has_left_still_answers_so_its_departure_can_travel() {
     );
 
     member.verify(admin.peer());
-    let (response, _) = member
-        .sync
-        .on_request(admin.peer(), GroupRequest::Fetch { group: id, from: 0 });
+    let (response, _) =
+        member.sync_on_request(admin.peer(), GroupRequest::Fetch { group: id, from: 0 });
     let GroupResponse::Entries { standings, .. } = response else {
         panic!("a node that has left must still answer a member, got {response:?}");
     };
@@ -619,13 +600,9 @@ fn a_node_that_has_left_still_answers_so_its_departure_can_travel() {
 fn a_peer_that_disconnects_is_forgotten() {
     let (mut admin, member, _id) = admin_and_member();
     admin.verify(member.peer());
-    admin.sync.on(GroupEvent::PeerGone {
-        peer: member.peer(),
-    });
+    admin.forget(member.peer());
 
-    let (response, _) = admin
-        .sync
-        .on_request(member.peer(), GroupRequest::Ask);
+    let (response, _) = admin.sync_on_request(member.peer(), GroupRequest::Ask);
     assert_eq!(
         response,
         GroupResponse::Unavailable,
@@ -638,12 +615,7 @@ fn a_flood_of_requests_is_refused_and_refills_on_the_tick() {
     let (mut admin, member, _id) = admin_and_member();
     admin.verify(member.peer());
 
-    let ask = |admin: &mut Node| {
-        admin
-            .sync
-            .on_request(member.peer(), GroupRequest::Ask)
-            .0
-    };
+    let ask = |admin: &mut Node| admin.sync_on_request(member.peer(), GroupRequest::Ask).0;
 
     let refused = (0..40)
         .filter(|_| ask(&mut admin) == GroupResponse::Unavailable)
@@ -670,7 +642,7 @@ fn a_stranger_offering_many_unknown_groups_writes_nothing() {
         })
         .collect();
 
-    let actions = node.sync.on(GroupEvent::Heads {
+    let actions = node.sync_on(GroupEvent::Heads {
         peer: stranger.peer(),
         heads: junk,
     });

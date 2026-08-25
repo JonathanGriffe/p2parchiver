@@ -1,18 +1,3 @@
-//! The application slot in [`AcBehaviour`], exercised with a real protocol.
-//!
-//! Every other test mounts `dummy::Behaviour`, which proves only that the generic parameter
-//! compiles. This mounts something that actually speaks — a request-response protocol defined
-//! *here*, in a crate that is not `ac-net` — and drives a full exchange over a real
-//! connection.
-//!
-//! That is the property the whole layering rests on: an application protocol can live outside
-//! `ac-net`, be mounted by the binary, negotiate over the same connection as `identify` and
-//! `ping`, and surface as `AcBehaviourEvent::App`. If this test fails, a future `ac-groups`
-//! cannot work, and the reason will be far harder to see once there is a membership log on top
-//! of it.
-
-// An integration test is its own crate, so the library's test-only allow does not reach here.
-// In a test a panic is the failure report.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Duration;
@@ -157,9 +142,6 @@ async fn an_application_protocol_mounted_by_the_binary_carries_a_round_trip() {
 
 #[tokio::test]
 async fn the_slot_does_not_disturb_the_protocols_around_it() {
-    // The app behaviour shares a connection with identify, ping and the rest. Mounting one
-    // must not shadow or reorder them — a regression here would look like "groups broke
-    // NAT traversal", which is a miserable thing to debug from that end.
     let (id_a, id_b) = (identity(), identity());
     let (peer_a, peer_b) = (id_a.peer_id(), id_b.peer_id());
 

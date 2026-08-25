@@ -19,15 +19,15 @@
 //! its own, because two peers who already agree exchange nothing and silence looks identical
 //! to a round that never started.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use libp2p::{PeerId, request_response};
 
 use ac_net::config::{Config, Paths};
-use ac_net::connectivity::Connectivity;
 use ac_net::identity::Identity;
+use ac_net::roster::Roster;
 
 use ac_files::content::Content;
 use ac_files::store::Files;
@@ -79,13 +79,6 @@ pub struct FileLink {
     outbound: HashMap<request_response::OutboundRequestId, (PeerId, Outbound)>,
     /// Round outcomes waiting to be handed to the supervisor, drained each tick.
     rounds: Vec<RoundOutcome>,
-    /// Peers that passed attestation but whose connection has not settled yet. Same reasoning
-    /// as `GroupLink::settling`, and more acute here: a transfer started on a circuit that is
-    /// about to be replaced wastes the slow path for the whole of a large file.
-    settling: HashSet<PeerId>,
-    /// Peers the file layer has been told about, so a `PeerGone` only ever follows a
-    /// `PeerVerified` it actually saw.
-    announced: HashSet<PeerId>,
     /// Where a spawned task opens its own handles.
     db: std::path::PathBuf,
 }
@@ -144,8 +137,6 @@ impl FileLink {
             sync: FileSync::new(files, groups, content),
             outbound: HashMap::new(),
             rounds: Vec::new(),
-            settling: HashSet::new(),
-            announced: HashSet::new(),
             db: path,
         })
     }
@@ -202,8 +193,12 @@ impl FileLink {
     /// `FileSync` still starts offers of its own — on promotion, and when our digest moves —
     /// so not every manifest request in flight is one the supervisor asked for. Hanging up on
     /// one would cut a catalogue exchange the supervisor never knew had started.
+    ///
+    /// The other half of that — a peer admitted but not yet settled, whose transfer would run
+    /// on a circuit about to be replaced — is the roster's answer now, and `PeerLink::drained`
+    /// asks it there.
     pub fn busy_with(&self, peer: &PeerId) -> bool {
-        self.settling.contains(peer) || self.outbound.values().any(|(p, _)| p == peer)
+        self.outbound.values().any(|(p, _)| p == peer)
     }
 
     /// Bytes of content this node holds, across every group. Feeds the storage budget.
@@ -216,49 +211,22 @@ impl FileLink {
         self.sync.dir_of(group)
     }
 
-    /// A peer completed mutual attestation. It is not usable to the file layer yet.
-    pub fn attested(&mut self, peer: PeerId) {
-        self.settling.insert(peer);
-    }
-
-    pub fn on_disconnected(&mut self, swarm: &mut ClientSwarm, peer: PeerId) {
-        self.settling.remove(&peer);
-        if self.announced.remove(&peer) {
-            let actions = self.sync.on(FileEvent::PeerGone { peer });
-            self.dispatch(swarm, actions);
-        }
-    }
-
-    /// Promote settled peers, collect finished transfers, then drive the machine's clock.
+    /// Drive the machine's clock.
     pub fn housekeeping(
         &mut self,
         swarm: &mut ClientSwarm,
-        connectivity: &Connectivity,
+        roster: &Roster,
         now: Instant,
         at: i64,
     ) {
-        let ready: Vec<PeerId> = self
-            .settling
-            .iter()
-            .copied()
-            .filter(|peer| crate::group_link::settled(connectivity, peer))
-            .collect();
-
-        for peer in ready {
-            self.settling.remove(&peer);
-            if self.announced.insert(peer) {
-                let actions = self.sync.on(FileEvent::PeerVerified { peer });
-                self.dispatch(swarm, actions);
-            }
-        }
-
-        let actions = self.sync.on(FileEvent::Tick { now, at });
+        let actions = self.sync.on(FileEvent::Tick { now, at }, roster);
         self.dispatch(swarm, actions);
     }
 
     pub fn on_event(
         &mut self,
         swarm: &mut ClientSwarm,
+        roster: &Roster,
         event: request_response::Event<ManifestRequest, ManifestResponse>,
     ) {
         use request_response::{Event, Message};
@@ -276,7 +244,7 @@ impl FileLink {
                 // `on_request` is total — always exactly one response — so the channel is
                 // always consumed and can never be stranded. That is why `FileAction` has no
                 // `Respond` variant to defer.
-                let (response, actions) = self.sync.on_request(peer, request);
+                let (response, actions) = self.sync.on_request(peer, request, roster);
                 let _ = swarm
                     .behaviour_mut()
                     .app
@@ -304,7 +272,7 @@ impl FileLink {
                 match (what, response) {
                     (Outbound::Ask, ManifestResponse::Heads(heads)) => {
                         self.rounds.push(RoundOutcome::Asked { peer });
-                        self.sync.on(FileEvent::Heads { peer, heads })
+                        self.sync.on(FileEvent::Heads { peer, heads }, roster)
                     }
                     // An ask answered with anything else — a refusal, or a reply to a question
                     // we did not put — reconciled nothing. `FileSync` sees such an answer as
@@ -324,17 +292,20 @@ impl FileLink {
                             more,
                             digest,
                         },
-                    ) if answered == group => self.sync.on(FileEvent::Changes {
-                        peer,
-                        group,
-                        after,
-                        entries,
-                        next,
-                        more,
-                        digest,
-                    }),
+                    ) if answered == group => self.sync.on(
+                        FileEvent::Changes {
+                            peer,
+                            group,
+                            after,
+                            entries,
+                            next,
+                            more,
+                            digest,
+                        },
+                        roster,
+                    ),
                     (Outbound::Changes { group, .. }, ManifestResponse::Unavailable) => {
-                        self.sync.on(FileEvent::Unavailable { peer, group })
+                        self.sync.on(FileEvent::Unavailable { peer, group }, roster)
                     }
                     // Dropped rather than guessed at: the arms above are the only pairings the
                     // protocol defines, and a peer does not choose what we asked.
@@ -354,7 +325,8 @@ impl FileLink {
                     }
                     _ => None,
                 };
-                self.sync.on(FileEvent::RequestFailed { peer, group })
+                self.sync
+                    .on(FileEvent::RequestFailed { peer, group }, roster)
             }
 
             _ => return,
@@ -393,7 +365,6 @@ impl FileLink {
     fn dispatch(&mut self, swarm: &mut ClientSwarm, actions: Vec<FileAction>) {
         for action in actions {
             match action {
-
                 FileAction::FetchChanges { peer, group, after } => {
                     let id = swarm
                         .behaviour_mut()

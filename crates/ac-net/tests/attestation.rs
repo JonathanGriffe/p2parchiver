@@ -1,16 +1,3 @@
-//! The mutual attestation exchange, over a real connection between two swarms.
-//!
-//! The unit tests in `ac_net::attest` prove the verification *logic*; this proves the
-//! protocol is actually mounted, negotiable between two clients, and that an attestation
-//! survives the wire intact — a signature checked over bytes that were re-encoded in
-//! transit would pass every unit test and fail in production.
-//!
-//! What it deliberately does not test is the daemon's *reaction* to a verdict (closing the
-//! connection), which lives in `ac-node` and needs the whole event loop. Here the verdict
-//! itself is the assertion.
-
-// An integration test is its own crate, so the library's test-only allow does not reach
-// here. In a test a panic is the failure report.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Duration;
@@ -72,9 +59,6 @@ async fn first_listen_addr(swarm: &mut ClientSwarm) -> Multiaddr {
 }
 
 /// One node's half of the exchange: send ours on connect, verify theirs on arrival.
-///
-/// Mirrors what `ac-node`'s daemon does, minus the closing — symmetric, so neither side is
-/// the interrogator and both reach their own verdict.
 fn step(
     swarm: &mut ClientSwarm,
     event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, NoApp>>,
@@ -247,9 +231,6 @@ async fn an_attestation_from_another_server_is_refused() {
 
 #[tokio::test]
 async fn a_stolen_attestation_does_not_travel() {
-    // b presents a genuine, unexpired, correctly-signed attestation — issued to somebody
-    // else. This is the check that makes an attestation useless to copy: presenting one
-    // means also holding the key it names, and then you are simply its subject.
     let server_key = Keypair::generate_ed25519();
     let server = server_key.public().to_peer_id();
 

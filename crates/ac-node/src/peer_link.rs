@@ -28,16 +28,16 @@
 //! offers each manifest event here first and passes on whatever this does not claim. Rounds go
 //! the other way — the supervisor decides *when*, and `FileLink` knows *what* to say.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, request_response};
 
 use ac_net::config::{Config, Paths};
-use ac_net::connectivity::Connectivity;
 use ac_net::identity::Identity;
 use ac_net::proto::{PresenceRequest, PresenceResponse};
+use ac_net::roster::Roster;
 
 use ac_files::content::Content;
 use ac_files::path::RelPath;
@@ -76,10 +76,6 @@ pub struct PeerLink {
     /// Presence queries outstanding, and who each asked about. The answer is a filter, so
     /// without the question it cannot be applied to anything.
     presence: HashMap<request_response::OutboundRequestId, Vec<PeerId>>,
-    /// Peers that passed attestation but whose connection has not settled yet.
-    settling: HashSet<PeerId>,
-    /// Peers the supervisor has been told about, so a `Gone` only follows a `Verified` it saw.
-    announced: HashSet<PeerId>,
     /// The server: never proposed to, and the only peer presence can be asked of.
     server: Option<PeerId>,
     /// Where the server is, for building circuit addresses.
@@ -131,8 +127,6 @@ impl PeerLink {
             holdings: HashMap::new(),
             proposals: HashMap::new(),
             presence: HashMap::new(),
-            settling: HashSet::new(),
-            announced: HashSet::new(),
             server,
             relay: config.server.clone(),
             direct: HashMap::new(),
@@ -144,8 +138,21 @@ impl PeerLink {
     }
 
     /// A peer completed mutual attestation. It is not usable to the supervisor yet.
-    pub fn attested(&mut self, peer: PeerId) {
-        self.settling.insert(peer);
+    /// The roster promoted this peer: admitted, and its connection has stopped changing shape.
+    ///
+    /// The only one of the three layers that still wants telling. `FileSync` and `GroupSync`
+    /// read the roster where they need it, but this arm does work no poll could reproduce —
+    /// it resets the peer's backoff and *puts the question* that starts a pull.
+    pub fn peer_ready(
+        &mut self,
+        swarm: &mut ClientSwarm,
+        files: &mut FileLink,
+        groups: &mut GroupLink,
+        roster: &Roster,
+        peer: PeerId,
+    ) {
+        let actions = self.peers.on(PeerEvent::Verified { peer });
+        self.dispatch(swarm, files, groups, roster, actions);
     }
 
     /// Discovery saw this peer. A liveness hint, and possibly an address worth preferring.
@@ -156,6 +163,7 @@ impl PeerLink {
         files: &mut FileLink,
         groups: &mut GroupLink,
         swarm: &mut ClientSwarm,
+        roster: &Roster,
     ) {
         // A circuit address tells us nothing we could not rebuild ourselves, and preferring it
         // over the one we would construct only risks pinning a stale relay.
@@ -166,7 +174,7 @@ impl PeerLink {
             self.direct.insert(peer, addr.clone());
         }
         let actions = self.peers.on(PeerEvent::Discovered { peer });
-        self.dispatch(swarm, files, groups, actions);
+        self.dispatch(swarm, files, groups, roster, actions);
     }
 
     pub fn on_disconnected(
@@ -174,13 +182,11 @@ impl PeerLink {
         swarm: &mut ClientSwarm,
         files: &mut FileLink,
         groups: &mut GroupLink,
+        roster: &Roster,
         peer: PeerId,
     ) {
-        self.settling.remove(&peer);
-        if self.announced.remove(&peer) {
-            let actions = self.peers.on(PeerEvent::Gone { peer });
-            self.dispatch(swarm, files, groups, actions);
-        }
+        let actions = self.peers.on(PeerEvent::Gone { peer });
+        self.dispatch(swarm, files, groups, roster, actions);
     }
 
     pub fn dial_failed(
@@ -188,42 +194,28 @@ impl PeerLink {
         swarm: &mut ClientSwarm,
         files: &mut FileLink,
         groups: &mut GroupLink,
+        roster: &Roster,
         peer: PeerId,
     ) {
         let actions = self.peers.on(PeerEvent::DialFailed { peer });
-        self.dispatch(swarm, files, groups, actions);
+        self.dispatch(swarm, files, groups, roster, actions);
     }
 
-    /// Promote settled peers, collect finished transfers and round outcomes, then tick.
+    /// Collect finished transfers and round outcomes, then tick.
     pub fn housekeeping(
         &mut self,
         swarm: &mut ClientSwarm,
         files: &mut FileLink,
         groups: &mut GroupLink,
-        connectivity: &Connectivity,
+        roster: &Roster,
         at: i64,
     ) {
-        let ready: Vec<PeerId> = self
-            .settling
-            .iter()
-            .copied()
-            .filter(|peer| crate::group_link::settled(connectivity, peer))
-            .collect();
-
-        for peer in ready {
-            self.settling.remove(&peer);
-            if self.announced.insert(peer) {
-                let actions = self.peers.on(PeerEvent::Verified { peer });
-                self.dispatch(swarm, files, groups, actions);
-            }
-        }
-
         // Transfers run in their own tasks, so their outcomes arrive on a channel rather than
         // as swarm events. Drained before the tick so a finished download frees its slot in
         // the same turn.
         for outcome in self.transfers.collect() {
             let actions = self.peers.on(outcome);
-            self.dispatch(swarm, files, groups, actions);
+            self.dispatch(swarm, files, groups, roster, actions);
         }
 
         // Exchanges the two layers finished on our behalf. Before the tick, so a settled one is
@@ -255,7 +247,7 @@ impl PeerLink {
                 RoundOutcome::Failed { peer } => PeerEvent::AskFailed { peer },
             };
             let actions = self.peers.on(event);
-            self.dispatch(swarm, files, groups, actions);
+            self.dispatch(swarm, files, groups, roster, actions);
         }
 
         // Before the tick, so the decision to fetch is made against the disk as it is now
@@ -266,7 +258,7 @@ impl PeerLink {
         }
 
         let actions = self.peers.on(PeerEvent::Tick { at });
-        self.dispatch(swarm, files, groups, actions);
+        self.dispatch(swarm, files, groups, roster, actions);
 
         // Published last, so what a person reads is the state the tick left behind rather than
         // the one it started from. A failure here is worth a line and nothing more: this is a
@@ -310,6 +302,7 @@ impl PeerLink {
         swarm: &mut ClientSwarm,
         files: &mut FileLink,
         groups: &mut GroupLink,
+        roster: &Roster,
         event: request_response::Event<ManifestRequest, ManifestResponse>,
     ) -> Option<request_response::Event<ManifestRequest, ManifestResponse>> {
         use request_response::{Event, Message};
@@ -362,7 +355,7 @@ impl PeerLink {
             }),
         };
 
-        self.dispatch(swarm, files, groups, actions);
+        self.dispatch(swarm, files, groups, roster, actions);
         None
     }
 
@@ -372,6 +365,7 @@ impl PeerLink {
         swarm: &mut ClientSwarm,
         files: &mut FileLink,
         groups: &mut GroupLink,
+        roster: &Roster,
         event: request_response::Event<SessionRequest, SessionResponse>,
     ) {
         use request_response::{Event, Message};
@@ -384,7 +378,7 @@ impl PeerLink {
             } => {
                 // Answered here, in the same turn, while the channel is still on the stack —
                 // the same discipline `FileLink` follows, so a channel can never be stranded.
-                let ready = self.drained(&peer, files, groups);
+                let ready = self.drained(&peer, files, groups, roster);
                 let _ = swarm.behaviour_mut().app.sessions.send_response(
                     channel,
                     if ready {
@@ -427,7 +421,7 @@ impl PeerLink {
             _ => return,
         };
 
-        self.dispatch(swarm, files, groups, actions);
+        self.dispatch(swarm, files, groups, roster, actions);
     }
 
     /// The server's answer to a presence query.
@@ -436,6 +430,7 @@ impl PeerLink {
         swarm: &mut ClientSwarm,
         files: &mut FileLink,
         groups: &mut GroupLink,
+        roster: &Roster,
         event: request_response::Event<PresenceRequest, PresenceResponse>,
     ) {
         use request_response::{Event, Message};
@@ -472,7 +467,7 @@ impl PeerLink {
             "who is online, answered"
         );
         let actions = self.peers.on(PeerEvent::Presence { asked, online });
-        self.dispatch(swarm, files, groups, actions);
+        self.dispatch(swarm, files, groups, roster, actions);
     }
 
     /// Whether this peer has any of our work outstanding.
@@ -488,8 +483,15 @@ impl PeerLink {
     /// and `FileSync` still starts catalogue offers of its own. Asking only the supervisor made
     /// a freshly verified peer look idle within milliseconds — so a node hung up before the
     /// group it had just been invited to had reached it, and nothing ever mirrored.
-    fn drained(&self, peer: &PeerId, files: &FileLink, groups: &GroupLink) -> bool {
-        self.transfers.running_with(peer) == 0
+    fn drained(
+        &self,
+        peer: &PeerId,
+        files: &FileLink,
+        groups: &GroupLink,
+        roster: &Roster,
+    ) -> bool {
+        roster.is_ready(peer)
+            && self.transfers.running_with(peer) == 0
             && self.peers.drained(*peer)
             && !files.busy_with(peer)
             && !groups.busy_with(peer)
@@ -501,6 +503,7 @@ impl PeerLink {
         swarm: &mut ClientSwarm,
         files: &mut FileLink,
         groups: &mut GroupLink,
+        roster: &Roster,
         actions: Vec<PeerAction>,
     ) {
         for action in actions {
@@ -514,7 +517,7 @@ impl PeerLink {
                     if let Err(e) = swarm.dial(addr) {
                         tracing::debug!(%peer, error = %e, "dial refused before it started");
                         let actions = self.peers.on(PeerEvent::DialFailed { peer });
-                        self.dispatch(swarm, files, groups, actions);
+                        self.dispatch(swarm, files, groups, roster, actions);
                     }
                 }
 
@@ -547,7 +550,7 @@ impl PeerLink {
                     // on-connect announce, and any fetch it started off the back of one.
                     if groups.busy_with(&peer) {
                         let actions = self.peers.on(PeerEvent::AskDeferred { peer });
-                        self.dispatch(swarm, files, groups, actions);
+                        self.dispatch(swarm, files, groups, roster, actions);
                         continue;
                     }
                     // Each layer knows what to say; the supervisor decided when and which. If
@@ -603,7 +606,7 @@ impl PeerLink {
                             terminal: false,
                             why: "the transfer pool was full".to_owned(),
                         });
-                        self.dispatch(swarm, files, groups, actions);
+                        self.dispatch(swarm, files, groups, roster, actions);
                     }
                 }
 
@@ -617,11 +620,11 @@ impl PeerLink {
                     // Another layer is mid-exchange with them. Reported back as a refusal
                     // rather than dropped, so the proposal is forgotten now and re-offered
                     // when things are actually quiet, instead of sitting out `CLOSE_TIMEOUT`.
-                    if !self.drained(&peer, files, groups) {
+                    if !self.drained(&peer, files, groups, roster) {
                         let actions = self
                             .peers
                             .on(PeerEvent::CloseAnswered { peer, ready: false });
-                        self.dispatch(swarm, files, groups, actions);
+                        self.dispatch(swarm, files, groups, roster, actions);
                         continue;
                     }
                     let id = swarm
@@ -724,6 +727,7 @@ fn report(notice: &Notice) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ac_net::connectivity::Connectivity;
     use std::time::{Duration, Instant};
 
     use libp2p::Multiaddr;
@@ -738,8 +742,8 @@ mod tests {
     use ac_files::path::RelPath;
     use ac_files::store::FileRow;
     use ac_groups::chain::Op;
-    use ac_groups::standing::Position;
     use ac_groups::id::GroupId;
+    use ac_groups::standing::Position;
 
     use crate::daemon::{App, AppEvent, app, track};
 
@@ -775,6 +779,7 @@ mod tests {
         peers: PeerLink,
         blobs: libp2p_stream::IncomingStreams,
         conn: Connectivity,
+        roster: Roster,
         peer: PeerId,
         dir: tempfile::TempDir,
         /// The clock the tick reports, advanced by [`PER_TICK`] each time round.
@@ -810,6 +815,7 @@ mod tests {
                 peers: PeerLink::open(&paths, &identity, None).unwrap(),
                 blobs,
                 conn: Connectivity::default(),
+                roster: Roster::default(),
                 peer: identity.peer_id(),
                 dir,
                 at: AT,
@@ -826,29 +832,27 @@ mod tests {
 
         /// The daemon's own routing, minus admission.
         ///
-        /// Attestation is bypassed — `attested` is called straight off the connection — so
-        /// these tests exercise the file path without also standing up a server to issue
-        /// credentials.
+        /// Attestation is bypassed — the peer is put in the roster straight off the
+        /// connection — so these tests exercise the file path without also standing up a
+        /// server to issue credentials.
         fn step(&mut self, event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
             track(&mut self.conn, &self.swarm, &event);
 
             match &event {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    self.link.attested(*peer_id);
-                    self.groups.attested(*peer_id);
-                    self.peers.attested(*peer_id);
+                    self.roster.admitted(*peer_id);
                 }
-                SwarmEvent::ConnectionClosed { peer_id, .. }
-                    if !self.swarm.is_connected(peer_id) =>
-                {
-                    self.link.on_disconnected(&mut self.swarm, *peer_id);
-                    self.groups.on_disconnected(&mut self.swarm, *peer_id);
-                    self.peers.on_disconnected(
-                        &mut self.swarm,
-                        &mut self.link,
-                        &mut self.groups,
-                        *peer_id,
-                    );
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    let still = self.swarm.is_connected(peer_id);
+                    if self.roster.disconnected(peer_id, still) {
+                        self.peers.on_disconnected(
+                            &mut self.swarm,
+                            &mut self.link,
+                            &mut self.groups,
+                            &self.roster,
+                            *peer_id,
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -861,17 +865,23 @@ mod tests {
                         &mut self.swarm,
                         &mut self.link,
                         &mut self.groups,
+                        &self.roster,
                         event,
                     ) {
-                        self.link.on_event(&mut self.swarm, event);
+                        self.link.on_event(&mut self.swarm, &self.roster, event);
                     }
                 }
                 SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Groups(event))) => {
-                    self.groups.on_event(&mut self.swarm, event);
+                    self.groups.on_event(&mut self.swarm, &self.roster, event);
                 }
                 SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Sessions(event))) => {
-                    self.peers
-                        .on_session(&mut self.swarm, &mut self.link, &mut self.groups, event);
+                    self.peers.on_session(
+                        &mut self.swarm,
+                        &mut self.link,
+                        &mut self.groups,
+                        &self.roster,
+                        event,
+                    );
                 }
                 _ => {}
             }
@@ -880,17 +890,26 @@ mod tests {
         fn tick(&mut self) {
             self.at += PER_TICK;
 
-            // The daemon's order: groups, then files, then the supervisor — which sees the
-            // round outcomes the file layer produced in the same turn.
+            // The daemon's order: promote once, then groups, then files, then the supervisor
+            // — which sees the round outcomes the file layer produced in the same turn.
+            for peer in self.roster.promote(&self.conn) {
+                self.peers.peer_ready(
+                    &mut self.swarm,
+                    &mut self.link,
+                    &mut self.groups,
+                    &self.roster,
+                    peer,
+                );
+            }
             self.groups
-                .housekeeping(&mut self.swarm, &self.conn, Instant::now(), self.at);
+                .housekeeping(&mut self.swarm, &self.roster, Instant::now(), self.at);
             self.link
-                .housekeeping(&mut self.swarm, &self.conn, Instant::now(), self.at);
+                .housekeeping(&mut self.swarm, &self.roster, Instant::now(), self.at);
             self.peers.housekeeping(
                 &mut self.swarm,
                 &mut self.link,
                 &mut self.groups,
-                &self.conn,
+                &self.roster,
                 self.at,
             );
         }
@@ -903,6 +922,7 @@ mod tests {
                 &mut self.link,
                 &mut self.groups,
                 &mut self.swarm,
+                &self.roster,
             );
         }
 
@@ -1053,7 +1073,9 @@ mod tests {
         let member_key = member.key();
         let store = member.link.sync().groups_mut();
         store.adopt(&entries, &[], AT).unwrap();
-        store.author_standing(&member_key, id, Position::In, AT).unwrap();
+        store
+            .author_standing(&member_key, id, Position::In, AT)
+            .unwrap();
         id
     }
 

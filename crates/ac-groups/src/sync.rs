@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ac_net::PeerId;
+use ac_net::budget::TickBudget;
 use ac_net::identity::Keypair;
+use ac_net::roster::Roster;
 
 use crate::chain::Op;
 use crate::id::GroupId;
@@ -58,12 +60,6 @@ pub enum Notice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupEvent {
-    PeerVerified {
-        peer: PeerId,
-    },
-    PeerGone {
-        peer: PeerId,
-    },
     Heads {
         peer: PeerId,
         heads: Vec<GroupHead>,
@@ -114,10 +110,8 @@ pub struct GroupSync {
     store: Groups,
     me: PeerId,
     key: Keypair,
-    verified: HashSet<PeerId>,
     inflight: HashMap<GroupId, InFlight>,
-    offered: HashMap<PeerId, HashSet<GroupId>>,
-    budget: HashMap<PeerId, u32>,
+    budget: TickBudget,
     now_at: i64,
 }
 
@@ -128,10 +122,8 @@ impl GroupSync {
             store,
             me,
             key,
-            verified: HashSet::new(),
             inflight: HashMap::new(),
-            offered: HashMap::new(),
-            budget: HashMap::new(),
+            budget: TickBudget::new(ANSWERS_PER_TICK),
             now_at: 0,
         }
     }
@@ -150,8 +142,9 @@ impl GroupSync {
         &mut self,
         peer: PeerId,
         request: GroupRequest,
+        roster: &Roster,
     ) -> (GroupResponse, Vec<GroupAction>) {
-        if !self.verified.contains(&peer) || !self.spend(peer) {
+        if !roster.is_ready(&peer) || !self.budget.spend(peer) {
             return (GroupResponse::Unavailable, Vec::new());
         }
 
@@ -181,23 +174,10 @@ impl GroupSync {
         }
     }
 
-    pub fn on(&mut self, event: GroupEvent) -> Vec<GroupAction> {
+    pub fn on(&mut self, event: GroupEvent, roster: &Roster) -> Vec<GroupAction> {
         match event {
-            GroupEvent::PeerVerified { peer } => {
-                self.verified.insert(peer);
-                Vec::new()
-            }
-
-            GroupEvent::PeerGone { peer } => {
-                self.verified.remove(&peer);
-                self.offered.remove(&peer);
-                self.budget.remove(&peer);
-                self.inflight.retain(|_, f| f.peer != peer);
-                Vec::new()
-            }
-
             GroupEvent::Heads { peer, heads } => {
-                if !self.verified.contains(&peer) {
+                if !roster.is_ready(&peer) {
                     return Vec::new();
                 }
                 self.on_heads(peer, heads)
@@ -218,7 +198,7 @@ impl GroupSync {
 
             GroupEvent::AskFailed { .. } => Vec::new(),
 
-            GroupEvent::Tick { now, at } => self.tick(now, at),
+            GroupEvent::Tick { now, at } => self.tick(now, at, roster),
         }
     }
 
@@ -226,8 +206,6 @@ impl GroupSync {
     fn on_heads(&mut self, peer: PeerId, heads: Vec<GroupHead>) -> Vec<GroupAction> {
         let heads: Vec<GroupHead> = heads.into_iter().take(MAX_HEADS_PER_ANSWER).collect();
         let named: HashSet<GroupId> = heads.iter().map(|h| h.group).collect();
-        self.offered.entry(peer).or_default().extend(named.iter());
-
         let mut actions = Vec::new();
 
         for head in &heads {
@@ -414,20 +392,13 @@ impl GroupSync {
         }
     }
 
-    fn tick(&mut self, now: Instant, at: i64) -> Vec<GroupAction> {
+    fn tick(&mut self, now: Instant, at: i64, roster: &Roster) -> Vec<GroupAction> {
         self.now_at = at;
-        self.budget.clear();
+        self.budget.reset();
 
-        // Abandon stalled episodes so the group is free to try again.
-        let stalled: Vec<GroupId> = self
-            .inflight
-            .iter()
-            .filter(|(_, f)| now >= f.deadline)
-            .map(|(g, _)| *g)
-            .collect();
-        for group in stalled {
-            self.inflight.remove(&group);
-        }
+        // Abandon episodes that can no longer finish, so the group is free to try again
+        self.inflight
+            .retain(|_, f| now < f.deadline && roster.is_ready(&f.peer));
 
         let actions = Vec::new();
 
@@ -473,15 +444,5 @@ impl GroupSync {
         if matches!(self.inflight.get(&group), Some(f) if f.peer == peer) {
             self.inflight.remove(&group);
         }
-    }
-
-    /// Take one answer's worth of this peer's inbound budget, or refuse.
-    fn spend(&mut self, peer: PeerId) -> bool {
-        let left = self.budget.entry(peer).or_insert(ANSWERS_PER_TICK);
-        if *left == 0 {
-            return false;
-        }
-        *left -= 1;
-        true
     }
 }

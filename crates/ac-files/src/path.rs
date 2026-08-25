@@ -45,10 +45,6 @@ impl RelPath {
                     component: component.to_owned(),
                 });
             }
-            // A NUL truncates the path at the syscall boundary, so a name containing one is
-            // not the name it appears to be. The other control characters are refused for a
-            // weaker reason — they make a path unquotable in a terminal — but neither belongs
-            // in an archive.
             if let Some(bad) = component.chars().find(|c| c.is_control()) {
                 return Err(PathError::Control { found: bad });
             }
@@ -66,7 +62,6 @@ impl RelPath {
         out
     }
 
-    /// The last component — the file's own name.
     pub fn file_name(&self) -> &str {
         self.0.rsplit('/').next().unwrap_or(&self.0)
     }
@@ -282,8 +277,6 @@ mod tests {
 
     #[test]
     fn a_multibyte_stem_is_not_cut_mid_character() {
-        // 120 two-byte characters plus ".jpg" is a legal component, and long enough that
-        // adding the marker forces a truncation — right where the boundary matters.
         let long = format!("{}.jpg", "é".repeat(120));
         let renamed = RelPath::parse(&long).unwrap().conflict_name("aabbccdd");
 

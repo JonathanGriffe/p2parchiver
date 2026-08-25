@@ -34,9 +34,6 @@ impl FileRow {
     }
 
     /// When this row last changed, in the clock of whoever changed it.
-    ///
-    /// The conflict rule, and the only thing timestamps decide: which of two versions of one
-    /// path is true. What is *new to a peer* is answered by `seen_seq`, never by this.
     pub fn changed_at(&self) -> i64 {
         self.removed_at.unwrap_or(self.added_at).max(self.added_at)
     }
@@ -45,32 +42,19 @@ impl FileRow {
 /// What one [`Files::merge`] did with a row from a peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Merged {
-    /// We already agreed. Nothing was written, and no peer is owed news.
     Unchanged,
-    /// Ours was newer, or the incoming row lost. Nothing was written.
     Rejected,
-    /// Applied as it stands.
     Applied,
-    /// Applied, and a *different* file that held this path was renamed out of the way.
     Conflicted { moved: RelPath },
-    /// Applied, and content already held under another path was collapsed onto one.
     Deduplicated { kept: RelPath, dropped: RelPath },
 }
 
 /// Which of two versions of one path is true.
-///
-/// Later `changed_at` wins; a tie breaks on the higher hash. Total, so every peer reaches the
-/// same answer from the same pair without coordinating, and three-way conflicts converge
-/// whatever order the peers meet in.
 fn wins_path(a: &FileRow, b: &FileRow) -> bool {
     (a.changed_at(), &a.hash) > (b.changed_at(), &b.hash)
 }
 
 /// Which of two paths keeps content the group holds twice.
-///
-/// Earliest `added_at` wins; a tie breaks on the lower path. Also total, and deliberately the
-/// *opposite* direction from [`wins_path`]: a name is settled by whoever used it first, while
-/// the content at one name is settled by whoever changed it last.
 fn wins_hash(a: &FileRow, b: &FileRow) -> bool {
     (a.added_at, &a.path) < (b.added_at, &b.path)
 }
@@ -79,9 +63,7 @@ fn wins_hash(a: &FileRow, b: &FileRow) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recorded {
     Added,
-    /// Same path, same content: nothing to do. Makes re-running a bulk add cheap and safe.
     Unchanged,
-    /// Same path, different content. Only reached when the caller asked to replace.
     Replaced,
 }
 
@@ -92,9 +74,6 @@ pub struct Files {
 
 impl Files {
     /// Open (creating if absent) the file tables at `path`.
-    ///
-    /// Takes a plain path rather than `ac_net::config::Paths` so this crate stays independent
-    /// of how a node lays out its directories; `ac-node` passes `paths.db_file()`.
     pub fn open(path: &Path, me: PeerId) -> Result<Self, FilesError> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -141,6 +120,7 @@ impl Files {
                  path     TEXT NOT NULL,
                  PRIMARY KEY (group_id, path)
              );
+             CREATE INDEX IF NOT EXISTS files_seen ON files(group_id, seen_seq);
              CREATE TABLE IF NOT EXISTS file_state (
                  group_id    TEXT PRIMARY KEY NOT NULL,
                  digest      BLOB,
@@ -150,50 +130,7 @@ impl Files {
              );",
         )?;
 
-        let store = Self { db, me };
-        store.migrate()?;
-
-        // After the migration, not with the table above: on a `files` table that predates
-        // these columns, `CREATE TABLE IF NOT EXISTS` is a no-op and indexing a column that
-        // does not exist yet fails the whole batch.
-        store
-            .db
-            .execute_batch("CREATE INDEX IF NOT EXISTS files_seen ON files(group_id, seen_seq);")?;
-        Ok(store)
-    }
-
-    /// Bring a `files` table written before sharing existed up to date.
-    ///
-    /// `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a node that ran the
-    /// local-storage milestone has a `files` table without these columns. Detected by trying
-    /// the read rather than tracking a version, which is the workspace's one precedent for
-    /// this (`ac_server::store`).
-    fn migrate(&self) -> Result<(), FilesError> {
-        if self
-            .db
-            .prepare("SELECT have, seen_seq FROM files LIMIT 1")
-            .is_ok()
-        {
-            return Ok(());
-        }
-
-        self.db.execute_batch(
-            "ALTER TABLE files ADD COLUMN have     INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE files ADD COLUMN seen_seq INTEGER NOT NULL DEFAULT 0;",
-        )?;
-        // Every row predating this column was put there by a local `ac file add`, so its
-        // bytes are on disk. `ac file verify` is what corrects the exceptions.
-        self.db
-            .execute_batch("UPDATE files SET have = 1 WHERE removed_at IS NULL;")?;
-        // A single sequence over what is already held, in a stable order, so the rows a peer
-        // has never seen are still offered rather than being invisible at seq 0.
-        self.db.execute_batch(
-            "UPDATE files SET seen_seq = (
-                 SELECT COUNT(*) FROM files AS earlier
-                 WHERE earlier.group_id = files.group_id AND earlier.path <= files.path
-             );",
-        )?;
-        Ok(())
+        Ok(Self { db, me })
     }
 
     pub fn me(&self) -> PeerId {
@@ -201,11 +138,6 @@ impl Files {
     }
 
     /// The directory holding `group`'s files, allocating one on first use.
-    ///
-    /// Recorded rather than recomputed, which is what makes the whole scheme work: a group
-    /// name is unvalidated, not unique, and reaches us from a remote admin. Deciding once and
-    /// writing the answer down means a collision is resolved a single time, and a directory
-    /// never moves under files already in it.
     pub fn dir_for(&mut self, group: GroupId, name: &str) -> Result<String, FilesError> {
         let tx = self
             .db
@@ -268,9 +200,6 @@ impl Files {
         let mut out = Vec::new();
         for row in rows {
             let (id, dir) = row?;
-            // A row we cannot parse names no group we could sweep for, and skipping it is
-            // safer than guessing: the sweep would otherwise treat every partial in that
-            // directory as an orphan.
             if let Ok(group) = id.parse() {
                 out.push((group, dir));
             }
@@ -279,10 +208,6 @@ impl Files {
     }
 
     /// Live rows whose bytes we do not hold.
-    ///
-    /// What a staging sweep must keep: exactly these paths can still have a transfer resume
-    /// into them. A removed row cannot — its bytes are deleted and nothing will fetch them
-    /// again — and neither can one we already hold.
     pub fn unfinished(&self, group: GroupId) -> Result<Vec<RelPath>, FilesError> {
         let mut stmt = self.db.prepare(
             "SELECT path FROM files
@@ -302,12 +227,6 @@ impl Files {
     }
 
     /// Record a file whose bytes are already in place.
-    ///
-    /// `replace` decides what happens when the path is held by *different* content; identical
-    /// content is always [`Recorded::Unchanged`], so re-running a bulk add is free.
-    ///
-    /// Re-recording a removed path clears `removed_at`. That is the one place a removal is
-    /// undone, and it is deliberate: it takes a local `ac file add` naming the path again.
     pub fn record(
         &mut self,
         group: GroupId,
@@ -347,26 +266,6 @@ impl Files {
     }
 
     /// Take in a row from a peer, resolving both kinds of collision it can cause.
-    ///
-    /// The whole reconciliation lives here rather than in the sync machine so that a test can
-    /// reach it without a socket, and so there is exactly one place where a catalogue changes.
-    ///
-    /// # Why `Content` is a parameter
-    ///
-    /// Two of the outcomes move bytes, and the move must happen **before** the rows that name
-    /// them are rewritten — a row claiming bytes that are not there yet is a lie the rest of
-    /// the node believes, while bytes with no row are merely untracked and are what
-    /// `ac file verify` reports. Taking the content layer as an argument is what makes that
-    /// ordering impossible to get wrong at a call site.
-    ///
-    /// # The two collisions
-    ///
-    /// **Two different files at one path.** Neither is discarded. The winner keeps the path;
-    /// the loser keeps its content under [`RelPath::conflict_name`].
-    ///
-    /// **One file at two paths.** A group holds any content once. The earliest path wins and
-    /// the later is tombstoned — but never before the winner's bytes are accounted for, so a
-    /// node holding only the loser's copy moves it rather than losing it.
     pub fn merge(
         &mut self,
         group: GroupId,
@@ -380,11 +279,6 @@ impl Files {
 
         let local = read_row(&tx, group, &incoming.path)?;
 
-        // Settled below, then used to decide the outcome. The two phases — who keeps the
-        // path, and who keeps the content — are independent, and **both** must run: a row
-        // that changes nothing about its own path can still be the second copy of content
-        // this group already holds, and returning early on "we agree" would leave that
-        // duplicate in place for ever.
         let mut settled = FileRow {
             path: incoming.path.clone(),
             ..incoming.clone()
@@ -395,8 +289,6 @@ impl Files {
         match &local {
             None => {}
 
-            // Same content under the same name. Not a conflict: settle on the earliest
-            // arrival and the later removal, so both sides stop rewriting the row.
             Some(local) if local.hash == incoming.hash => {
                 settled.added_at = local.added_at.min(incoming.added_at);
                 settled.removed_at = match (local.removed_at, incoming.removed_at) {
@@ -408,7 +300,6 @@ impl Files {
                 }
             }
 
-            // Different content, both live: the case where something must not be thrown away.
             Some(local) if !local.is_removed() && !incoming.is_removed() => {
                 if wins_path(incoming, local) {
                     displaced = Some(local.clone());
@@ -418,14 +309,10 @@ impl Files {
                 }
             }
 
-            // At least one side is a tombstone, so there is no content to preserve on the
-            // losing side and the plain conflict rule decides.
             Some(local) if !wins_path(incoming, local) => return Ok(Merged::Rejected),
             Some(_) => {}
         }
 
-        // Move the displaced file before anything names its new home. Bytes first, rows
-        // second: bytes with no row are untracked and recoverable, a row with no bytes is not.
         if let Some(loser) = &displaced {
             let moved = loser.path.conflict_name(&loser.hash);
             let held = loser.have && move_bytes(content, dir, &loser.path, &moved)?;
@@ -442,15 +329,12 @@ impl Files {
         }
 
         if outcome != Merged::Unchanged {
-            // A row learned from a peer never claims bytes we do not hold — unless we already
-            // had exactly this content under exactly this name.
             let have = local
                 .as_ref()
                 .is_some_and(|l| l.have && l.hash == settled.hash && l.path == settled.path);
             write_row(&tx, group, &settled, have)?;
         }
 
-        // --- one copy of any content, per group ---
         if !settled.is_removed()
             && let Some(twin) = read_twin(&tx, group, &settled)?
         {
@@ -460,8 +344,6 @@ impl Files {
                 (&twin, &settled)
             };
 
-            // Never delete the only copy: if the survivor has no bytes and the loser does,
-            // the content moves onto the surviving name instead of being thrown away.
             let keep_have = read_row(&tx, group, &keep.path)?.is_some_and(|r| r.have);
             let drop_have = read_row(&tx, group, &drop.path)?.is_some_and(|r| r.have);
             if drop_have && !keep_have {
@@ -477,8 +359,6 @@ impl Files {
                     })?;
             }
 
-            // Tombstoned rather than deleted: a peer that has not deduped yet would otherwise
-            // re-offer the row and we would recreate it on every connection.
             let seq = next_seq(&tx, group)?;
             tx.execute(
                 "UPDATE files SET removed_at = ?3, have = 0, seen_seq = ?4
@@ -501,10 +381,6 @@ impl Files {
         Ok(outcome)
     }
 
-    /// Whether this group already holds `hash`, and at which live path.
-    ///
-    /// One group keeps one copy of any content, so this is what `ac file add` asks before
-    /// copying anything in. Served by the `files_hash` index.
     pub fn path_of_hash(&self, group: GroupId, hash: &str) -> Result<Option<RelPath>, FilesError> {
         let found: Option<String> = self
             .db
@@ -522,9 +398,6 @@ impl Files {
             .transpose()
     }
 
-    /// Set whether this node holds a file's bytes.
-    ///
-    /// Does **not** bump `seen_seq`: `have` is local and no peer is owed the news.
     pub fn mark_have(
         &mut self,
         group: GroupId,
@@ -538,12 +411,6 @@ impl Files {
         Ok(())
     }
 
-    /// Rows this node has written since `cursor`, oldest first, and the highest included.
-    ///
-    /// Ordering by `seen_seq` rather than by any timestamp is the whole point. A row learned
-    /// today but *created* long ago gets a fresh, high `seen_seq`, so it is offered onward —
-    /// whereas a cursor over `added_at` would place it below a peer's mark and it would never
-    /// travel. Three members who meet at different times depend on this.
     pub fn changes_since(
         &self,
         group: GroupId,
@@ -580,7 +447,6 @@ impl Files {
         Ok((out, highest))
     }
 
-    /// Whether anything remains past `cursor`, so a response can say `more`.
     pub fn has_changes_after(&self, group: GroupId, cursor: u64) -> Result<bool, FilesError> {
         Ok(self
             .db
@@ -593,7 +459,6 @@ impl Files {
             .is_some())
     }
 
-    /// How far we have read one peer's change log for one group.
     pub fn cursor(&self, group: GroupId, peer: &PeerId) -> Result<u64, FilesError> {
         let found: Option<i64> = self
             .db
@@ -606,11 +471,6 @@ impl Files {
         Ok(found.unwrap_or(0).max(0) as u64)
     }
 
-    /// Record a new position in a peer's log.
-    ///
-    /// Only ever called with a value the peer itself reported. A cursor derived from our own
-    /// state — a count, a clock, a guess — could sit past rows we never received, and those
-    /// rows would then be skipped for good.
     pub fn set_cursor(
         &mut self,
         group: GroupId,
@@ -629,12 +489,6 @@ impl Files {
         Ok(())
     }
 
-    /// Record that the user wants this file's bytes.
-    ///
-    /// **In the database, not in memory**, because `ac file get` is a different process from
-    /// the daemon that will do the fetching — SQLite is the only channel between them, exactly
-    /// as it is for `ac group add`. It also means a want outlives a restart, which matters
-    /// when the holder is a peer that is rarely online.
     pub fn want(&mut self, group: GroupId, path: &RelPath) -> Result<(), FilesError> {
         self.db.execute(
             "INSERT INTO file_wants (group_id, path) VALUES (?1, ?2)
@@ -674,36 +528,7 @@ impl Files {
     }
 
     /// Fingerprint of a group's whole catalogue: "are our lists identical?", nothing more.
-    ///
-    /// Covers only what is shared — path, hash, and the two timestamps that decide conflicts.
-    /// `have` and `seen_seq` are excluded because they are local, and folding either in would
-    /// make two peers with identical catalogues disagree for ever.
-    ///
-    /// Removed rows count. A tombstone is shared state, and leaving it out would make a peer
-    /// that has seen a deletion permanently disagree with one that has not.
-    ///
-    /// # Cached, and unable to go stale
-    ///
-    /// A full scan and a SHA-256 over every row: 19ms for a 50,000-file group, which was being
-    /// paid twice a tick per group by the supervisor and again on every catalogue exchange.
-    /// The result is kept in `file_state` against the `seen_seq` it was computed at, and a
-    /// mismatch is what recomputes it.
-    ///
-    /// **The validity token is the same counter the writers already advance**, so there is no
-    /// dirty flag for a write path to forget to set — and forgetting one would serve a
-    /// confidently wrong digest, which is a sync that never converges. `ac file add` in another
-    /// process invalidates this without knowing it exists. It holds because every mutation that
-    /// the digest covers goes through [`write_row`] or takes a fresh `next_seq` of its own,
-    /// while `mark_have` — the one write that does not advance the counter — touches only
-    /// `have`, which the digest excludes.
-    ///
-    /// Writing through `&self` is deliberate: this is memoization, it changes nothing anyone can
-    /// observe, and a `&mut self` here would force every read path in the supervisor to hold a
-    /// mutable borrow of the store.
     pub fn digest(&self, group: GroupId) -> Result<[u8; 32], FilesError> {
-        // One read transaction over both the counter and the scan. Without it a write landing
-        // between them could be included in the hash and stamped with the seq from before it,
-        // and the entry would then look valid to the next reader.
         let tx = self.db.unchecked_transaction()?;
 
         let seq = seq_in(&tx, group)?;
@@ -728,8 +553,6 @@ impl Files {
         )?;
         let mut rows = stmt.query(params![group.to_string()])?;
 
-        // Tag byte, continuing the domain separation `ac_groups::id` established: 0x00 entry,
-        // 0x01 group, 0x02 standings.
         let mut hasher = Sha256::new();
         hasher.update([0x03u8]);
 
@@ -739,8 +562,6 @@ impl Files {
             let added_at: i64 = row.get(2)?;
             let removed_at: Option<i64> = row.get(3)?;
 
-            // Length-prefixed so that two adjacent fields cannot be slid across the boundary
-            // between them to produce the same bytes from a different catalogue.
             hasher.update((path.len() as u64).to_be_bytes());
             hasher.update(path.as_bytes());
             hasher.update((hash.len() as u64).to_be_bytes());
@@ -752,15 +573,8 @@ impl Files {
         let digest: [u8; 32] = hasher.finalize().into();
         drop(rows);
         drop(stmt);
-        // End the read before writing. Upgrading a deferred transaction that has already read
-        // can fail outright rather than wait for the writer ahead of it, and this one has just
-        // scanned the whole table.
         drop(tx);
 
-        // Best effort, and deliberately not fatal: the cache is an optimisation, and a digest
-        // that could be computed should not be withheld because it could not be written down.
-        // Nor does the pair need to be written atomically with the scan — if a write landed in
-        // between, the stamp is behind the counter, which is precisely the state that recomputes.
         if let Ok(seq) = i64::try_from(seq) {
             let stored = self.db.execute(
                 "INSERT INTO file_state (group_id, digest, digest_seq) VALUES (?1, ?2, ?3)
@@ -777,38 +591,12 @@ impl Files {
     }
 
     /// This group's change counter: the highest position handed out in its log.
-    ///
-    /// Monotonic within a group's life, advanced inside the writer's transaction by every
-    /// mutation the catalogue digest covers, and advanced by nothing else — so "has our
-    /// catalogue moved" is this integer against a remembered one, and needs no hashing.
-    ///
-    /// An index seek on `files_seen`, not a scan.
-    ///
-    /// **Local to this node.** It counts *our* writes, so two nodes holding identical catalogues
-    /// agree on their digests and disagree on this. Never compare it with a peer's; that is what
-    /// the digest is for.
     pub fn seq(&self, group: GroupId) -> Result<u64, FilesError> {
         let tx = self.db.unchecked_transaction()?;
         seq_in(&tx, group)
     }
 
     /// Stamp when this group's catalogue last moved, and answer when that was.
-    ///
-    /// The editing pause is measured from here. It is recorded rather than kept in memory so
-    /// that restarting the daemon does not restart the pause — a node that was two seconds from
-    /// telling the group about an afternoon's work should not go quiet for another two minutes
-    /// because it was restarted.
-    ///
-    /// **Stamped by whoever notices, with the clock it was given.** The alternative was for the
-    /// writers to stamp it, which is more exact — the daemon may not have been running when
-    /// `ac file add` ran, and then this records when the daemon next looked rather than when the
-    /// edit happened. That costs one pause in a case where the node was down anyway, and it buys
-    /// not threading a clock through `record`, `merge` and `write_row` and their fifty callers.
-    /// It also keeps the store's writers free of policy: nothing about an edit knows what a
-    /// pause is.
-    /// Asked on every tick, so it answers with the stamp rather than merely setting it: the
-    /// caller wants "how long has this been still", and a separate read to find out would be a
-    /// second query for a question this one has already answered.
     pub fn note_change(&mut self, group: GroupId, at: i64) -> Result<i64, FilesError> {
         let tx = self
             .db
@@ -843,10 +631,6 @@ impl Files {
     }
 
     /// How many live rows in this group we do not hold the bytes for.
-    ///
-    /// A count, not a list. The dial decision only needs "is there anything, and roughly how
-    /// much", and under auto-mirror the list can be tens of thousands of rows — built once per
-    /// group per tick it would dominate everything else the supervisor does.
     pub fn missing_count(&self, group: GroupId) -> Result<u64, FilesError> {
         let n: i64 = self.db.query_row(
             "SELECT COUNT(*) FROM files
@@ -858,15 +642,6 @@ impl Files {
     }
 
     /// How many bytes of content this node holds, across every group.
-    ///
-    /// Across groups, not per group, because the limit it feeds is a property of the *disk*:
-    /// a per-group budget would let three groups of 100 GiB each fill a 200 GiB volume while
-    /// every one of them was under its own ceiling.
-    ///
-    /// Counts what the index says, which is what the budget is about. Content is deduplicated
-    /// within a group but not across them, and a removed row has had its bytes deleted, so
-    /// this is close enough to what is on disk for a ceiling — and unlike walking the storage
-    /// root, it costs one query rather than a stat of every file.
     pub fn held_bytes(&self) -> Result<u64, FilesError> {
         let total: i64 = self.db.query_row(
             "SELECT COALESCE(SUM(size), 0) FROM files WHERE have = 1 AND removed_at IS NULL",
@@ -877,10 +652,6 @@ impl Files {
     }
 
     /// The next rows worth asking a peer for, wanted ones first.
-    ///
-    /// `ac file get` no longer decides *whether* a file is fetched — under auto-mirror
-    /// everything arrives eventually — so a want is a statement about **order**. Putting those
-    /// rows at the front is the whole of what the command now does.
     pub fn missing(&self, group: GroupId, limit: usize) -> Result<Vec<FileRow>, FilesError> {
         let mut stmt = self.db.prepare(
             "SELECT f.path, f.size, f.hash, f.modified, f.added_at, f.added_by,
@@ -930,9 +701,6 @@ impl Files {
     }
 
     /// Every file in `group`, in path order.
-    ///
-    /// Removed rows are excluded unless asked for: they are history, and a listing that mixed
-    /// them in would misrepresent what the group holds.
     pub fn list(
         &self,
         group: GroupId,
@@ -967,15 +735,11 @@ impl Files {
     }
 
     /// Mark a file removed. The row stays; the caller deletes the bytes.
-    ///
-    /// Returns whether anything changed, so the CLI can tell "removed" from "was not there".
     pub fn remove(&mut self, group: GroupId, path: &RelPath, at: i64) -> Result<bool, FilesError> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        // The removal is news, so it takes a fresh position in the log — otherwise a peer
-        // whose cursor is already past this row would never hear that the file went.
         let seq = next_seq(&tx, group)?;
         let changed = tx.execute(
             "UPDATE files SET removed_at = ?3, have = 0, seen_seq = ?4
@@ -992,22 +756,6 @@ impl Files {
     }
 
     /// Drop everything this node records about a group's files, for `ac group forget`.
-    ///
-    /// Local only, and it does not touch the bytes — deleting a user's content as a
-    /// side effect of forgetting a group is not something to do without being asked.
-    ///
-    /// **Every table, not just the two that hold the catalogue.** `file_sync` and
-    /// `file_wants` used to survive, which was invisible until the supervisor arrived: a want
-    /// for a forgotten group is work that can never be satisfied, so it kept the node dialling
-    /// for ever and made the quiescence property unreachable. `Groups::forget` clears all of
-    /// its tables; this matches it.
-    ///
-    /// **`file_state` above all.** This is the one place a group's change counter goes
-    /// backwards, because it is the one place rows are deleted rather than tombstoned. Leaving
-    /// a cached digest behind means the re-created group's first row takes `seen_seq = 1`, the
-    /// stale entry recorded at `digest_seq = 1` matches, and [`Files::digest`] confidently
-    /// returns the *previous* catalogue's fingerprint — a catalogue that would then never
-    /// converge with anyone's.
     pub fn forget_group(&mut self, group: GroupId) -> Result<(), FilesError> {
         let tx = self
             .db
@@ -1030,13 +778,6 @@ impl Files {
 }
 
 /// Write a row and give it the next position in this group's change log.
-///
-/// Every write goes through here, because a row that changed without advancing `seen_seq`
-/// would be invisible to every peer whose cursor is already past it — the file would exist
-/// locally and never travel again.
-///
-/// The counter is per group and allocated inside the caller's transaction, which every write
-/// takes with `BEGIN IMMEDIATE`, so two processes cannot hand out the same number.
 fn write_row(
     tx: &rusqlite::Transaction<'_>,
     group: GroupId,
@@ -1061,8 +802,6 @@ fn write_row(
         params![
             group.to_string(),
             row.path.as_str(),
-            // SQLite integers are signed. No real file reaches 8 exabytes, but a silent
-            // wrap would store a negative size, so say so instead.
             i64::try_from(row.size).map_err(|_| FilesError::CorruptRow)?,
             row.hash,
             row.modified,
@@ -1077,11 +816,6 @@ fn write_row(
 }
 
 /// Move a file, reporting whether there was anything there.
-///
-/// A missing source is not an error. `have` is a claim about the disk and the disk can
-/// disagree — a file deleted by hand, a half-restored backup. Failing the merge on that would
-/// wedge the catalogue permanently against a peer, so instead the row simply stops claiming
-/// to hold the content and `ac file verify` reports the discrepancy.
 fn move_bytes(
     content: &Content,
     dir: &str,
@@ -1139,8 +873,6 @@ fn next_seq(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<u64, Files
 }
 
 /// The highest position this group has handed out, or zero.
-///
-/// An index seek on `files_seen`, which is why it is cheap enough to ask on every tick.
 fn seq_in(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<u64, FilesError> {
     let highest: i64 = tx.query_row(
         "SELECT COALESCE(MAX(seen_seq), 0) FROM files WHERE group_id = ?1",
@@ -1457,11 +1189,6 @@ mod tests {
 
     #[test]
     fn a_forgotten_group_does_not_leave_its_digest_behind() {
-        // The one place the change counter goes backwards, and therefore the one place a cached
-        // digest can be wrong rather than merely stale: rows are deleted here, not tombstoned,
-        // so the re-created group hands out `seen_seq = 1` again. A surviving entry stamped at
-        // seq 1 matches, and the digest served is the *old* catalogue's — a group that would
-        // then disagree with every peer for ever and never be able to say why.
         let (mut files, me) = store();
         let g = group_id(1);
         files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
@@ -1480,10 +1207,6 @@ mod tests {
 
     #[test]
     fn the_cached_digest_is_invalidated_by_the_writes_it_covers() {
-        // Nothing tells the cache it is out of date; it notices, by asking the same counter the
-        // writers advance. So the interesting case is a write from a *different* handle on the
-        // same database, which is what `ac file add` is — it cannot invalidate anything it does
-        // not know exists.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.db");
         let me = peer();
@@ -1528,9 +1251,6 @@ mod tests {
 
     #[test]
     fn the_pause_is_measured_from_the_change_not_from_noticing_twice() {
-        // `note_change` is asked on every tick, so it must answer "it moved" exactly once per
-        // change — otherwise the idle countdown restarts every second and never elapses, which
-        // is the bug this whole mechanism replaced.
         let (mut files, me) = store();
         let g = group_id(1);
 
@@ -1548,9 +1268,6 @@ mod tests {
 
     #[test]
     fn held_bytes_counts_only_what_is_here_and_live() {
-        // The storage budget is a claim about a disk, so a row we merely know about must not
-        // count towards it — otherwise joining a group with a terabyte in it would report the
-        // node as full before a single byte arrived.
         let (mut files, me) = store();
         let g = group_id(1);
 
@@ -1584,13 +1301,6 @@ mod tests {
 
     #[test]
     fn forgetting_a_group_leaves_no_work_behind() {
-        // `file_sync` and `file_wants` used to survive a forget, which was harmless while
-        // nothing read them on a schedule. Under the supervisor a want is *outstanding work*:
-        // one for a group we are no longer in can never be satisfied by anybody, so the node
-        // would keep looking for a holder for ever and could never go quiet.
-        //
-        // A stale cursor is milder but the same shape — it would make a re-joined group resume
-        // from a position in a log we no longer have.
         let (mut files, me) = store();
         let g = group_id(1);
         let path = RelPath::parse("a.jpg").unwrap();
@@ -1610,75 +1320,6 @@ mod tests {
             0,
             "and a cursor into a log we no longer hold would skip rows on re-joining"
         );
-    }
-
-    #[test]
-    fn a_table_from_before_sharing_is_migrated_in_place() {
-        // `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a node that ran the
-        // local-storage milestone would otherwise open a `files` table with neither column
-        // and fail every query. This is the only code path that touches data a user already
-        // has, so it is exercised against a real old-shape table.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.sqlite");
-        let me = peer();
-        let g = group_id(1);
-
-        let old = Connection::open(&path).unwrap();
-        old.execute_batch(
-            "CREATE TABLE files (
-                 group_id   TEXT NOT NULL,
-                 path       TEXT NOT NULL,
-                 size       INTEGER NOT NULL,
-                 hash       TEXT NOT NULL,
-                 modified   INTEGER NOT NULL,
-                 added_at   INTEGER NOT NULL,
-                 added_by   TEXT NOT NULL,
-                 removed_at INTEGER,
-                 PRIMARY KEY (group_id, path)
-             );",
-        )
-        .unwrap();
-        for (i, p) in ["a.jpg", "b.jpg", "gone.jpg"].iter().enumerate() {
-            old.execute(
-                "INSERT INTO files
-                     (group_id, path, size, hash, modified, added_at, added_by, removed_at)
-                 VALUES (?1, ?2, 3, ?3, ?4, ?4, ?5, ?6)",
-                params![
-                    g.to_string(),
-                    p,
-                    format!("h{i}"),
-                    AT,
-                    me.to_base58(),
-                    if *p == "gone.jpg" { Some(AT) } else { None },
-                ],
-            )
-            .unwrap();
-        }
-        drop(old);
-
-        let files = Files::open(&path, me).unwrap();
-        let live = files.list(g, None, false).unwrap();
-
-        assert_eq!(live.len(), 2);
-        assert!(
-            live.iter().all(|r| r.have),
-            "rows that predate the column were added locally, so their bytes are here"
-        );
-        assert!(
-            live.iter().all(|r| r.seen_seq > 0),
-            "a row left at zero would sit below every peer's cursor and never be offered"
-        );
-
-        let removed = files.list(g, None, true).unwrap();
-        assert_eq!(removed.len(), 3);
-        assert!(
-            !removed.iter().find(|r| r.is_removed()).unwrap().have,
-            "a tombstone does not claim to hold bytes"
-        );
-
-        // Idempotent: opening again must not re-run or double-count anything.
-        let again = Files::open(&path, me).unwrap();
-        assert_eq!(again.digest(g).unwrap(), files.digest(g).unwrap());
     }
 
     #[test]
@@ -1732,9 +1373,6 @@ mod tests {
 
     #[test]
     fn a_row_learned_late_still_travels() {
-        // The property the whole `seen_seq` design exists for. A row created long ago but
-        // written here just now must sit at the *end* of our log, not among the old rows —
-        // otherwise a peer whose cursor is already past that point would never receive it.
         let (mut files, me) = store();
         let g = group_id(1);
 

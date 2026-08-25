@@ -39,6 +39,7 @@ use ac_net::connectivity::Connectivity;
 use ac_net::identity::Identity;
 use ac_net::link::{HOUSEKEEPING_TICK, ServerLink};
 use ac_net::proto::{AttestRequest, PeerAttestRequest, PeerAttestResponse};
+use ac_net::roster::Roster;
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
@@ -206,6 +207,10 @@ pub async fn run(
     // headline claim — relayed connections upgrade to direct — actually held.
     let mut connectivity = Connectivity::default();
 
+    // Who is admitted, and who is ready to be talked to. The one copy of that fact: every
+    // layer below borrows it rather than keeping a set of its own.
+    let mut roster = Roster::default();
+
     // One clock for both schedules the supervisor keeps — reconnection and re-discovery.
     // Neither needs sub-second precision, and a single tick is easier to reason about than
     // two futures racing in the `select!`.
@@ -226,11 +231,19 @@ pub async fn run(
                     at: attest::now(),
                     server_connected,
                 });
-                dispatch_admission(&mut swarm, actions, &mut groups, &mut files, &mut peers);
-                groups.housekeeping(&mut swarm, &connectivity, Instant::now(), attest::now());
-                files.housekeeping(&mut swarm, &connectivity, Instant::now(), attest::now());
+                dispatch_admission(&mut swarm, actions, &mut roster);
+
+                // Promoted once, here, and fanned out — rather than three layers each running
+                // the same test against the same `Connectivity` in whatever order the calls
+                // below happened to be written in.
+                for peer in roster.promote(&connectivity) {
+                    peers.peer_ready(&mut swarm, &mut files, &mut groups, &roster, peer);
+                }
+
+                groups.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
+                files.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
                 // Last, so it sees the round outcomes the file layer produced this turn.
-                peers.housekeeping(&mut swarm, &mut files, &mut groups, &connectivity, attest::now());
+                peers.housekeeping(&mut swarm, &mut files, &mut groups, &roster, attest::now());
             }
 
             event = swarm.select_next_some() => {
@@ -245,7 +258,7 @@ pub async fn run(
                             peer: *peer_id,
                             now: Instant::now(),
                         });
-                        dispatch_admission(&mut swarm, actions, &mut groups, &mut files, &mut peers);
+                        dispatch_admission(&mut swarm, actions, &mut roster);
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         let still_connected = swarm.is_connected(peer_id);
@@ -253,11 +266,14 @@ pub async fn run(
                             peer: *peer_id,
                             still_connected,
                         });
-                        dispatch_admission(&mut swarm, actions, &mut groups, &mut files, &mut peers);
-                        if !still_connected {
-                            groups.on_disconnected(&mut swarm, *peer_id);
-                            files.on_disconnected(&mut swarm, *peer_id);
-                            peers.on_disconnected(&mut swarm, &mut files, &mut groups, *peer_id);
+                        dispatch_admission(&mut swarm, actions, &mut roster);
+                        // The roster's answer, not the swarm's: it says whether this peer had
+                        // been promoted, so the supervisor only hears about a peer it was told
+                        // about. `GroupLink` and `FileLink` need no telling at all now — they
+                        // read the roster where it matters, and their outstanding requests
+                        // resolve themselves as `OutboundFailure`.
+                        if roster.disconnected(peer_id, still_connected) {
+                            peers.on_disconnected(&mut swarm, &mut files, &mut groups, &roster, *peer_id);
                         }
                     }
                     // The one discovery path that needs no server at all, so it is handled
@@ -272,6 +288,7 @@ pub async fn run(
                                 &mut files,
                                 &mut groups,
                                 &mut swarm,
+                                &roster,
                             );
                         }
                     }
@@ -279,7 +296,7 @@ pub async fn run(
                     // when the attempt went out — this is what stops the peer also being
                     // treated as online, so the next round rotates past them.
                     SwarmEvent::OutgoingConnectionError { peer_id: Some(peer), .. } => {
-                        peers.dial_failed(&mut swarm, &mut files, &mut groups, *peer);
+                        peers.dial_failed(&mut swarm, &mut files, &mut groups, &roster, *peer);
                     }
                     _ => {}
                 }
@@ -311,6 +328,7 @@ pub async fn run(
                                         &mut files,
                                         &mut groups,
                                         &mut swarm,
+                                        &roster,
                                     );
                                 }
                             }
@@ -324,35 +342,35 @@ pub async fn run(
                 match event {
                     SwarmEvent::Behaviour(AcBehaviourEvent::PeerAttest(event)) => {
                         on_peer_attest(
-                            &mut swarm, &mut admission, &mut groups, &mut files, &mut peers, event,
+                            &mut swarm, &mut admission, &mut roster, event,
                         );
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::Attest(event)) => {
                         on_renewal(
-                            &mut swarm, &mut admission, &mut groups, &mut files, &mut peers, event,
+                            &mut swarm, &mut admission, &mut roster, event,
                         );
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Groups(event))) => {
-                        groups.on_event(&mut swarm, event);
+                        groups.on_event(&mut swarm, &roster, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Manifests(event))) => {
                         // The supervisor's holdings queries share this behaviour with the file
                         // layer's offers and pages, so ids are unique across the two and this
                         // is a claim rather than a race.
                         if let Some(event) =
-                            peers.claim_manifest(&mut swarm, &mut files, &mut groups, event)
+                            peers.claim_manifest(&mut swarm, &mut files, &mut groups, &roster, event)
                         {
-                            files.on_event(&mut swarm, event);
+                            files.on_event(&mut swarm, &roster, event);
                         }
                     }
                     // `libp2p_stream` emits nothing through the behaviour — its `ToSwarm` is
                     // `()`. Inbound streams arrive on the `IncomingStreams` handle instead.
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Blobs(()))) => {}
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Sessions(event))) => {
-                        peers.on_session(&mut swarm, &mut files, &mut groups, event);
+                        peers.on_session(&mut swarm, &mut files, &mut groups, &roster, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::Presence(event)) => {
-                        peers.on_presence(&mut swarm, &mut files, &mut groups, event);
+                        peers.on_presence(&mut swarm, &mut files, &mut groups, &roster, event);
                     }
                     other => on_event(other),
                 }
@@ -451,13 +469,7 @@ fn report_discovered(registrations: &[rendezvous::Registration], me: libp2p::Pee
 ///
 /// This and [`GroupLink::dispatch`] are the only places a swarm and a layer's actions meet;
 /// everything above them is policy that runs with no socket.
-fn dispatch_admission(
-    swarm: &mut ClientSwarm,
-    actions: Vec<AdmissionAction>,
-    groups: &mut GroupLink,
-    files: &mut FileLink,
-    peers: &mut PeerLink,
-) {
+fn dispatch_admission(swarm: &mut ClientSwarm, actions: Vec<AdmissionAction>, roster: &mut Roster) {
     for action in actions {
         match action {
             AdmissionAction::Send { peer, attestation } => {
@@ -495,13 +507,11 @@ fn dispatch_admission(
                 let _ = swarm.disconnect_peer_id(peer);
             }
 
-            // Admitted is not yet usable by the app layer: the group layer hears about it
-            // once the connection has settled — see `GroupLink::settling`.
+            // Admitted is not yet usable by the app layer. The roster holds them back until
+            // the connection has stopped changing shape — see `Roster::promote`.
             AdmissionAction::Admitted { peer, username } => {
                 println!("verified {username} {peer}");
-                groups.attested(peer);
-                files.attested(peer);
-                peers.attested(peer);
+                roster.admitted(peer);
             }
 
             AdmissionAction::Note(note) => report_admission(&note),
@@ -542,9 +552,7 @@ fn report_admission(note: &AdmissionNotice) {
 fn on_peer_attest(
     swarm: &mut ClientSwarm,
     admission: &mut Admission,
-    groups: &mut GroupLink,
-    files: &mut FileLink,
-    peers: &mut PeerLink,
+    roster: &mut Roster,
     event: request_response::Event<PeerAttestRequest, PeerAttestResponse>,
 ) {
     let actions = match event {
@@ -590,16 +598,14 @@ fn on_peer_attest(
         request_response::Event::ResponseSent { .. } => Vec::new(),
     };
 
-    dispatch_admission(swarm, actions, groups, files, peers);
+    dispatch_admission(swarm, actions, roster);
 }
 
 /// The server's answer to a renewal request.
 fn on_renewal(
     swarm: &mut ClientSwarm,
     admission: &mut Admission,
-    groups: &mut GroupLink,
-    files: &mut FileLink,
-    peers: &mut PeerLink,
+    roster: &mut Roster,
     event: request_response::Event<AttestRequest, ac_net::proto::AttestResponse>,
 ) {
     let actions = match event {
@@ -622,7 +628,7 @@ fn on_renewal(
         }
     };
 
-    dispatch_admission(swarm, actions, groups, files, peers);
+    dispatch_admission(swarm, actions, roster);
 }
 
 fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {

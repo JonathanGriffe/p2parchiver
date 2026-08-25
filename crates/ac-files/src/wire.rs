@@ -1,87 +1,23 @@
-//! The `/ac/manifest/3.0.0` and `/ac/blob/1.0.0` protocols: what is said, not how it is carried.
-//!
-//! Names, message types and limits are here; what carries them is `ac-node`'s, which is the only
-//! crate that mounts anything. That split is what keeps **this whole crate free of libp2p** —
-//! not as a convention a grep polices, but because libp2p is not a dependency and its types
-//! cannot be named. The store, the paths, the conflict rules and the sync policy are therefore
-//! testable against a temp directory with no socket, and provably so.
-//!
-//! The blob protocol has always worked this way — [`BLOB_PROTOCOL`] is a string that `ac-node`
-//! turns into a stream. The manifest protocol used to declare its own `request_response`
-//! behaviour here, which is what made libp2p a dependency; it is now built alongside the blob
-//! stream, from [`MANIFEST_PROTOCOL`] and the two size limits below.
-//!
-//! # Two protocols, because they carry different things
-//!
-//! **The manifest** is small, structured, and request-response: "what do you have?" answered
-//! by a page of catalogue rows. It is capped like any other message and buffered whole.
-//!
-//! **A blob** is a file, possibly gigabytes of it, and request-response cannot carry that —
-//! `request_response` holds an entire message in memory, so a chunked version would need
-//! out-of-order reassembly, a second hashing pass, and blocking disk reads inside the event
-//! loop. Blobs travel over a **stream** instead, opened per transfer. Only the header types
-//! live here; the stream itself is `ac-node`'s, because it needs a runtime and a spawned task.
-
 use ac_groups::id::GroupId;
 use serde::{Deserialize, Serialize};
 
 use crate::path::RelPath;
 use crate::store::FileRow;
 
-/// Bumped on any incompatible change to the types below. The version lives in the name because
-/// multistream-select negotiates on it, so an incompatible peer fails cleanly at negotiation
-/// rather than misreading a message — the same convention as `ac_net::proto`.
-///
-/// `2.0.0` added [`ManifestRequest::Holdings`]. Adding a request variant is not backward
-/// compatible — an older peer cannot decode it — so the name carries the bump rather than a
-/// feature flag, and an old peer fails at negotiation instead of on a message it cannot read.
-/// `3.0.0` replaced the offer with [`ManifestRequest::Ask`], turning the exchange from a push
-/// into a pull.
 pub const MANIFEST_PROTOCOL: &str = "/ac/manifest/3.0.0";
 
-/// Versioned separately from the manifest: the two change for different reasons, and a peer
-/// that cannot exchange catalogues has no use for a blob stream either way.
 pub const BLOB_PROTOCOL: &str = "/ac/blob/1.0.0";
 
-/// Ceiling on how many groups one answer may name.
-///
-/// Matches `ac_groups::wire`, and for the same reason: without a cap it is an unbounded
-/// allocation on the receiving side.
 pub const MAX_HEADS_PER_ANSWER: usize = 128;
-
-/// Rows one `Changes` response may carry.
-///
-/// Not a limit on how large a catalogue may be — a peer that has more says so with `more` and
-/// is asked again from the position it reported. That is what makes a node returning after a
-/// year converge over several rounds instead of hitting a ceiling it cannot get past.
 pub const MAX_ENTRIES_PER_RESPONSE: usize = 2048;
 
-/// Paths one [`ManifestRequest::Holdings`] may ask about.
-///
-/// A count cap alone does **not** bound the message — a path may be a kilobyte — so the
-/// builder also stops when the encoded request approaches [`MAX_REQUEST_BYTES`]. This is the
-/// friendlier of the two limits: it keeps a query to a round number of files rather than to
-/// wherever the bytes happened to run out.
 pub const MAX_HOLDINGS_QUERY: usize = 512;
 
-/// Largest request we will decode. A `Holdings` query of 512 paths dominates it.
 pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
-/// Largest response we will decode.
-///
-/// A denial-of-service backstop, not a page size: `request_response` buffers whole messages,
-/// so an unbounded response is a memory attack. [`MAX_ENTRIES_PER_RESPONSE`] is what actually
-/// bounds a page, and `a_full_page_fits_in_a_response` checks the two agree.
-///
-/// Public because `ac-node` builds the codec from it. The number is a fact about this protocol
-/// and belongs beside the messages it bounds, even though the codec it configures is elsewhere.
 pub const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 /// What one peer believes about one group's catalogue.
-///
-/// The digest answers "are our lists identical?" and nothing else: equal means there is
-/// nothing to do and no rows are exchanged at all, which is the common case on every
-/// reconnection. `count` is advisory, for reporting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileHead {
     #[serde(with = "ac_groups::bytes::group_id")]
@@ -92,15 +28,9 @@ pub struct FileHead {
 }
 
 /// One catalogue row, as it crosses the wire.
-///
-/// Deliberately **not** a `FileRow`: `have` and `seen_seq` are local facts that would be
-/// meaningless or actively wrong on another node, and leaving them out of the type is what
-/// stops either being sent by accident.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub path: String,
-    /// Raw content hash, not the hex the store keeps. Hex would double the dominant field of
-    /// every entry — 32 bytes against 64 — and this is what a catalogue is mostly made of.
     #[serde(with = "ac_groups::bytes::digest")]
     pub hash: [u8; 32],
     pub size: u64,
@@ -113,66 +43,27 @@ pub struct ManifestEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManifestRequest {
-    /// "Tell me the catalogues you believe we share."
-    ///
-    /// Carries nothing: syncing is a pull, exactly as `ac_groups::wire::GroupRequest::Ask` is.
-    /// What comes back is built only from `ac_groups::store::Groups::shared_with`, the one thing
-    /// allowed to name a group's content to a peer.
     Ask,
-    /// Everything past our position in *this peer's own* change log.
-    ///
-    /// `after` is a position the peer itself reported, never a timestamp and never a number we
-    /// invented. A row created long ago but learned by them recently sits at the end of their
-    /// log, so it is still delivered — which a cursor over `added_at` would miss.
     Changes { group: GroupId, after: u64 },
-    /// "Of these paths, which do you actually hold?"
-    ///
-    /// A **pull**, not an advertisement: nothing is volunteered, holdings never enter the
-    /// digest, and the answer only ever describes the files that were asked about.
-    ///
-    /// It exists because the blob protocol answers one file at a time and has no way to say
-    /// *"nothing else here for you"*. Without this, concluding that a peer cannot help would
-    /// mean opening a stream per missing file — five hundred round trips to learn that a peer
-    /// holds none of them. This answers it in one.
-    ///
-    /// It cannot ride on [`ManifestResponse::Changes`] instead, which is the cheaper-looking
-    /// design: in a mirror two members usually have *identical catalogues and different
-    /// holdings*, so their digests match, no entries are exchanged, and there is nothing to
-    /// carry a `have` bit on. The case that matters transfers nothing to piggyback on.
     Holdings { group: GroupId, paths: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManifestResponse {
-    /// The responder's view of what the two share, in answer to [`ManifestRequest::Ask`].
     Heads(Vec<FileHead>),
     Changes {
         group: GroupId,
         entries: Vec<ManifestEntry>,
-        /// The highest log position in this batch, which becomes the asker's new cursor.
         next: u64,
-        /// Whether anything remains past `next`.
         more: bool,
-        /// The responder's digest as of now, so the asker can tell convergence from
-        /// "there is more to come".
         #[serde(with = "ac_groups::bytes::digest")]
         digest: [u8; 32],
     },
-    /// One bit per path of the request, in the order asked: set means "I hold this".
-    ///
-    /// A bitmap rather than a list of paths, because the asker already knows what it asked
-    /// and echoing the strings back would multiply a 512-path query by the length of its
-    /// paths for no information.
     Holdings {
         group: GroupId,
         #[serde(with = "ac_groups::bytes::blob")]
         held: Vec<u8>,
     },
-    /// Refused, with **no reason given, deliberately**.
-    ///
-    /// Distinguishing "I have never heard of that group" from "you are not a member of it"
-    /// would turn guessing a `GroupId` into a membership oracle — the same argument as
-    /// `ac_groups::wire::GroupResponse::Unavailable`.
     Unavailable,
 }
 
@@ -192,9 +83,6 @@ pub fn pack_holdings(held: impl IntoIterator<Item = bool>) -> Vec<u8> {
 }
 
 /// Read bit `i` back out.
-///
-/// Out of range reads `false`, so a peer returning a short bitmap withholds files rather than
-/// inventing them — the safe direction, since the cost is asking someone else.
 pub fn holds(bitmap: &[u8], i: usize) -> bool {
     bitmap
         .get(i / 8)
@@ -202,9 +90,6 @@ pub fn holds(bitmap: &[u8], i: usize) -> bool {
 }
 
 /// Sent by the opener of a blob stream, length-prefixed, before any bytes flow.
-///
-/// `hash` names the content rather than trusting the path, so the receiver can verify what
-/// arrived is what it asked for even if the catalogue moved underneath it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobRequest {
     #[serde(with = "ac_groups::bytes::group_id")]
@@ -212,18 +97,13 @@ pub struct BlobRequest {
     pub path: String,
     #[serde(with = "ac_groups::bytes::digest")]
     pub hash: [u8; 32],
-    /// Where to start. Non-zero resumes a transfer that was cut off — which is routine rather
-    /// than exceptional, because a relayed transfer is cut every `MAX_CIRCUIT_BYTES`.
     pub offset: u64,
 }
 
 /// The answer to a [`BlobRequest`], before the bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobReply {
-    /// Bytes follow: `size` of them, counting from the requested offset.
     Sending { size: u64 },
-    /// Refused or absent, and which is not said — same reasoning as
-    /// [`ManifestResponse::Unavailable`].
     Unavailable,
 }
 
@@ -231,8 +111,6 @@ impl ManifestEntry {
     /// What we would tell a peer about one of our rows.
     pub fn of(row: &FileRow) -> Option<Self> {
         let mut hash = [0u8; 32];
-        // A row whose hash is not 32 bytes of hex cannot have come from `Content::stage`.
-        // Skipped rather than sent, so one damaged row does not poison a whole page.
         hex::decode_to_slice(&row.hash, &mut hash).ok()?;
 
         Some(Self {
@@ -247,11 +125,6 @@ impl ManifestEntry {
     }
 
     /// Turn a peer's entry into a row, or reject it.
-    ///
-    /// Everything a peer controls is validated here, at the edge: the path becomes a
-    /// [`RelPath`] before anything joins it to a directory, and the peer id must parse. A row
-    /// arriving from the network never claims `have` — bytes are fetched separately, and a
-    /// peer does not get to tell us what is on our own disk.
     pub fn into_row(self) -> Option<FileRow> {
         Some(FileRow {
             path: RelPath::parse(&self.path).ok()?,
@@ -262,7 +135,6 @@ impl ManifestEntry {
             added_by: self.added_by.parse().ok()?,
             removed_at: self.removed_at,
             have: false,
-            // Assigned by our own store when the row is written.
             seen_seq: 0,
         })
     }
@@ -391,15 +263,6 @@ mod tests {
 
     #[test]
     fn a_hash_costs_what_it_weighs() {
-        // Measured, not assumed. serde encodes `[u8; 32]` as a sequence of integers unless
-        // told otherwise, costing ~2 bytes per random byte — the mistake `ac_groups::bytes`
-        // exists to document. Dropping the adapter would put `hash` at ~64 bytes instead of
-        // 34 and inflate every entry of every catalogue.
-        //
-        // An entry is ~164 bytes today, and the shape of that is worth knowing before anyone
-        // tries to shrink it: roughly 53 in CBOR field names, 52 in the base58 peer id, 34 in
-        // the hash, and the rest in the path and three timestamps. The peer id and the field
-        // names are the fat, not the hash.
         let size = encoded(&entry("a.jpg")).len();
         assert!(
             size <= 175,

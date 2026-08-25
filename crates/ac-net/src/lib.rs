@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod attest;
 pub mod authz;
+pub mod budget;
 pub mod config;
 pub mod connectivity;
 pub mod identity;
@@ -10,6 +11,7 @@ pub mod keepalive;
 pub mod limits;
 pub mod link;
 pub mod proto;
+pub mod roster;
 pub mod swarm;
 
 pub use libp2p::PeerId;

@@ -307,6 +307,11 @@ async fn answer(
     let files = Files::open(&db, me)?;
     let groups = Groups::open(&db, me)?;
 
+    // The free function, not `FileSync::may_serve`: this runs in its own task with its own
+    // handles and never sees the roster. That is not a gap. A stream cannot exist without an
+    // admitted connection — `Admission` disconnects anyone who fails — so the only question
+    // left is whether the *stores* entitle this peer to these bytes, which is exactly what
+    // this answers.
     let Some(size) = may_serve(&files, &groups, &peer, request.group, &path) else {
         write_frame(&mut stream, &BlobReply::Unavailable).await?;
         stream.close().await?;

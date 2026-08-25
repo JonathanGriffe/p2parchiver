@@ -562,9 +562,6 @@ mod tests {
 
     #[test]
     fn a_parked_transfer_resumes_where_it_stopped() {
-        // The path a relayed transfer takes *every* time: a circuit is cut at its byte cap,
-        // and the next attempt continues. sha256 cannot be resumed from a length, so the
-        // partial has to be re-read to rebuild the state — this is what checks that it is.
         let (content, _tmp) = content();
         let path = rel("big.bin");
         let whole: Vec<u8> = (0..CHUNK * 3 + 77).map(|i| (i % 251) as u8).collect();
@@ -688,8 +685,6 @@ mod tests {
 
     #[test]
     fn two_files_sharing_a_basename_do_not_share_a_staging_file() {
-        // The two would otherwise both be `clip_mp4.part`, so parking one would offer its
-        // length as the other's resume offset — a hash failure on every attempt after.
         let (content, _tmp) = content();
         let a = rel("2024/clip.mp4");
         let b = rel("2023/clip.mp4");

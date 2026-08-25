@@ -20,8 +20,8 @@ use ac_groups::standing::{Position, Standing};
 use ac_groups::store::Groups;
 use ac_net::PeerId;
 use ac_net::identity::Keypair;
-use ac_peers::sync::{HEARTBEAT, 
-    DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_WINDOW, Limits, MAX_TRANSFERS, MIN_BACKOFF,
+use ac_peers::sync::{
+    DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_WINDOW, HEARTBEAT, Limits, MAX_TRANSFERS, MIN_BACKOFF,
     Notice, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent, Peers, ROUND_TIMEOUT,
     SHARE_AFTER_IDLE,
 };
@@ -721,9 +721,7 @@ fn membership_is_offered_before_the_catalogue() {
     let second = node.tick(AT + 1);
     assert!(
         matches!(
-            second
-                .iter()
-                .find(|a| matches!(a, PeerAction::Ask { .. })),
+            second.iter().find(|a| matches!(a, PeerAction::Ask { .. })),
             Some(PeerAction::Ask {
                 offering: Offering::Catalogue,
                 ..
