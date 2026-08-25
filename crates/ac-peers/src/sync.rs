@@ -13,8 +13,7 @@ pub const PRESENCE_INTERVAL: i64 = 300;
 /// How long a group may go without asking anybody what they have.
 pub const HEARTBEAT: i64 = 4 * 3600;
 
-/// Per-peer dial backoff.
-pub const MIN_BACKOFF: i64 = 30;
+pub const MIN_BACKOFF: i64 = 15;
 pub const MAX_BACKOFF: i64 = 30 * 60;
 
 /// Dials to one member before they are taken off the lists they are on.
@@ -430,23 +429,13 @@ impl Peers {
                 state.backoff = MIN_BACKOFF;
                 state.attempts = 0;
 
-                let groups: Vec<GroupId> = self
-                    .groups
-                    .list()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|row| row.state == State::Active)
-                    .map(|row| row.id)
-                    .collect();
-                if groups.iter().any(|g| self.members_of(*g).contains(&peer)) {
-                    self.pending.insert(
-                        peer,
-                        Owed {
-                            chain: true,
-                            catalogue: true,
-                        },
-                    );
-                }
+                self.pending.insert(
+                    peer,
+                    Owed {
+                        chain: true,
+                        catalogue: true,
+                    },
+                );
                 Vec::new()
             }
 
@@ -805,6 +794,18 @@ impl Peers {
         if share_catalogue {
             self.enqueue(group, false, true);
         }
+
+        tracing::debug!(
+            %group,
+            membership_moved,
+            catalogue_moved,
+            share_catalogue,
+            changes,
+            idle_for = at - changed_at,
+            owed = self.pending.len(),
+            "armed"
+        );
+
         if membership_moved || share_catalogue {
             // Accounted for. Anything after this is somebody else's, until we change it again.
             let mut recorded = self.seen.get(&group).copied().unwrap_or_default();
@@ -915,6 +916,15 @@ impl Peers {
                     && self.peers.get(p).is_none_or(|s| self.now >= s.failed.0)
             })
             .partition(|p| self.connected.contains(p));
+
+        tracing::debug!(
+            pending = self.pending.len(),
+            connected_owed = connected.len(),
+            absent_owed = absent.len(),
+            connected_total = self.connected.len(),
+            started = self.started.len(),
+            "rounds"
+        );
 
         let mut actions = Vec::new();
         let none_to_ask = connected.is_empty();

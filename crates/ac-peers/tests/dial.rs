@@ -354,6 +354,31 @@ fn rounds(actions: &[PeerAction]) -> Vec<PeerId> {
 // ---- regressions for failures found while reviewing the design ----
 
 #[test]
+fn a_node_that_knows_no_groups_still_asks_whoever_it_meets() {
+    // How anybody is *first* told they are in a group. An ask carries nothing — the answer is
+    // what tells the asker what the other side holds — so a node learns of a group only by
+    // asking somebody already in it. While this was gated on groups we already knew about, a
+    // node that knew none could ask nobody: the author knocked, the knock delivered nothing,
+    // and an invitation issued while the member was offline never arrived at all.
+    //
+    // `mirror-lab.sh` properties 1 to 3 are the end-to-end form of this.
+    let mut node = Node::new();
+    let stranger = peers(1)[0];
+
+    assert!(
+        node.peers.groups_mut().list().unwrap().is_empty(),
+        "this node is in no groups and so has nothing of its own to say"
+    );
+
+    node.peers.on(PeerEvent::Verified { peer: stranger });
+    assert_eq!(
+        rounds(&node.tick(AT)),
+        vec![stranger],
+        "and must still put the question, or it can only ever answer one"
+    );
+}
+
+#[test]
 fn one_change_in_a_fifty_member_group_is_not_fifty_dials() {
     // The mistake the whole design corrects. Iterating peers and asking "is there work with
     // them" answers the same for every member under auto-mirror, so all forty-nine look equally

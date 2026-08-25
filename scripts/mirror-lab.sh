@@ -187,6 +187,20 @@ main() {
     CAROL=$(ac carol id)
     DAVE=$(ac dave id)
 
+    say "1. they find each other, unprompted"
+    run_node alice; run_node bob; run_node carol
+
+    # **The nodes first, the group second.** A person adds members from a machine that is
+    # already running, so the registry has answered by the time anything is enqueued. Building
+    # the group before the daemon existed made the very first enqueue read an empty registry —
+    # a state no real sequence produces, and one that cost the whole change, since `arm` records
+    # the news as accounted for whether or not anybody was reachable to receive it.
+    # Not fatal: if the registry is slow the properties below say so far more usefully than
+    # `set -e` killing the run here would.
+    wait_for 30 "alice to see the others in the registry" \
+        bash -c "[ \$(grep -ac 'discovered a peer' '$LAB/alice.log' 2>/dev/null || echo 0) -ge 2 ]" \
+        || true
+
     say "one group, two members"
     ac alice group create --name holiday >/dev/null
     GROUP=$(group_id alice)
@@ -200,8 +214,6 @@ main() {
     ac alice file add "$GROUP" "$LAB/content/notes.txt" >/dev/null
     echo "  $GROUP with 2 files"
 
-    say "1. they find each other, unprompted"
-    run_node alice; run_node bob; run_node carol
     if wait_for "$SETTLE" "bob to hear about the group" in_group bob \
        && wait_for "$SETTLE" "carol to hear about the group" in_group carol; then
         ok "bob and carol learned the group with no --dial"

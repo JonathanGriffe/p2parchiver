@@ -164,6 +164,10 @@ impl GroupLink {
                     self.rounds.push(RoundOutcome::Asked { peer });
                     self.sync.on(GroupEvent::Heads { peer, heads }, roster)
                 }
+                (Some(Outbound::Ask { .. }), _) => {
+                    self.rounds.push(RoundOutcome::Failed { peer });
+                    return;
+                }
                 (
                     Some(Outbound::Fetch { group, .. }),
                     GroupResponse::Entries {
