@@ -1,24 +1,3 @@
-//! The bytes themselves: getting them in, out, and checking they are still there.
-//!
-//! # Why a file lands in two steps
-//!
-//! Copying straight to the destination would make a half-written file indistinguishable from
-//! a complete one — an interrupted `ac file add` would leave a truncated photo that looks
-//! exactly like a real one, and the index would agree with it. So content is written to a
-//! staging file first, flushed, and only then renamed into place. `rename` within a
-//! filesystem is atomic, so the destination either does not exist or is the whole file.
-//!
-//! The durability sequence — write, `sync_all`, rename, then **fsync the parent directory** —
-//! is the one `ac_net::identity` uses for the private key, and for the same reason: without
-//! the last step the rename itself can be lost, leaving the staging file and no destination.
-//!
-//! # And why the row comes after
-//!
-//! The index is a cache of the filesystem, so a row must never promise bytes that are not
-//! there. Bytes first, row second. A crash between the two leaves an untracked file, which is
-//! harmless and which [`Content::walk`] finds. The opposite order would leave a row pointing
-//! at nothing, which is a lie the rest of the system would believe.
-
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,8 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::path::RelPath;
 
-/// Where staging files are written, inside the group directory so the rename never crosses a
-/// filesystem boundary — which would silently turn it into a copy, losing atomicity.
+/// Where staging files are written,
 const STAGING_DIRNAME: &str = ".staging";
 
 /// Read buffer. Large enough that a multi-gigabyte video is not read a page at a time, small
@@ -36,10 +14,6 @@ const STAGING_DIRNAME: &str = ".staging";
 const CHUNK: usize = 64 * 1024;
 
 /// A file copied into staging, hashed, and waiting to be renamed into place.
-///
-/// Dropping one without [`Content::commit`] leaves the staging file behind. That is deliberate
-/// — cleanup on drop cannot report its own failure, and a leftover staging file is visible,
-/// inert, and removed by the next `verify`.
 #[derive(Debug)]
 pub struct Staged {
     staged: PathBuf,
@@ -50,11 +24,6 @@ pub struct Staged {
 }
 
 /// A transfer in progress: bytes going into staging, hashed as they arrive.
-///
-/// Separate from [`Staged`] because a download can stop half way and be picked up later, which
-/// a local copy never does. [`Sink::park`] is what makes that safe — dropping without either
-/// `park` or `finish` leaves the partial file too, but says nothing about whether it is
-/// trustworthy.
 #[derive(Debug)]
 pub struct Sink {
     file: File,
@@ -99,9 +68,6 @@ impl Sink {
 }
 
 /// Unix seconds, for the mtime a downloaded file gets.
-///
-/// Its own arrival, not the sender's claim: `modified` describes where a copy came from, and
-/// on this node it came from the network just now.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -136,9 +102,6 @@ impl Content {
     }
 
     /// Copy `src` into staging, hashing it in the same pass.
-    ///
-    /// One pass matters: a library import re-reading every file to hash it would double the
-    /// I/O on exactly the workload where that hurts most.
     pub fn stage(&self, dir: &str, path: &RelPath, src: &Path) -> io::Result<Staged> {
         let group_dir = self.group_dir(dir);
         let staging = group_dir.join(STAGING_DIRNAME);
@@ -200,25 +163,60 @@ impl Content {
     fn staging_of(&self, dir: &str, path: &RelPath) -> PathBuf {
         self.group_dir(dir)
             .join(STAGING_DIRNAME)
-            .join(format!("{}.part", sanitize_stem(path)))
+            .join(Self::staging_name(path))
+    }
+
+    /// What a partial for `path` is called.
+    pub fn staging_name(path: &RelPath) -> String {
+        format!("{}.part", sanitize_stem(path))
+    }
+
+    /// Delete partials in `dir` that no live transfer could still want.
+    pub fn sweep_staging<'a>(
+        &self,
+        dir: &str,
+        keep: impl IntoIterator<Item = &'a RelPath>,
+        idle_for: std::time::Duration,
+    ) -> io::Result<usize> {
+        let keep: std::collections::HashSet<String> =
+            keep.into_iter().map(Self::staging_name).collect();
+
+        let staging = self.group_dir(dir).join(STAGING_DIRNAME);
+        let entries = match fs::read_dir(&staging) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+
+        let mut swept = 0;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if keep.contains(name) {
+                continue;
+            }
+
+            let meta = entry.metadata()?;
+            if !meta.is_file() || !idle_since(&meta, idle_for) {
+                continue;
+            }
+
+            match fs::remove_file(entry.path()) {
+                Ok(()) => swept += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(swept)
     }
 
     /// How much of this file a previous attempt already wrote.
-    ///
-    /// Zero when there is nothing, which is also the right answer for "start from the top".
     pub fn staged_len(&self, dir: &str, path: &RelPath) -> u64 {
         fs::metadata(self.staging_of(dir, path)).map_or(0, |m| m.len())
     }
 
     /// Open the staging file to continue a transfer at `from`.
-    ///
-    /// The hash state is rebuilt by re-reading what is already there, because sha256 cannot be
-    /// resumed from a length. That is one local pass over the partial file, against
-    /// re-fetching the whole thing over the network — and for a relayed transfer, which is cut
-    /// every circuit, it is the difference between finishing and never finishing.
-    ///
-    /// `from` disagreeing with what is on disk means the peer is answering a different
-    /// question than we asked, so the partial is discarded and the transfer starts over.
     pub fn resume(&self, dir: &str, path: &RelPath, from: u64) -> io::Result<Sink> {
         let staged = self.staging_of(dir, path);
         if let Some(parent) = staged.parent() {
@@ -271,14 +269,6 @@ impl Content {
     }
 
     /// Move a file to another path inside the same group.
-    ///
-    /// Used when a path is resolved away from content this node holds — a conflict renaming
-    /// the loser, or duplicate content collapsing onto the earlier path. In both cases the
-    /// bytes are already correct and only their name is wrong, so this is a rename rather
-    /// than a transfer.
-    ///
-    /// Both paths are under one group directory, so the rename never crosses a filesystem and
-    /// cannot silently degrade into a copy.
     pub fn rename(&self, dir: &str, from: &RelPath, to: &RelPath) -> io::Result<()> {
         let source = self.locate(dir, from);
         let dest = self.locate(dir, to);
@@ -298,10 +288,6 @@ impl Content {
     }
 
     /// Throw away a staged file without putting it in place.
-    ///
-    /// The caller that decides *after* staging not to go ahead — because the content turned
-    /// out to be identical, or because the path is taken — needs this. Without it every
-    /// declined add would leave a `.part` file for `verify` to complain about.
     pub fn discard(&self, staged: Staged) -> io::Result<()> {
         match fs::remove_file(&staged.staged) {
             Ok(()) => Ok(()),
@@ -311,8 +297,6 @@ impl Content {
     }
 
     /// Delete a file's bytes, and any now-empty directories above it.
-    ///
-    /// A missing file is not an error: the caller's intent is that it be gone.
     pub fn remove(&self, dir: &str, path: &RelPath) -> io::Result<()> {
         let target = self.locate(dir, path);
         match fs::remove_file(&target) {
@@ -326,10 +310,6 @@ impl Content {
     }
 
     /// Drop directories left empty above `target`, stopping at the group's own directory.
-    ///
-    /// Leaving `photos/2024/` behind after its last photo went would make the tree grow
-    /// monotonically. `remove_dir` only succeeds on an empty directory, so this cannot take
-    /// anything with it.
     fn prune_above(&self, dir: &str, target: &Path) {
         let group_dir = self.group_dir(dir);
         let mut parent = target.parent().map(Path::to_path_buf);
@@ -361,10 +341,6 @@ impl Content {
     }
 
     /// Every file actually present in a group's directory, as group-relative paths.
-    ///
-    /// Skips the staging directory, and skips symlinks: following one would let a link placed
-    /// inside the root report a file that lives outside it. Anything unreadable or with a name
-    /// that is not a valid [`RelPath`] is left out — it cannot be a file this crate wrote.
     pub fn walk(&self, dir: &str) -> io::Result<Vec<RelPath>> {
         let group_dir = self.group_dir(dir);
         let mut found = Vec::new();
@@ -405,11 +381,28 @@ fn walk_into(base: &Path, dir: &Path, out: &mut Vec<RelPath>) -> io::Result<()> 
 
 /// A staging filename derived from the destination, kept short and free of separators.
 fn sanitize_stem(path: &RelPath) -> String {
-    path.file_name()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .take(64)
-        .collect()
+    let mut readable = String::new();
+    for c in path.file_name().chars() {
+        let c = if c.is_alphanumeric() { c } else { '_' };
+        if readable.len() + c.len_utf8() > 64 {
+            break;
+        }
+        readable.push(c);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_str().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+
+    format!("{readable}-{}", &digest[..16])
+}
+
+/// Whether this file has gone untouched for at least `idle_for`.
+fn idle_since(meta: &fs::Metadata, idle_for: std::time::Duration) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|idle| idle >= idle_for)
 }
 
 fn mtime_of(meta: &fs::Metadata) -> i64 {
@@ -423,6 +416,7 @@ fn mtime_of(meta: &fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn content() -> (Content, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -630,6 +624,98 @@ mod tests {
         assert_eq!(content.staged_len("g", &path), 0);
         let sink = content.resume("g", &path, 0).unwrap();
         assert_eq!(sink.size(), 0);
+    }
+
+    #[test]
+    fn a_sweep_keeps_what_is_still_wanted_and_drops_the_rest() {
+        let (content, _tmp) = content();
+        let wanted = rel("videos/wanted.mp4");
+        let orphan = rel("videos/tombstoned.mp4");
+
+        for path in [&wanted, &orphan] {
+            let mut sink = content.resume("g", path, 0).unwrap();
+            sink.write(b"partial").unwrap();
+            sink.park().unwrap();
+        }
+
+        // Only `wanted` is still a live row we lack bytes for.
+        let swept = content
+            .sweep_staging("g", [&wanted], Duration::ZERO)
+            .unwrap();
+
+        assert_eq!(swept, 1);
+        assert_eq!(content.staged_len("g", &wanted), 7, "still resumable");
+        assert_eq!(content.staged_len("g", &orphan), 0, "the orphan is gone");
+    }
+
+    #[test]
+    fn a_sweep_leaves_a_partial_that_was_just_written_to() {
+        // The race the idle window exists for: a row can be tombstoned by a peer's merge while
+        // its bytes are still arriving, and unlinking under an open `Sink` breaks the rename.
+        let (content, _tmp) = content();
+        let path = rel("live.mp4");
+
+        let mut sink = content.resume("g", &path, 0).unwrap();
+        sink.write(b"arriving").unwrap();
+
+        let swept = content
+            .sweep_staging("g", [], Duration::from_secs(3600))
+            .unwrap();
+
+        assert_eq!(swept, 0);
+        sink.park().unwrap();
+        assert_eq!(content.staged_len("g", &path), 8);
+    }
+
+    #[test]
+    fn sweeping_a_group_that_never_staged_anything_is_not_an_error() {
+        let (content, _tmp) = content();
+        assert_eq!(content.sweep_staging("g", [], Duration::ZERO).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_sweep_does_not_touch_committed_files() {
+        let (content, tmp) = content();
+        let src = source(tmp.path(), "in.txt", b"hello");
+        let path = rel("docs/notes.txt");
+
+        let staged = content.stage("g", &path, &src).unwrap();
+        content.commit(staged).unwrap();
+
+        assert_eq!(content.sweep_staging("g", [], Duration::ZERO).unwrap(), 0);
+        assert!(content.exists("g", &path));
+    }
+
+    #[test]
+    fn two_files_sharing_a_basename_do_not_share_a_staging_file() {
+        // The two would otherwise both be `clip_mp4.part`, so parking one would offer its
+        // length as the other's resume offset — a hash failure on every attempt after.
+        let (content, _tmp) = content();
+        let a = rel("2024/clip.mp4");
+        let b = rel("2023/clip.mp4");
+
+        let mut sink = content.resume("g", &a, 0).unwrap();
+        sink.write(&[1u8; 4096]).unwrap();
+        let parked = sink.park().unwrap();
+
+        assert_eq!(content.staged_len("g", &a), parked);
+        assert_eq!(
+            content.staged_len("g", &b),
+            0,
+            "the other path must see nothing staged"
+        );
+    }
+
+    #[test]
+    fn a_staging_name_fits_what_a_filesystem_will_take() {
+        // The longest component a `RelPath` allows, in the widest characters there are: 64 of
+        // those is 256 bytes of stem on its own, before the suffix and the extension.
+        let (content, _tmp) = content();
+        let path = rel(&format!("deep/{}.mp4", "🎬".repeat(62)));
+
+        let staged = content.staging_of("g", &path);
+        let name = staged.file_name().unwrap().to_str().unwrap();
+        assert!(name.len() <= 255, "{} bytes: {name:?}", name.len());
     }
 
     #[test]

@@ -90,6 +90,38 @@ pub struct FileLink {
     db: std::path::PathBuf,
 }
 
+/// How long a partial must sit untouched before a sweep will remove it.
+///
+/// Generous on purpose. The cost of waiting is disk that a crashed transfer left behind; the
+/// cost of being hasty is deleting a file some other task is mid-write on. Only one of those
+/// is worth avoiding.
+const STAGING_IDLE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Drop partials that no transfer could still resume into.
+///
+/// At startup, because that is where the orphans are: a partial left by a crash is never asked
+/// about again, since nothing enumerates staging and the only lookup there is goes forwards
+/// from a path the catalogue still names. Not on the tick — that would be a `read_dir` per
+/// group, for ever, to almost always find nothing.
+///
+/// Best-effort throughout. A node that cannot tidy its staging directory should still start.
+fn sweep_staging(files: &Files, content: &Content) {
+    let Ok(dirs) = files.group_dirs() else {
+        return;
+    };
+
+    for (group, dir) in dirs {
+        let Ok(keep) = files.unfinished(group) else {
+            continue;
+        };
+        match content.sweep_staging(&dir, &keep, STAGING_IDLE) {
+            Ok(0) => {}
+            Ok(swept) => tracing::info!(%group, swept, "removed abandoned partial downloads"),
+            Err(error) => tracing::warn!(%group, %error, "could not sweep staging"),
+        }
+    }
+}
+
 impl FileLink {
     pub fn open(paths: &Paths, identity: &Identity) -> Result<Self> {
         let path = paths.db_file();
@@ -106,6 +138,7 @@ impl FileLink {
         let config = Config::load(&paths.config_file())
             .with_context(|| format!("reading the config at {}", paths.config_file().display()))?;
         let content = Content::new(config.storage_root(paths));
+        sweep_staging(&files, &content);
 
         Ok(Self {
             sync: FileSync::new(files, groups, content),

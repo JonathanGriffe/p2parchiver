@@ -1,18 +1,3 @@
-//! The file index, in the node's existing `state.sqlite`.
-//!
-//! The bytes on disk are the truth and this is the cache — the inverse of `ac_groups`, where
-//! signed bytes are authoritative. So a row here is a claim about the filesystem, and the one
-//! rule that keeps the claim honest is that **nothing writes a row before the bytes it
-//! describes exist**. `crate::content` is what makes that possible.
-//!
-//! # Sharing the database
-//!
-//! This file already has three writers across two processes — `contacts`, `ac_groups`, and the
-//! server's own store in its own directory. A fourth inherits the same two disciplines, for
-//! the reasons `ac_groups::store` sets out at length: `BEGIN IMMEDIATE` rather than deferred,
-//! so the write lock is taken before the work rather than after it, and a `busy_timeout`, so a
-//! concurrent writer is a short wait rather than an immediate `SQLITE_BUSY`.
-
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -34,25 +19,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct FileRow {
     pub path: RelPath,
     pub size: u64,
-    /// sha256 of the content, hex. Computed while the bytes are copied in.
     pub hash: String,
-    /// The source file's mtime, unix seconds. Advisory: it describes where the file came
-    /// from, and nothing orders by it.
     pub modified: i64,
     pub added_at: i64,
     pub added_by: PeerId,
-    /// Set once removed. The row survives so that an automatic sync cannot resurrect the
-    /// file, and so a peer has a timestamp to compare against `added_at`.
     pub removed_at: Option<i64>,
-    /// Whether the bytes are on this node's disk.
-    ///
-    /// **Local, and it never travels.** Two peers holding the same catalogue with different
-    /// download states must agree on [`Files::digest`], or they would resync for ever — the
-    /// same reason `ac_groups::members::standings_digest` folds over members only.
     pub have: bool,
-    /// This node's position for this row in its own change log. See [`Files::changes_since`].
-    ///
-    /// Also local, and also never sent: peer B's 412 and peer C's 412 are unrelated numbers.
     pub seen_seq: u64,
 }
 
@@ -284,6 +256,49 @@ impl Files {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    /// Every group that has a directory allocated, for a sweep that has to visit all of them.
+    pub fn group_dirs(&self) -> Result<Vec<(GroupId, String)>, FilesError> {
+        let mut stmt = self.db.prepare("SELECT group_id, dir FROM file_roots")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, dir) = row?;
+            // A row we cannot parse names no group we could sweep for, and skipping it is
+            // safer than guessing: the sweep would otherwise treat every partial in that
+            // directory as an orphan.
+            if let Ok(group) = id.parse() {
+                out.push((group, dir));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Live rows whose bytes we do not hold.
+    ///
+    /// What a staging sweep must keep: exactly these paths can still have a transfer resume
+    /// into them. A removed row cannot — its bytes are deleted and nothing will fetch them
+    /// again — and neither can one we already hold.
+    pub fn unfinished(&self, group: GroupId) -> Result<Vec<RelPath>, FilesError> {
+        let mut stmt = self.db.prepare(
+            "SELECT path FROM files
+             WHERE group_id = ?1 AND removed_at IS NULL AND have = 0",
+        )?;
+        let rows = stmt.query_map(params![group.to_string()], |row| row.get::<_, String>(0))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            // An unparseable path cannot name a staging file either, since the name is derived
+            // from the path we would have parsed.
+            if let Ok(path) = RelPath::parse(&row?) {
+                out.push(path);
+            }
+        }
+        Ok(out)
     }
 
     /// Record a file whose bytes are already in place.
@@ -1898,6 +1913,41 @@ mod tests {
 
         let stored = files.list(g, None, true).unwrap();
         assert!(!stored[0].have, "the bytes went with the row");
+    }
+
+    #[test]
+    fn only_live_rows_we_lack_are_unfinished() {
+        // The keep-set a staging sweep is built from: everything else has no transfer that
+        // could still resume into it.
+        let (mut files, me) = store();
+        let g = group_id(1);
+
+        let missing = row(me, "want.mp4", "aa");
+        let held = row(me, "have.mp4", "bb");
+        let gone = row(me, "removed.mp4", "cc");
+
+        files.record(g, &missing, false).unwrap();
+        files.record(g, &held, false).unwrap();
+        files.record(g, &gone, false).unwrap();
+        // `record` is for bytes already in place, so the row that stands for one learned from
+        // a peer has to give its `have` back.
+        files.mark_have(g, &missing.path, false).unwrap();
+        files.remove(g, &gone.path, AT).unwrap();
+
+        let unfinished = files.unfinished(g).unwrap();
+        assert_eq!(unfinished, vec![missing.path]);
+    }
+
+    #[test]
+    fn a_forgotten_group_has_no_directory_left_to_sweep() {
+        let (mut files, _me) = store();
+        let g = group_id(1);
+        let dir = files.dir_for(g, "holiday").unwrap();
+
+        assert_eq!(files.group_dirs().unwrap(), vec![(g, dir)]);
+
+        files.forget_group(g).unwrap();
+        assert!(files.group_dirs().unwrap().is_empty());
     }
 
     /// A store, its peer, and a content root the merge can move bytes in.

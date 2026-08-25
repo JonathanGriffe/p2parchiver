@@ -296,6 +296,14 @@ pub fn forget(paths: &Paths, needle: &str) -> Result<()> {
     let (mut files, content) = open_files(paths, &identity)?;
     let held = files.list(id, None, false).unwrap_or_default().len();
     let dir = files.dir_of(id).ok().flatten();
+
+    // Partials are not "left on disk" the way finished files are — they are fragments of
+    // downloads that can now never complete, since the rows naming them are about to go. Swept
+    // before `forget_group`, which drops the `file_roots` row this needs to find them at all.
+    if let Some(dir) = &dir {
+        let _ = content.sweep_staging(dir, &[], std::time::Duration::ZERO);
+    }
+
     files
         .forget_group(id)
         .with_context(|| format!("forgetting the files of {needle}"))?;

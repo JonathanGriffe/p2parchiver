@@ -1,30 +1,10 @@
-//! Turning a group's name into a directory name.
-//!
-//! A group name is display text. `ac_groups::chain::check_name` caps its length and requires
-//! it non-empty, and that is the whole rule — no character is excluded, and the name reaches
-//! this node inside a log signed by *someone else's* admin. So it cannot be used as a path
-//! component as it stands: `../../.ssh` is a legal group name.
-//!
-//! Sanitising is lossy on purpose. Two different names can produce one directory name, and
-//! that is fine, because nothing here decides the final directory — [`crate::store::Files`]
-//! does, by trying this and adding a suffix until it is unused, then writing the answer down.
-//! This function only has to produce something safe and recognisable.
-
-/// Longest directory name to produce, in bytes, leaving room for a `-<hex>` suffix.
 const MAX_DIRNAME: usize = 128;
 
 /// A safe directory name for `name`, or `None` if nothing usable survives.
-///
-/// `None` means the caller should fall back to the group's id, which is always safe. That is
-/// better than inventing a placeholder here: the store already has an unambiguous name for
-/// the group, and this module has no business choosing one.
 pub fn sanitize(name: &str) -> Option<String> {
     let mut out = String::with_capacity(name.len());
 
     for c in name.chars() {
-        // Separators and control characters become `_`. Everything else survives, including
-        // spaces and non-ASCII: this is an archive people browse, and mangling `Noël` into
-        // `No_l` would be a worse outcome than the shell quoting it needs.
         if c == '/' || c == '\\' || c.is_control() {
             out.push('_');
         } else {
@@ -39,8 +19,6 @@ pub fn sanitize(name: &str) -> Option<String> {
 
     let mut result = trimmed.to_owned();
     if result.len() > MAX_DIRNAME {
-        // Truncate on a character boundary, then re-trim: cutting mid-name can expose a
-        // trailing dot or space that was harmless in the middle.
         let mut cut = MAX_DIRNAME;
         while cut > 0 && !result.is_char_boundary(cut) {
             cut -= 1;
@@ -56,10 +34,6 @@ pub fn sanitize(name: &str) -> Option<String> {
 }
 
 /// Strip whitespace and dots from both ends, repeatedly.
-///
-/// Repeatedly because one pass is not a fixed point: `". . ."` loses its outer dots, then its
-/// spaces, and leaves a single `.` — which is not a spare directory name but the *current*
-/// one. Alternating characters are exactly the case a single pass gets wrong.
 fn trim_edges(raw: &str) -> &str {
     let mut s = raw;
     loop {

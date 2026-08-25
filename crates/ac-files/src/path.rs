@@ -1,14 +1,3 @@
-//! A path inside a group, validated once and carried as a type.
-//!
-//! Every path a user types, and in the next milestone every path a peer sends, becomes one of
-//! these before anything joins it to a directory. The alternative — checking at each call site
-//! — is one forgotten check away from writing outside the storage root, and the check is not
-//! the sort of thing a reviewer notices missing.
-//!
-//! The rules are deliberately strict rather than clever. Nothing here tries to *repair* a bad
-//! path: a caller that meant `a/../b` can say `b`, and silently rewriting it would mean the
-//! path stored differs from the path asked for.
-
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -69,11 +58,6 @@ impl RelPath {
     }
 
     /// Join this path beneath `dir`.
-    ///
-    /// Safe by construction: every component was proved to be an ordinary name, so the result
-    /// cannot climb out of `dir`. It may still traverse a **symlink** placed inside the
-    /// storage root by something other than this crate, which is why `content` resolves the
-    /// final location before writing rather than trusting this alone.
     pub fn join_under(&self, dir: &Path) -> PathBuf {
         let mut out = dir.to_path_buf();
         for component in self.0.split('/') {
@@ -92,23 +76,12 @@ impl RelPath {
     }
 
     /// The name this path takes when it loses a fight for its own name.
-    ///
-    /// Two peers can each add a *different* file at one path. Neither may be discarded, so the
-    /// loser keeps its content here instead. `hash` is the losing content's, which makes the
-    /// result a pure function of what is being renamed: every peer derives the same name
-    /// without coordinating, and re-deriving it for the same content is idempotent.
-    ///
-    /// Inserted before the final extension rather than appended, so the file still opens in
-    /// whatever reads that type — `archive.tar.gz` becomes `archive.tar.conflict-<hex>.gz`.
     pub fn conflict_name(&self, hash: &str) -> Self {
         let (dir, name) = match self.0.rfind('/') {
             Some(at) => (&self.0[..=at], &self.0[at + 1..]),
             None => ("", self.0.as_str()),
         };
 
-        // A leading dot is part of the name, not an extension: `.bashrc` has no suffix. Skip
-        // one *character* rather than one byte — a name starting with `é` would otherwise be
-        // sliced mid-character, which panics.
         let first = name.chars().next().map_or(0, char::len_utf8);
         let split = name[first..].rfind('.').map(|at| at + first);
         let (stem, ext) = match split {
@@ -118,11 +91,6 @@ impl RelPath {
 
         let mark = format!(".conflict-{}", &hash[..8.min(hash.len())]);
 
-        // Trim the stem, never the marker or the extension: losing the marker would collide
-        // with the winner, and losing the extension would change what the file is.
-        // The cut is walked back to a character boundary *before* slicing: `&s[..n]` panics
-        // on a non-boundary rather than rounding, and a stem of multibyte characters lands
-        // between them routinely.
         let room = MAX_COMPONENT.saturating_sub(mark.len() + ext.len());
         let mut cut = room.min(stem.len());
         while cut > 0 && !stem.is_char_boundary(cut) {
@@ -130,16 +98,10 @@ impl RelPath {
         }
         let stem = &stem[..cut];
 
-        // Already validated by construction: every component came from a valid path, and the
-        // marker is hex. The fallback keeps this total rather than introducing a `Result` no
-        // caller could act on.
         Self::parse(&format!("{dir}{stem}{mark}{ext}")).unwrap_or_else(|_| self.clone())
     }
 
     /// Build a path from a directory prefix and a name, validating the result.
-    ///
-    /// `dir` may be empty, meaning the group's root. Used by `ac file add --to`, where the
-    /// two halves come from different places and only their combination is meaningful.
     pub fn under(dir: &str, name: &str) -> Result<Self, PathError> {
         let dir = dir.trim_matches('/');
         if dir.is_empty() {

@@ -262,6 +262,10 @@ async fn download(
 
     let staged = sink.finish()?;
     if staged.hash != want.hash {
+        // Discarded, unlike a short read: these bytes are not a head start, they are poison.
+        // Left in place, the next attempt reads their length as its resume offset and fails
+        // the same way for ever, blaming a different peer each time.
+        content.discard(staged).ok();
         anyhow::bail!(Refusal::WrongContent);
     }
     content.commit(staged)?;
