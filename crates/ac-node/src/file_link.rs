@@ -142,9 +142,6 @@ impl FileLink {
     }
 
     /// The policy machine underneath, for setting up a scenario in tests.
-    ///
-    /// Not how the daemon works: the CLI writes through its *own* handle in another process,
-    /// and the machine notices on the next tick.
     #[cfg(test)]
     pub(crate) fn sync(&mut self) -> &mut FileSync {
         &mut self.sync
@@ -335,11 +332,7 @@ impl FileLink {
         self.dispatch(swarm, actions);
     }
 
-    /// Serve an inbound blob stream.
-    ///
-    /// Handed straight to a task with its own handles. The authorization is re-checked there
-    /// rather than here, because reading a file the size of a film must not happen on the
-    /// event loop.
+    /// Serve an inbound blob stream from a peer the daemon has already found ready.
     pub fn on_inbound_blob(&self, peer: PeerId, stream: libp2p::swarm::Stream) {
         blob::serve(
             self.db.clone(),

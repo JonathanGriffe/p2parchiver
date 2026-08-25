@@ -276,8 +276,6 @@ main() {
     fi
 
     say "7. a change after the quiet re-dials"
-    # The one property that pays the editing pause: the group has converged and everyone has
-    # answered, so nothing short-circuits the debounce the way the first mirror does.
     head -c 50000 /dev/urandom > "$LAB/content/late.bin"
     ac alice file add "$GROUP" "$LAB/content/late.bin" >/dev/null
     if wait_for "$((EDIT_PAUSE + SETTLE))" "the late file to reach bob" bash -c \

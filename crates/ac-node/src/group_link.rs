@@ -141,10 +141,6 @@ impl GroupLink {
                     },
                 ..
             } => {
-                // Answered here, in the same turn, while the channel is still on the stack.
-                // `on_request` is total — always exactly one response — so the channel is
-                // always consumed and can never be stranded. That is why `GroupAction` has
-                // no `Respond` variant to defer.
                 let (response, actions) = self.sync.on_request(peer, request, roster);
                 let _ = swarm
                     .behaviour_mut()
@@ -283,7 +279,7 @@ mod tests {
     use ac_net::authz::AcceptAnyPeer;
     use ac_net::swarm::{AcBehaviourEvent, Role, build};
 
-    use crate::daemon::{App, app, track};
+    use crate::daemon::{App, app};
 
     // `ac_groups::tests::sync` already proves the sync *policy* against an in-process bus.
     // What it cannot prove is anything about the wire: that `/ac/group/3.0.0` is mounted and
@@ -311,7 +307,6 @@ mod tests {
     struct Node {
         swarm: ClientSwarm,
         link: GroupLink,
-        conn: Connectivity,
         roster: Roster,
         peer: PeerId,
         /// Replies observed on the wire, for assertions the adapter would otherwise swallow.
@@ -338,7 +333,6 @@ mod tests {
             Self {
                 swarm: build(&identity, &config, Role::Client, AcceptAnyPeer, app()).unwrap(),
                 link: GroupLink::open(&paths, &identity).unwrap(),
-                conn: Connectivity::default(),
                 roster: Roster::default(),
                 peer: identity.peer_id(),
                 seen: Vec::new(),
@@ -352,8 +346,6 @@ mod tests {
         /// connection — so these tests exercise the group path without also standing up a
         /// server to issue credentials. Admission has its own tests above and in `ac-net`.
         fn step(&mut self, event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
-            track(&mut self.conn, &self.swarm, &event);
-
             match &event {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     self.roster.admitted(*peer_id);
@@ -391,7 +383,7 @@ mod tests {
         /// wasteful and exactly right here: it is what a supervisor with no record of the peer
         /// would do, and it lets the exchange start as soon as the connection settles.
         fn tick(&mut self) {
-            self.roster.promote(&self.conn);
+            self.roster.promote(&Connectivity::default());
             self.link
                 .housekeeping(&mut self.swarm, &self.roster, Instant::now(), AT);
 

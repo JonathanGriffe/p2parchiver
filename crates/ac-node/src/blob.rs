@@ -1,28 +1,3 @@
-//! Moving file bytes, over a stream rather than a message.
-//!
-//! The **only** module in the workspace that names `libp2p-stream`, and the only place file
-//! content crosses a socket.
-//!
-//! # Why a stream, and why a task
-//!
-//! `request_response` buffers a whole message in memory, so a file cannot be one. Chunking it
-//! into messages would mean reassembling out-of-order pieces, hashing in a second pass rather
-//! than while copying, and reading from disk inside the event loop. A stream avoids all three:
-//! one transfer is one duplex byte stream, fed straight into `Content::stage`, hashed as it is
-//! written — the same loop `ac file add` already uses.
-//!
-//! Each transfer therefore runs in its own task, off the event loop, and **opens its own
-//! database handle**. Nothing in this workspace is shared behind a lock; `ac-server` opens
-//! three connections for exactly this reason. Outcomes come back on a channel and are drained
-//! on the housekeeping tick.
-//!
-//! # Resuming is ordinary, not exceptional
-//!
-//! A relayed transfer is cut every `MAX_CIRCUIT_BYTES`, so a large file over a relay *will*
-//! span several attempts. A partial download stays in staging; the next attempt re-reads it to
-//! rebuild the hash state and asks for the rest. That local read is far cheaper than starting
-//! a multi-gigabyte transfer again.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -39,20 +14,12 @@ use libp2p::{PeerId, StreamProtocol};
 use std::io::Read as _;
 use tokio::sync::mpsc;
 
-/// Copy buffer. Matches `ac_files::content`'s, so a transfer and a local add move bytes in the
-/// same sized bites.
 const CHUNK: usize = 64 * 1024;
 
-/// Ceiling on a header, which is a handful of fixed fields plus a path.
 const MAX_HEADER_BYTES: usize = 4096;
 
-/// Transfers that may run at once.
-///
-/// Bounded because each holds a database handle, a staging file and a socket. Eight matches
-/// `ac_files::sync`'s outbound cap, so neither half of the file layer can starve the other.
 const MAX_CONCURRENT: usize = 8;
 
-/// What one download needs to know.
 pub struct Wanted {
     pub peer: PeerId,
     pub group: GroupId,
@@ -61,20 +28,9 @@ pub struct Wanted {
     pub dir: String,
 }
 
-/// The two failures a peer cannot fix by being asked the same thing again.
-///
-/// This distinction is the supervisor's whole basis for giving up on a peer, and only this
-/// module can draw it — "they refused" and "the wire broke" look identical from above. A typed
-/// error rather than a string, because a message that gets reworded would silently turn a
-/// terminal failure back into an infinite retry, which is precisely the bug §0 of this
-/// milestone fixed on the serving side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// They answered `Unavailable` — after a holdings query said they held it, that is their
-    /// index disagreeing with their disk.
     Unavailable,
-    /// A *complete* transfer whose content did not hash to what was asked for. Misbehaviour,
-    /// not misfortune.
     WrongContent,
 }
 
@@ -91,26 +47,15 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// Whether a failed transfer is worth retrying with the same peer.
-///
-/// Everything that is not a [`Refusal`] is retryable, and a short read in particular: a relayed
-/// transfer is cut every `MAX_CIRCUIT_BYTES` by design, so a severed stream is the *ordinary*
-/// case for a large file and the partial resumes from where it stopped.
 fn terminal(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Refusal>().is_some()
 }
 
 /// Blob transfers in flight, and the channel their outcomes come back on.
-///
-/// Keyed by peer, because the close decision depends on "is a transfer running with P" — a
-/// bare count cannot answer that, and proposing to close a peer we are mid-download from is
-/// the one mistake this protocol exists to avoid.
 pub struct Transfers {
     outcomes: mpsc::UnboundedSender<PeerEvent>,
     inbox: mpsc::UnboundedReceiver<PeerEvent>,
     running: HashMap<PeerId, usize>,
-    /// Where a spawned task opens its own handles. Passed rather than shared, because nothing
-    /// in this workspace shares a connection behind a lock.
     db: PathBuf,
     me: PeerId,
 }
@@ -127,7 +72,6 @@ impl Transfers {
         }
     }
 
-    /// Everything that finished since the last tick.
     pub fn collect(&mut self) -> Vec<PeerEvent> {
         let mut out = Vec::new();
         while let Ok(event) = self.inbox.try_recv() {
@@ -164,13 +108,6 @@ impl Transfers {
     }
 
     /// Start a download, and say whether it started.
-    ///
-    /// **Answering is the point.** Declining silently was safe while `ac-files` drove fetching
-    /// off a timer and simply asked again; it stopped being safe the moment the supervisor began
-    /// counting what it had issued, because a refusal it never heard about was a transfer it
-    /// waited on for ever. The supervisor now paces itself to `MAX_TRANSFERS` and should never
-    /// reach this, so a `false` here means the two have drifted — and the caller turns it into a
-    /// retryable failure rather than a file that quietly never arrives.
     #[must_use]
     pub fn fetch(
         &mut self,
@@ -217,8 +154,6 @@ async fn download(
     let mut hash = [0u8; 32];
     hex::decode_to_slice(&want.hash, &mut hash)?;
 
-    // Whatever a previous attempt managed. Its hash state is rebuilt by re-reading it, which
-    // is a local read against re-fetching everything.
     let resume = content.staged_len(&want.dir, &want.path);
 
     let mut stream = control
@@ -254,17 +189,12 @@ async fn download(
     }
 
     if got != expected {
-        // Kept, not discarded: a short read is what a severed relay circuit looks like, and
-        // the next attempt continues from here.
         sink.park()?;
         anyhow::bail!("transfer ended early after {got} of {expected} bytes");
     }
 
     let staged = sink.finish()?;
     if staged.hash != want.hash {
-        // Discarded, unlike a short read: these bytes are not a head start, they are poison.
-        // Left in place, the next attempt reads their length as its resume offset and fails
-        // the same way for ever, blaming a different peer each time.
         content.discard(staged).ok();
         anyhow::bail!(Refusal::WrongContent);
     }
@@ -276,10 +206,6 @@ async fn download(
 }
 
 /// Answer an inbound blob stream.
-///
-/// Spawned with its own database handles: the authorization has to be re-checked here rather
-/// than trusted from whoever accepted the stream, and the event loop must not block on a disk
-/// read the size of a film.
 pub fn serve(
     db: PathBuf,
     content: Content,
@@ -307,20 +233,12 @@ async fn answer(
     let files = Files::open(&db, me)?;
     let groups = Groups::open(&db, me)?;
 
-    // The free function, not `FileSync::may_serve`: this runs in its own task with its own
-    // handles and never sees the roster. That is not a gap. A stream cannot exist without an
-    // admitted connection — `Admission` disconnects anyone who fails — so the only question
-    // left is whether the *stores* entitle this peer to these bytes, which is exactly what
-    // this answers.
     let Some(size) = may_serve(&files, &groups, &peer, request.group, &path) else {
         write_frame(&mut stream, &BlobReply::Unavailable).await?;
         stream.close().await?;
         return Ok(());
     };
 
-    // The hash is what was asked for, not what the path happens to hold now. Refusing a
-    // mismatch means a catalogue that moved underneath the request produces a clean retry
-    // rather than the wrong bytes.
     let row = files.get(request.group, &path)?;
     if row.is_none_or(|r| r.hash != hex::encode(request.hash)) {
         write_frame(&mut stream, &BlobReply::Unavailable).await?;
@@ -334,24 +252,9 @@ async fn answer(
         return Ok(());
     };
 
-    // Opened *before* the reply, never after.
-    //
-    // Promising bytes and then failing to find them is indistinguishable, from the other end,
-    // from a relay circuit being cut mid-transfer — which is routine and therefore retried.
-    // So a row whose `have` is stale used to produce an unbounded retry loop: the requester
-    // asked, was promised, received nothing, resumed, and asked again for ever. Worse than
-    // wasted work, it meant a single stale row anywhere left a peer with permanent
-    // outstanding work, so it could never go idle.
     let file = match content.open_at(&dir, &path, request.offset) {
         Ok(file) => file,
         Err(e) => {
-            // Our index was wrong. Correct it here rather than only refusing this request:
-            // otherwise the same claim is made to every other member in turn, and nothing
-            // surfaces it to whoever could put the file back.
-            //
-            // `have = 0`, **not** a tombstone. `removed_at` means the file was deleted from
-            // the group; this only means the bytes are not on *this* disk, and other members
-            // may hold it perfectly well.
             tracing::warn!(%path, error = %e, "indexed as held, but not on disk; correcting");
             let mut files = files;
             let _ = files.mark_have(request.group, &path, false);
@@ -379,9 +282,6 @@ async fn answer(
 }
 
 /// Write a length-prefixed CBOR value.
-///
-/// Length-prefixed because a stream has no message boundaries: without one the reader cannot
-/// tell where a header stops and the file begins.
 async fn write_frame<T: serde::Serialize>(
     stream: &mut libp2p::swarm::Stream,
     value: &T,

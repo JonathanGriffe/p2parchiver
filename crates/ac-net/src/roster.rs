@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use libp2p::PeerId;
 
-use crate::connectivity::{Connectivity, State};
+use crate::connectivity::Connectivity;
 
 /// How far a peer has got. Admission is not the same thing as being usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +33,7 @@ impl Roster {
     pub fn promote(&mut self, connectivity: &Connectivity) -> Vec<PeerId> {
         let mut ready = Vec::new();
         for (peer, standing) in self.peers.iter_mut() {
-            if *standing == Standing::Ready || !settled(connectivity, peer) {
+            if *standing == Standing::Ready || !connectivity.is_settled(peer) {
                 continue;
             }
             *standing = Standing::Ready;
@@ -46,14 +46,6 @@ impl Roster {
     pub fn is_ready(&self, peer: &PeerId) -> bool {
         self.peers.get(peer) == Some(&Standing::Ready)
     }
-}
-
-/// Whether a peer's connection has stopped changing shape.
-fn settled(connectivity: &Connectivity, peer: &PeerId) -> bool {
-    !matches!(
-        connectivity.get(peer).map(|s| s.effective_state()),
-        Some(State::UpgradePending)
-    )
 }
 
 #[cfg(test)]

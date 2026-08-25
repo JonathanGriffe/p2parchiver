@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use ac_files::path::RelPath;
 use ac_files::store::{FileRow, Files};
-use ac_files::sync::{FileAction, FileEvent, FileSync, Notice};
+use ac_files::sync::{FileAction, FileEvent, FileSync, Notice, may_serve};
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_files::{Content, ManifestEntry};
 use ac_groups::chain::Op;
@@ -76,8 +76,12 @@ impl Node {
         self.sync.on_request(peer, request, &self.roster)
     }
 
+    /// The free function, which is the one the blob path actually calls.
+    ///
+    /// It takes no roster: a blob stream cannot exist without an admitted connection, so the
+    /// only question left is whether the stores entitle this peer to these bytes.
     fn sync_may_serve(&mut self, peer: PeerId, group: GroupId, path: &RelPath) -> Option<u64> {
-        self.sync.may_serve(peer, group, path, &self.roster)
+        may_serve(self.sync.files(), self.sync.groups(), &peer, group, path)
     }
 
     /// A peer that has gone. The roster forgets them; nothing else needs telling.

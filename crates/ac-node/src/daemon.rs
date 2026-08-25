@@ -1,23 +1,3 @@
-//! The client's event loop.
-//!
-//! `ac-net` builds the swarm and owns the protocols; this drives it. What it deliberately
-//! does *not* do is decide who to talk to.
-//!
-//! Discovery reports every peer the server knows about, and this module dials none of
-//! them. Choosing which are worth connecting to is a product decision — group membership
-//! in milestone 2 — and the app layer will make it. Dialling itself is already available
-//! (`Swarm::dial`), and who is currently connected is already answerable
-//! (`Swarm::connected_peers`), so no interface is invented here ahead of a real caller.
-//!
-//! # Admission
-//!
-//! What it *does* decide is who may stay. Every peer connection runs a mutual attestation
-//! exchange — see [`ac_net::admission`] — and one that does not complete is closed. That is an
-//! authorization check on a live connection, not on the act of connecting, and the
-//! distinction is the one `ac_net::authz` spends its module docs on: the credential is
-//! signed by the server, so verifying it needs no prior knowledge of the peer and cannot
-//! deadlock the way a locally-held trust list does.
-
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -44,35 +24,6 @@ use ac_net::swarm::{AcBehaviourEvent, Role, build};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
 /// This node's application layer: four protocols in one slot.
-///
-/// They live in `ac-groups`, `ac-files` and `ac-peers`, none of which can add a field to
-/// `AcBehaviour` from outside its own crate — so the binary supplies them through the app slot
-/// instead. That is the whole reason the slot exists, and why `ac-net` names no group, file or
-/// session type.
-///
-/// Composed here rather than in `ac-net` because the slot takes exactly one behaviour and this
-/// is the only place that knows which ones a client speaks. The derive generates `AppEvent`
-/// with a variant per field, which is what the routing below matches on.
-///
-/// `blobs` is a bare stream protocol rather than request-response: a file is far too large to
-/// buffer as one message, and chunking it would mean reassembling out-of-order pieces, hashing
-/// in a second pass, and reading from disk inside the event loop.
-///
-/// `sessions` is the odd one out: it carries no data at all, only the question "are you done
-/// with me too?". It obeys the slot's first rule the same as the rest — it may *ask* to close
-/// a connection and can never refuse one.
-///
-/// # Why the behaviours are built here rather than in those crates
-///
-/// Each of the three used to export its own `Behaviour` alias and constructor, which is what
-/// made `libp2p` a dependency of all three. Now they export the protocol name, the message
-/// types and the size ceilings — facts about the protocol — and this crate turns them into
-/// something mountable. `ac-groups`, `ac-files` and `ac-peers` therefore cannot name a libp2p
-/// type at all, which is a stronger statement than the greps in their `tests/layering.rs`:
-/// the compiler enforces it, because the dependency is gone.
-///
-/// `blobs` has always worked this way — `ac_files::wire::BLOB_PROTOCOL` is a `&str` and the
-/// stream is opened here. This makes the other three consistent with it.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct App {
     pub groups: request_response::cbor::Behaviour<GroupRequest, GroupResponse>,
@@ -105,18 +56,6 @@ pub fn app() -> App {
 }
 
 /// One CBOR request-response behaviour, built from what a protocol declares about itself.
-///
-/// The three above were three copies of this function in three crates, identical but for the
-/// names they closed over. They are all [`ProtocolSupport::Full`] because all three exchanges
-/// are symmetric — either side may offer and either may be asked, and on a relayed connection
-/// that DCUtR later upgrades, "who dialled" is not a distinction worth building on. That is the
-/// same reasoning as `/ac/peer-attest/1.0.0` in `ac-net`.
-///
-/// The size maxima are always passed explicitly. libp2p's codec defaults are 1 MiB request and
-/// 10 MiB response, which is a memory budget none of these protocols has any use for, and
-/// `request_response` buffers a whole message before handing it over — so the ceiling is what
-/// bounds what one peer can make this node allocate. Each protocol's own crate holds its number
-/// and has a test proving its largest legal message fits underneath.
 fn cbor_behaviour<Req, Resp>(
     protocol: &'static str,
     max_request: u64,
@@ -144,10 +83,6 @@ where
 pub type ClientSwarm = libp2p::Swarm<ac_net::swarm::AcBehaviour<AcceptAnyPeer, App>>;
 
 /// Listen, optionally dial, and run until interrupted.
-///
-/// The authorizer is [`AcceptAnyPeer`]: a client accepts connections from anyone, because
-/// refusing by identity would prevent a peer from ever delivering the group membership
-/// proof that authorizes it. Resource limits, not identity, bound what a stranger costs.
 pub async fn run(
     identity: &Identity,
     config: &Config,
@@ -178,9 +113,6 @@ pub async fn run(
         None => None,
     };
 
-    // Admission. Always present, including on a node that has never enrolled: such a node
-    // has nothing to verify anyone against, so it closes every peer connection rather than
-    // leaving one open and unchecked.
     let (mut admission, notes) = Admission::load(
         &paths.attestation_file(),
         identity.peer_id(),
@@ -191,29 +123,15 @@ pub async fn run(
         report_admission(&note);
     }
 
-    // The application layer. Its store is the same `state.sqlite` the CLI writes, which is
-    // how `ac group add` in another process reaches a running daemon.
     let mut groups = GroupLink::open(paths, identity)?;
     let mut files = FileLink::open(paths, identity)?;
-    // The supervisor. Opened last because it needs the server's peer id, which comes from the
-    // link above — presence is asked of the server and the server is never hung up on.
     let mut peers = PeerLink::open(paths, identity, link.as_ref().map(|l| l.server))?;
 
-    // Inbound blob streams do not arrive as swarm events; `libp2p_stream` hands them over on
-    // this handle instead, which is why it is taken once here and polled in the loop.
     let mut blobs = FileLink::accept_blobs(&mut swarm)?;
-
-    // How each peer is reachable, and why. The only record of whether milestone 1's
-    // headline claim — relayed connections upgrade to direct — actually held.
     let mut connectivity = Connectivity::default();
 
-    // Who is admitted, and who is ready to be talked to. The one copy of that fact: every
-    // layer below borrows it rather than keeping a set of its own.
     let mut roster = Roster::default();
 
-    // One clock for both schedules the supervisor keeps — reconnection and re-discovery.
-    // Neither needs sub-second precision, and a single tick is easier to reason about than
-    // two futures racing in the `select!`.
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -233,55 +151,75 @@ pub async fn run(
                 });
                 dispatch_admission(&mut swarm, actions, &mut roster);
 
-                // Promoted once, here, and fanned out — rather than three layers each running
-                // the same test against the same `Connectivity` in whatever order the calls
-                // below happened to be written in.
                 for peer in roster.promote(&connectivity) {
                     peers.peer_ready(&mut swarm, &mut files, &mut groups, &roster, peer);
                 }
 
                 groups.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
                 files.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
-                // Last, so it sees the round outcomes the file layer produced this turn.
                 peers.housekeeping(&mut swarm, &mut files, &mut groups, &roster, attest::now());
             }
 
             event = swarm.select_next_some() => {
-                track(&mut connectivity, &swarm, &event);
+                match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        let relayed = endpoint
+                            .get_remote_address()
+                            .iter()
+                            .any(|p| p == Protocol::P2pCircuit);
+                        connectivity.connected(peer_id, relayed);
 
-                // Admission runs before the `ServerLink` arm so that a peer which fails
-                // the check is closed in the same turn it was seen, rather than lingering
-                // for a tick. The server itself is exempt and skipped inside.
-                match &event {
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         let actions = admission.on(AdmissionEvent::Connected {
-                            peer: *peer_id,
+                            peer: peer_id,
                             now: Instant::now(),
                         });
                         dispatch_admission(&mut swarm, actions, &mut roster);
+
+                        if let Some(link) = &mut link {
+                            link.reserve(&mut swarm, peer_id);
+                        }
+                        report_connected(peer_id, &endpoint);
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        let still_connected = swarm.is_connected(peer_id);
+
+                    SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                        // The swarm's answer, asked once and used by all four: a peer holds a
+                        // relayed *and* a direct connection while an upgrade settles, so one
+                        // closing is not the peer leaving.
+                        let still_connected = swarm.is_connected(&peer_id);
+                        connectivity.disconnected(peer_id, still_connected);
+
                         let actions = admission.on(AdmissionEvent::Disconnected {
-                            peer: *peer_id,
+                            peer: peer_id,
                             still_connected,
                         });
                         dispatch_admission(&mut swarm, actions, &mut roster);
-                        // The roster's answer, not the swarm's: it says whether this peer had
-                        // been promoted, so the supervisor only hears about a peer it was told
-                        // about. `GroupLink` and `FileLink` need no telling at all now — they
-                        // read the roster where it matters, and their outstanding requests
-                        // resolve themselves as `OutboundFailure`.
-                        if roster.disconnected(peer_id, still_connected) {
-                            peers.on_disconnected(&mut swarm, &mut files, &mut groups, &roster, *peer_id);
+
+                        if roster.disconnected(&peer_id, still_connected) {
+                            peers.on_disconnected(&mut swarm, &mut files, &mut groups, &roster, peer_id);
                         }
+                        if let Some(link) = &mut link {
+                            link.on_disconnected(peer_id, still_connected);
+                        }
+                        tracing::info!(peer = %peer_id, cause = ?cause, "disconnected");
                     }
-                    // The one discovery path that needs no server at all, so it is handled
-                    // here rather than inside the `ServerLink` arm below. An mDNS address is
-                    // direct by construction, which makes it strictly better than the circuit
-                    // the supervisor would otherwise build.
+
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        if let Some(peer) = peer_id {
+                            peers.dial_failed(&mut swarm, &mut files, &mut groups, &roster, peer);
+                        }
+                        tracing::warn!(peer = ?peer_id, %error, "outgoing connection failed");
+                    }
+
+                    SwarmEvent::ExternalAddrConfirmed { address } => {
+                        if let Some(link) = &mut link {
+                            link.publish(&mut swarm);
+                        }
+                        println!("external {address}");
+                    }
+
                     SwarmEvent::Behaviour(AcBehaviourEvent::Mdns(mdns::Event::Discovered(found))) => {
-                        for (peer, addr) in found {
+                        for (peer, addr) in &found {
+                            tracing::info!(%peer, %addr, "discovered a peer on the local network");
                             peers.discovered(
                                 *peer,
                                 std::slice::from_ref(addr),
@@ -292,79 +230,61 @@ pub async fn run(
                             );
                         }
                     }
-                    // A dial that never landed. The supervisor's backoff already advanced
-                    // when the attempt went out — this is what stops the peer also being
-                    // treated as online, so the next round rotates past them.
-                    SwarmEvent::OutgoingConnectionError { peer_id: Some(peer), .. } => {
-                        peers.dial_failed(&mut swarm, &mut files, &mut groups, &roster, *peer);
-                    }
-                    _ => {}
-                }
 
-                if let Some(link) = &mut link {
-                    match &event {
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            link.reserve(&mut swarm, *peer_id);
-                        }
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            link.on_disconnected(*peer_id, swarm.is_connected(peer_id));
-                        }
-                        // Registering needs an external address, and on a NATed node the
-                        // first one to exist is the relay circuit. So this is both "we
-                        // became reachable" and "we now have something worth publishing".
-                        SwarmEvent::ExternalAddrConfirmed { .. } => {
-                            link.publish(&mut swarm);
-                        }
-                        SwarmEvent::Behaviour(AcBehaviourEvent::RendezvousClient(
-                            rendezvous::client::Event::Discovered { registrations, .. },
-                        )) => {
-                            report_discovered(registrations, identity.peer_id());
-                            for registration in registrations {
-                                let peer = registration.record.peer_id();
-                                if peer != identity.peer_id() {
-                                    peers.discovered(
-                                        peer,
-                                        registration.record.addresses(),
-                                        &mut files,
-                                        &mut groups,
-                                        &mut swarm,
-                                        &roster,
-                                    );
-                                }
+                    SwarmEvent::Behaviour(AcBehaviourEvent::RendezvousClient(
+                        rendezvous::client::Event::Discovered { registrations, .. },
+                    )) => {
+                        report_discovered(&registrations, identity.peer_id());
+                        for registration in &registrations {
+                            let peer = registration.record.peer_id();
+                            if peer != identity.peer_id() {
+                                peers.discovered(
+                                    peer,
+                                    registration.record.addresses(),
+                                    &mut files,
+                                    &mut groups,
+                                    &mut swarm,
+                                    &roster,
+                                );
                             }
                         }
-                        _ => {}
+                        println!("discovered {} peer(s)", registrations.len());
                     }
-                }
 
-                // Dispatched by value rather than by reference, because answering an
-                // inbound request means taking ownership of its `ResponseChannel`.
-                match event {
+                    SwarmEvent::Behaviour(AcBehaviourEvent::Dcutr(event)) => {
+                        let peer = event.remote_peer_id;
+                        connectivity.hole_punch(peer, event.result.is_ok());
+
+                        match &event.result {
+                            Ok(_) => {
+                                let took = connectivity
+                                    .get(&peer)
+                                    .and_then(|s| s.upgrade_took())
+                                    .unwrap_or_default();
+                                println!("direct {peer} after {:.1}s", took.as_secs_f32());
+                            }
+                            Err(e) => {
+                                tracing::info!(%peer, error = %e, "hole punch failed; staying relayed");
+                            }
+                        }
+                    }
+
                     SwarmEvent::Behaviour(AcBehaviourEvent::PeerAttest(event)) => {
-                        on_peer_attest(
-                            &mut swarm, &mut admission, &mut roster, event,
-                        );
+                        on_peer_attest(&mut swarm, &mut admission, &mut roster, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::Attest(event)) => {
-                        on_renewal(
-                            &mut swarm, &mut admission, &mut roster, event,
-                        );
+                        on_renewal(&mut swarm, &mut admission, &mut roster, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Groups(event))) => {
                         groups.on_event(&mut swarm, &roster, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Manifests(event))) => {
-                        // The supervisor's holdings queries share this behaviour with the file
-                        // layer's offers and pages, so ids are unique across the two and this
-                        // is a claim rather than a race.
                         if let Some(event) =
                             peers.claim_manifest(&mut swarm, &mut files, &mut groups, &roster, event)
                         {
                             files.on_event(&mut swarm, &roster, event);
                         }
                     }
-                    // `libp2p_stream` emits nothing through the behaviour — its `ToSwarm` is
-                    // `()`. Inbound streams arrive on the `IncomingStreams` handle instead.
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Blobs(()))) => {}
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Sessions(event))) => {
                         peers.on_session(&mut swarm, &mut files, &mut groups, &roster, event);
@@ -376,10 +296,13 @@ pub async fn run(
                 }
             }
 
-            // Inbound blob streams. Handed straight to a task with its own database handles,
-            // so a peer reading a large file never occupies the event loop.
             Some((peer, stream)) = blobs.next() => {
-                files.on_inbound_blob(peer, stream);
+                if roster.is_ready(&peer) {
+                    files.on_inbound_blob(peer, stream);
+                } else {
+                    tracing::debug!(%peer, "declining a blob stream from a peer that is not ready");
+                    drop(stream);
+                }
             }
 
             _ = tokio::signal::ctrl_c() => {
@@ -390,66 +313,17 @@ pub async fn run(
     }
 }
 
-/// Translate swarm events into connectivity transitions, and report the interesting ones.
-///
-/// This is the only place the two halves meet: [`Connectivity`] takes plain values so it
-/// can be tested without a network, and this turns libp2p's events into those values.
-pub fn track<A: ac_net::authz::PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
-    connectivity: &mut Connectivity,
-    swarm: &libp2p::Swarm<ac_net::swarm::AcBehaviour<A, X>>,
-    event: &SwarmEvent<AcBehaviourEvent<A, X>>,
-) {
-    match event {
-        SwarmEvent::ConnectionEstablished {
-            peer_id, endpoint, ..
-        } => {
-            let relayed = endpoint
-                .get_remote_address()
-                .iter()
-                .any(|p| p == Protocol::P2pCircuit);
-            connectivity.connected(*peer_id, relayed);
-        }
-
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            // A peer holds a relayed *and* a direct connection while an upgrade settles,
-            // so one closing does not mean the peer is gone. The swarm knows which.
-            connectivity.disconnected(*peer_id, swarm.is_connected(peer_id));
-        }
-
-        SwarmEvent::Behaviour(AcBehaviourEvent::Dcutr(event)) => {
-            let succeeded = event.result.is_ok();
-            connectivity.hole_punch(event.remote_peer_id, succeeded);
-
-            let peer = event.remote_peer_id;
-            match &event.result {
-                Ok(_) => {
-                    let took = connectivity
-                        .get(&peer)
-                        .and_then(|s| s.upgrade_took())
-                        .unwrap_or_default();
-                    println!("direct {peer} after {:.1}s", took.as_secs_f32());
-                }
-                // Expected under symmetric NAT, where no amount of retrying helps. The
-                // relayed connection remains and stays usable.
-                Err(e) => {
-                    tracing::info!(%peer, error = %e, "hole punch failed; staying relayed");
-                }
-            }
-        }
-
-        _ => {}
-    }
+/// A connection, and which way it was opened.
+fn report_connected(peer: libp2p::PeerId, endpoint: &libp2p::core::ConnectedPoint) {
+    tracing::info!(
+        %peer,
+        addr = %endpoint.get_remote_address(),
+        role = if endpoint.is_dialer() { "dialer" } else { "listener" },
+        "connected"
+    );
 }
 
 /// Report everything the server returned, and connect to none of it.
-///
-/// Every peer, unfiltered — including ones this node will never want. Which of them are
-/// worth a connection is a product decision, so nothing here makes it. Until the app layer
-/// does, `ac run` discovers peers and dials only what `--dial` names.
-///
-/// Addresses arrive inside a signed `PeerRecord`, but nothing would depend on that
-/// signature even when they are used: dialling `/p2p/<peer>` proves possession of the key
-/// regardless, so a wrong address costs a failed dial and nothing more.
 fn report_discovered(registrations: &[rendezvous::Registration], me: libp2p::PeerId) {
     for registration in registrations {
         let peer = registration.record.peer_id();
@@ -466,9 +340,6 @@ fn report_discovered(registrations: &[rendezvous::Registration], me: libp2p::Pee
 }
 
 /// Carry out what [`Admission`] asked for.
-///
-/// This and [`GroupLink::dispatch`] are the only places a swarm and a layer's actions meet;
-/// everything above them is policy that runs with no socket.
 fn dispatch_admission(swarm: &mut ClientSwarm, actions: Vec<AdmissionAction>, roster: &mut Roster) {
     for action in actions {
         match action {
@@ -546,9 +417,6 @@ fn report_admission(note: &AdmissionNotice) {
 }
 
 /// One `/ac/peer-attest/1.0.0` event.
-///
-/// An inbound request is answered in this same turn: the channel is held across
-/// `on_request`, which always yields exactly one response, so it can never be stranded.
 fn on_peer_attest(
     swarm: &mut ClientSwarm,
     admission: &mut Admission,
@@ -563,10 +431,6 @@ fn on_peer_attest(
                 let (response, actions) =
                     admission.on_request(peer, &request.attestation, Instant::now(), attest::now());
                 if let Some(behaviour) = swarm.behaviour_mut().peer_attest.as_mut() {
-                    // Best effort. A rejected peer is disconnected by the action below,
-                    // which can truncate this — the closed connection is the message that
-                    // matters, and the reason string is a courtesy to whoever reads both
-                    // sides' logs.
                     let _ = behaviour.send_response(channel, response);
                 }
                 actions
@@ -631,31 +495,13 @@ fn on_renewal(
     dispatch_admission(swarm, actions, roster);
 }
 
+/// Swarm events this node only reports on.
 fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             // Printed rather than logged, and with the peer id appended, so the output
             // can be pasted straight into another node's `--dial`.
             println!("listening {address}");
-        }
-
-        SwarmEvent::ConnectionEstablished {
-            peer_id, endpoint, ..
-        } => {
-            tracing::info!(
-                peer = %peer_id,
-                addr = %endpoint.get_remote_address(),
-                role = if endpoint.is_dialer() { "dialer" } else { "listener" },
-                "connected"
-            );
-        }
-
-        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-            tracing::info!(peer = %peer_id, cause = ?cause, "disconnected");
-        }
-
-        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            tracing::warn!(peer = ?peer_id, %error, "outgoing connection failed");
         }
 
         SwarmEvent::IncomingConnectionError {
@@ -693,12 +539,6 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
                 "peer protocols"
             );
             println!("observed {} by {}", info.observed_addr, peer_id);
-        }
-
-        // The swarm has decided one of those candidates is really ours. This is the
-        // reachability verdict in its most useful form: an address others can dial.
-        SwarmEvent::ExternalAddrConfirmed { address } => {
-            println!("external {address}");
         }
 
         SwarmEvent::ExternalAddrExpired { address } => {
@@ -754,15 +594,6 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
             tracing::info!(?event, "relay client event");
         }
 
-        // LAN peers, found without the server. Reported, not dialled — same rule as
-        // rendezvous results: whether a peer is worth connecting to is not this layer's
-        // decision.
-        SwarmEvent::Behaviour(AcBehaviourEvent::Mdns(mdns::Event::Discovered(found))) => {
-            for (peer, addr) in found {
-                tracing::info!(%peer, %addr, "discovered a peer on the local network");
-            }
-        }
-
         SwarmEvent::Behaviour(AcBehaviourEvent::Mdns(mdns::Event::Expired(gone))) => {
             for (peer, addr) in gone {
                 tracing::debug!(%peer, %addr, "local peer stopped announcing");
@@ -772,9 +603,6 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
         SwarmEvent::Behaviour(AcBehaviourEvent::RendezvousClient(event)) => match event {
             rendezvous::client::Event::Registered { ttl, namespace, .. } => {
                 println!("registered {namespace} (ttl {ttl}s)");
-            }
-            rendezvous::client::Event::Discovered { registrations, .. } => {
-                println!("discovered {} peer(s)", registrations.len());
             }
             rendezvous::client::Event::RegisterFailed { error, .. } => {
                 tracing::warn!(?error, "the server refused our registration");

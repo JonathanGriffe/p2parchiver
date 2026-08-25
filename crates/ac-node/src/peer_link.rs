@@ -745,7 +745,7 @@ mod tests {
     use ac_groups::id::GroupId;
     use ac_groups::standing::Position;
 
-    use crate::daemon::{App, AppEvent, app, track};
+    use crate::daemon::{App, AppEvent, app};
 
     // The wire-level tests for the whole file path, supervisor included. `ac_files::sync`
     // proves the reconciliation policy and `ac_peers::sync` proves the dial and fetch policy,
@@ -778,7 +778,6 @@ mod tests {
         groups: GroupLink,
         peers: PeerLink,
         blobs: libp2p_stream::IncomingStreams,
-        conn: Connectivity,
         roster: Roster,
         peer: PeerId,
         dir: tempfile::TempDir,
@@ -814,7 +813,6 @@ mod tests {
                 // nodes are dialled directly, and `Verified` is what marks a peer usable.
                 peers: PeerLink::open(&paths, &identity, None).unwrap(),
                 blobs,
-                conn: Connectivity::default(),
                 roster: Roster::default(),
                 peer: identity.peer_id(),
                 dir,
@@ -836,8 +834,6 @@ mod tests {
         /// connection — so these tests exercise the file path without also standing up a
         /// server to issue credentials.
         fn step(&mut self, event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
-            track(&mut self.conn, &self.swarm, &event);
-
             match &event {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     self.roster.admitted(*peer_id);
@@ -892,7 +888,7 @@ mod tests {
 
             // The daemon's order: promote once, then groups, then files, then the supervisor
             // — which sees the round outcomes the file layer produced in the same turn.
-            for peer in self.roster.promote(&self.conn) {
+            for peer in self.roster.promote(&Connectivity::default()) {
                 self.peers.peer_ready(
                     &mut self.swarm,
                     &mut self.link,

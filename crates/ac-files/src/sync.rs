@@ -154,6 +154,10 @@ impl FileSync {
         &mut self.files
     }
 
+    pub fn groups(&self) -> &Groups {
+        &self.groups
+    }
+
     pub fn groups_mut(&mut self) -> &mut Groups {
         &mut self.groups
     }
@@ -215,20 +219,6 @@ impl FileSync {
                 (ManifestResponse::Holdings { group, held }, Vec::new())
             }
         }
-    }
-
-    /// Whether we would serve this peer this file's bytes.
-    pub fn may_serve(
-        &mut self,
-        peer: PeerId,
-        group: GroupId,
-        path: &RelPath,
-        roster: &Roster,
-    ) -> Option<u64> {
-        if !roster.is_ready(&peer) {
-            return None;
-        }
-        may_serve(&self.files, &self.groups, &peer, group, path)
     }
 
     pub fn on(&mut self, event: FileEvent, roster: &Roster) -> Vec<FileAction> {

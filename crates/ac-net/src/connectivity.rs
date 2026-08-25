@@ -3,8 +3,6 @@ use std::time::{Duration, Instant};
 
 use libp2p::PeerId;
 
-pub const MAX_HOLE_PUNCH_ATTEMPTS: u32 = 3;
-
 pub const UPGRADE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How a peer is reachable right now.
@@ -66,11 +64,6 @@ impl PeerState {
             self.state
         }
     }
-
-    /// Whether libp2p will keep trying, or has spent its attempts or its time.
-    pub fn may_still_upgrade(&self) -> bool {
-        self.effective_state() == State::UpgradePending && self.attempts < MAX_HOLE_PUNCH_ATTEMPTS
-    }
 }
 
 /// Per-peer connection state.
@@ -129,6 +122,14 @@ impl Connectivity {
         }
     }
 
+    /// Whether this peer's connection has stopped changing shape.
+    pub fn is_settled(&self, peer: &PeerId) -> bool {
+        !matches!(
+            self.peers.get(peer).map(|s| s.effective_state()),
+            Some(State::UpgradePending)
+        )
+    }
+
     pub fn get(&self, peer: &PeerId) -> Option<&PeerState> {
         self.peers.get(peer)
     }
@@ -170,7 +171,34 @@ mod tests {
         c.connected(p, true);
 
         assert_eq!(c.state(&p), State::UpgradePending);
-        assert!(c.get(&p).unwrap().may_still_upgrade());
+        assert_eq!(c.get(&p).unwrap().attempts, 0, "none reported yet");
+    }
+
+    #[test]
+    fn only_a_pending_upgrade_is_unsettled() {
+        // What `Roster::promote` asks. The unknown-peer case is load-bearing: it is why a test
+        // holding an empty `Connectivity` promotes everyone, and why a node that somehow
+        // admitted a peer it never saw connect is not held for ever.
+        let mut c = Connectivity::default();
+        let p = peer();
+        assert!(c.is_settled(&p), "nothing in flight to wait on");
+
+        c.connected(p, true);
+        assert!(!c.is_settled(&p), "a punch is in flight");
+
+        c.hole_punch(p, false);
+        assert!(
+            c.is_settled(&p),
+            "relayed is a final answer, not a degraded one"
+        );
+
+        c.connected(p, true);
+        c.peers.get_mut(&p).unwrap().since =
+            Instant::now() - UPGRADE_TIMEOUT - Duration::from_secs(1);
+        assert!(
+            c.is_settled(&p),
+            "the side that is never told a punch failed still stops waiting"
+        );
     }
 
     #[test]
@@ -210,25 +238,32 @@ mod tests {
         c.hole_punch(p, false);
 
         assert_eq!(c.state(&p), State::Relayed);
-        assert!(
-            !c.get(&p).unwrap().may_still_upgrade(),
+        assert_eq!(
+            c.get(&p).unwrap().effective_state(),
+            State::Relayed,
             "a settled relayed connection is not still pending"
         );
     }
 
     #[test]
-    fn attempts_are_counted_and_run_out() {
+    fn attempts_are_counted_across_connections() {
         let mut c = Connectivity::default();
         let p = peer();
         c.connected(p, true);
 
-        for _ in 0..MAX_HOLE_PUNCH_ATTEMPTS {
+        for _ in 0..3 {
             c.connected(p, true); // libp2p retries over the relayed connection
             c.hole_punch(p, false);
         }
+        assert_eq!(c.get(&p).unwrap().attempts, 3);
 
-        assert_eq!(c.get(&p).unwrap().attempts, MAX_HOLE_PUNCH_ATTEMPTS);
-        assert!(!c.get(&p).unwrap().may_still_upgrade());
+        c.disconnected(p, false);
+        c.connected(p, true);
+        assert_eq!(
+            c.get(&p).unwrap().attempts,
+            3,
+            "a reconnection does not clear the record"
+        );
     }
 
     #[test]
@@ -314,7 +349,6 @@ mod tests {
             Instant::now() - UPGRADE_TIMEOUT - Duration::from_secs(1);
 
         assert_eq!(c.get(&p).unwrap().effective_state(), State::Relayed);
-        assert!(!c.get(&p).unwrap().may_still_upgrade());
         assert_eq!(
             c.get(&p).unwrap().state,
             State::UpgradePending,
