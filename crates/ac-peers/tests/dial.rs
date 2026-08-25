@@ -22,7 +22,7 @@ use ac_net::PeerId;
 use ac_net::identity::Keypair;
 use ac_peers::sync::{
     DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_WINDOW, HEARTBEAT, Limits, MAX_TRANSFERS, MIN_BACKOFF,
-    Notice, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent, Peers, ROUND_TIMEOUT,
+    NoRoom, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent, Peers, ROUND_TIMEOUT,
     SHARE_AFTER_IDLE,
 };
 
@@ -586,10 +586,14 @@ fn a_new_file_is_fetched_although_the_group_had_given_up_before() {
     // Exhaust the group: the one member holds nothing we want.
     let mut backed_off = false;
     for k in 0..8 {
-        let actions = step(&mut node, AT + k, false);
-        if actions
+        step(&mut node, AT + k, false);
+        // Giving up *is* the content backoff, which `status` reports.
+        if node
+            .peers
+            .status()
+            .groups
             .iter()
-            .any(|a| matches!(a, PeerAction::Note(Notice::Unobtainable { .. })))
+            .any(|g| g.content_until > 0)
         {
             backed_off = true;
             break;
@@ -1517,16 +1521,6 @@ fn fetches(actions: &[PeerAction]) -> usize {
         .count()
 }
 
-fn out_of_space(actions: &[PeerAction]) -> Vec<&Notice> {
-    actions
-        .iter()
-        .filter_map(|a| match a {
-            PeerAction::Note(note @ Notice::OutOfSpace { .. }) => Some(note),
-            _ => None,
-        })
-        .collect()
-}
-
 #[test]
 fn the_free_space_floor_stops_fetching_and_says_so_once() {
     // The floor protects the machine rather than the archive: somebody who set no budget has
@@ -1537,13 +1531,13 @@ fn the_free_space_floor_stops_fetching_and_says_so_once() {
 
     let first = step(&mut node, AT, true);
     assert_eq!(fetches(&first), 0, "no room, so nothing is asked for");
-    assert_eq!(out_of_space(&first).len(), 1, "{first:?}");
+    assert!(
+        matches!(node.peers.room(), Some(NoRoom::Floor { .. })),
+        "and it is the floor that stopped it"
+    );
 
     let again = step(&mut node, AT + 1, true);
-    assert!(
-        out_of_space(&again).is_empty(),
-        "said once per transition, not once per tick: {again:?}"
-    );
+    assert_eq!(fetches(&again), 0, "and it stays stopped: {again:?}");
 }
 
 #[test]
@@ -1556,10 +1550,7 @@ fn a_budget_stops_fetching_short_of_the_disk_filling() {
     let actions = step(&mut node, AT, true);
     assert_eq!(fetches(&actions), 0);
     assert!(
-        matches!(
-            out_of_space(&actions).first(),
-            Some(Notice::OutOfSpace { floor: false, .. })
-        ),
+        matches!(node.peers.room(), Some(NoRoom::Budget { .. })),
         "the budget stopped it, not the floor: {actions:?}"
     );
 }
@@ -1695,12 +1686,14 @@ fn nobody_reachable_is_not_the_same_as_nobody_having_it() {
     node.learn_file(id, "wanted.bin");
 
     // Nobody online, nobody connected.
-    let quiet = step(&mut node, AT, true);
+    step(&mut node, AT, true);
     assert!(
-        !quiet
+        node.peers
+            .status()
+            .groups
             .iter()
-            .any(|a| matches!(a, PeerAction::Note(Notice::Unobtainable { .. }))),
-        "not having asked anyone is not the same as having been refused: {quiet:?}"
+            .all(|g| g.content_until == 0),
+        "not having asked anyone is not the same as having been refused"
     );
 
     // A member turns up. The group must not be sitting in a backoff it should never have

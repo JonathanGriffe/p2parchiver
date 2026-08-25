@@ -3,9 +3,9 @@
 //! The third and last of the adapters, and the one with the widest reach: the supervisor
 //! decides *who to call*, so this is the only module that turns a decision into a `dial`.
 //!
-//! `ac-peers` names no address, no connection and no request id — `tests/layering.rs` there
-//! enforces it — which is what lets a fifty-member group, a week-long absence or a peer that
-//! never answers be set up in a test in microseconds. The price is that everything libp2p
+//! `ac-peers` names no address, no connection and no request id — it does not depend on libp2p,
+//! so the compiler enforces it — which is what lets a fifty-member group, a week-long absence
+//! or a peer that never answers be set up in a test in microseconds. The price is that everything libp2p
 //! knows and the policy does not has to be supplied here:
 //!
 //! - **How to reach a peer.** [`PeerAction::Dial`] carries only a peer id. Most nodes publish
@@ -15,11 +15,11 @@
 //!   dialling out. A direct address is used only when discovery has offered a non-circuit one
 //!   this session.
 //! - **Request correlation**, for holdings queries, presence and close proposals alike.
-//! - **Waiting for a connection to settle**, the same reason [`crate::group_link`] does it: a
-//!   transfer started on a circuit that a hole punch is about to replace wastes the slow path
-//!   for the whole of a large file.
 //! - **Every word a person reads**, so `ac-peers` returns a typed `Notice` and its tests
 //!   assert on meaning rather than phrasing.
+//!
+//! Waiting for a connection to settle is *not* among them any more: that is
+//! [`ac_net::roster::Roster`]'s, which every layer asks rather than tracking for itself.
 //!
 //! # Two behaviours, three owners
 //!
@@ -45,7 +45,7 @@ use ac_files::store::Files;
 use ac_files::wire::{ManifestRequest, ManifestResponse, holds};
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
-use ac_peers::sync::{Limits, Notice, Offering, PeerAction, PeerEvent, Peers};
+use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
 use crate::blob::{self, Transfers};
@@ -642,8 +642,6 @@ impl PeerLink {
                     tracing::debug!(%peer, "both sides are done; closing");
                     let _ = swarm.disconnect_peer_id(peer);
                 }
-
-                PeerAction::Note(notice) => report(&notice),
             }
         }
     }
@@ -673,57 +671,6 @@ impl PeerLink {
     }
 }
 
-/// Bytes, as a person would write them.
-///
-/// Binary units, matching what `config.toml` accepts by default — a limit reported in units
-/// the user cannot compare with the one they set would be worse than no report.
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-/// The binary owns the wording; the machine owns the facts.
-fn report(notice: &Notice) {
-    match notice {
-        Notice::Downloaded { group, path } => {
-            println!("got {path} ({})", group.short());
-        }
-        Notice::Unobtainable { group, path } => {
-            println!("nobody reachable has {path} ({})", group.short());
-            println!("  it stays wanted; this node will keep asking as members come and go");
-        }
-        Notice::Undelivered { peer, group, path } => {
-            tracing::info!(%peer, group = %group.short(), %path, "claimed a file it could not deliver");
-        }
-        Notice::Rejected { peer, why } => {
-            println!("ignored something from {peer}: {why}");
-        }
-        Notice::OutOfSpace { held, limit, floor } => {
-            let held = human(*held);
-            let limit = human(*limit);
-            if *floor {
-                println!("stopped mirroring: less than {limit} free on the storage volume");
-                println!("  holding {held}. nothing was deleted; free some space and it resumes");
-            } else {
-                println!("stopped mirroring: holding {held} of the {limit} storage_max allows");
-                println!("  nothing was deleted; raise storage_max in config.toml to continue");
-            }
-        }
-        Notice::Trouble { why } => {
-            tracing::warn!(%why, "supervisor trouble");
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;

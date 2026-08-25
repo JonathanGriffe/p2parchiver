@@ -1,28 +1,8 @@
-//! What to ask a peer for, once there is one to ask.
-//!
-//! A pure function of the file index. No peer is named, no connection exists, nothing is
-//! scheduled: that belongs to `sync`, and keeping it out of here is what makes the choice
-//! testable without a socket.
-//!
-//! This module used to also hold `behind`, the predicate that decided whether a group was worth
-//! talking to anybody about. It answered three questions — news, heartbeat, content — and the
-//! supervisor ended up answering the first two itself, more precisely, against what each peer
-//! had actually been told rather than against a single per-group record. The third is a count
-//! the index can give directly. So `behind` was left computing a catalogue digest, per group
-//! per tick, for a verdict its only caller discarded.
-
 use ac_files::path::RelPath;
 use ac_files::store::{Files, FilesError};
 use ac_groups::id::GroupId;
 use ac_groups::store::StoreError;
 
-/// The next files worth asking a peer about, wanted ones first.
-///
-/// Only called once a connection exists and we are about to ask — never for a dial decision.
-///
-/// `limit` should be the holdings-query cap: the responder answers only that many, and a
-/// longer query silently loses the tail rather than misaligning, so over-asking would skip
-/// files every round rather than fail visibly.
 pub fn next_missing(
     files: &Files,
     group: GroupId,
@@ -54,9 +34,6 @@ mod tests {
     const AT: i64 = 1_000_000;
 
     /// A node's two stores and the group it admins.
-    ///
-    /// No content root: nothing here touches bytes. What a group still needs is answerable from
-    /// the index alone, which is the point of the question being this cheap.
     struct Node {
         files: Files,
         groups: Groups,

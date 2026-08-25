@@ -10,15 +10,6 @@ use crate::proto::{AttestResponse, PeerAttestResponse};
 /// How long a peer has to complete the exchange before it is closed.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Notice {
-    Attested { username: String, hours: i64 },
-    RenewalRefused { reason: String },
-    IssuedUnusable { error: String },
-    NotCached { path: PathBuf, error: String },
-    NotEnrolled,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdmissionAction {
     Send {
@@ -38,7 +29,6 @@ pub enum AdmissionAction {
         peer: PeerId,
         username: String,
     },
-    Note(Notice),
 }
 
 /// What happened to a renewal we asked for.
@@ -120,23 +110,22 @@ pub struct Admission {
 
 impl Admission {
     /// Load the cached attestation, discarding one that is no longer usable.
-    pub fn load(path: &Path, me: PeerId, server: Option<PeerId>, at: i64) -> (Self, Vec<Notice>) {
+    pub fn load(path: &Path, me: PeerId, server: Option<PeerId>, at: i64) -> Self {
         let path = path.to_path_buf();
-        let mut notes = Vec::new();
 
         let Some(server) = server else {
-            notes.push(Notice::NotEnrolled);
-            return (
-                Self {
-                    path,
-                    me,
-                    server: None,
-                    mine: None,
-                    renewing: false,
-                    peers: HashMap::new(),
-                },
-                notes,
+            tracing::warn!(
+                "this node has not enrolled, so it can verify nobody and can prove nothing \
+                 about itself. Every peer connection will be closed. Run `ac join` first."
             );
+            return Self {
+                path,
+                me,
+                server: None,
+                mine: None,
+                renewing: false,
+                peers: HashMap::new(),
+            };
         };
 
         let mine = attest::load(&path)
@@ -159,17 +148,14 @@ impl Admission {
                 }
             });
 
-        (
-            Self {
-                path,
-                me,
-                server: Some(server),
-                mine,
-                renewing: false,
-                peers: HashMap::new(),
-            },
-            notes,
-        )
+        Self {
+            path,
+            me,
+            server: Some(server),
+            mine,
+            renewing: false,
+            peers: HashMap::new(),
+        }
     }
 
     pub fn server(&self) -> Option<PeerId> {
@@ -386,10 +372,11 @@ impl Admission {
                         if let Err(e) = attest::save(&self.path, &attestation) {
                             // Not fatal: the attestation works for this run, and the next start
                             // simply renews again.
-                            actions.push(AdmissionAction::Note(Notice::NotCached {
-                                path: self.path.clone(),
-                                error: e.to_string(),
-                            }));
+                            tracing::warn!(
+                                path = %self.path.display(),
+                                error = %e,
+                                "could not cache the attestation"
+                            );
                         }
                         let hours = (statement.expires_at - at).max(0) / 3600;
                         let username = statement.username.clone();
@@ -406,17 +393,24 @@ impl Admission {
                             actions.extend(self.send_ours(peer));
                         }
 
-                        actions.push(AdmissionAction::Note(Notice::Attested { username, hours }));
+                        tracing::info!(%username, hours, "attested");
                         actions
                     }
-                    Err(e) => vec![AdmissionAction::Note(Notice::IssuedUnusable {
-                        error: e.to_string(),
-                    })],
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "the server issued an attestation this node cannot use"
+                        );
+                        Vec::new()
+                    }
                 }
             }
 
+            // Logged rather than reported, like `Renewal::Failed` below: nothing a person
+            // does about it differs, and the reason string is for whoever reads the log.
             Renewal::Refused { reason } => {
-                vec![AdmissionAction::Note(Notice::RenewalRefused { reason })]
+                tracing::warn!(reason, "attestation refused");
+                Vec::new()
             }
 
             Renewal::Failed { error } => {

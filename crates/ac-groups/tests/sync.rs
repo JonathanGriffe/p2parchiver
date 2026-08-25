@@ -6,7 +6,7 @@ use ac_groups::chain::{Entry, Op};
 use ac_groups::id::GroupId;
 use ac_groups::standing::Position;
 use ac_groups::store::{Groups, State};
-use ac_groups::sync::{GroupAction, GroupEvent, GroupSync, Notice};
+use ac_groups::sync::{GroupAction, GroupEvent, GroupSync};
 use ac_groups::wire::{GroupHead, GroupRequest, GroupResponse};
 use ac_net::PeerId;
 use ac_net::connectivity::Connectivity;
@@ -103,25 +103,21 @@ fn asked(node: &mut Node, peer: PeerId) -> Vec<GroupId> {
 fn fetches(actions: &[GroupAction]) -> Vec<(PeerId, GroupId, u64)> {
     actions
         .iter()
-        .filter_map(|a| match a {
-            GroupAction::Fetch { peer, group, from } => Some((*peer, *group, *from)),
-            _ => None,
-        })
+        .map(|GroupAction::Fetch { peer, group, from }| (*peer, *group, *from))
         .collect()
 }
 
 /// Dispatch actions between two nodes until nothing is left to send.
-fn settle(a: &mut Node, b: &mut Node, seed: Vec<(Side, Step)>) -> Vec<Notice> {
+fn settle(a: &mut Node, b: &mut Node, seed: Vec<(Side, Step)>) {
     let mut queue = seed;
-    let mut notes = Vec::new();
 
     for _ in 0..200 {
         let Some((side, action)) = queue.pop() else {
-            return notes;
+            return;
         };
         match side {
-            Side::A => step(a, b, Side::A, action, &mut queue, &mut notes),
-            Side::B => step(b, a, Side::B, action, &mut queue, &mut notes),
+            Side::A => step(a, b, Side::A, action, &mut queue),
+            Side::B => step(b, a, Side::B, action, &mut queue),
         }
     }
     panic!("the exchange never settled");
@@ -148,11 +144,8 @@ fn step(
     side: Side,
     action: Step,
     queue: &mut Vec<(Side, Step)>,
-    notes: &mut Vec<Notice>,
 ) {
     match action {
-        Step::Act(GroupAction::Note(n)) => notes.push(n),
-
         Step::Ask => {
             let (response, theirs) = receiver.sync_on_request(sender.peer(), GroupRequest::Ask);
             queue.extend(theirs.into_iter().map(|x| (side.other(), Step::Act(x))));
@@ -197,7 +190,7 @@ fn step(
 
 /// Connect two nodes and let them sync to quiescence. `a` is [`Side::A`].
 /// Verify both ways and let each side offer, as the supervisor does on a fresh connection.
-fn connect(a: &mut Node, b: &mut Node) -> Vec<Notice> {
+fn connect(a: &mut Node, b: &mut Node) {
     a.verify(b.peer());
     b.verify(a.peer());
 
@@ -270,7 +263,7 @@ fn an_answer_names_exactly_the_shared_groups() {
 #[test]
 fn a_new_member_learns_the_whole_group() {
     let (mut admin, mut member, id) = admin_and_member();
-    let notes = connect(&mut admin, &mut member);
+    connect(&mut admin, &mut member);
 
     let row = member.sync.store().get(id).unwrap().unwrap();
     assert_eq!(row.head_seq, 2);
@@ -287,9 +280,10 @@ fn a_new_member_learns_the_whole_group() {
             .unwrap()
             .contains(&member.peer())
     );
-    assert!(
-        notes.iter().any(|n| matches!(n, Notice::Invited { .. })),
-        "and are told, so they can accept: {notes:?}"
+    assert_eq!(
+        member.sync.store().get(id).unwrap().unwrap().state,
+        State::Pending,
+        "and hold it unanswered, so they can accept"
     );
 }
 
@@ -348,7 +342,7 @@ fn an_answer_never_provokes_another_question() {
     assert!(
         actions
             .iter()
-            .all(|a| matches!(a, GroupAction::Fetch { .. } | GroupAction::Note(_))),
+            .all(|a| matches!(a, GroupAction::Fetch { .. })),
         "an answer must produce fetches only"
     );
 }
@@ -457,7 +451,7 @@ fn a_removed_member_finds_out_by_asking() {
         .unwrap();
     add(&mut admin, id, Node::new().peer(), "carol");
 
-    let notes = connect(&mut admin, &mut member);
+    connect(&mut admin, &mut member);
 
     assert!(
         !member
@@ -474,10 +468,13 @@ fn a_removed_member_finds_out_by_asking() {
         "up to and including their removal, and not one entry further"
     );
     assert!(
-        notes
-            .iter()
-            .any(|n| matches!(n, Notice::RemovedByAdmin { .. })),
-        "and are told so: {notes:?}"
+        !member
+            .sync
+            .store()
+            .members(id)
+            .unwrap()
+            .contains(&member.peer()),
+        "and their own copy of the chain no longer lists them"
     );
 }
 
@@ -493,15 +490,13 @@ fn the_admin_ratifies_a_departure_exactly_once() {
         .author_standing(&member.key, id, Position::Out, AT)
         .unwrap();
 
-    // Three reconnections, as a restart or a digest repair would produce.
-    let ratified: usize = (0..3)
-        .map(|_| {
-            connect(&mut admin, &mut member)
-                .iter()
-                .filter(|n| matches!(n, Notice::Ratified { .. }))
-                .count()
-        })
-        .sum();
+    // Three reconnections, as a restart or a digest repair would produce. The chain is what
+    // says how often the departure was ratified: each `Op::Remove` is one entry.
+    let before = admin.sync.store().get(id).unwrap().unwrap().head_seq;
+    for _ in 0..3 {
+        connect(&mut admin, &mut member);
+    }
+    let ratified = admin.sync.store().get(id).unwrap().unwrap().head_seq - before;
 
     assert_eq!(
         ratified, 1,
@@ -537,15 +532,16 @@ fn a_non_admin_notes_a_departure_but_does_not_ratify_it() {
         .unwrap();
 
     let head_before = carol.sync.store().get(id).unwrap().unwrap().head_seq;
-    let notes = connect(&mut carol, &mut bob);
+    connect(&mut carol, &mut bob);
 
     assert!(
-        notes.iter().any(|n| matches!(n, Notice::Departed { .. })),
-        "a member notes it: {notes:?}"
-    );
-    assert!(
-        !notes.iter().any(|n| matches!(n, Notice::Ratified { .. })),
-        "but only the admin may write the Remove"
+        carol
+            .sync
+            .store()
+            .departed(id)
+            .unwrap()
+            .contains(&bob.peer()),
+        "a member records the departure"
     );
     assert_eq!(
         carol.sync.store().get(id).unwrap().unwrap().head_seq,

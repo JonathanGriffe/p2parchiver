@@ -1,61 +1,10 @@
-//! The `/ac/session/1.0.0` protocol: what is said, not how it is carried.
-//!
-//! The name, the two message types and the size ceiling are here; the `request_response`
-//! behaviour that carries them is built by `ac-node`, the only crate that mounts anything. That
-//! split is what keeps **this whole crate free of libp2p** — not as a convention a grep
-//! polices, but because libp2p is not a dependency and its types cannot be named. So everything
-//! that decides anything — who to dial, what to ask for, when to hang up — is free of
-//! networking types by construction, which is what lets the whole supervisor be driven from a
-//! test with no socket.
-//!
-//! # What it is for
-//!
-//! Two peers that have finished with each other should stop holding a connection open, and
-//! neither of them can tell on its own: a peer sitting silent may be about to ask for a
-//! four-gigabyte file. So closing is **proposed**, not announced. We propose when we are
-//! drained — no round in flight with them, no transfer in flight with them, and they are not
-//! the member we are currently pulling a group's files through — and they answer under the
-//! same test on their side.
-//!
-//! Only the **proposer** disconnects when both sides say `Ready`. One side hanging up is
-//! enough, and two would race.
-//!
-//! # It is politeness, not correctness
-//!
-//! Nothing here is load-bearing for data integrity. A connection cut mid-transfer parks the
-//! partial and resumes later, which `ac-node`'s blob reader already does because a relayed
-//! transfer is severed every `MAX_CIRCUIT_BYTES` regardless of what anyone intended. This
-//! protocol exists so that the common case — both sides genuinely done — costs one round trip
-//! instead of an idle-timeout, and so a peer is never cut off mid-sentence when it could have
-//! said "not yet".
-//!
-//! Two peers that never speak this protocol still work. Their connections are reaped by
-//! `IDLE_CONNECTION_TIMEOUT` instead, which is exactly what happens with a peer running an
-//! older build.
-
 use serde::{Deserialize, Serialize};
-
-/// Bumped on any incompatible change to the types below. The version lives in the name because
-/// multistream-select negotiates on it, so an incompatible peer fails cleanly at negotiation
-/// rather than misreading a message — the same convention as `ac_net::proto`.
 pub const SESSION_PROTOCOL: &str = "/ac/session/1.0.0";
 
 /// Largest session message either side will decode.
-///
-/// A kilobyte for what encodes to a handful of bytes. Set explicitly rather than left at the
-/// codec's 1 MiB request and 10 MiB response, because those are a memory budget this protocol
-/// has no use for: anything larger than this is not a session message and refusing to buffer
-/// it costs nothing.
-///
-/// Public because `ac-node` builds the codec from it. Deliberately not shared with the group,
-/// manifest or presence ceilings: each is checked against its own protocol's largest legal
-/// message by a test in its own crate, and one number cannot answer to four of those.
 pub const MAX_SESSION_BYTES: u64 = 1024;
 
 /// "I have nothing further for you. Do you have anything further for me?"
-///
-/// Carries no reason and no group. Whether *we* are done is a fact about the whole peer, and
-/// whether *they* are is exactly what the answer says — so there is nothing to qualify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionRequest {
     Closing,
@@ -64,11 +13,7 @@ pub enum SessionRequest {
 /// The answer, which is only ever about the responder's own outstanding work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionResponse {
-    /// Drained on this side too. The **proposer** may now disconnect.
     Ready,
-    /// Still has something to ask for or to send. The proposal is dropped and the connection
-    /// left alone; whoever is still busy will go quiet eventually and the question is asked
-    /// again then.
     Busy,
 }
 

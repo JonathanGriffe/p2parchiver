@@ -14,5 +14,5 @@ pub use id::{EntryHash, GroupId};
 pub use members::{Member, Members};
 pub use standing::{Position, Standing, StandingBody, StandingError, StandingSet};
 pub use store::{Applied, GroupRow, Groups, Resolved, State, StoreError};
-pub use sync::{GroupAction, GroupEvent, GroupSync, Notice};
+pub use sync::{GroupAction, GroupEvent, GroupSync};
 pub use wire::{GROUP_PROTOCOL, GroupHead, GroupRequest, GroupResponse};

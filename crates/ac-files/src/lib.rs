@@ -10,7 +10,7 @@ pub mod wire;
 pub use content::{Content, Staged};
 pub use path::{PathError, RelPath};
 pub use store::{FileRow, Files, FilesError, Merged, Recorded};
-pub use sync::{FileAction, FileEvent, FileSync, Notice};
+pub use sync::{FileAction, FileEvent, FileSync};
 pub use wire::{
     BLOB_PROTOCOL, BlobReply, BlobRequest, FileHead, MANIFEST_PROTOCOL, ManifestEntry,
     ManifestRequest, ManifestResponse,

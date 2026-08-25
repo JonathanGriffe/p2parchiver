@@ -29,7 +29,7 @@ use ac_net::roster::Roster;
 
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
-use ac_groups::sync::{GroupAction, GroupEvent, GroupSync, Notice};
+use ac_groups::sync::{GroupAction, GroupEvent, GroupSync};
 use ac_groups::wire::{GroupRequest, GroupResponse};
 
 use crate::daemon::ClientSwarm;
@@ -50,7 +50,8 @@ enum Outbound {
 ///
 /// `ac-groups` decides *what* to do and returns [`GroupAction`]s; this performs them. The
 /// separation is what lets the whole sync policy be tested with no socket, and it is enforced
-/// by `ac-groups/tests/layering.rs` rather than by discipline.
+/// by the compiler rather than by discipline: `ac-groups` does not depend on libp2p, so a
+/// libp2p type is unnameable there.
 pub struct GroupLink {
     sync: GroupSync,
     outbound: HashMap<request_response::OutboundRequestId, Outbound>,
@@ -225,45 +226,8 @@ impl GroupLink {
                         .send_request(&peer, GroupRequest::Fetch { group, from });
                     self.outbound.insert(id, Outbound::Fetch { peer, group });
                 }
-                GroupAction::Note(notice) => report(&notice),
             }
         }
-    }
-}
-
-/// Put a group-layer notice in front of a person.
-///
-/// The group layer returns a typed [`Notice`] and never a string, so every word a user reads
-/// is chosen here — and tests there can assert on meaning rather than on phrasing.
-fn report(notice: &Notice) {
-    match notice {
-        Notice::Invited { group, name } => {
-            println!("invited to group {name:?} ({})", group.short());
-            println!("  join it with: ac group accept {}", group.short());
-        }
-        Notice::RemovedByAdmin { group, name } => {
-            println!(
-                "removed from group {name:?} ({}) by its admin",
-                group.short()
-            );
-        }
-        Notice::MembershipChanged {
-            group,
-            added,
-            removed,
-        } => {
-            tracing::info!(%group, added, removed, "group membership changed");
-        }
-        Notice::Departed { group, peer } => {
-            tracing::info!(%group, %peer, "a member has left");
-        }
-        Notice::Ratified { group, peer } => {
-            tracing::info!(%group, %peer, "recorded a member's departure");
-        }
-        Notice::Rejected { group, peer, why } => {
-            tracing::warn!(%group, %peer, why, "refused a peer's group data");
-        }
-        Notice::Trouble { why } => tracing::warn!(why, "group sync trouble"),
     }
 }
 

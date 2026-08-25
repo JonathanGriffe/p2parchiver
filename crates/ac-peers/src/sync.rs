@@ -1,27 +1,3 @@
-//! The supervisor, as a state machine.
-//!
-//! Consumes [`PeerEvent`]s and returns [`PeerAction`]s. It never sees a `Swarm`, an address, or
-//! a request id — `ac-node` translates in both directions — which is what lets a fifty-member
-//! group, a peer that never answers, or a four-hour heartbeat be set up in a test in
-//! microseconds.
-//!
-//! # Two loops, both over groups
-//!
-//! A **catalogue round** is kilobytes and matters for correctness. A **content pull** is
-//! gigabytes and saturates a link. They get separate budgets so a long download in one group
-//! can never delay the small exchange that tells another group a file was deleted.
-//!
-//! Both iterate groups. A peer appears only as the means of resolving a group's need, which is
-//! what keeps dials proportional to how many groups this node is in rather than to how many
-//! people are in them.
-//!
-//! # The clock is wall time, and it is an input
-//!
-//! Everything here is scheduled on `at` — unix seconds, arriving on [`PeerEvent::Tick`]. No
-//! `Instant`, unlike the layers below, because every interval here is minutes to hours and a
-//! single clock is easier to reason about than two. A backwards clock jump postpones work; a
-//! forward one does a burst early. Both recover, and neither can lose anything.
-
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use ac_files::path::RelPath;
@@ -32,183 +8,55 @@ use ac_net::PeerId;
 
 use crate::missing::{PeersError, next_missing};
 
-// A change is told to **every member who has not heard it**, and there is deliberately no
-// fanout constant rationing that.
-//
-// An epidemic was the right answer to a budget of two circuits a minute: telling everyone was
-// unaffordable, so each node told three and relied on them to pass it on. The budget was the
-// problem. A circuit was priced for bulk transfer, so a two-hundred-byte offer cost what 64 MiB
-// cost, and the client had to ration accordingly. With the relay's unit resized — same bandwidth
-// ceiling, sixteen circuits a minute instead of two — telling everyone is simply affordable, and
-// one hop beats several: fewer messages in total, no dependence on intermediaries staying up,
-// and nothing to reason about regarding who has already been told on our behalf.
-//
-// What remains bounded is bounded by things that already existed: `MAX_PEER_CONNECTIONS`,
-// `DIALS_PER_WINDOW`, and the fact that a member already connected costs no circuit at all.
-// Members who are offline are not chased; they catch up by offering to everyone they meet when
-// they return, since nothing about a round is remembered across a restart.
-
-/// How often to ask the server who is actually online.
-///
-/// Matched to `ServerLink`'s discovery interval: presence is no more useful than discovery is
-/// fresh, and asking more often would only sharpen an answer nothing else can keep up with.
-///
-/// The answer now has exactly one consumer — choosing which member to pull content through. The
-/// catalogue loop dials what it owes news to without consulting it, which is what let the
-/// urgent, off-interval re-ask go: every question that existed to answer promptly is now
-/// answered by dialling instead of by asking.
 pub const PRESENCE_INTERVAL: i64 = 300;
 
 /// How long a group may go without asking anybody what they have.
-///
-/// Syncing is a pull, so this is the only thing that decides when we talk to a group at all: a
-/// local change enqueues nobody, and a peer learns our state by asking for it. Hours rather
-/// than minutes because membership changes are rare and nothing here is urgent.
-///
-/// **One member per interval, not all of them.** Any member who is up to date can answer for
-/// the whole group, and every other member is doing this too — so news spreads between them
-/// rather than each node collecting it from everybody itself. What is needed is to hear from
-/// *the group* on a timer, and the rotation is what stops that always meaning the same peer.
 pub const HEARTBEAT: i64 = 4 * 3600;
 
 /// Per-peer dial backoff.
-///
-/// Far more patient than `ServerLink`'s 1s–60s. That is one server this node depends on; these
-/// are many peers who are usually asleep, and each attempt spends one of the two relay circuits
-/// a client is allowed per minute.
 pub const MIN_BACKOFF: i64 = 30;
 pub const MAX_BACKOFF: i64 = 30 * 60;
 
 /// Dials to one member before they are taken off the lists they are on.
-///
-/// The whole of what replaces asking the registry before calling. Three attempts, paced by
-/// [`MIN_BACKOFF`] doubling — 0s, 30s, 90s on the clock the backoff runs on, and about two
-/// minutes end to end, since a dial takes time to fail as well as time to be allowed.
-///
-/// Both halves matter. Dropping a member on the *first* failure is the same mistake as never
-/// calling them: a node that is restarting, reconnecting to the relay, or missing from a
-/// five-minute-old presence answer is unreachable for a few seconds and has done nothing to
-/// deserve being written off until the next thing we happen to change. Never dropping them is
-/// the other failure — a member who is switched off would keep a group looking as though it had
-/// something outstanding for ever, and keep spending circuits to prove it.
-///
-/// Three failures is not a judgement about the peer and nothing persists it: the backoff carries
-/// what was learned, and the next thing we have to say puts them back on the list.
 pub const DIAL_ATTEMPTS: usize = 3;
 
 /// After a full rotation in which no member could help.
-///
-/// Not an optimisation — the thing that stops a permanent dial loop. Wanting a file no online
-/// member holds is the *normal* state of a mirror, and without this a node rotates the member
-/// list for ever, spending a circuit each time.
 pub const MIN_CONTENT_BACKOFF: i64 = 30;
 pub const MAX_CONTENT_BACKOFF: i64 = 30 * 60;
 
-// There is deliberately no cap on concurrent catalogue offers. An offer is one small
-// request/response that transfers nothing at all when the digests agree, and the number that can
-// be outstanding is already bounded twice: by `MAX_PEER_CONNECTIONS`, and beneath that by the
-// relay allowance. A separate limit of two bought nothing and cost a
-// great deal — being a *held* resource rather than a deadline, any exchange that ended without
-// saying so took a slot for good, and two of those stopped the node gossiping while it reported
-// itself idle. What bounds propagation now is `MAX_PEER_CONNECTIONS` and the dial allowance,
-// both of which bound the thing that is actually scarce.
-
-/// Changes to a group's catalogue that will be shared without waiting for a pause.
-///
-/// Unused since syncing became a pull: nothing waits for the catalogue to be still, because
-/// nothing pushes it. Kept because `ac file` still paces its own reporting by it.
-///
-/// The other half of [`SHARE_AFTER_IDLE`]: a safety valve so a long unbroken stream of edits
-/// cannot sit unshared indefinitely.
 pub const SHARE_AFTER_CHANGES: u64 = 1000;
 
 /// How long a group's catalogue must be still before it is shared.
-///
-/// Editing arrives in sessions, not in single events. Sorting photographs by hand is one every
-/// twenty seconds for half an hour, and telling everybody after each one means dialling the
-/// whole group ninety times to deliver what is really one afternoon's work — at two minutes of
-/// quiet, it is one round instead.
-///
-/// **Membership is not delayed by this.** A chain or standings change is shared at once: it is
-/// rare, it is small, and it is the precondition for a catalogue reaching anybody, so making a
-/// newly added member wait out an editing session would be the one delay that matters.
 pub const SHARE_AFTER_IDLE: i64 = 120;
 
 /// Transfers running at once, across every peer and group.
-///
-/// A depth, not a ceiling to be issued up to and forgotten. A holdings answer may name hundreds
-/// of files a peer holds, and firing all of them at once does not download them faster — the
-/// blob layer starts eight and refuses the rest, so the surplus was counted as running by a
-/// supervisor that then waited for outcomes which could never arrive. That left the group with a
-/// source it could not release, one of two content slots held for good, and a connection open
-/// with nothing on it.
-///
-/// So the offer is kept as a queue and drained by completions: one finishes, the next starts,
-/// and the number in flight is the number of tasks that actually exist. Matched to
-/// `blob::MAX_CONCURRENT`, which remains as a backstop that now refuses out loud.
 pub const MAX_TRANSFERS: usize = 8;
 
 /// Concurrent content pulls overall, and **at most one per group**.
-///
-/// Both halves are needed. Without the per-group cap a group of ten thousand files takes every
-/// slot and holds them for hours, and a group of ten never pulls anything at all.
 pub const MAX_CONTENT_PEERS: usize = 2;
 
 /// Connections to hold at once.
-///
-/// Well under `ac_net::limits::MAX_ESTABLISHED_TOTAL`, and mindful that a relayed dial spends
-/// one of the relay's sixteen server-wide circuits.
 pub const MAX_PEER_CONNECTIONS: usize = 16;
 
 /// How long a close proposal may go unanswered before it is forgotten.
 pub const CLOSE_TIMEOUT: i64 = 30;
 
 /// Circuits this node may open in [`DIAL_WINDOW`], matching what the relay actually allows.
-///
-/// Mirrors the server's `CIRCUITS_PER_PEER_PER_WINDOW`, and pacing to it is not politeness —
-/// it is the difference between choosing who to call and having the choice made for us. Dials
-/// beyond the allowance are refused by the relay with "resource limit exceeded", and that
-/// refusal charges the *peer's* backoff for a fault entirely our own: the member is then not
-/// retried for thirty seconds, then a minute, while remaining perfectly reachable.
-///
-/// The lab showed the cost exactly. A node spent both of its circuits in one tick — one on a
-/// member that had been stopped, one on a member that held nothing — and its two dials to the
-/// only peer with the file it wanted were both refused. It then reported the file unobtainable
-/// having never once asked the node holding it.
 pub const DIALS_PER_WINDOW: usize = 16;
 
 /// The window [`DIALS_PER_WINDOW`] is measured over. Matches the server's, deliberately.
 pub const DIAL_WINDOW: i64 = 60;
 
 /// How long a question may be outstanding before it is written off.
-///
-/// With no global cap left, this no longer guards a scarce slot — it guards the *peer*. A peer
-/// may have one question in flight, and until it ends that peer is neither asked again nor
-/// counted as drained, so an exchange that finishes without saying so would hold one member out
-/// of the rotation and one connection open indefinitely. Expiry is the only ending that cannot
-/// be forgotten, which is why it exists at all: the paths that report an ending have been wrong
-/// twice already, and there is no reason to think a future one cannot be.
-///
-/// Generous, because a legitimate exchange may read several pages of catalogue over a relay.
 pub const ROUND_TIMEOUT: i64 = 60;
 
 /// Free space this node will not eat into, whatever the configured budget says.
-///
-/// This protects the **machine**, not the archive. A mirror that takes the last gigabyte of
-/// someone's root disk breaks everything else running on it, and a person who set no budget
-/// has not agreed to that. Two gigabytes is enough for a desktop to keep functioning while
-/// somebody notices and does something about it.
 pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// What the node is allowed to fill.
-///
-/// Two limits doing different jobs: [`MIN_FREE_BYTES`] protects the machine and is not
-/// negotiable, `storage_max` honours what the user actually asked for and may be absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// Free bytes to leave on the volume holding the storage root.
     pub min_free: u64,
-    /// Stop mirroring once this node holds this much. `None` means no ceiling beyond the floor.
     pub storage_max: Option<u64>,
 }
 
@@ -228,61 +76,20 @@ struct Space {
     held: u64,
 }
 
-/// Something worth telling a person. Typed, so tests assert on meaning and `ac-node` owns the
-/// wording.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Notice {
-    /// A file finished transferring and its content matched what was asked for.
-    ///
-    /// Lives here rather than in `ac_files::sync` because that machine no longer knows a
-    /// transfer happened: it is catalogue-only, and `have` changing is not a catalogue change.
-    Downloaded { group: GroupId, path: RelPath },
-    /// Wanted, and no reachable member has it. Distinguishes "nobody can supply this" from
-    /// "still downloading", which otherwise look identical from the outside.
-    Unobtainable { group: GroupId, path: RelPath },
-    /// A peer claimed a file in its holdings and could not deliver it.
-    Undelivered {
-        peer: PeerId,
-        group: GroupId,
-        path: RelPath,
-    },
-    /// A peer sent bytes that did not match the hash asked for. Misbehaviour, not misfortune.
-    Rejected { peer: PeerId, why: String },
-    /// There is no room for more content, so mirroring has stopped.
-    ///
-    /// Emitted once per transition rather than per refused file: a node at its ceiling refuses
-    /// every fetch it considers, and saying so each time would bury everything else.
-    OutOfSpace {
-        held: u64,
-        /// What stopped it — the configured budget, or the free-space floor.
-        limit: u64,
-        floor: bool,
-    },
-    /// Nobody's fault and nothing to do.
-    Trouble { why: String },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRoom {
+    Floor { held: u64, limit: u64 },
+    Budget { held: u64, limit: u64 },
 }
 
-/// What the machine wants done. `ac-node` is the only thing that can do any of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerAction {
-    /// Reach this peer. *How* is the daemon's business: a cached direct address if it has one,
-    /// otherwise a circuit through the server.
     Dial {
         peer: PeerId,
     },
-    /// Ask the server which of these are connected right now.
     AskPresence {
         peers: Vec<PeerId>,
     },
-    /// Ask this peer what they have, for **every group we share with them**.
-    ///
-    /// Peer-shaped because the message is. The question carries nothing at all, and the answer
-    /// names every group the responder shares with us — so there is nothing a single-group
-    /// variant could ask that this does not, and the supervisor cannot count one group and
-    /// quietly receive the rest, which is where its accounting used to drift from the wire.
-    ///
-    /// A node is expected to be in a few groups and unlikely to exceed twenty, so an answer
-    /// never approaches `MAX_HEADS_PER_ANSWER`.
     Ask {
         peer: PeerId,
         offering: Offering,
@@ -305,29 +112,18 @@ pub enum PeerAction {
     Disconnect {
         peer: PeerId,
     },
-    Note(Notice),
 }
 
 /// Everything the machine reacts to.
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
-    /// Seen on the network. A liveness hint that complements presence — mDNS in particular
-    /// means "reachable on this LAN right now", which the server cannot know.
     Discovered {
         peer: PeerId,
     },
-    /// The server's answer to [`PeerAction::AskPresence`].
-    ///
-    /// Carries **what was asked** as well as what came back, because the answer is a filter
-    /// and says nothing whatever about anyone else. The daemon has the asked set already — it
-    /// correlated the reply — so this costs nothing and makes the event self-describing rather
-    /// than dependent on which query is outstanding.
     Presence {
         asked: Vec<PeerId>,
         online: Vec<PeerId>,
     },
-    /// Attested *and* settled — the daemon holds a peer until its connection stops changing
-    /// shape, so this is later than "connected".
     Verified {
         peer: PeerId,
     },
@@ -337,41 +133,21 @@ pub enum PeerEvent {
     DialFailed {
         peer: PeerId,
     },
-    /// An exchange for this group finished with this peer, on the named protocol.
-    ///
-    /// Reported for exchanges *they* started as well as ours. Both carry our heads — theirs in
-    /// the answer we sent — so either way they have seen where we are, and recording it stops
-    /// us telling somebody what they have just told us.
     Synced {
         peer: PeerId,
         group: GroupId,
         offering: Offering,
     },
-    /// We asked this peer what they have and the question is answered, whatever came back.
-    ///
-    /// The pull's only bookkeeping: it stamps the clock that decides when to ask again, and
-    /// clears that half of what we still meant to ask them. Nothing records what *they* now
-    /// know, because under a pull that is not ours to track.
     Asked {
         peer: PeerId,
         offering: Offering,
     },
-    /// The question was never put, because the group layer was still talking to this peer.
-    ///
-    /// Not a failure and not a refusal: nothing went out, so nothing is recorded either way and
-    /// the ordinary loop tries again on the next tick.
     AskDeferred {
         peer: PeerId,
     },
-    /// A question failed outright, so the slot is free but nothing was learned.
-    ///
-    /// Peer-shaped like the question itself: one that never arrived, or was answered with a
-    /// refusal, told us nothing about any shared group. There is no such thing as one group of
-    /// a question failing.
     AskFailed {
         peer: PeerId,
     },
-    /// Their answer to a holdings query, in the order asked.
     Holdings {
         peer: PeerId,
         group: GroupId,
@@ -383,8 +159,6 @@ pub enum PeerEvent {
         group: GroupId,
         path: RelPath,
     },
-    /// A transfer failed. `terminal` separates "this peer cannot give me this" from "the
-    /// connection broke" — see [`Peers::on`].
     BlobFailed {
         peer: PeerId,
         group: GroupId,
@@ -399,33 +173,16 @@ pub enum PeerEvent {
         peer: PeerId,
         ready: bool,
     },
-    /// What the disk looks like now, reported by the daemon before each tick.
-    ///
-    /// An input rather than something read here, for the same reason the clock is: `statvfs`
-    /// needs a filesystem, and a policy that called it could not be driven through a full disk
-    /// from a test.
     Space {
-        /// Free bytes on the volume holding the storage root.
         free: u64,
-        /// Bytes of content this node holds, across every group.
         held: u64,
     },
-    /// The only clock. Unix seconds.
     Tick {
         at: i64,
     },
 }
 
 /// What the supervisor is waiting on, for somebody to read.
-///
-/// The first question anyone asks about a component like this is *why is it not doing
-/// anything*, and until this existed nothing could answer it: every reason lives in memory in
-/// the running daemon — a backoff that has not expired, a member believed offline, a content
-/// pull suspended after a fruitless rotation — and none of it is derivable from the database.
-///
-/// Read-only, and nothing acts on it. Taking a snapshot must not advance the rotation or spend
-/// a budget, so [`Peers::status`] takes `&self` and reports where the rotation stands rather
-/// than asking it to move.
 #[derive(Debug, Clone)]
 pub struct Status {
     pub groups: Vec<GroupStatus>,
@@ -435,11 +192,8 @@ pub struct Status {
 #[derive(Debug, Clone)]
 pub struct GroupStatus {
     pub group: GroupId,
-    /// Live rows we do not hold.
     pub missing: u64,
-    /// Members who have not been told the current news. Zero means everyone has it.
     pub unheard: usize,
-    /// The member whose turn it is, if the rotation has anywhere to go.
     pub next: Option<PeerId>,
     /// The member this group's files are currently being pulled through.
     pub source: Option<PeerId>,
@@ -988,7 +742,8 @@ impl Peers {
 
                 // A slot has just come free, so the next queued file starts now — that is what
                 // keeps eight running until the offer is exhausted rather than eight ever.
-                let mut actions = vec![PeerAction::Note(Notice::Downloaded { group, path })];
+                tracing::info!(%group, %path, "got a file");
+                let mut actions = Vec::new();
                 actions.extend(self.pump(peer));
                 actions.extend(self.continue_pull(peer));
                 actions
@@ -1023,11 +778,12 @@ impl Peers {
                     .or_default()
                     .insert(path.clone());
 
-                let mut actions = vec![PeerAction::Note(Notice::Undelivered { peer, group, path })];
+                tracing::info!(%peer, %group, %path, "claimed a file it could not deliver");
+                let mut actions = Vec::new();
                 actions.extend(self.pump(peer));
                 if why.contains("hash") {
                     // Wrong bytes are misbehaviour, not misfortune, and are worded as such.
-                    actions.push(PeerAction::Note(Notice::Rejected { peer, why }));
+                    tracing::warn!(%peer, why, "ignored something from a peer");
                 }
                 actions.extend(self.continue_pull(peer));
                 actions
@@ -1094,10 +850,25 @@ impl Peers {
         // kilobytes, and a node that stopped syncing its index when it ran out of room would
         // also stop being able to *say* what it is missing.
         match self.room() {
-            Some(note) => {
+            Some(why) => {
+                // Said once per transition, not once per tick: a node at its ceiling refuses
+                // every fetch it considers, and one line per file would bury everything else.
                 if !self.cramped {
                     self.cramped = true;
-                    actions.push(PeerAction::Note(note));
+                    match why {
+                        NoRoom::Floor { held, limit } => tracing::warn!(
+                            held,
+                            min_free = limit,
+                            "stopped mirroring: too little free space on the storage volume. \
+                             Nothing was deleted; free some space and it resumes"
+                        ),
+                        NoRoom::Budget { held, limit } => tracing::warn!(
+                            held,
+                            storage_max = limit,
+                            "stopped mirroring: at the storage_max the config allows. Nothing \
+                             was deleted; raise storage_max in config.toml to continue"
+                        ),
+                    }
                 }
             }
             None => {
@@ -1143,16 +914,6 @@ impl Peers {
     }
 
     /// Notice what has changed about this group, and decide whether to tell anybody.
-    ///
-    /// **Only what we did ourselves is propagated.** `seen` is updated whenever something
-    /// reaches us from a peer, so a difference against it is by construction a local change —
-    /// our own `ac file add`, our own `ac group add`, our own standing. Merging somebody else's
-    /// change enqueues nobody: they are telling the group themselves, and a member neither of
-    /// us can reach is not made reachable by a second node trying.
-    ///
-    /// What that costs is bounded and understood: a member the author never reaches waits for
-    /// their own heartbeat. What it saves is every node in the group re-telling every other,
-    /// which is the difference between one message per member and one per member per member.
     fn arm(&mut self, group: GroupId, at: i64) {
         let Ok(current) = self.current(group) else {
             return;
@@ -1473,24 +1234,26 @@ impl Peers {
 
     /// Why there is no room for more content, or `None` if there is.
     ///
+    /// Public because *which* limit stopped the mirror is a fact about this node, not a message
+    /// about it — `ac peer status` and this crate's tests both need the answer, and neither can
+    /// read a log line.
+    ///
     /// Absent a report we assume there is room. The daemon sends one immediately before every
     /// tick, so the only window is startup — and refusing to fetch because nothing has told us
     /// the disk size yet would be a worse failure than briefly not knowing.
-    fn room(&self) -> Option<Notice> {
+    pub fn room(&self) -> Option<NoRoom> {
         let space = self.space?;
 
         if space.free < self.limits.min_free {
-            return Some(Notice::OutOfSpace {
+            return Some(NoRoom::Floor {
                 held: space.held,
                 limit: self.limits.min_free,
-                floor: true,
             });
         }
         match self.limits.storage_max {
-            Some(max) if space.held >= max => Some(Notice::OutOfSpace {
+            Some(max) if space.held >= max => Some(NoRoom::Budget {
                 held: space.held,
                 limit: max,
-                floor: false,
             }),
             _ => None,
         }
@@ -1743,14 +1506,12 @@ impl Peers {
 
     /// Every member has been asked and none could help.
     fn exhaust_group(&mut self, group: GroupId, at: i64) -> Vec<PeerAction> {
-        let mut actions = Vec::new();
-
         // Said once per unproductive rotation, so "nobody reachable has this" is
         // distinguishable from "still downloading" — which otherwise look identical.
         if let Ok(missing) = next_missing(&self.files, group, 1)
             && let Some((path, _)) = missing.into_iter().next()
         {
-            actions.push(PeerAction::Note(Notice::Unobtainable { group, path }));
+            tracing::info!(%group, %path, "nobody reachable has this; it stays wanted");
         }
 
         if let Some(state) = self.state.get_mut(&group) {
@@ -1759,7 +1520,7 @@ impl Peers {
             state.spent.clear();
             state.source = None;
         }
-        actions
+        Vec::new()
     }
 
     // ---- closing ----
@@ -2143,7 +1904,7 @@ impl Peers {
     /// Separate from [`Self::next_member`] because the two answer different questions and
     /// conflating them cost this design a real bug: "nobody is reachable" is not the same as
     /// "everybody has been asked and none of them could help", and treating the first as the
-    /// second armed the content backoff — with a `Notice::Unobtainable` to match — for a group
+    /// second armed the content backoff — saying nobody reachable had it — for a group
     /// whose members simply had not been dialled yet.
     fn reachable(&self, group: GroupId) -> Vec<PeerId> {
         self.groups

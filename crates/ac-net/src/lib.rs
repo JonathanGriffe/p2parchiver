@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod admission;
+pub mod admission_link;
 pub mod attest;
 pub mod authz;
 pub mod budget;

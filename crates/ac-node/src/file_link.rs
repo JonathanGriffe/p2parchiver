@@ -1,10 +1,12 @@
 //! Where the swarm and `ac-files` meet.
 //!
-//! The counterpart of [`crate::group_link`], and it owns the same two things the policy layer
-//! deliberately does not: **request correlation**, because a bare `Unavailable` names no group
-//! and an `OutboundFailure` carries only a request id; and **waiting for a connection to
-//! settle**, because a peer that has just passed attestation may be reachable only over a
-//! relay circuit that a hole punch is about to replace.
+//! The counterpart of [`crate::group_link`], and it owns the thing the policy layer deliberately
+//! does not: **request correlation**, because a bare `Unavailable` names no group and an
+//! `OutboundFailure` carries only a request id.
+//!
+//! Whether a peer may be talked to at all it does not own — [`ac_net::roster::Roster`] answers
+//! that, and holds a freshly attested peer back until its connection has stopped changing
+//! shape, so a transfer never starts on a relay circuit a hole punch is about to replace.
 //!
 //! # Serving blobs, but never asking for them
 //!
@@ -31,7 +33,7 @@ use ac_net::roster::Roster;
 
 use ac_files::content::Content;
 use ac_files::store::Files;
-use ac_files::sync::{FileAction, FileEvent, FileSync, Notice};
+use ac_files::sync::{FileAction, FileEvent, FileSync};
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
@@ -371,39 +373,7 @@ impl FileLink {
                 FileAction::Settled { peer, group } => {
                     self.rounds.push(RoundOutcome::Settled { peer, group });
                 }
-
-                FileAction::Note(notice) => report(&notice),
             }
-        }
-    }
-}
-
-/// The binary owns the wording; the machine owns the facts.
-fn report(notice: &Notice) {
-    match notice {
-        Notice::Learned { group, count } => {
-            println!("{count} file(s) in {}", group.short());
-        }
-        Notice::Conflicted { group, kept, moved } => {
-            println!("two files wanted {kept} in {}", group.short());
-            println!("  kept both; the other is now {moved}");
-        }
-        Notice::Deduplicated {
-            group,
-            kept,
-            dropped,
-        } => {
-            println!(
-                "{dropped} held the same content as {kept} ({})",
-                group.short()
-            );
-            println!("  a group keeps one copy, so {dropped} was dropped");
-        }
-        Notice::Rejected { peer, why } => {
-            println!("ignored something from {peer}: {why}");
-        }
-        Notice::Trouble { why } => {
-            tracing::warn!(%why, "file sync trouble");
         }
     }
 }

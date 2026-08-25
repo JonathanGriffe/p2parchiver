@@ -26,39 +26,6 @@ const MAX_INFLIGHT: usize = 8;
 const PENDING_TTL: i64 = 30 * 24 * 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Notice {
-    Invited {
-        group: GroupId,
-        name: String,
-    },
-    RemovedByAdmin {
-        group: GroupId,
-        name: String,
-    },
-    MembershipChanged {
-        group: GroupId,
-        added: usize,
-        removed: usize,
-    },
-    Departed {
-        group: GroupId,
-        peer: PeerId,
-    },
-    Ratified {
-        group: GroupId,
-        peer: PeerId,
-    },
-    Rejected {
-        group: GroupId,
-        peer: PeerId,
-        why: String,
-    },
-    Trouble {
-        why: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupEvent {
     Heads {
         peer: PeerId,
@@ -95,7 +62,6 @@ pub enum GroupAction {
         group: GroupId,
         from: u64,
     },
-    Note(Notice),
 }
 
 /// One outstanding fetch. Keyed by group, so there is one episode per group at a time.
@@ -221,7 +187,9 @@ impl GroupSync {
                         self.fetch(&mut actions, peer, head.group, row.head_seq);
                     }
                 }
-                Err(e) => actions.push(GroupAction::Note(Notice::Trouble { why: e.to_string() })),
+                Err(e) => {
+                    tracing::warn!(group = %head.group, error = %e, "could not read a group");
+                }
             }
         }
 
@@ -295,24 +263,20 @@ impl GroupSync {
                 return actions;
             }
             Err(e) => {
-                actions.push(GroupAction::Note(Notice::Rejected {
-                    group,
-                    peer,
-                    why: e.to_string(),
-                }));
+                tracing::warn!(%group, %peer, error = %e, "refused a peer's group data");
                 return actions;
             }
         };
 
-        self.report(&mut actions, group, &applied);
-        self.answer_invitation(&mut actions, group, at);
-        self.ratify(&mut actions, group, &applied, at);
+        self.report(group, &applied);
+        self.answer_invitation(group, at);
+        self.ratify(group, &applied, at);
 
         actions
     }
 
-    /// Turn what changed into something a person would want to read.
-    fn report(&self, actions: &mut Vec<GroupAction>, group: GroupId, applied: &Applied) {
+    /// Say what changed, where it changed.
+    fn report(&self, group: GroupId, applied: &Applied) {
         let name = self
             .store
             .get(group)
@@ -322,31 +286,26 @@ impl GroupSync {
             .unwrap_or_default();
 
         if applied.we_joined {
-            actions.push(GroupAction::Note(Notice::Invited {
-                group,
-                name: name.clone(),
-            }));
+            tracing::info!(%group, %name, "invited to a group; accept it with `ac group accept`");
         }
         if applied.we_lost {
-            actions.push(GroupAction::Note(Notice::RemovedByAdmin {
-                group,
-                name: name.clone(),
-            }));
+            tracing::info!(%group, %name, "removed from a group by its admin");
         }
         if !applied.added.is_empty() || !applied.removed.is_empty() {
-            actions.push(GroupAction::Note(Notice::MembershipChanged {
-                group,
-                added: applied.added.len(),
-                removed: applied.removed.len(),
-            }));
+            tracing::info!(
+                %group,
+                added = applied.added.len(),
+                removed = applied.removed.len(),
+                "group membership changed"
+            );
         }
         for peer in &applied.departed {
-            actions.push(GroupAction::Note(Notice::Departed { group, peer: *peer }));
+            tracing::info!(%group, %peer, "a member has left");
         }
     }
 
     /// Author a "pending" invitation to mark we have received an invitation to a group.
-    fn answer_invitation(&mut self, actions: &mut Vec<GroupAction>, group: GroupId, at: i64) {
+    fn answer_invitation(&mut self, group: GroupId, at: i64) {
         let pending = matches!(self.store.get(group), Ok(Some(row)) if row.state == State::Pending);
         let named = matches!(self.store.members(group), Ok(m) if m.contains(&self.me));
         let spoken = matches!(self.store.my_standing_seq(group), Ok(Some(_)));
@@ -357,20 +316,12 @@ impl GroupSync {
             .store
             .author_standing(&self.key, group, Position::Unanswered, at)
         {
-            actions.push(GroupAction::Note(Notice::Trouble {
-                why: format!("could not record an unanswered invitation: {e}"),
-            }));
+            tracing::warn!(%group, error = %e, "could not record an unanswered invitation");
         }
     }
 
     /// If we admin this group, make a departure official.
-    fn ratify(
-        &mut self,
-        actions: &mut Vec<GroupAction>,
-        group: GroupId,
-        applied: &Applied,
-        at: i64,
-    ) {
+    fn ratify(&mut self, group: GroupId, applied: &Applied, at: i64) {
         if applied.departed.is_empty() {
             return;
         }
@@ -384,10 +335,10 @@ impl GroupSync {
                 peer: peer.to_base58(),
             };
             match self.store.author(&self.key, group, op, at) {
-                Ok(_) => actions.push(GroupAction::Note(Notice::Ratified { group, peer: *peer })),
-                Err(e) => actions.push(GroupAction::Note(Notice::Trouble {
-                    why: format!("could not ratify a departure: {e}"),
-                })),
+                Ok(_) => tracing::info!(%group, %peer, "recorded a member's departure"),
+                Err(e) => {
+                    tracing::warn!(%group, peer = %peer, error = %e, "could not ratify a departure");
+                }
             }
         }
     }

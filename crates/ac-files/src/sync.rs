@@ -24,31 +24,6 @@ const ANSWERS_PER_TICK: u32 = 8;
 /// Catalogue reads outstanding at once, across all peers and groups.
 const MAX_INFLIGHT: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Notice {
-    Learned {
-        group: GroupId,
-        count: usize,
-    },
-    Conflicted {
-        group: GroupId,
-        kept: RelPath,
-        moved: RelPath,
-    },
-    Deduplicated {
-        group: GroupId,
-        kept: RelPath,
-        dropped: RelPath,
-    },
-    Rejected {
-        peer: PeerId,
-        why: String,
-    },
-    Trouble {
-        why: String,
-    },
-}
-
 /// What the machine wants done. The daemon is the only thing that can do any of it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileAction {
@@ -61,7 +36,6 @@ pub enum FileAction {
         peer: PeerId,
         group: GroupId,
     },
-    Note(Notice),
 }
 
 /// Everything the machine reacts to.
@@ -305,9 +279,8 @@ impl FileSync {
         self.inflight.remove(&group);
 
         let Some(dir) = self.dir_of(group) else {
-            return vec![FileAction::Note(Notice::Trouble {
-                why: format!("no directory for group {}", group.short()),
-            })];
+            tracing::warn!(%group, "no directory for this group; cannot merge its catalogue");
+            return Vec::new();
         };
 
         let mut actions = Vec::new();
@@ -315,10 +288,7 @@ impl FileSync {
 
         for entry in entries.into_iter().take(MAX_ENTRIES_PER_RESPONSE) {
             let Some(row) = entry.into_row() else {
-                actions.push(FileAction::Note(Notice::Rejected {
-                    peer,
-                    why: "a catalogue entry was unusable".to_owned(),
-                }));
+                tracing::warn!(%peer, %group, "ignored an unusable catalogue entry");
                 continue;
             };
 
@@ -327,34 +297,31 @@ impl FileSync {
                 Ok(Merged::Applied) => applied += 1,
                 Ok(Merged::Conflicted { moved }) => {
                     applied += 1;
-                    actions.push(FileAction::Note(Notice::Conflicted {
-                        group,
-                        kept: row.path.clone(),
-                        moved,
-                    }));
+                    tracing::info!(
+                        %group,
+                        kept = %row.path,
+                        %moved,
+                        "two files wanted the same path; kept both"
+                    );
                 }
                 Ok(Merged::Deduplicated { kept, dropped }) => {
                     applied += 1;
-                    actions.push(FileAction::Note(Notice::Deduplicated {
-                        group,
-                        kept,
-                        dropped,
-                    }));
+                    // A group keeps one copy of any content, so the later path goes.
+                    tracing::info!(%group, %kept, %dropped, "dropped a duplicate");
                 }
-                Err(e) => actions.push(FileAction::Note(Notice::Trouble { why: e.to_string() })),
+                Err(e) => {
+                    tracing::warn!(%group, path = %row.path, error = %e, "could not merge a row");
+                }
             }
         }
 
         // The cursor moves only to a position the peer reported.
         if let Err(e) = self.files.set_cursor(group, &peer, next) {
-            actions.push(FileAction::Note(Notice::Trouble { why: e.to_string() }));
+            tracing::warn!(%group, %peer, error = %e, "could not record how far we read");
         }
 
         if applied > 0 {
-            actions.push(FileAction::Note(Notice::Learned {
-                group,
-                count: applied,
-            }));
+            tracing::info!(%group, count = applied, "learned files");
         }
 
         if more && self.read(&mut actions, peer, group, next, retried) {

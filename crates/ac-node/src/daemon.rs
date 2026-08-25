@@ -11,14 +11,13 @@ use crate::group_link::GroupLink;
 use crate::peer_link::PeerLink;
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_groups::wire::{GroupRequest, GroupResponse};
-use ac_net::admission::{Admission, AdmissionAction, AdmissionEvent, Notice as AdmissionNotice};
+use ac_net::admission_link::AdmissionLink;
 use ac_net::attest;
 use ac_net::authz::AcceptAnyPeer;
 use ac_net::config::{Config, Paths};
 use ac_net::connectivity::Connectivity;
 use ac_net::identity::Identity;
 use ac_net::link::{HOUSEKEEPING_TICK, ServerLink};
-use ac_net::proto::{AttestRequest, PeerAttestRequest, PeerAttestResponse};
 use ac_net::roster::Roster;
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
 use ac_peers::wire::{SessionRequest, SessionResponse};
@@ -113,15 +112,12 @@ pub async fn run(
         None => None,
     };
 
-    let (mut admission, notes) = Admission::load(
+    let mut admission = AdmissionLink::load(
         &paths.attestation_file(),
         identity.peer_id(),
         link.as_ref().map(|l| l.server),
         attest::now(),
     );
-    for note in notes {
-        report_admission(&note);
-    }
 
     let mut groups = GroupLink::open(paths, identity)?;
     let mut files = FileLink::open(paths, identity)?;
@@ -141,15 +137,7 @@ pub async fn run(
                 if let Some(link) = &mut link {
                     link.housekeeping(&mut swarm);
                 }
-                let server_connected = admission
-                    .server()
-                    .is_some_and(|server| swarm.is_connected(&server));
-                let actions = admission.on(AdmissionEvent::Tick {
-                    now: Instant::now(),
-                    at: attest::now(),
-                    server_connected,
-                });
-                dispatch_admission(&mut swarm, actions, &mut roster);
+                admission.housekeeping(&mut swarm, &mut roster, attest::now());
 
                 for peer in roster.promote(&connectivity) {
                     peers.peer_ready(&mut swarm, &mut files, &mut groups, &roster, peer);
@@ -169,11 +157,7 @@ pub async fn run(
                             .any(|p| p == Protocol::P2pCircuit);
                         connectivity.connected(peer_id, relayed);
 
-                        let actions = admission.on(AdmissionEvent::Connected {
-                            peer: peer_id,
-                            now: Instant::now(),
-                        });
-                        dispatch_admission(&mut swarm, actions, &mut roster);
+                        admission.connected(&mut swarm, &mut roster, peer_id);
 
                         if let Some(link) = &mut link {
                             link.reserve(&mut swarm, peer_id);
@@ -188,11 +172,7 @@ pub async fn run(
                         let still_connected = swarm.is_connected(&peer_id);
                         connectivity.disconnected(peer_id, still_connected);
 
-                        let actions = admission.on(AdmissionEvent::Disconnected {
-                            peer: peer_id,
-                            still_connected,
-                        });
-                        dispatch_admission(&mut swarm, actions, &mut roster);
+                        admission.disconnected(&mut swarm, &mut roster, peer_id, still_connected);
 
                         if roster.disconnected(&peer_id, still_connected) {
                             peers.on_disconnected(&mut swarm, &mut files, &mut groups, &roster, peer_id);
@@ -270,10 +250,10 @@ pub async fn run(
                     }
 
                     SwarmEvent::Behaviour(AcBehaviourEvent::PeerAttest(event)) => {
-                        on_peer_attest(&mut swarm, &mut admission, &mut roster, event);
+                        admission.on_peer_attest(&mut swarm, &mut roster, attest::now(), event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::Attest(event)) => {
-                        on_renewal(&mut swarm, &mut admission, &mut roster, event);
+                        admission.on_renewal(&mut swarm, &mut roster, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Groups(event))) => {
                         groups.on_event(&mut swarm, &roster, event);
@@ -337,162 +317,6 @@ fn report_discovered(registrations: &[rendezvous::Registration], me: libp2p::Pee
             "discovered a peer"
         );
     }
-}
-
-/// Carry out what [`Admission`] asked for.
-fn dispatch_admission(swarm: &mut ClientSwarm, actions: Vec<AdmissionAction>, roster: &mut Roster) {
-    for action in actions {
-        match action {
-            AdmissionAction::Send { peer, attestation } => {
-                match swarm.behaviour_mut().peer_attest.as_mut() {
-                    Some(behaviour) => {
-                        behaviour.send_request(
-                            &peer,
-                            PeerAttestRequest {
-                                attestation: *attestation,
-                            },
-                        );
-                    }
-                    // Only a server builds without this protocol, and a server never runs
-                    // this loop. Silence here would look exactly like a peer that never
-                    // answers, so it is worth a line rather than a shrug.
-                    None => tracing::error!(
-                        %peer,
-                        "asked to attest without the peer-attest protocol mounted"
-                    ),
-                }
-            }
-
-            AdmissionAction::Renew { server } => match swarm.behaviour_mut().attest.as_mut() {
-                Some(behaviour) => {
-                    behaviour.send_request(&server, AttestRequest);
-                }
-                None => tracing::error!(
-                    %server,
-                    "asked to renew without the attest protocol mounted"
-                ),
-            },
-
-            AdmissionAction::Close { peer, why } => {
-                println!("refused {peer} ({why})");
-                let _ = swarm.disconnect_peer_id(peer);
-            }
-
-            // Admitted is not yet usable by the app layer. The roster holds them back until
-            // the connection has stopped changing shape — see `Roster::promote`.
-            AdmissionAction::Admitted { peer, username } => {
-                println!("verified {username} {peer}");
-                roster.admitted(peer);
-            }
-
-            AdmissionAction::Note(note) => report_admission(&note),
-        }
-    }
-}
-
-fn report_admission(note: &AdmissionNotice) {
-    match note {
-        AdmissionNotice::Attested { username, hours } => {
-            println!("attested as {username} for {hours}h");
-        }
-        AdmissionNotice::RenewalRefused { reason } => {
-            tracing::warn!(reason, "attestation refused");
-        }
-        AdmissionNotice::IssuedUnusable { error } => {
-            tracing::error!(
-                error,
-                "the server issued an attestation this node cannot use"
-            );
-        }
-        AdmissionNotice::NotCached { path, error } => {
-            tracing::warn!(path = %path.display(), error, "could not cache the attestation");
-        }
-        AdmissionNotice::NotEnrolled => {
-            tracing::warn!(
-                "this node has not enrolled, so it can verify nobody and can prove nothing \
-                 about itself. Every peer connection will be closed. Run `ac join` first."
-            );
-        }
-    }
-}
-
-/// One `/ac/peer-attest/1.0.0` event.
-fn on_peer_attest(
-    swarm: &mut ClientSwarm,
-    admission: &mut Admission,
-    roster: &mut Roster,
-    event: request_response::Event<PeerAttestRequest, PeerAttestResponse>,
-) {
-    let actions = match event {
-        request_response::Event::Message { peer, message, .. } => match message {
-            request_response::Message::Request {
-                request, channel, ..
-            } => {
-                let (response, actions) =
-                    admission.on_request(peer, &request.attestation, Instant::now(), attest::now());
-                if let Some(behaviour) = swarm.behaviour_mut().peer_attest.as_mut() {
-                    let _ = behaviour.send_response(channel, response);
-                }
-                actions
-            }
-
-            request_response::Message::Response { response, .. } => match response {
-                PeerAttestResponse::Accepted => admission.on(AdmissionEvent::Accepted { peer }),
-                PeerAttestResponse::Rejected(why) => {
-                    admission.on(AdmissionEvent::Rejected { peer, why })
-                }
-            },
-        },
-
-        request_response::Event::OutboundFailure { peer, error, .. } => {
-            admission.on(AdmissionEvent::ExchangeFailed {
-                peer,
-                error: error.to_string(),
-            })
-        }
-
-        // Their request to us failed mid-flight. Not fatal on its own — their side will
-        // retry or time out — so this only stops *us* from having verified them, which the
-        // deadline already covers.
-        request_response::Event::InboundFailure { peer, error, .. } => {
-            tracing::debug!(%peer, %error, "inbound attestation failed");
-            Vec::new()
-        }
-
-        request_response::Event::ResponseSent { .. } => Vec::new(),
-    };
-
-    dispatch_admission(swarm, actions, roster);
-}
-
-/// The server's answer to a renewal request.
-fn on_renewal(
-    swarm: &mut ClientSwarm,
-    admission: &mut Admission,
-    roster: &mut Roster,
-    event: request_response::Event<AttestRequest, ac_net::proto::AttestResponse>,
-) {
-    let actions = match event {
-        request_response::Event::Message {
-            message: request_response::Message::Response { response, .. },
-            ..
-        } => admission.on(AdmissionEvent::Renewed(ac_net::admission::renewal_of(
-            response,
-        ))),
-
-        request_response::Event::OutboundFailure { error, .. } => admission.on(
-            AdmissionEvent::Renewed(ac_net::admission::Renewal::Failed {
-                error: error.to_string(),
-            }),
-        ),
-
-        other => {
-            tracing::trace!(?other, "attest event");
-            Vec::new()
-        }
-    };
-
-    dispatch_admission(swarm, actions, roster);
 }
 
 /// Swarm events this node only reports on.

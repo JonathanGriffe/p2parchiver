@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use ac_files::path::RelPath;
 use ac_files::store::{FileRow, Files};
-use ac_files::sync::{FileAction, FileEvent, FileSync, Notice, may_serve};
+use ac_files::sync::{FileAction, FileEvent, FileSync, may_serve};
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_files::{Content, ManifestEntry};
 use ac_groups::chain::Op;
@@ -212,17 +212,20 @@ impl Side {
 }
 
 /// Dispatch actions between two nodes until nothing is left to send.
-fn settle(a: &mut Node, b: &mut Node, seed: Vec<(Side, Step)>) -> Vec<Notice> {
+fn settle(a: &mut Node, b: &mut Node, seed: Vec<(Side, Step)>) -> Vec<FileAction> {
     let mut queue = seed;
-    let mut notes = Vec::new();
+    let mut seen = Vec::new();
 
     for _ in 0..500 {
         let Some((side, action)) = queue.pop() else {
-            return notes;
+            return seen;
         };
+        if let Step::Act(act) = &action {
+            seen.push(act.clone());
+        }
         match side {
-            Side::A => step(a, b, Side::A, action, &mut queue, &mut notes),
-            Side::B => step(b, a, Side::B, action, &mut queue, &mut notes),
+            Side::A => step(a, b, Side::A, action, &mut queue),
+            Side::B => step(b, a, Side::B, action, &mut queue),
         }
     }
     panic!("the exchange never settled");
@@ -234,11 +237,8 @@ fn step(
     side: Side,
     action: Step,
     queue: &mut Vec<(Side, Step)>,
-    notes: &mut Vec<Notice>,
 ) {
     match action {
-        Step::Act(FileAction::Note(note)) => notes.push(note),
-
         // A report, not an instruction. `ac-node` turns it into the supervisor's round
         // bookkeeping; here it only has to not be work.
         Step::Act(FileAction::Settled { .. }) => {}
@@ -290,7 +290,7 @@ fn step(
 
 /// Connect two nodes and let them sync to quiescence. `a` is [`Side::A`].
 /// Verify both ways and let each side offer, as the supervisor does on a fresh connection.
-fn connect(a: &mut Node, b: &mut Node) -> Vec<Notice> {
+fn connect(a: &mut Node, b: &mut Node) -> Vec<FileAction> {
     a.verify(b.peer());
     b.verify(a.peer());
 
@@ -373,11 +373,15 @@ fn a_catalogue_that_already_matches_costs_nothing() {
     alice.verify(bob.peer());
     bob.verify(alice.peer());
     let seed = vec![(Side::A, Step::Ask), (Side::B, Step::Ask)];
-    let notes = settle(&mut alice, &mut bob, seed);
+    let acted = settle(&mut alice, &mut bob, seed);
 
+    // The digests already agree, so neither side even asks for a page. Stronger than checking
+    // that nothing was learned: nothing was *read*.
     assert!(
-        !notes.iter().any(|n| matches!(n, Notice::Learned { .. })),
-        "nothing was learned because nothing differed: {notes:?}"
+        !acted
+            .iter()
+            .any(|a| matches!(a, FileAction::FetchChanges { .. })),
+        "equal digests must exchange no rows at all: {acted:?}"
     );
 }
 
