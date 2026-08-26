@@ -560,6 +560,7 @@ impl Peers {
                 tracing::info!(%group, %path, "got a file");
                 let mut actions = Vec::new();
                 actions.extend(self.pump(peer));
+                actions.extend(self.resolve_stalled(peer));
                 actions.extend(self.continue_pull(peer));
                 actions
             }
@@ -579,6 +580,7 @@ impl Peers {
                     // next attempt resumes; nothing is held against the peer, and the path
                     // stays missing so the next query offers it again.
                     let mut actions = self.pump(peer);
+                    actions.extend(self.resolve_stalled(peer));
                     actions.extend(self.continue_pull(peer));
                     return actions;
                 }
@@ -596,6 +598,7 @@ impl Peers {
                 tracing::info!(%peer, %group, %path, "claimed a file it could not deliver");
                 let mut actions = Vec::new();
                 actions.extend(self.pump(peer));
+                actions.extend(self.resolve_stalled(peer));
                 if why.contains("hash") {
                     // Wrong bytes are misbehaviour, not misfortune, and are worded as such.
                     tracing::warn!(%peer, why, "ignored something from a peer");
@@ -660,6 +663,7 @@ impl Peers {
             self.arm(*group, at);
         }
         actions.extend(self.start_rounds());
+        actions.extend(self.pump_queues());
 
         // Catalogues are exchanged whatever the disk looks like: knowing what exists costs
         // kilobytes, and a node that stopped syncing its index when it ran out of room would
@@ -1236,11 +1240,8 @@ impl Peers {
             // Nothing could be started and nothing is running, so no completion will come back
             // to drive the queue. Decide here or the group stalls holding a source.
             return if self.space.is_some() && !self.queued.get(&peer).is_none_or(|q| q.is_empty()) {
-                // Our disk, not their shortcoming. Release the source without marking them
-                // spent, so they are the first place we look once there is room again — marking
-                // them spent would rotate through every member to discover the same thing, and
-                // then report the file unobtainable, which it is not.
-                self.release_source(peer, group)
+                // Our disk, not their shortcoming.
+                self.resolve_stalled(peer)
             } else {
                 // They claimed rows that have since vanished from our own catalogue.
                 self.spend_peer(peer, group)
@@ -1307,6 +1308,44 @@ impl Peers {
             });
         }
 
+        actions
+    }
+
+    /// Let go of the groups this peer sources but can no longer be driven for.
+    fn resolve_stalled(&mut self, peer: PeerId) -> Vec<PeerAction> {
+        // Still working, or waiting on a slot rather than on space
+        if self.peers.get(&peer).is_some_and(|s| s.transfers > 0)
+            || self.running_transfers() >= MAX_TRANSFERS
+        {
+            return Vec::new();
+        }
+
+        let stalled: HashSet<GroupId> = self
+            .queued
+            .get(&peer)
+            .map(|queue| queue.iter().map(|(group, _)| *group).collect())
+            .unwrap_or_default();
+
+        stalled
+            .into_iter()
+            .flat_map(|group| self.release_source(peer, group))
+            .collect()
+    }
+
+    /// Drive every waiting queue, not just the one a transfer came back on.
+    fn pump_queues(&mut self) -> Vec<PeerAction> {
+        let waiting: Vec<PeerId> = self
+            .queued
+            .iter()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(peer, _)| *peer)
+            .collect();
+
+        let mut actions = Vec::new();
+        for peer in waiting {
+            actions.extend(self.pump(peer));
+            actions.extend(self.resolve_stalled(peer));
+        }
         actions
     }
 

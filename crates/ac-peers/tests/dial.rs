@@ -605,6 +605,82 @@ fn a_big_offer_is_fetched_eight_at_a_time_until_none_are_left() {
 }
 
 #[test]
+fn a_queue_the_slots_shut_out_is_not_abandoned_there() {
+    let mut node = Node::new();
+    let members = peers(2);
+    let (first, second) = (
+        node.group_with(&members[..1]),
+        node.group_with(&members[1..]),
+    );
+    for i in 0..MAX_TRANSFERS {
+        node.learn_file(first, &format!("f{i:02}.bin"));
+    }
+    node.learn_file(second, "shut-out.bin");
+    node.all_up(&members);
+
+    // Both groups find a source in the same tick, so both queries go out together.
+    let asked = node.tick(AT);
+    let queries: Vec<(PeerId, GroupId, Vec<RelPath>)> = asked
+        .iter()
+        .filter_map(|a| match a {
+            PeerAction::AskHoldings { peer, group, paths } => Some((*peer, *group, paths.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(queries.len(), 2, "one source per group: {asked:?}");
+
+    // Answered in the order that fills the pool first.
+    let mut answer = |group: GroupId| {
+        let (peer, group, paths) = queries
+            .iter()
+            .find(|(_, g, _)| *g == group)
+            .cloned()
+            .expect("both groups asked");
+        node.peers.on(PeerEvent::Holdings {
+            peer,
+            group,
+            held: vec![true; paths.len()],
+            paths,
+        })
+    };
+
+    let running = fetched_paths(&answer(first));
+    assert_eq!(running.len(), MAX_TRANSFERS, "the pool is full");
+    assert_eq!(
+        fetches(&answer(second)),
+        0,
+        "and the second group's offer cannot start anything yet"
+    );
+
+    // Draining the first group frees every slot, and pumps nobody but the peer that completed.
+    let (peer, group, _) = queries
+        .iter()
+        .find(|(_, g, _)| *g == first)
+        .cloned()
+        .expect("the first group asked");
+    for path in running {
+        let actions = node.peers.on(PeerEvent::BlobDone { peer, group, path });
+        assert_eq!(
+            fetches(&actions),
+            0,
+            "the first group has nothing left to fetch: {actions:?}"
+        );
+    }
+
+    // Nothing is running, nothing is queued for the peer that just finished, and the shut-out
+    // queue is still sitting there. The tick is what has to notice.
+    let resumed = node.tick(AT + 1);
+    assert_eq!(
+        fetched_paths(&resumed)
+            .iter()
+            .filter(|p| p.as_str() == "shut-out.bin")
+            .count(),
+        1,
+        "the waiting queue is driven once there is room: {resumed:?}"
+    );
+}
+
+#[test]
 fn a_new_file_is_fetched_although_the_group_had_given_up_before() {
     // The backoff is a conclusion about a catalogue — "no member here has what we are missing" —
     // and a catalogue that has since moved invalidates it. The plan says as much: reset on the
@@ -1546,6 +1622,52 @@ fn cramped(storage_max: Option<u64>, free: u64, held: u64) -> (Node, GroupId) {
     node.all_up(&members);
     node.peers.on(PeerEvent::Space { free, held });
     (node, id)
+}
+
+fn source_of(node: &Peers, group: GroupId) -> Option<PeerId> {
+    node.status()
+        .groups
+        .into_iter()
+        .find(|g| g.group == group)
+        .and_then(|g| g.source)
+}
+
+#[test]
+fn a_source_the_budget_shut_out_is_let_go_when_the_last_transfer_ends() {
+    let mut node = Node::with_limits(Limits {
+        min_free: 0,
+        storage_max: Some(1),
+    });
+    let members = peers(1);
+    let id = node.group_with(&members);
+    for i in 0..3 {
+        node.learn_file(id, &format!("f{i}.bin"));
+    }
+    node.all_up(&members);
+    node.peers.on(PeerEvent::Space {
+        free: 1_000_000,
+        held: 0,
+    });
+
+    let running = fetched_paths(&step(&mut node, AT, true));
+    assert_eq!(running.len(), 1, "the budget has room for exactly one");
+    assert_eq!(
+        source_of(&node.peers, id),
+        Some(members[0]),
+        "and the group is pulling through the peer that offered them"
+    );
+
+    node.peers.on(PeerEvent::BlobDone {
+        peer: members[0],
+        group: id,
+        path: running[0].clone(),
+    });
+
+    assert_eq!(
+        source_of(&node.peers, id),
+        None,
+        "the rest cannot start and nothing is running, so the peer is let go at once"
+    );
 }
 
 fn fetches(actions: &[PeerAction]) -> usize {
