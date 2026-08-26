@@ -1,26 +1,5 @@
 #!/usr/bin/env bash
 #
-# The supervisor, end to end, on loopback.
-#
-# One server and three clients, all enrolled, sharing one group. **Nobody is given anybody
-# else's address**: that is the whole claim of milestone 5, so every `ac run` here is started
-# without `--dial` and the nodes have to find each other through the server's registry.
-#
-# # What this lab does and does not prove
-#
-# It proves the *decisions*: who to dial, what to fetch, and when to hang up. Those are the
-# hard parts and they are what milestone 5 added.
-#
-# It does **not** prove NAT traversal. Every node is on loopback and reachable from every
-# other, so connections here are direct and no hole punch is attempted. `netns-lab.sh` is the
-# NAT topology, needs root, and per its own header cannot punch either — hole punching is
-# validated on real networks. Nothing here contradicts that; it is a different question.
-#
-#   scripts/mirror-lab.sh          # run everything
-#   scripts/mirror-lab.sh keep     # leave the nodes running afterwards, for poking at
-#
-# Logs land in $LAB/<node>.log and the databases in $LAB/<node>/.
-
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,24 +7,12 @@ AC="$REPO/target/release/ac"
 ACS="$REPO/target/release/ac-server"
 LAB="${LAB_DIR:-/tmp/ac-mirror-lab}"
 
-# The binary's crate is named `ac`, so every module in it logs under `ac::…` — `ac_node` is
-# the *package* name and matches nothing. Getting that wrong hides the supervisor entirely,
-# which is exactly the part this lab exists to watch.
 NODE_LOG="${RUST_LOG:-ac=debug,ac_net=info,libp2p=warn}"
 
 # Generous, because CI machines are slow and the point of a failure here is to be legible
 # rather than fast. Discovery runs on a 300s interval, but a node also asks at startup.
 SETTLE=90
 
-# `ac_peers::sync::SHARE_AFTER_IDLE`, which an edit waits out before the group is told: an
-# afternoon of sorting photographs should cost one round, not ninety. Nothing here can shorten
-# it, so anything waiting on a *new* file has to budget for it on top of `SETTLE` — a member is
-# told about an edit no sooner than two minutes after the editing stops.
-#
-# The first mirror does not pay it. A member who has not answered the invitation is sent the
-# catalogue as soon as the registry says they are there, precisely because they may never have
-# been told the group exists at all — so properties 1 to 3 settle in seconds and property 7,
-# which edits a group that has already converged, is the one that waits.
 EDIT_PAUSE=120
 
 pass=0
@@ -122,9 +89,6 @@ enrol() {
     code=$(AC_SERVER_HOME="$LAB/srv" "$ACS" invite new --label "$who" | awk '/^invite/ {print $2}')
     ac "$who" join "$ENROL" "$code" --username "$who" >/dev/null
 
-    # mDNS off everywhere: on one host it would find everyone instantly and prove nothing
-    # about the registry, which is the path a real deployment depends on. Rewritten rather
-    # than appended — `ac join` already wrote the key, and a duplicate is a parse error.
     sed -i 's/^mdns = .*/mdns = false/' "$LAB/$who/config.toml"
     echo "  $who $(ac "$who" id)"
 }
@@ -136,25 +100,12 @@ run_node() {
     echo $! > "$LAB/$who.pid"
 }
 
-# Every node runs the same binary with the same arguments and differs only by `AC_HOME`, which
-# is an environment variable and so does not appear in the command line. `pkill -f` therefore
-# matched nothing, and the one property that needs a node *gone* — gossip — was quietly being
-# answered by a node that was still running.
 stop_node() {
     local who=$1
     [[ -f "$LAB/$who.pid" ]] || return 0
     kill "$(cat "$LAB/$who.pid")" 2>/dev/null || true
     wait_for 10 "$who to stop" bash -c "! kill -0 $(cat "$LAB/$who.pid") 2>/dev/null"
 }
-
-# ---------------------------------------------------------------- properties
-
-# `ac group list` prints `name  short-id  standing  members` with no header, so the id is the
-# second field of the first row. There is only ever one group in this lab.
-# `ac group list` prints `name  short-id  standing  members` with no header, so the id is the
-# second field of the first row — but only when there *is* a row. With no groups it prints
-# advice, whose second field is the word "groups.", and taking it made every membership check
-# pass against a node that had learned nothing at all.
 group_id() {
     ac "$1" group list 2>/dev/null | awk 'NR==1 && /^[a-z]/ && NF>=4 {print $2}'
 }
@@ -168,9 +119,6 @@ in_group() { [[ "$(group_id "$1")" =~ ^[0-9a-f]{8}$ ]]; }
 main() {
     need_binaries
 
-    # The ports below are fixed, and the exit trap only runs for a run that exits: one killed
-    # outright leaves a server holding them. Take the stragglers out first, and wait for the
-    # port rather than discovering it 20s later as "could not listen on address".
     pkill -x ac-server 2>/dev/null || true
     pkill -x ac 2>/dev/null || true
     wait_for 15 "port 45001 to be free" \
@@ -190,13 +138,6 @@ main() {
     say "1. they find each other, unprompted"
     run_node alice; run_node bob; run_node carol
 
-    # **The nodes first, the group second.** A person adds members from a machine that is
-    # already running, so the registry has answered by the time anything is enqueued. Building
-    # the group before the daemon existed made the very first enqueue read an empty registry —
-    # a state no real sequence produces, and one that cost the whole change, since `arm` records
-    # the news as accounted for whether or not anybody was reachable to receive it.
-    # Not fatal: if the registry is slow the properties below say so far more usefully than
-    # `set -e` killing the run here would.
     wait_for 30 "alice to see the others in the registry" \
         bash -c "[ \$(grep -ac 'discovered a peer' '$LAB/alice.log' 2>/dev/null || echo 0) -ge 2 ]" \
         || true
@@ -256,11 +197,6 @@ main() {
     run_node dave
     sleep 2
     ac alice group add "$GROUP" "$DAVE" --username dave >/dev/null
-    # Promptly, but "prompt" is bounded by the relay rather than by the supervisor: a node may
-    # open about two circuits a minute, so a member added while its inviter is mid-gossip waits
-    # for the allowance to roll over — the relay answers "resource limit exceeded" and the dial
-    # backs off. The property being tested is that this happens in a minute or two rather than
-    # on the four-hour heartbeat, so the budget is generous on purpose.
     if wait_for 120 "dave to hear about the group" in_group dave; then
         ok "dave learned the group promptly after being added"
     else
@@ -268,8 +204,6 @@ main() {
     fi
 
     say "5. it goes quiet"
-    # Everything has converged, so nothing should be dialling. Counted over a window rather
-    # than asserted to be zero: a heartbeat is hours away, but a stray retry is not a bug.
     before=$(grep -c "dialling a member" "$LAB/alice.log" || true)
     sleep 25
     after=$(grep -c "dialling a member" "$LAB/alice.log" || true)
@@ -299,21 +233,10 @@ main() {
     fi
 
     say "8. bytes come from whoever holds them, not from the author"
-    # This used to read "gossip, not polling", and stopped alice the moment *bob* had the file
-    # — then asked carol to get it from bob. That is the epidemic model, where a row learned
-    # second-hand travels onward. Propagation is author-only now: alice tells every member
-    # herself, and bob, having merely *learned* late.bin, has nothing of his own to say about
-    # it. So the old property could only pass by winning a race — alice reaching carol before
-    # the test killed her — and it did, about half the time. Losing it left carol reporting
-    # `missing 0` and perfectly converged as far as she knew, waiting on a four-hour heartbeat.
-    #
-    # What is genuinely true, and worth a lab, is the half about *bytes*: the catalogue comes
-    # from the author, but the content is pulled from whoever has it. So wait until carol has
-    # been told the row, take the author away, and require her to fetch it from bob.
     if wait_for "$SETTLE" "carol to be told about the late file" bash -c \
         "$(declare -f ac group_id knows); LAB=$LAB AC=$AC; knows carol late.bin"
     then
-        ok "alice told carol as well as bob — the author tells everyone"
+        ok "alice told carol as well as bob, the author tells everyone"
     else
         bad "carol was never told about the late file"
     fi

@@ -1,15 +1,3 @@
-//! `ac group` — create groups and decide who is in them.
-//!
-//! Every command here writes to `state.sqlite` and returns. A running `ac run` picks the
-//! change up on its next housekeeping tick and tells the peers that should hear about it —
-//! the same arrangement `ac peer add` already uses, and the reason the store insists on
-//! `BEGIN IMMEDIATE` and a busy timeout.
-//!
-//! Nothing here talks to the network, so every command works offline. What it cannot do
-//! offline is *propagate*, which is a property of the design rather than a limitation of the
-//! CLI: membership is a signed log, so a change is real the moment it is signed and merely
-//! unseen until someone connects.
-
 use ac_groups::chain::Op;
 use ac_groups::standing::Position;
 use ac_groups::store::{GroupRow, State};
@@ -25,8 +13,6 @@ use crate::contacts::Contacts;
 pub fn create(paths: &Paths, name: &str) -> Result<()> {
     let (identity, mut groups) = open(paths)?;
 
-    // The name we go by inside the group is the one the server attested, not one invented
-    // here — so a member's advisory username and their attested one start out agreeing.
     let attestation = attest::load(&paths.attestation_file())
         .context("reading this node's attestation")?
         .ok_or_else(|| anyhow!("this node has not enrolled with a server; run `ac join` first"))?;
@@ -69,8 +55,6 @@ pub fn list(paths: &Paths) -> Result<()> {
             notes.push("admin".to_owned());
         }
         if !members.contains(&identity.peer_id()) {
-            // We hold the group but the chain no longer lists us. Worth saying plainly:
-            // `state` is our own consent and does not change when someone removes us.
             notes.push("removed by admin".to_owned());
         }
 
@@ -152,15 +136,6 @@ pub fn add(paths: &Paths, needle: &str, peer: &PeerId, username: Option<&str>) -
     let (id, row) = resolve(&groups, needle)?;
     require_admin(&row, &identity, "add members")?;
 
-    // Fall back to whatever this node already calls them, rather than making the flag
-    // mandatory and retyping a name the contact list already holds.
-    //
-    // **Checked here, before anything is authored.** This is not display text once it is in
-    // the chain: it is signed, replicated and permanent, and `Chain::validate` holds it to
-    // the username rules. Contact labels predating that check can fail them — `pi` is two
-    // characters and a username needs three — and letting one through meant the refusal came
-    // back as `entry 1 carries an unusable username`, which names a chain entry the person
-    // never mentioned and does not say which name was the problem.
     let (raw, source) = match username {
         Some(name) => (name.to_owned(), "username"),
         None => (
@@ -178,9 +153,6 @@ pub fn add(paths: &Paths, needle: &str, peer: &PeerId, username: Option<&str>) -
         ),
     };
 
-    // Normalised, not merely accepted, so what lands in the chain is the canonical form —
-    // the same form the server attests. `create` takes its username straight from the
-    // attestation for that reason; this is the other half of it.
     let username = attest::normalise_username(&raw).map_err(|e| {
         anyhow!(
             "unusable {source} {raw:?}: {e}\n\
@@ -265,7 +237,7 @@ pub fn leave(paths: &Paths, needle: &str) -> Result<()> {
     if row.admin == identity.peer_id() {
         bail!(
             "you created {}, and a group cannot outlive its only admin. To stop holding it \
-             on this node, use `ac group forget {needle}` — which tells nobody.",
+             on this node, use `ac group forget {needle}`, which tells nobody.",
             row.name
         );
     }
@@ -282,7 +254,7 @@ pub fn leave(paths: &Paths, needle: &str) -> Result<()> {
     println!();
     println!("This node stops sharing that group immediately, whatever anyone else believes.");
     println!("The others are told when they next connect, and the admin then makes it");
-    println!("official. Being added again will not undo this — you would accept afresh.");
+    println!("official. Being added again will not undo this, you would accept afresh.");
     Ok(())
 }
 
@@ -291,15 +263,10 @@ pub fn forget(paths: &Paths, needle: &str) -> Result<()> {
     let (id, row) = resolve(&groups, needle)?;
     let admin = row.admin == identity.peer_id();
 
-    // The index goes; the bytes stay. Forgetting a group is a local bookkeeping act, and
-    // deleting someone's photos as a side effect of it is not something to do unasked.
     let (mut files, content) = open_files(paths, &identity)?;
     let held = files.list(id, None, false).unwrap_or_default().len();
     let dir = files.dir_of(id).ok().flatten();
 
-    // Partials are not "left on disk" the way finished files are — they are fragments of
-    // downloads that can now never complete, since the rows naming them are about to go. Swept
-    // before `forget_group`, which drops the `file_roots` row this needs to find them at all.
     if let Some(dir) = &dir {
         let _ = content.sweep_staging(dir, &[], std::time::Duration::ZERO);
     }
@@ -327,7 +294,7 @@ pub fn forget(paths: &Paths, needle: &str) -> Result<()> {
     } else {
         println!();
         println!("Nothing was told to anyone. The others still list you, and will keep");
-        println!("offering it — use `ac group leave` instead if you meant to tell them.");
+        println!("offering it, use `ac group leave` instead if you meant to tell them.");
     }
     Ok(())
 }

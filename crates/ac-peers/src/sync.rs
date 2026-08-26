@@ -20,11 +20,6 @@ pub const MAX_BACKOFF: i64 = 30 * 60;
 pub const DIAL_ATTEMPTS: usize = 3;
 
 /// Circuits opened for *news* in one tick.
-///
-/// The pacing that keeps one change in a large group from becoming one dial per member. It used
-/// to fall out of the loop shape — one peer per group per tick — and is stated here now that the
-/// queue is peer-shaped. Peers already connected are not counted: reaching them costs no circuit,
-/// and spreading the news to everyone we can already talk to is the point.
 pub const DIALS_PER_ROUND: usize = 1;
 
 /// After a full rotation in which no member could help.
@@ -1413,7 +1408,7 @@ impl Peers {
         None
     }
 
-    /// Whether this peer may be called right now — the dial backoff, and nothing else.
+    /// Whether this peer may be called right now, the dial backoff, and nothing else.
     fn callable(&self, peer: &PeerId) -> bool {
         self.connected.contains(peer) || self.peers.get(peer).is_none_or(|s| self.now >= s.retry_at)
     }

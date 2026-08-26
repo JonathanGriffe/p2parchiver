@@ -1,27 +1,3 @@
-//! What the running daemon is waiting on, published so another process can read it.
-//!
-//! # Why this exists at all
-//!
-//! Everything else `ac` reports is a fact in the database: what files exist, who is in a group,
-//! who this node has met. The supervisor's reasons are not. A dial that is not happening is
-//! being *not done* because of a backoff that has not expired, a member believed offline, or a
-//! content pull suspended after a rotation in which nobody could help — and every one of those
-//! lives in memory in a process the CLI cannot see.
-//!
-//! So the daemon writes a snapshot on each housekeeping tick and `ac peer status` reads it.
-//! SQLite is the channel because it already is: `ac file add` in one process reaches a running
-//! daemon the same way, and adding a second mechanism for one command would be worse than the
-//! staleness this accepts.
-//!
-//! # It is a snapshot, and says so
-//!
-//! [`Snapshot::at`] is when the daemon last wrote. A reader that finds it minutes old is
-//! looking at a stopped daemon, and that is by far the commonest answer to "why is it not doing
-//! anything" — so it is reported first and never silently.
-//!
-//! Nothing reads this back into the supervisor. It is a diagnostic, and a corrupt or absent
-//! snapshot costs a person one confusing command rather than a node that behaves differently.
-
 use std::path::Path;
 
 use std::str::FromStr;
@@ -31,15 +7,12 @@ use ac_net::PeerId;
 use ac_peers::sync::{GroupStatus, PeerStatus, Status};
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// A snapshot, plus when it was taken.
 pub struct Snapshot {
-    /// Unix seconds. `None` when the daemon has never written one.
     pub at: Option<i64>,
     pub groups: Vec<GroupStatus>,
     pub peers: Vec<PeerStatus>,
 }
 
-/// The published view of the supervisor, backed by SQLite.
 pub struct Published {
     db: Connection,
 }
@@ -47,8 +20,6 @@ pub struct Published {
 impl Published {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let db = Connection::open(path)?;
-        // The same pragmas every other store here opens with: several processes write this
-        // file, so WAL and a busy timeout are not optional.
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "foreign_keys", "ON")?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -81,10 +52,6 @@ impl Published {
     }
 
     /// Replace the snapshot wholesale.
-    ///
-    /// One transaction, and a delete before every insert: a group we have left or a member who
-    /// was removed must vanish from the report rather than linger as a row nothing updates.
-    /// `BEGIN IMMEDIATE` because a reader in another process may be mid-query.
     pub fn publish(&mut self, status: &Status, at: i64) -> Result<(), rusqlite::Error> {
         let tx = self
             .db
@@ -137,10 +104,6 @@ impl Published {
     }
 
     /// Whatever the daemon last published, or an empty snapshot if it never has.
-    ///
-    /// A row that will not parse is dropped rather than failing the command: this is a
-    /// diagnostic, and refusing to print anything because one peer id is malformed would be
-    /// exactly the wrong trade.
     pub fn read(&self) -> Result<Snapshot, rusqlite::Error> {
         let at: Option<i64> = self
             .db

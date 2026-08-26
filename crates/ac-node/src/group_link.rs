@@ -1,22 +1,3 @@
-//! The adapter between the swarm and the group layer.
-//!
-//! `ac-groups` decides *what* to say and to whom; this carries it out. It is the only code in
-//! the workspace naming both a `Swarm` and a `GroupSync`, which is why it lives here rather
-//! than in either crate: `ac-groups` may name no libp2p networking type, and `ac-net` must not
-//! depend on `ac-groups` at all.
-//!
-//! Two things it owns that the group layer deliberately does not:
-//!
-//! - **Request correlation.** A bare `Unavailable` names no group and an `OutboundFailure`
-//!   carries nothing but a request id, so without a map from id to what we asked, the group
-//!   layer could not be told *what* failed.
-//!
-//! Who is admitted and settled it does *not* own: that is `ac_net::roster::Roster`, borrowed
-//! on every call rather than mirrored here.
-//!
-//! The wording of everything a person reads about groups is also here, so `ac-groups` can
-//! return a typed `Notice` and its own tests assert on meaning rather than on phrasing.
-
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -36,30 +17,14 @@ use crate::daemon::ClientSwarm;
 use crate::file_link::RoundOutcome;
 
 /// What we asked a peer, kept so a bare reply can be matched back to it.
-///
-/// `GroupResponse::Unavailable` names no group and an `OutboundFailure` carries nothing but a
-/// request id, so without this the group layer could not be told *what* failed. Keeping the
-/// map here rather than in `ac-groups` is what keeps `OutboundRequestId` — a libp2p type — out
-/// of that crate.
 enum Outbound {
     Ask { peer: PeerId },
     Fetch { peer: PeerId, group: GroupId },
 }
 
-/// The only place a swarm and `ac-groups` are named together.
-///
-/// `ac-groups` decides *what* to do and returns [`GroupAction`]s; this performs them. The
-/// separation is what lets the whole sync policy be tested with no socket, and it is enforced
-/// by the compiler rather than by discipline: `ac-groups` does not depend on libp2p, so a
-/// libp2p type is unnameable there.
 pub struct GroupLink {
     sync: GroupSync,
     outbound: HashMap<request_response::OutboundRequestId, Outbound>,
-    /// Exchange outcomes waiting to be handed to the supervisor, drained each tick.
-    ///
-    /// The same report `FileLink` makes, for the same reason: the supervisor decides when to
-    /// talk to a peer, and the one thing it cannot work out for itself is whether a given
-    /// exchange delivered anything.
     rounds: Vec<RoundOutcome>,
 }
 
@@ -81,11 +46,7 @@ impl GroupLink {
         std::mem::take(&mut self.rounds)
     }
 
-    /// Ask this peer which groups they believe we share, because the supervisor decided it was
-    /// time.
-    ///
-    /// Always goes out: the request carries nothing, and what we would have said is exactly what
-    /// we cannot know until they answer.
+    /// Ask this peer which groups they believe we share,
     pub fn ask(&mut self, swarm: &mut ClientSwarm, peer: PeerId) {
         let id = swarm
             .behaviour_mut()
@@ -96,14 +57,6 @@ impl GroupLink {
     }
 
     /// Whether a chain exchange with this peer is still outstanding.
-    ///
-    /// Asked by the supervisor before it hangs up. Membership arrives over *this* protocol, and
-    /// nothing about it is visible to `ac-peers` — so without this a freshly connected peer
-    /// looks idle the instant it is verified and is closed a few milliseconds later, before the
-    /// group it was about to be told about has reached it.
-    ///
-    /// The other half of that — a peer admitted but not yet settled — is the roster's answer
-    /// now, and `PeerLink::drained` asks it there.
     pub fn busy_with(&self, peer: &PeerId) -> bool {
         self.outbound.values().any(|out| match out {
             Outbound::Ask { peer: p } | Outbound::Fetch { peer: p, .. } => p == peer,
@@ -111,9 +64,6 @@ impl GroupLink {
     }
 
     /// Drive the machine's clock.
-    ///
-    /// `now` is passed in rather than read here, so the group layer's schedules can be driven
-    /// deterministically from a test — the same reason its `Tick` carries a clock at all.
     pub fn housekeeping(
         &mut self,
         swarm: &mut ClientSwarm,
@@ -189,9 +139,6 @@ impl GroupLink {
                 (Some(Outbound::Fetch { group, .. }), GroupResponse::Unavailable) => self
                     .sync
                     .on(GroupEvent::Unavailable { peer, group }, roster),
-                // A reply of the wrong shape for what we asked, or about a different group.
-                // Dropped rather than guessed at: the arms above are the only pairings the
-                // protocol defines, and a peer does not get to choose what we asked.
                 _ => return,
             },
 
@@ -217,8 +164,7 @@ impl GroupLink {
         self.dispatch(swarm, actions);
     }
 
-    /// Perform what the group layer asked for. The only code that calls into the swarm on
-    /// its behalf.
+    /// Perform what the group layer asked for
     fn dispatch(&mut self, swarm: &mut ClientSwarm, actions: Vec<GroupAction>) {
         for action in actions {
             match action {
@@ -248,16 +194,6 @@ mod tests {
     use ac_net::swarm::{AcBehaviourEvent, Role, build};
 
     use crate::daemon::{App, app};
-
-    // `ac_groups::tests::sync` already proves the sync *policy* against an in-process bus.
-    // What it cannot prove is anything about the wire: that `/ac/group/3.0.0` is mounted and
-    // reachable through the app slot, that entries survive libp2p's own CBOR codec rather
-    // than just a `ciborium` round trip, that the size caps admit a realistic chain, and that
-    // [`GroupLink`] correlates a bare reply back to the request that caused it.
-    //
-    // These live inside the crate rather than in `tests/` because `ac-node` is a binary with
-    // no library target, so an integration test could not reach `GroupLink` at all — and
-    // rewriting its dispatch in the test would prove only that the copy works.
 
     use ac_groups::chain::Op;
     use ac_groups::id::GroupId;
@@ -309,10 +245,6 @@ mod tests {
         }
 
         /// The daemon's own routing, minus admission.
-        ///
-        /// Attestation is bypassed — the peer is put in the roster straight off the
-        /// connection — so these tests exercise the group path without also standing up a
-        /// server to issue credentials. Admission has its own tests above and in `ac-net`.
         fn step(&mut self, event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
             match &event {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -327,8 +259,6 @@ mod tests {
                 _ => {}
             }
 
-            // Only the group half of the app slot; the manifest and blob protocols are
-            // `FileLink`'s and have their own tests.
             if let SwarmEvent::Behaviour(AcBehaviourEvent::App(crate::daemon::AppEvent::Groups(
                 event,
             ))) = event
@@ -344,12 +274,7 @@ mod tests {
             }
         }
 
-        /// Housekeeping, then offer to whoever is connected — standing in for the supervisor.
-        ///
-        /// `ac-peers` decides when to talk to a peer, and these tests do not run it, so without
-        /// this the two nodes connect and then sit in silence. Offering on every tick is
-        /// wasteful and exactly right here: it is what a supervisor with no record of the peer
-        /// would do, and it lets the exchange start as soon as the connection settles.
+        /// Housekeeping, then offer to whoever is connected
         fn tick(&mut self) {
             self.roster.promote(&Connectivity::default());
             self.link
@@ -394,10 +319,6 @@ mod tests {
     }
 
     /// Dial `a` from `b`, returning the address so it can be dialled again.
-    ///
-    /// Calling this twice would hang: `listen_addr` waits for a `NewListenAddr`, and a swarm
-    /// emits that once per address for the life of the listener. Reconnecting means re-dialling
-    /// the address we already have.
     async fn connect(a: &mut Node, b: &mut Node) -> Multiaddr {
         let addr = a.listen_addr().await.with(Protocol::P2p(a.peer));
         b.swarm.dial(addr.clone()).expect("dial accepted");
@@ -405,11 +326,6 @@ mod tests {
     }
 
     /// An admin holding one group, with `member` added to it and `extra` further entries.
-    ///
-    /// The tail is built **in memory and stored in one call**, not by repeated
-    /// [`Groups::author`]. Each `author` reloads and re-verifies the whole chain, so building
-    /// n entries that way costs O(n²) signature checks — fine for the tens of entries a real
-    /// group holds, ruinous for a test that wants hundreds. See the note on [`Groups::chain`].
     fn group_with(admin: &mut Node, member: &Node, extra: usize) -> GroupId {
         let key = Identity::load_or_generate(&admin._dir.path().join("identity.key"))
             .unwrap()
@@ -486,9 +402,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_long_chain_crosses_in_one_response() {
-        // There is no chunking: one `Fetch` is answered by one response carrying everything.
-        // This puts a chain far past anything a family group would reach through libp2p's
-        // codec, so the explicit size maxima in `ac_groups::wire` are exercised for real.
         let mut alice = Node::new();
         let mut bob = Node::new();
         let id = group_with(&mut alice, &bob, 300);
@@ -524,10 +437,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_departure_is_collected_on_the_next_connection() {
-        // Syncing happens on connection, not on a timer, so a change made while apart is what
-        // the next exchange is for. This is also the only path that exercises fetch rule 2 on
-        // the wire: a node that has left stops advertising, so nobody offers it anything, and
-        // the admin collects its standing only by noticing the silence and asking.
         let mut alice = Node::new();
         let mut bob = Node::new();
         let id = group_with(&mut alice, &bob, 0);
@@ -538,8 +447,6 @@ mod tests {
         })
         .await;
 
-        // Apart now: bob joins and then changes his mind with nobody listening. Both sides
-        // must observe the close, or the reconnection is not a fresh peer to both of them.
         let (alice_peer, bob_peer) = (alice.peer, bob.peer);
         let _ = bob.swarm.disconnect_peer_id(alice_peer);
         run_until(&mut alice, &mut bob, move |a, b| {
@@ -565,7 +472,7 @@ mod tests {
                 .members(id)
                 .unwrap()
                 .contains(&bob_peer),
-            "alice cannot know yet — nothing was connected"
+            "alice cannot know yet, nothing was connected"
         );
 
         bob.swarm.dial(addr).expect("re-dial accepted");
@@ -605,10 +512,6 @@ mod tests {
 
         let carol_peer = carol.peer;
         run_until(&mut alice, &mut carol, move |a, c| {
-            // Promotion, not connection. Alice refuses everything from a peer still in
-            // `settling`, so asking before she has promoted carol would test that refusal
-            // instead of the membership one — and carol never re-asks, so the exchange would
-            // then simply never produce the answer under test.
             a.roster.is_ready(&carol_peer) && c.roster.is_ready(&alice_peer)
         })
         .await;

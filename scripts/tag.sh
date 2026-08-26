@@ -11,15 +11,6 @@
 #   feat:             minor
 #   anything else     patch
 #
-# Git tags are the only source of truth. Nothing is written back to the repository — no
-# version file, no release commit — which is what keeps CI from triggering itself.
-#
-# `Cargo.toml` therefore keeps its own version and `ac-server --version` reports that rather
-# than the release. What identifies a running image is its tag, and the version is also on
-# the image as the standard `org.opencontainers.image.version` label. Stamping it into
-# `Cargo.toml` at build time was the alternative and it costs a full recompile of the
-# dependency tree on every push, because the edit lands in a layer above `cargo build` and
-# invalidates it — see the cache note in `.github/workflows/ci.yml`.
 
 set -euo pipefail
 
@@ -48,9 +39,6 @@ if [[ -z "$LAST_BASE_TAG" ]]; then
     # decide the opening version like any other, rather than it being picked by hand: a
     # history containing a `feat:` opens at 0.1.0.
     #
-    # Not merely tidy — without this the arithmetic below runs on empty strings and
-    # `git log ..HEAD` is a syntax error, which is how this script fails on the one run
-    # nobody has tested it on.
     echo "No release tags yet; counting from 0.0.0 over the whole history"
     MAJOR=0 MINOR=0 PATCH=0
     RANGE=HEAD
@@ -61,9 +49,6 @@ fi
 
 echo "Current base version: $MAJOR.$MINOR.$PATCH"
 
-# `%B` is the whole message, subject and body. `--oneline` would have been the subject alone,
-# and `BREAKING CHANGE` belongs in the footer by convention — so the one bump that must never
-# be missed is the one that would have been.
 COMMITS=$(git log "$RANGE" --format=%B)
 
 echo "Commits since that version:"

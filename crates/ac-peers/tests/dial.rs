@@ -1,13 +1,3 @@
-//! The supervisor, driven by hand.
-//!
-//! No swarm, no socket, no tokio, no sleeping — a four-hour heartbeat and a thirty-minute
-//! backoff are both a matter of choosing the `at` passed to a tick.
-//!
-//! The first several tests are regressions for failures this design was found to have while
-//! being reviewed, before any of it was written. Each is noted as such, because every one of
-//! them looks like working code from the outside.
-
-// An integration test is its own crate, so the library's test-only allow does not reach here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashSet;
@@ -92,10 +82,6 @@ impl Node {
         self.record(group, path, true);
     }
 
-    /// A row we know of and do not hold — what a catalogue sync leaves behind.
-    ///
-    /// Through `merge`, which is how such a row really arrives: `record` is the local edit path
-    /// and would both claim the row as our news and fail to mark it as something we now want.
     fn learn_file(&mut self, group: GroupId, path: &str) {
         let row = self.row(path, false);
         let dir = self.peers.files_mut().dir_for(group, "holiday").unwrap();
@@ -162,9 +148,6 @@ impl Node {
             .unwrap();
     }
 
-    /// A member's signed answer to the invitation, arriving as a chain sync would deliver it.
-    ///
-    /// Signed by them, so it cannot be faked with `author_standing` — that one writes *our* row.
     fn accept_invite(&mut self, group: GroupId, key: &Keypair) {
         let standing = Standing::author(key, group, 1, Position::In, AT).unwrap();
         let entries: Vec<_> = self
@@ -182,16 +165,6 @@ impl Node {
     }
 
     /// Everyone online and connected, as a settled network would be.
-    ///
-    /// **Settled includes the connect-time reconcile.** `Verified` puts the chain question on
-    /// the wire itself and the catalogue follows on its answer, so a helper that dropped those
-    /// would leave every peer looking mid-exchange for the rest of the test — and a peer with an
-    /// offer outstanding is one `start_rounds` skips.
-    /// Tick, then answer whatever circuit it opened.
-    ///
-    /// The question follows the connection now, not the tick that asked for one, so a test that
-    /// only ticks sees a `Dial` and nothing else. Returns the questions first, then the tick's
-    /// own actions, so `rounds` and `find(Ask)` read as they did.
     fn tick_connecting(&mut self, at: i64) -> Vec<PeerAction> {
         let actions = self.tick(at);
         let mut out = Vec::new();
@@ -236,10 +209,6 @@ impl Node {
         }
     }
 
-    /// Everyone reachable but nobody connected — the ordinary state under sparse connections.
-    ///
-    /// What most propagation tests want: news is a reason to *dial*, and a member already on the
-    /// other end of a connection is one no dial can reach and no question can tell.
     fn all_online(&mut self, members: &[PeerId]) {
         self.peers.on(PeerEvent::Presence {
             asked: members.to_vec(),
@@ -247,7 +216,6 @@ impl Node {
         });
     }
 
-    /// Returns everything the connecting produced — the questions, and what their answers led to.
     fn all_up(&mut self, members: &[PeerId]) -> Vec<PeerAction> {
         self.peers.on(PeerEvent::Presence {
             asked: members.to_vec(),
@@ -261,10 +229,6 @@ impl Node {
         seen
     }
 
-    /// Answer every question in `actions`, and every question those answers produce.
-    ///
-    /// A settled catalogue is what opens a content pull, so what `Synced` hands back matters as
-    /// much as what the questions themselves did — dropping it loses the holdings query.
     fn settle_all(&mut self, actions: &[PeerAction]) -> Vec<PeerAction> {
         let groups = self.shared_groups();
         let mut queue: Vec<PeerAction> = actions.to_vec();
@@ -368,14 +332,6 @@ fn settle_offers(node: &mut Node, actions: &[PeerAction], group: GroupId) -> Vec
 }
 
 /// Tick once to notice an edit, and answer when the pause it must wait out has elapsed.
-///
-/// `SHARE_AFTER_IDLE` is deliberate and not skippable: a single `ac file add` is not told to the
-/// group until the catalogue has been still for two minutes, so that an afternoon of sorting
-/// photographs costs one round rather than ninety. Membership is exempt and goes at once, which
-/// is why only the catalogue tests need this.
-///
-/// Two ticks are needed because the first is what *notices* the edit — the supervisor is told
-/// nothing by the process that made it and can only compare the store against what it last saw.
 fn after_editing_pause(node: &mut Node, at: i64) -> i64 {
     node.tick(at);
     at + SHARE_AFTER_IDLE + 1
@@ -413,20 +369,12 @@ fn dials(actions: &[PeerAction]) -> Vec<PeerId> {
 }
 
 /// One tick, with every action answered the way a cooperative network would.
-///
-/// Collects actions produced by the answers as well as by the tick itself — a round that is
-/// never answered leaves the peer looking busy for ever, which silently disables every close
-/// test in this file.
 fn step(node: &mut Node, at: i64, holds: bool) -> Vec<PeerAction> {
     let mut seen = Vec::new();
     let mut queue = node.tick(at);
 
     while let Some(action) = queue.pop() {
         match &action {
-            // An offer names every group shared with that peer, and each settles separately —
-            // so answering one means answering for all of them, as the daemon does. Whether it
-            // was the chain or the catalogue is the supervisor's business: it recorded which,
-            // and settles the matching half.
             PeerAction::Ask { peer, offering } => {
                 for group in node.shared_groups() {
                     queue.extend(node.peers.on(PeerEvent::Synced {
@@ -465,10 +413,6 @@ fn step(node: &mut Node, at: i64, holds: bool) -> Vec<PeerAction> {
 
 /// Run until the node stops asking for things, returning when that happened and everything
 /// it did on the way.
-///
-/// The actions matter: a close proposal is emitted by whichever tick first finds the peer
-/// drained, which is usually one of these — so a test that settles and *then* looks for the
-/// proposal finds nothing, the proposal already being outstanding.
 fn settle(node: &mut Node, from: i64) -> (i64, Vec<PeerAction>) {
     let mut seen = Vec::new();
     for at in (from..).take(20) {
@@ -507,13 +451,6 @@ fn rounds(actions: &[PeerAction]) -> Vec<PeerId> {
 
 #[test]
 fn a_node_that_knows_no_groups_still_asks_whoever_it_meets() {
-    // How anybody is *first* told they are in a group. An ask carries nothing — the answer is
-    // what tells the asker what the other side holds — so a node learns of a group only by
-    // asking somebody already in it. While this was gated on groups we already knew about, a
-    // node that knew none could ask nobody: the author knocked, the knock delivered nothing,
-    // and an invitation issued while the member was offline never arrived at all.
-    //
-    // `mirror-lab.sh` properties 1 to 3 are the end-to-end form of this.
     let mut node = Node::new();
     let stranger = peers(1)[0];
 
@@ -532,14 +469,6 @@ fn a_node_that_knows_no_groups_still_asks_whoever_it_meets() {
 
 #[test]
 fn one_change_in_a_fifty_member_group_is_not_fifty_dials() {
-    // The mistake the whole design corrects. Iterating peers and asking "is there work with
-    // them" answers the same for every member under auto-mirror, so all forty-nine look equally
-    // worth dialling — ~2,450 circuits per interval to discover nothing changed.
-    //
-    // **Circuits, specifically.** Reaching a member we are already connected to costs none, and
-    // telling everyone we can already reach is the point; what has to be paced is opening new
-    // ones, which `DIALS_PER_ROUND` does. So the members here are *online* and not connected,
-    // which is the state that used to produce a dial each.
     let mut node = Node::new();
     let members = peers(49);
     let id = node.group_with(&members);
@@ -604,15 +533,6 @@ fn adding_a_member_provokes_a_round_although_no_file_changed() {
 
 #[test]
 fn no_more_circuits_are_opened_than_the_relay_allows() {
-    // The allowance is the server's, and spending past it does not get us more connections —
-    // it gets us refusals, each of which backs off a member who was reachable all along.
-    //
-    // In the lab a node spent both circuits in one tick, on a member that had been stopped and
-    // a member that held nothing, and then had both of its dials to the only peer holding the
-    // file it wanted refused by the relay. It reported the file unobtainable without ever
-    // asking the node that had it.
-    // More members than the window allows, so the cap is what stops us rather than running out
-    // of people to call.
     let mut node = Node::new();
     let members = peers(DIALS_PER_WINDOW * 2);
     let id = node.group_with(&members);
@@ -647,13 +567,6 @@ fn no_more_circuits_are_opened_than_the_relay_allows() {
 
 #[test]
 fn a_round_nobody_answers_does_not_wedge_the_node() {
-    // Only `MAX_CATALOGUE_ROUNDS` rounds may run at once, so a round that never settles takes a
-    // slot with it for good. Two of them and this node stops gossiping entirely — while
-    // reporting itself idle, connected, and with news still to send, which is what `ac peer
-    // status` showed in the lab: "2 round(s)" against a peer that had answered nothing.
-    //
-    // The refusal that caused it is fixed at its source in `ac-files`. This is the guarantee
-    // that the *next* unreported ending costs a minute rather than the node.
     let mut node = Node::new();
     let members = peers(3);
     let id = node.group_with(&members);
@@ -671,10 +584,6 @@ fn a_round_nobody_answers_does_not_wedge_the_node() {
         "the slots are full while they are outstanding"
     );
 
-    // Past the timeout they are written off, which frees the slot without re-asking the peer
-    // that took it: they are still connected, and a member on the other end of a connection is
-    // never asked from a tick. Their retry waits for the call to end — what the tick may do
-    // meanwhile is reach somebody else.
     node.add_file(id, "b.jpg");
     let swept = node.tick_connecting(AT + ROUND_TIMEOUT + 1);
     assert!(
@@ -691,10 +600,6 @@ fn a_round_nobody_answers_does_not_wedge_the_node() {
 
 #[test]
 fn a_backlog_larger_than_one_question_is_walked_rather_than_re_asked() {
-    // One question names at most `MAX_HOLDINGS_QUERY` paths, so an answer of "none of those"
-    // is about a page and not about the group. Reading "none" as "nothing at all" wrote a peer
-    // off for a backlog it had never been asked about, and — since every member was then asked
-    // the same first page — a group whose files all sorted after it reported them unobtainable.
     const PAGE: usize = ac_files::wire::MAX_HOLDINGS_QUERY;
 
     let mut node = Node::new();
@@ -926,15 +831,6 @@ fn a_queue_the_slots_shut_out_is_not_abandoned_there() {
 
 #[test]
 fn a_new_file_is_fetched_although_the_group_had_given_up_before() {
-    // The backoff is a conclusion about a catalogue — "no member here has what we are missing" —
-    // and a catalogue that has since moved invalidates it. The plan says as much: reset on the
-    // catalogue changing or on a member returning, because `have` is local and a peer acquiring
-    // a file moves nothing on the wire, so re-asking is the only discovery there is.
-    //
-    // Neither reset existed. A group that exhausted its rotation once — which happens routinely
-    // in a mirror, where members hold the same files and each finds the other has nothing for
-    // it — doubled its way to a multi-minute silence and served it out even as new files
-    // arrived. In the lab a member knew a file existed and never once asked for it.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
@@ -973,11 +869,6 @@ fn a_new_file_is_fetched_although_the_group_had_given_up_before() {
 
 #[test]
 fn a_member_already_connected_is_asked_before_one_that_needs_a_circuit() {
-    // Circuits are the scarce resource — two a minute, server-enforced — and an open connection
-    // costs none. Choosing by rotation alone spent the whole allowance dialling members who
-    // could not be reached while an idle connection to one who could help was held and then
-    // hung up on: in the lab a file stayed `remote` on a node that knew it existed and had
-    // burned six refused circuits on the two peers that did not have it.
     let mut node = Node::new();
     let members = peers(3);
     let id = node.group_with(&members);
@@ -990,9 +881,6 @@ fn a_member_already_connected_is_asked_before_one_that_needs_a_circuit() {
     });
     let held = members[2];
 
-    // The claim is about *who is spoken to*, not about the tick going quiet. News to the two
-    // members we cannot reach genuinely needs circuits — they cannot be told any other way — so
-    // a dial alongside this is right. The question to `held` rides the connection itself.
     let mut actions = node.peers.on(PeerEvent::Verified { peer: held });
     actions.extend(node.tick(AT));
     assert!(
@@ -1006,11 +894,6 @@ fn a_member_already_connected_is_asked_before_one_that_needs_a_circuit() {
 
 #[test]
 fn every_member_is_asked_once_not_one_member_repeatedly() {
-    // Coming round to a group is a claim about *members*, not about how many requests went out,
-    // and the difference only shows when the members are not equally callable. A peer we already
-    // hold a connection to always is; the rest need a relay circuit this node may not be allowed
-    // to open yet. Counting sends rather than recipients spent the whole rotation on the peer
-    // that was easiest to reach and left the rest unasked.
     let mut node = Node::new();
     let members = peers(3);
     node.group_with(&members);
@@ -1038,12 +921,6 @@ fn every_member_is_asked_once_not_one_member_repeatedly() {
 
 #[test]
 fn membership_is_offered_before_the_catalogue() {
-    // The chain first, always. A catalogue offer is gated on membership the other side may not
-    // have yet — `shared_with` will not name the group to them — so sending both at once means
-    // the file heads arrive to be refused, and the exchange has to happen again.
-    //
-    // Both spread by the same record and the same loop; the only difference between them is
-    // this ordering, and it exists because one is the precondition for the other.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
@@ -1062,8 +939,6 @@ fn membership_is_offered_before_the_catalogue() {
         "membership goes first: {first:?}"
     );
 
-    // Answered, so the chain half of the record is now theirs. `Asked` is what discharges it —
-    // one question covers every shared group, so answering it settles that half for all of them.
     for group in node.shared_groups() {
         node.peers.on(PeerEvent::Synced {
             peer: members[0],
@@ -1076,8 +951,6 @@ fn membership_is_offered_before_the_catalogue() {
         offering: Offering::Chain,
     });
 
-    // On the answer, not on the next tick: membership is what gates a catalogue answer, so the
-    // moment they have it is the moment the second question can be put.
     assert!(
         matches!(
             second.iter().find(|a| matches!(a, PeerAction::Ask { .. })),
@@ -1120,8 +993,6 @@ fn a_settled_membership_round_does_not_write_off_the_catalogue() {
         }));
     }
 
-    // The catalogue half was never on the wire, so it is still outstanding — and follows on the
-    // answer itself, rather than on a later tick or the group's next heartbeat.
     assert_eq!(
         rounds(&followed),
         members,
@@ -1141,12 +1012,6 @@ fn a_settled_membership_round_does_not_write_off_the_catalogue() {
 
 #[test]
 fn a_change_made_by_the_cli_in_another_process_is_offered_once() {
-    // `ac file add` runs in another process and notifies nothing; SQLite is the only channel
-    // between them. The supervisor notices by comparing the store to what each peer is known to
-    // hold — and having offered, it stops, rather than repeating every tick.
-    //
-    // This property used to live in `ac-files`, which offered on its own schedule. It moved
-    // here with the responsibility.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
@@ -1187,11 +1052,6 @@ fn a_member_we_have_never_asked_is_due_at_once() {
 
 #[test]
 fn a_quiet_group_waits_for_its_heartbeat() {
-    // The two triggers are separate and this pins the second. A change of ours dials the group
-    // at once — that is `a_change_made_by_the_cli_in_another_process_is_offered_once`. With
-    // nothing of ours to say, the only thing left is the timer, and it is hours away rather
-    // than the next tick. This replaced a test about declines, which described a refusal the
-    // pull has no notion of: a question carries nothing, so there is nothing to refuse.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
@@ -1219,16 +1079,6 @@ fn a_quiet_group_waits_for_its_heartbeat() {
 
 #[test]
 fn what_we_learn_from_a_peer_is_not_re_told_to_the_group() {
-    // This asserted the opposite until the epidemic went away, and the inversion is the point of
-    // the design rather than an accident of it. Under a fanout of three, a responder had to stay
-    // armed or a change reached only the members its author happened to call. Telling everybody
-    // directly is now affordable — sixteen circuits a minute rather than two — so the author
-    // reaches every member itself, and a second node repeating what it just heard is one message
-    // per member *per member*.
-    //
-    // `seen` moving on every settled exchange, ours or theirs, is what makes this fall out for
-    // nothing: a difference against it is a local change by construction, so there is no
-    // provenance to track and nothing that arrives from a peer ever enqueues anybody.
     let mut node = Node::new();
     let members = peers(2);
     let id = node.group_with(&members);
@@ -1269,13 +1119,6 @@ fn what_we_learn_from_a_peer_is_not_re_told_to_the_group() {
 
 #[test]
 fn a_member_added_a_moment_ago_is_called_as_soon_as_they_are_seen() {
-    // Under the push, adding a member armed the news and the dial followed on that tick, with
-    // nothing having vouched for the newcomer. Pull gives that up: the chain moving enqueues
-    // nobody, and the group's own timer is hours away.
-    //
-    // What reaches them instead is the invitation rule — we hold no standing of theirs in a
-    // group our chain says they are in, so the moment anything reveals they exist we call them.
-    // Being *seen* is the whole signal, and discovery supplies it within minutes.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
@@ -1315,14 +1158,6 @@ fn a_member_added_a_moment_ago_is_called_as_soon_as_they_are_seen() {
 #[test]
 fn a_member_who_has_never_answered_the_invitation_is_told_again_when_the_server_sees_them() {
     // What the presence query is still for, now that nothing waits on its answer.
-    //
-    // Someone invited and away cannot ask for the group — they do not know it exists — and under
-    // author-only propagation no other member will offer it to them. Our three attempts have
-    // already run out and taken them off the list. Being reported online is then the only signal
-    // there is, and it costs one small request rather than a circuit.
-    //
-    // The test is a *standing*, not a sync cursor: a standing is signed by the member and is the
-    // only thing that says they know the group exists.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
@@ -1356,12 +1191,6 @@ fn a_member_who_has_never_answered_the_invitation_is_told_again_when_the_server_
 
 #[test]
 fn the_content_pull_still_waits_for_the_registry() {
-    // The half of presence that survives. Delivering news is an obligation to a named member and
-    // is not negotiable on a five-minute-old answer; pulling gigabytes is a *choice* between
-    // members, and one the server saw recently is the better candidate.
-    //
-    // So a member reported away is still dialled — we may owe them something — but is not asked
-    // to supply a file until something vouches for them.
     const { assert!(PRESENCE_INTERVAL > 0) };
 
     let mut node = Node::new();
@@ -1373,8 +1202,6 @@ fn the_content_pull_still_waits_for_the_registry() {
         online: Vec::new(),
     });
 
-    // Raw, not `step`: completing the dial would connect them, and a live connection vouches
-    // for a peer far better than the registry ever could — which is a different claim.
     let actions = node.tick(AT);
     assert!(
         !actions
@@ -1383,8 +1210,6 @@ fn the_content_pull_still_waits_for_the_registry() {
         "nothing has vouched for them, so they are not made a source: {actions:?}"
     );
 
-    // The server changes its mind. Now they are worth pulling through — and connecting is what
-    // does the vouching, so the question goes out as that connection reconciles.
     let opening = node.all_up(&members);
     let mut asked = opening
         .iter()
@@ -1402,11 +1227,6 @@ fn the_content_pull_still_waits_for_the_registry() {
 
 #[test]
 fn a_change_reaches_every_member_not_a_sample_of_them() {
-    // News goes to everyone who has not heard it. An epidemic with a fanout of three was the
-    // right answer to a budget of two circuits a minute — telling everybody was unaffordable, so
-    // each node told a few and trusted them to pass it on. Resizing the relay's unit removed the
-    // scarcity, and with it the reason to sample: one hop, fewer messages in total, and no
-    // dependence on an intermediary staying up long enough to relay what it heard.
     let mut node = Node::new();
     let members = peers(6);
     let id = node.group_with(&members);
@@ -1431,12 +1251,6 @@ fn a_change_reaches_every_member_not_a_sample_of_them() {
 
 #[test]
 fn telling_everyone_stops_by_itself() {
-    // Once every member holds what we hold, the group goes quiet — rather than re-offering
-    // because the store still differs from something, which is what a comparison against a
-    // single per-group record would do.
-    //
-    // Each member takes two exchanges: membership first, then the catalogue, since a peer
-    // cannot be offered a catalogue for a group it may not know it belongs to.
     let mut node = Node::new();
     let members = peers(6);
     let id = node.group_with(&members);
@@ -1499,7 +1313,6 @@ fn a_peer_that_acquires_a_file_later_is_asked_again() {
         step(&mut node, AT + offset, false);
     }
 
-    // Well past the backoff they are asked again — and this time they have it.
     let mut fetched = false;
     for offset in 200..210 {
         for action in step(&mut node, AT + offset, true) {
@@ -1519,13 +1332,6 @@ fn a_peer_that_acquires_a_file_later_is_asked_again() {
 
 #[test]
 fn a_member_the_registry_calls_away_is_dialled_anyway() {
-    // The inversion. This used to assert the opposite, and the opposite is what silenced nodes:
-    // an answer is at most five minutes old, is about the moment it was taken, and a member it
-    // leaves out was never called at all — so a peer that had reconnected since, or had not
-    // finished starting when the question was asked, simply never heard anything again.
-    //
-    // A refused circuit costs one of sixteen a minute and comes back in seconds. Not calling
-    // somebody who is there costs the propagation.
     let mut node = Node::new();
     let members = peers(3);
     let id = node.group_with(&members);
@@ -1551,8 +1357,6 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
     // for ever and keeps spending circuits to prove it. Ending it on the *first* failure is the
     // same mistake as never calling: a node restarting is unreachable for a few seconds and has
     // done nothing to deserve being written off.
-    //
-    // Three attempts, paced by the backoff — 0s, 30s, 90s.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
@@ -1586,9 +1390,6 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
         at - AT
     );
 
-    // Not a verdict about them: the clock puts them back on the list. Under the push it was
-    // the next thing we had to say that did, which is the half that changed — there is no
-    // longer any such thing.
     node.add_file(id, "b.jpg");
     assert_eq!(
         node.peers.status().groups[0].owed,
@@ -1653,12 +1454,6 @@ fn backoff_advances_on_the_attempt_and_resets_on_verified() {
 
 #[test]
 fn a_stranger_is_called_before_a_familiar_member() {
-    // A newly added member has not answered the invitation, and round-robin would put them last
-    // in a large group — which is exactly where being told promptly matters.
-    //
-    // Their standing is what says so, not a sync cursor: a member who accepted months ago and
-    // has never swapped a catalogue with us is no stranger, and one we have swapped catalogues
-    // with who never accepted is.
     let mut node = Node::new();
     let keys: Vec<Keypair> = (0..5).map(|_| Keypair::generate_ed25519()).collect();
     let members: Vec<PeerId> = keys.iter().map(|k| k.public().to_peer_id()).collect();
@@ -1690,9 +1485,6 @@ fn a_stranger_is_called_before_a_familiar_member() {
 
 #[test]
 fn a_drained_peer_is_proposed_to_even_while_the_group_is_behind() {
-    // The second design failure. Tying idleness to the *group* is permanently false under
-    // auto-mirror, so rotating through the members left every connection held for ever — each
-    // one having already said it could not help.
     let mut node = Node::new();
     let members = peers(2);
     let id = node.group_with(&members);
@@ -1931,9 +1723,6 @@ fn fetches(actions: &[PeerAction]) -> usize {
 
 #[test]
 fn the_free_space_floor_stops_fetching_and_says_so_once() {
-    // The floor protects the machine rather than the archive: somebody who set no budget has
-    // not agreed to give up the last of their root disk. And it is said *once* — a node at its
-    // ceiling refuses every fetch it considers, so one line per file would bury everything.
     let (mut node, id) = cramped(None, 500, 0);
     node.learn_file(id, "big.bin");
 
@@ -1965,9 +1754,6 @@ fn a_budget_stops_fetching_short_of_the_disk_filling() {
 
 #[test]
 fn space_appearing_resumes_the_mirror() {
-    // Neither limit deletes anything, so the file is still missing and still wanted. This is
-    // what makes hitting a ceiling legible rather than terminal — and it is the reason a
-    // refusal for space must not mark the peer spent or deny the path.
     let (mut node, id) = cramped(Some(100), 1_000_000, 100);
     node.learn_file(id, "big.bin");
 
@@ -2014,10 +1800,6 @@ fn a_file_larger_than_the_headroom_is_not_started() {
 
 #[test]
 fn a_presence_answer_says_nothing_about_peers_it_was_not_asked_about() {
-    // The bug that silenced a whole node in the lab. The query skips peers we are already
-    // connected to, so applying its answer as a *replacement* dropped every one of them from
-    // the online set — and with nobody usable, the supervisor stopped dialling and stopped
-    // pulling while sitting in a conversation with the very peers it had forgotten.
     let mut node = Node::new();
     let members = peers(2);
     let id = node.group_with(&members);
@@ -2043,11 +1825,6 @@ fn a_presence_answer_says_nothing_about_peers_it_was_not_asked_about() {
         online: Vec::new(),
     });
 
-    // Read straight off the state rather than inferred from what the node happened to do this
-    // tick: the bug was that the answer was applied as a *replacement*, so the peer it said
-    // nothing about vanished from the online set. Under a pull nothing schedules a round off the
-    // back of an edit, so there is no traffic to read it from — and the state is the truth
-    // anyway.
     let status = node.peers.status();
     let online = |peer: &PeerId| {
         status
@@ -2083,18 +1860,11 @@ fn a_presence_answer_says_nothing_about_peers_it_was_not_asked_about() {
 
 #[test]
 fn nobody_reachable_is_not_the_same_as_nobody_having_it() {
-    // A group whose members have simply not been dialled yet must not be declared exhausted.
-    // Conflating the two armed the content backoff — for minutes, doubling — and reported every
-    // missing file as unobtainable, on the strength of never having asked anybody. In the lab
-    // this stopped a node mirroring at all: the backoff was set while it was still connecting,
-    // and by the time a member arrived the group was suppressed.
     let mut node = Node::new();
     let members = peers(2);
     let id = node.group_with(&members);
     node.learn_file(id, "wanted.bin");
 
-    // Nobody online, nobody connected — so the tick is taken raw, or the heartbeat's dial would
-    // be answered and there would be somebody connected after all.
     node.tick(AT);
     assert!(
         node.peers
@@ -2105,8 +1875,6 @@ fn nobody_reachable_is_not_the_same_as_nobody_having_it() {
         "not having asked anyone is not the same as having been refused"
     );
 
-    // A member turns up. The group must not be sitting in a backoff it should never have
-    // entered — the file is asked for straight away.
     let opening = node.all_up(&members[..1]);
     let mut asked = opening
         .iter()

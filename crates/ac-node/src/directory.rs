@@ -1,26 +1,3 @@
-//! Everyone this node knows a name for: hand-added contacts, plus fellow group members.
-//!
-//! The two are merged **at read time rather than copied**. `contacts` and `group_members` live
-//! in the same `state.sqlite`, so there is nothing to gain by materialising one into the other
-//! — and plenty to lose: a copy has to be invalidated on every membership change, and a peer
-//! who is both a contact and a fellow member would exist twice with no way to say which row is
-//! the truth. `contacts.rs` promises "one fact, one place"; this is where that is kept.
-//!
-//! So the contact list keeps meaning exactly what it meant before — peers a person named by
-//! hand — and this view is the union, computed fresh on every call.
-//!
-//! # A contact outranks a membership
-//!
-//! A peer who is both appears **once**, as [`Source::Contact`], carrying the label its person
-//! typed. That is deliberate rather than a tie-break of convenience: a contact's label is
-//! chosen locally by the user, whereas a group username is advisory text chosen by *that
-//! group's admin*. Preferring the username would let a remote admin rename an entry in your
-//! own address book by editing their log.
-//!
-//! Group usernames are shown, but only for peers the user never named themselves, and
-//! [`Source`] always says which kind of name is on screen. Nothing here is ever compared for
-//! authorization — see [`ac_groups::members::Member::username`].
-
 use std::collections::BTreeMap;
 
 use ac_groups::store::{Groups, State};
@@ -32,9 +9,7 @@ use crate::contacts::Contacts;
 /// Why we know a name for this peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// Added by hand. The name is the label the user typed.
     Contact,
-    /// A fellow member of at least one group. The name is the admin's advisory username.
     Group,
 }
 
@@ -47,17 +22,9 @@ pub struct Known {
 }
 
 /// Every peer this node has a name for, ordered by name then peer id.
-///
-/// Excludes this node itself: it appears in the fold of every group it belongs to, and is not
-/// something a person wants listed among their contacts.
-///
-/// Only groups we actually take part in contribute — `Active`, and naming us.
-/// A group we left or were removed from would otherwise keep injecting people we no longer
-/// share anything with, which is the opposite of what leaving means.
 pub fn everyone(contacts: &Contacts, groups: &Groups, me: PeerId) -> Result<Vec<Known>> {
     let mut known: BTreeMap<PeerId, Known> = BTreeMap::new();
 
-    // Groups first, so the contact pass below can overwrite rather than check.
     for row in groups.list().context("listing groups")? {
         if row.state != State::Active {
             continue;
@@ -73,9 +40,6 @@ pub fn everyone(contacts: &Contacts, groups: &Groups, me: PeerId) -> Result<Vec<
             if member.peer == me {
                 continue;
             }
-            // A peer in several groups may carry a different advisory username in each. Taking
-            // the first by group order makes the choice deterministic; there is no "right" one,
-            // and the name is advisory in every group anyway.
             known.entry(member.peer).or_insert_with(|| Known {
                 peer: member.peer,
                 name: member.username.clone(),
@@ -84,8 +48,6 @@ pub fn everyone(contacts: &Contacts, groups: &Groups, me: PeerId) -> Result<Vec<
         }
     }
 
-    // A hand-typed label wins over an admin's username, and replaces the entry outright so a
-    // peer who is both is reported once, as a contact.
     for contact in contacts.list().context("listing contacts")? {
         known.insert(
             contact.peer,
