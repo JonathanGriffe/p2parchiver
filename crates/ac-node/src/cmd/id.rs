@@ -1,5 +1,3 @@
-//! `ac id` — print this node's peer id, creating the identity if it does not exist yet.
-
 use anyhow::{Context, Result};
 
 use ac_net::config::Paths;
@@ -14,7 +12,6 @@ pub fn run(paths: &Paths) -> Result<()> {
         tracing::info!(path = %key_path.display(), "generated a new identity");
     }
 
-    // stdout stays machine-readable: the peer id alone, nothing else.
     println!("{}", identity.peer_id());
     Ok(())
 }

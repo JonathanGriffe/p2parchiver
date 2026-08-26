@@ -1,43 +1,19 @@
-//! The contact list: peers this node wants to find and stay connected to.
-//!
-//! **This is not an access-control list.** It never decides who may connect — clients
-//! accept anyone, and data is authorized per group (see `ac_net::authz`). What it does is
-//! answer "who am I looking for", which drives rendezvous lookups (stage 8) and
-//! reconnection (stage 10).
-//!
-//! The distinction matters because the two are easy to conflate and the consequences
-//! differ sharply: a contact list that is out of date means slower discovery, while an
-//! access list that is out of date means a member returning from an absence can be
-//! refused by peers that have not heard of them yet.
-//!
-//! Entries are added by hand and only by hand. Groups have since arrived, and a group's
-//! signed membership log — `ac_groups::chain` — is now the record of who belongs. Discovery
-//! should read that log directly rather than copying its peers in here: one fact, one place.
-//! It does not yet, because discovery itself is not wired up; when it is, this list narrows to
-//! what it is actually for, which is peers a person named who are in no group.
-//!
-//! Note that the two are not redundant even once that lands. Membership says who belongs;
-//! this says who to go looking for. A group of two hundred does not mean two hundred dials.
-
 use std::path::Path;
 
 use ac_net::PeerId;
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// A peer id is unreadable; the label is how a person refers to a contact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contact {
     pub peer: PeerId,
     pub label: String,
 }
 
-/// The contact list, backed by SQLite.
 pub struct Contacts {
     db: Connection,
 }
 
 impl Contacts {
-    /// Open (creating if absent) the contact list at `path`.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -51,12 +27,7 @@ impl Contacts {
     }
 
     fn from_connection(db: Connection) -> rusqlite::Result<Self> {
-        // WAL lets `ac peer add` write while `ac run` reads, which is the whole point of
-        // querying SQLite live rather than caching in the daemon.
         db.pragma_update(None, "journal_mode", "WAL")?;
-        // This file is shared with the group tables, which the *daemon* writes on every
-        // ingest — so two processes can now genuinely collide here. Without a timeout that is
-        // an immediate `SQLITE_BUSY` rather than a short wait.
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS contacts (
@@ -68,8 +39,6 @@ impl Contacts {
     }
 
     /// Add a contact, or relabel one already present.
-    ///
-    /// Returns whether this was a new contact, so the CLI can say which happened.
     pub fn add(&self, peer: &PeerId, label: &str) -> rusqlite::Result<bool> {
         let existed = self.get(peer)?.is_some();
         self.db.execute(
@@ -109,8 +78,6 @@ impl Contacts {
 
         let mut out = Vec::new();
         for row in rows {
-            // A row whose peer id no longer parses is corrupt rather than merely absent;
-            // skip it instead of failing the whole listing.
             if let Some(contact) = row? {
                 out.push(contact);
             }
@@ -207,8 +174,6 @@ mod tests {
 
     #[test]
     fn changes_are_visible_to_a_separate_connection() {
-        // The daemon and `ac peer add` are different processes. If this did not hold,
-        // adding a contact would require restarting the daemon.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let p = peer();

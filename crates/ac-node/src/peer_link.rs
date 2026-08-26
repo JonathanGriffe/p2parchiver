@@ -10,10 +10,7 @@ use ac_net::proto::{PresenceRequest, PresenceResponse};
 use ac_net::roster::Roster;
 
 use ac_files::content::Content;
-use ac_files::path::RelPath;
 use ac_files::store::Files;
-use ac_files::wire::{ManifestRequest, ManifestResponse, holds};
-use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
 use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers};
 use ac_peers::wire::{SessionRequest, SessionResponse};
@@ -24,47 +21,16 @@ use crate::file_link::{FileLink, RoundOutcome};
 use crate::group_link::GroupLink;
 use crate::status::Published;
 
-/// A holdings query we sent, kept so the bitmap can be matched to the paths it answers.
-///
-/// The paths have to be remembered rather than re-derived: `next_missing` reads the store, and
-/// by the time the answer arrives the store may have moved. A bitmap lined up against a
-/// different list would attribute one file's answer to another.
-struct Query {
-    peer: PeerId,
-    group: GroupId,
-    paths: Vec<RelPath>,
-}
-
-/// The only place a swarm and `ac-peers` are named together.
 pub struct PeerLink {
     peers: Peers,
-    /// Blob transfers in flight, keyed by peer so "is a transfer running with P" is answerable.
     transfers: Transfers,
-    holdings: HashMap<request_response::OutboundRequestId, Query>,
-    /// Close proposals outstanding, so a bare `Ready`/`Busy` names the peer it is about.
     proposals: HashMap<request_response::OutboundRequestId, PeerId>,
-    /// Presence queries outstanding, and who each asked about. The answer is a filter, so
-    /// without the question it cannot be applied to anything.
     presence: HashMap<request_response::OutboundRequestId, Vec<PeerId>>,
-    /// The server: never proposed to, and the only peer presence can be asked of.
     server: Option<PeerId>,
-    /// Where the server is, for building circuit addresses.
     relay: Option<Multiaddr>,
-    /// Non-circuit addresses discovery has offered this session.
-    ///
-    /// In memory on purpose. A stored address outlives the lease behind it, and dialling a
-    /// corpse costs one of the circuits a client is allowed.
     direct: HashMap<PeerId, Multiaddr>,
     content: Content,
-    /// The storage root, whose volume is the one whose free space bounds mirroring.
-    ///
-    /// Kept rather than re-derived: it may be a mount of its own, so asking about the data
-    /// directory instead would police the wrong disk.
     root: std::path::PathBuf,
-    /// Where the volatile half of this module's state is published for `ac peer status`.
-    ///
-    /// Everything above is in memory and invisible to another process, which is the whole
-    /// reason a person cannot otherwise be told why a dial is not happening.
     status: Published,
 }
 
@@ -80,8 +46,6 @@ impl PeerLink {
 
         let files = Files::open(&path, me)
             .with_context(|| format!("opening the file index at {}", path.display()))?;
-        // A fourth handle on the same database, for the same reason as everywhere else here:
-        // nothing in this workspace shares a connection behind a lock.
         let groups = Groups::open(&path, me)
             .with_context(|| format!("opening the group store at {}", path.display()))?;
 
@@ -91,15 +55,11 @@ impl PeerLink {
         let content = Content::new(root.clone());
 
         Ok(Self {
-            // `storage_max` is a byte count in the file, so there is nothing to parse and no
-            // way for it to be malformed without `Config::load` having already refused it.
-            // `None` means no ceiling beyond the free-space floor `Limits::default` carries.
             peers: Peers::new(files, groups, at).with_limits(Limits {
                 storage_max: config.storage_max,
                 ..Limits::default()
             }),
             transfers: Transfers::new(path.clone(), me),
-            holdings: HashMap::new(),
             proposals: HashMap::new(),
             presence: HashMap::new(),
             server,
@@ -112,12 +72,7 @@ impl PeerLink {
         })
     }
 
-    /// A peer completed mutual attestation. It is not usable to the supervisor yet.
-    /// The roster promoted this peer: admitted, and its connection has stopped changing shape.
-    ///
-    /// The only one of the three layers that still wants telling. `FileSync` and `GroupSync`
-    /// read the roster where they need it, but this arm does work no poll could reproduce —
-    /// it resets the peer's backoff and *puts the question* that starts a pull.
+    /// A peer completed mutual attestation
     pub fn peer_ready(
         &mut self,
         swarm: &mut ClientSwarm,
@@ -140,8 +95,6 @@ impl PeerLink {
         swarm: &mut ClientSwarm,
         roster: &Roster,
     ) {
-        // A circuit address tells us nothing we could not rebuild ourselves, and preferring it
-        // over the one we would construct only risks pinning a stale relay.
         if let Some(addr) = addresses
             .iter()
             .find(|a| !a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
@@ -176,26 +129,36 @@ impl PeerLink {
         self.dispatch(swarm, files, groups, roster, actions);
     }
 
-    /// Collect finished transfers and round outcomes, then tick.
-    pub fn housekeeping(
+    /// Wait for a transfer to end, and act on it.
+    pub async fn next_transfer(&mut self) -> Option<PeerEvent> {
+        self.transfers.finished().await
+    }
+
+    pub fn on_transfer(
         &mut self,
         swarm: &mut ClientSwarm,
         files: &mut FileLink,
         groups: &mut GroupLink,
         roster: &Roster,
-        at: i64,
+        event: PeerEvent,
+    ) {
+        let actions = self.peers.on(event);
+        self.dispatch(swarm, files, groups, roster, actions);
+    }
+
+    /// Feed the supervisor everything the other layers have finished.
+    pub fn collect(
+        &mut self,
+        swarm: &mut ClientSwarm,
+        files: &mut FileLink,
+        groups: &mut GroupLink,
+        roster: &Roster,
     ) {
         for outcome in self.transfers.collect() {
             let actions = self.peers.on(outcome);
             self.dispatch(swarm, files, groups, roster, actions);
         }
 
-        // Exchanges the two layers finished on our behalf. Before the tick, so a settled one is
-        // counted before the next is chosen.
-        //
-        // Both report the same three outcomes; which protocol they came from is what says
-        // whether membership or the catalogue was reconciled, and only the matching half of the
-        // supervisor's record may be written from it.
         let outcomes: Vec<(Offering, RoundOutcome)> = groups
             .drain_rounds()
             .into_iter()
@@ -217,14 +180,37 @@ impl PeerLink {
                 },
                 RoundOutcome::Asked { peer } => PeerEvent::Asked { peer, offering },
                 RoundOutcome::Failed { peer } => PeerEvent::AskFailed { peer },
+                RoundOutcome::Holdings {
+                    peer,
+                    group,
+                    paths,
+                    held,
+                } => PeerEvent::Holdings {
+                    peer,
+                    group,
+                    paths,
+                    held,
+                },
+                RoundOutcome::HoldingsRefused { peer, group } => {
+                    PeerEvent::HoldingsRefused { peer, group }
+                }
             };
             let actions = self.peers.on(event);
             self.dispatch(swarm, files, groups, roster, actions);
         }
+    }
 
-        // Before the tick, so the decision to fetch is made against the disk as it is now
-        // rather than as it was five seconds ago — and so a transfer that has just landed is
-        // counted before the next batch is chosen.
+    /// Collect whatever is outstanding, then tick.
+    pub fn housekeeping(
+        &mut self,
+        swarm: &mut ClientSwarm,
+        files: &mut FileLink,
+        groups: &mut GroupLink,
+        roster: &Roster,
+        at: i64,
+    ) {
+        self.collect(swarm, files, groups, roster);
+
         if let Some((free, held)) = self.disk(files) {
             self.peers.on(PeerEvent::Space { free, held });
         }
@@ -232,23 +218,13 @@ impl PeerLink {
         let actions = self.peers.on(PeerEvent::Tick { at });
         self.dispatch(swarm, files, groups, roster, actions);
 
-        // Published last, so what a person reads is the state the tick left behind rather than
-        // the one it started from. A failure here is worth a line and nothing more: this is a
-        // diagnostic, and a node that stopped syncing because it could not write its own
-        // status report would be a poor trade.
         if let Err(e) = self.status.publish(&self.peers.status(), at) {
             tracing::debug!(error = %e, "could not publish supervisor status");
         }
     }
 
     /// Free bytes on the storage volume, and bytes of content this node holds.
-    ///
-    /// `None` when either cannot be answered, which leaves the supervisor's previous view in
-    /// place. That is the right failure: a storage root on a network mount that is briefly
-    /// unavailable should not read as "no free space" and stop mirroring.
     fn disk(&self, files: &FileLink) -> Option<(u64, u64)> {
-        // The root may not exist yet on a node that has never held anything, so fall back to
-        // its parent rather than reporting a disk that cannot be measured.
         let probe = if self.root.exists() {
             self.root.clone()
         } else {
@@ -263,65 +239,6 @@ impl PeerLink {
             }
         };
         Some((free, files.held_bytes()?))
-    }
-
-    /// Take a manifest event if it answers one of *our* requests, or hand it back.
-    ///
-    /// `FileLink` owns the manifest protocol's other users, and both send through the same
-    /// behaviour — so ids are unique across the pair and this is a claim, not a race.
-    pub fn claim_manifest(
-        &mut self,
-        swarm: &mut ClientSwarm,
-        files: &mut FileLink,
-        groups: &mut GroupLink,
-        roster: &Roster,
-        event: request_response::Event<ManifestRequest, ManifestResponse>,
-    ) -> Option<request_response::Event<ManifestRequest, ManifestResponse>> {
-        use request_response::{Event, Message};
-
-        let id = match &event {
-            Event::Message {
-                message: Message::Response { request_id, .. },
-                ..
-            } => *request_id,
-            Event::OutboundFailure { request_id, .. } => *request_id,
-            _ => return Some(event),
-        };
-        // Not ours. Handed back rather than dropped — `?` here would swallow every offer and
-        // every page the file layer is waiting for, which looks exactly like a peer that never
-        // answers.
-        let Some(query) = self.holdings.remove(&id) else {
-            return Some(event);
-        };
-
-        let actions = match event {
-            Event::Message {
-                peer,
-                message: Message::Response { response, .. },
-                ..
-            } if peer == query.peer => match response {
-                ManifestResponse::Holdings { group, held } if group == query.group => {
-                    let held: Vec<bool> = (0..query.paths.len()).map(|i| holds(&held, i)).collect();
-                    self.peers.on(PeerEvent::Holdings {
-                        peer,
-                        group,
-                        paths: query.paths,
-                        held,
-                    })
-                }
-                _ => self.peers.on(PeerEvent::HoldingsRefused {
-                    peer,
-                    group: query.group,
-                }),
-            },
-            _ => self.peers.on(PeerEvent::HoldingsRefused {
-                peer: query.peer,
-                group: query.group,
-            }),
-        };
-
-        self.dispatch(swarm, files, groups, roster, actions);
-        None
     }
 
     /// A peer asking whether we are finished with it, and our answers to the same question.
@@ -528,13 +445,7 @@ impl PeerLink {
                 }
 
                 PeerAction::AskHoldings { peer, group, paths } => {
-                    let id = files.holdings(
-                        swarm,
-                        peer,
-                        group,
-                        paths.iter().map(|p| p.to_string()).collect(),
-                    );
-                    self.holdings.insert(id, Query { peer, group, paths });
+                    files.holdings(swarm, peer, group, paths);
                 }
 
                 PeerAction::FetchBlob {
@@ -767,17 +678,7 @@ mod tests {
 
             match event {
                 SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Manifests(event))) => {
-                    // The daemon's own routing: the supervisor claims its holdings queries,
-                    // the file layer gets everything else.
-                    if let Some(event) = self.peers.claim_manifest(
-                        &mut self.swarm,
-                        &mut self.link,
-                        &mut self.groups,
-                        &self.roster,
-                        event,
-                    ) {
-                        self.link.on_event(&mut self.swarm, &self.roster, event);
-                    }
+                    self.link.on_event(&mut self.swarm, &self.roster, event);
                 }
                 SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Groups(event))) => {
                     self.groups.on_event(&mut self.swarm, &self.roster, event);
@@ -793,6 +694,26 @@ mod tests {
                 }
                 _ => {}
             }
+
+            // The daemon collects after every swarm event, so this has to as well — otherwise
+            // the tests measure a routing the daemon does not use, and every answer looks a
+            // whole tick slower than it is.
+            self.peers.collect(
+                &mut self.swarm,
+                &mut self.link,
+                &mut self.groups,
+                &self.roster,
+            );
+        }
+
+        fn on_transfer(&mut self, outcome: PeerEvent) {
+            self.peers.on_transfer(
+                &mut self.swarm,
+                &mut self.link,
+                &mut self.groups,
+                &self.roster,
+                outcome,
+            );
         }
 
         fn tick(&mut self) {
@@ -901,15 +822,27 @@ mod tests {
             if done(a, b) {
                 return;
             }
+            // A finished transfer is not a swarm event, so it gets its own arm here as it does
+            // in the daemon. Held over the end of the block rather than handled inside it: the
+            // future borrows the supervisor, and acting on the outcome needs the whole node.
+            let (mut done_a, mut done_b) = (None, None);
             tokio::select! {
                 event = a.swarm.select_next_some() => a.step(event),
                 event = b.swarm.select_next_some() => b.step(event),
                 Some((peer, stream)) = a.blobs.next() => a.link.on_inbound_blob(peer, stream),
                 Some((peer, stream)) = b.blobs.next() => b.link.on_inbound_blob(peer, stream),
+                Some(outcome) = a.peers.next_transfer() => done_a = Some(outcome),
+                Some(outcome) = b.peers.next_transfer() => done_b = Some(outcome),
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {
                     a.tick();
                     b.tick();
                 }
+            }
+            if let Some(outcome) = done_a {
+                a.on_transfer(outcome);
+            }
+            if let Some(outcome) = done_b {
+                b.on_transfer(outcome);
             }
         }
         // What each side is still waiting on. A bare timeout says only that nothing happened,

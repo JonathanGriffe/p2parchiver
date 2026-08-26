@@ -1,8 +1,3 @@
-//! `ac join` — redeem an invite code with a server.
-//!
-//! One short-lived swarm: dial, ask, record the answer, exit. It does not become the
-//! daemon, so a failed enrolment leaves nothing behind to clean up.
-
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,8 +13,6 @@ use ac_net::identity::Identity;
 use ac_net::proto::{EnrollRequest, EnrollResponse};
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
 
-/// Long enough for a slow link and a relay hop, short enough that a wrong address fails
-/// while the user is still watching.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn run(paths: &Paths, server: &Multiaddr, code: &str, username: &str) -> Result<()> {
@@ -30,8 +23,6 @@ pub fn run(paths: &Paths, server: &Multiaddr, code: &str, username: &str) -> Res
         )
     })?;
 
-    // Checked here as well as on the server so a typo costs nothing — no dial, no round
-    // trip, and the invite stays unspent. The server's check is the one that counts.
     let username = normalise_username(username)
         .map_err(|e| anyhow!("{e}"))
         .context("that username cannot be used")?;
@@ -54,24 +45,15 @@ pub fn run(paths: &Paths, server: &Multiaddr, code: &str, username: &str) -> Res
         &username,
     ))?;
 
-    // Verified before it is stored, so a server that hands out something unusable is
-    // caught here rather than on the first peer connection days later. Everything checked
-    // is known locally: our own peer id, and the server's from the address just dialled.
     attestation
         .verify(&identity.peer_id(), &server_peer, attest::now())
         .map_err(|e| anyhow!("{e}"))
         .context("the server issued an attestation this node cannot use")?;
 
-    // The address given on the command line reaches the *enrolment* listener, which
-    // speaks nothing else. Everything from here on — relay, rendezvous, AutoNAT — lives
-    // on the service listener, whose address the server just told us. Store that one; the
-    // enrolment address is never needed again.
     let service_addr = pick_service_addr(&service, server).ok_or_else(|| {
         anyhow!("the server did not say where to reach its services; it may be misconfigured")
     })?;
 
-    // Only recorded once the server has accepted, so a failed attempt leaves the node's
-    // configuration untouched.
     config.server = Some(service_addr.clone());
     config
         .save(&config_path)
@@ -123,8 +105,6 @@ async fn enroll(
         loop {
             match swarm.select_next_some().await {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == server_peer => {
-                    // Reaching here already proves the server holds the key for the peer
-                    // id in the address; the handshake would have failed otherwise.
                     if !asked && let Some(enroll) = swarm.behaviour_mut().enroll.as_mut() {
                         asked = true;
                         enroll.send_request(
@@ -176,18 +156,6 @@ async fn enroll(
 }
 
 /// Choose which of the server's service addresses to keep.
-///
-/// The server offers one per bound interface and transport, most unreachable from here.
-/// Two preferences, in order:
-///
-/// 1. **Same host as enrolment.** If the enrolment listener answered at that address, the
-///    service listener on the same machine almost certainly will too.
-/// 2. **QUIC over TCP.** QUIC carries its own TLS and multiplexing, so it connects in
-///    fewer round trips, and its single UDP flow is what makes hole punching viable in
-///    stage 9. Picking TCP here would work and quietly forgo both.
-///
-/// This is the one address the client keeps, so getting it wrong is not a slow path — it
-/// is the only path.
 fn pick_service_addr(service: &[Multiaddr], enrolled_via: &Multiaddr) -> Option<Multiaddr> {
     let host = enrolled_via.iter().find(|p| {
         matches!(
@@ -228,7 +196,6 @@ mod tests {
 
     #[test]
     fn quic_is_preferred_over_tcp_on_the_same_host() {
-        // TCP would work, and would quietly forgo the transport stage 9 depends on.
         let service = addrs(&["/ip4/127.0.0.1/tcp/4001", "/ip4/127.0.0.1/udp/4001/quic-v1"]);
         let via: Multiaddr = "/ip4/127.0.0.1/udp/4002/quic-v1".parse().unwrap();
 
@@ -240,7 +207,6 @@ mod tests {
 
     #[test]
     fn the_host_that_enrolment_worked_on_wins_over_transport() {
-        // A QUIC address on an interface we cannot reach is worse than TCP on one we can.
         let service = addrs(&["/ip4/10.9.9.9/udp/4001/quic-v1", "/ip4/127.0.0.1/tcp/4001"]);
         let via: Multiaddr = "/ip4/127.0.0.1/udp/4002/quic-v1".parse().unwrap();
 
@@ -277,8 +243,6 @@ mod tests {
 
     #[test]
     fn an_address_without_a_peer_id_yields_none() {
-        // Refusing this is the point: without a peer id there is nothing pinned, and a
-        // different server at that address would be accepted silently.
         let addr: Multiaddr = "/ip4/203.0.113.7/udp/4001/quic-v1".parse().unwrap();
         assert!(peer_id_of(&addr).is_none());
     }

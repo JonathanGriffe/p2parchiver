@@ -22,7 +22,6 @@ use ac_net::roster::Roster;
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
-/// This node's application layer: four protocols in one slot.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct App {
     pub groups: request_response::cbor::Behaviour<GroupRequest, GroupResponse>,
@@ -31,8 +30,6 @@ pub struct App {
     pub sessions: request_response::cbor::Behaviour<SessionRequest, SessionResponse>,
 }
 
-/// None of these is const-constructible, so this is a function where the `dummy::Behaviour` it
-/// replaced was a `const`.
 pub fn app() -> App {
     App {
         groups: cbor_behaviour(
@@ -78,10 +75,8 @@ where
     )
 }
 
-/// A convenient alias for the concrete swarm this module drives.
 pub type ClientSwarm = libp2p::Swarm<ac_net::swarm::AcBehaviour<AcceptAnyPeer, App>>;
 
-/// Listen, optionally dial, and run until interrupted.
 pub async fn run(
     identity: &Identity,
     config: &Config,
@@ -170,9 +165,6 @@ pub async fn run(
                     }
 
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                        // The swarm's answer, asked once and used by all four: a peer holds a
-                        // relayed *and* a direct connection while an upgrade settles, so one
-                        // closing is not the peer leaving.
                         let still_connected = swarm.is_connected(&peer_id);
                         connectivity.disconnected(peer_id, still_connected);
 
@@ -263,11 +255,7 @@ pub async fn run(
                         groups.on_event(&mut swarm, &roster, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Manifests(event))) => {
-                        if let Some(event) =
-                            peers.claim_manifest(&mut swarm, &mut files, &mut groups, &roster, event)
-                        {
-                            files.on_event(&mut swarm, &roster, event);
-                        }
+                        files.on_event(&mut swarm, &roster, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Blobs(()))) => {}
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Sessions(event))) => {
@@ -278,6 +266,12 @@ pub async fn run(
                     }
                     other => on_event(other),
                 }
+
+                peers.collect(&mut swarm, &mut files, &mut groups, &roster);
+            }
+
+            Some(outcome) = peers.next_transfer() => {
+                peers.on_transfer(&mut swarm, &mut files, &mut groups, &roster, outcome);
             }
 
             Some((peer, stream)) = blobs.next() => {
@@ -327,8 +321,6 @@ fn report_discovered(registrations: &[rendezvous::Registration], me: libp2p::Pee
 fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
-            // Printed rather than logged, and with the peer id appended, so the output
-            // can be pasted straight into another node's `--dial`.
             println!("listening {address}");
         }
 
@@ -340,8 +332,6 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
             tracing::warn!(from = %send_back_addr, %error, "incoming connection failed");
         }
 
-        // What a peer reports seeing us as. Everything about NAT traversal starts here:
-        // AutoNAT verifies these candidates, and DCUtR punches toward the confirmed one.
         SwarmEvent::Behaviour(AcBehaviourEvent::Identify(identify::Event::Received {
             peer_id,
             info,
@@ -352,15 +342,9 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
                 agent = %info.agent_version,
                 observed_addr = %info.observed_addr,
                 protocols = info.protocols.len(),
-                // Addresses the peer advertises for itself. Expected to be zero until a
-                // peer has a confirmed external address, because we ask identify to omit
-                // raw listen addresses — see the config in ac_net::swarm.
                 advertised_addrs = info.listen_addrs.len(),
                 "identified"
             );
-            // The names matter when a peer is missing a capability: a client that cannot
-            // reserve a relay slot will show `/libp2p/circuit/relay/0.2.0/hop` absent
-            // here, which is far quicker to spot than inferring it from a failure.
             tracing::debug!(
                 peer = %peer_id,
                 protocols = ?info.protocols.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
@@ -373,21 +357,14 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
             tracing::warn!(%address, "external address no longer valid");
         }
 
-        // A gateway forwarded a port: the best outcome available, since it means no relay
-        // and no hole punch are needed at all.
         SwarmEvent::Behaviour(AcBehaviourEvent::Upnp(upnp::Event::NewExternalAddr(address))) => {
             println!("upnp {address}");
         }
 
         SwarmEvent::Behaviour(AcBehaviourEvent::Upnp(event)) => {
-            // The common case on home networks: no IGD, or a gateway that is itself
-            // behind another NAT. Not an error, just the path we cannot take.
             tracing::info!(?event, "no port mapping available");
         }
 
-        // AutoNAT's answer for one candidate address. `Ok` means a server dialled us back
-        // successfully, which is what promotes a candidate to a confirmed external
-        // address; `Err` means we are behind something that blocks unsolicited inbound.
         SwarmEvent::Behaviour(AcBehaviourEvent::AutonatClient(autonat::v2::client::Event {
             tested_addr,
             server,
@@ -407,10 +384,6 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
                 limit,
             },
         )) => {
-            // The reservation is what makes the circuit address usable. `limit` is the
-            // relay telling us how much it will carry per circuit — whatever *that* server
-            // was configured with, which need not match ours, so it is logged rather than
-            // assumed.
             println!(
                 "reserved via {relay_peer_id}{}",
                 if renewal { " (renewed)" } else { "" }
@@ -457,9 +430,6 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
             tracing::warn!(peer = %peer, error = %e, "ping failed");
         }
 
-        // A listener dying is never routine — for a circuit address it means the relay
-        // reservation was refused or lost, which is exactly the failure this stage exists
-        // to make visible. Buried at trace level it looks like nothing happened at all.
         SwarmEvent::ListenerError { listener_id, error } => {
             tracing::warn!(?listener_id, %error, "listener error");
         }

@@ -1,25 +1,3 @@
-//! `ac probe` — a one-shot diagnostic run.
-//!
-//! Answers the questions milestone 1 exists to answer, for a person staring at a node that
-//! is not working: am I reachable, did the relay reservation land, and — given a peer —
-//! did the connection to it end up direct or relayed.
-//!
-//! # What this does *not* do
-//!
-//! It starts **a node of its own**, like `ac join` does. It cannot see a running `ac run`,
-//! and reports nothing about one. So it answers "could a fresh node reach this peer?"
-//! rather than "what is my daemon doing right now?", and those diverge exactly where
-//! failures are stateful — an exhausted hole-punch attempt count, a reservation that
-//! lapsed, a connection stuck relayed.
-//!
-//! Most first-line failures (no reservation, unreachable, server down) do reproduce on a
-//! fresh node, which is what makes it useful anyway. Inspecting a live daemon would need a
-//! control socket, and that is a commitment worth deciding on its own merits rather than
-//! smuggling in behind a diagnostic.
-//!
-//! Its other job is as an instrument: stage 11's "≥9/10 runs reach Direct" needs something
-//! that produces a per-run verdict, and this is it.
-
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -35,12 +13,8 @@ use ac_net::connectivity::{Connectivity, State};
 use ac_net::identity::Identity;
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
 
-/// Long enough for AutoNAT (which probes every 5s) and a hole punch, short enough that
-/// someone watching does not give up first.
 const RUN_FOR: Duration = Duration::from_secs(20);
 
-/// What the run observed. Collected rather than printed as it happens, so the report reads
-/// as a summary instead of a log.
 #[derive(Default)]
 struct Findings {
     upnp: Option<Multiaddr>,
@@ -50,9 +24,6 @@ struct Findings {
     unreachable: usize,
     reservation: Option<PeerId>,
     circuit: Option<Multiaddr>,
-    /// Why the dial to the target failed, when it did. Without this a dial that was
-    /// rejected and a dial that was never sent both report "never connected", which are
-    /// opposite problems.
     dial_error: Option<String>,
 }
 
@@ -127,22 +98,12 @@ async fn probe(
                     .any(|p| p == Protocol::P2pCircuit);
                 connectivity.connected(*peer_id, relayed);
 
-                // Reserving before the connection exists makes the relay behaviour issue
-                // its own competing dial, which libp2p then rejects. See `daemon`.
                 if *peer_id == server_peer && !reserved {
                     reserved = true;
                     let circuit = server.clone().with(Protocol::P2pCircuit);
                     let _ = swarm.listen_on(circuit);
                 }
 
-                // Dial the target as soon as the relay itself is reachable.
-                //
-                // This deliberately does not wait on our own reservation. A reservation
-                // makes *us* reachable; nothing about dialling out through a relay needs
-                // one. Waiting for it put the dial in a race with the relay transport's
-                // own reservation setup, and the race was lost often enough that reachable
-                // peers were reported unreachable — the relay logged no circuit at all,
-                // because the HOP request never got sent.
                 if *peer_id == server_peer
                     && let Some(peer) = target
                     && !dialled
@@ -226,7 +187,6 @@ fn report(
         (None, None) => println!("upnp      no gateway responded"),
     }
 
-    // AutoNAT's verdict, stated as what it is: how many servers agreed, not a guess.
     if !findings.reachable.is_empty() {
         println!(
             "reach     Public — {} address(es) confirmed",
@@ -254,8 +214,6 @@ fn report(
     }
 
     let Some(peer) = target else {
-        // Without a target there is nothing to say about hole punching, and saying
-        // nothing is better than implying a verdict was reached.
         let others: HashSet<_> = connectivity
             .connected_peers()
             .map(|(p, _)| *p)
@@ -273,9 +231,6 @@ fn report(
             None => println!("path      {peer}: never connected (no dial was attempted)"),
         },
         Some(state) => {
-            // `effective_state`, not the raw one: only DCUtR's initiator is told the
-            // outcome, so a probe that dialled the peer is the side that never hears.
-            // Reading the raw state here would report "still pending" indefinitely.
             let effective = state.effective_state();
             let how = match effective {
                 State::Direct => "DIRECT",

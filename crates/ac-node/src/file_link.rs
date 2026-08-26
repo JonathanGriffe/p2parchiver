@@ -1,26 +1,3 @@
-//! Where the swarm and `ac-files` meet.
-//!
-//! The counterpart of [`crate::group_link`], and it owns the thing the policy layer deliberately
-//! does not: **request correlation**, because a bare `Unavailable` names no group and an
-//! `OutboundFailure` carries only a request id.
-//!
-//! Whether a peer may be talked to at all it does not own — [`ac_net::roster::Roster`] answers
-//! that, and holds a freshly attested peer back until its connection has stopped changing
-//! shape, so a transfer never starts on a relay circuit a hole punch is about to replace.
-//!
-//! # Serving blobs, but never asking for them
-//!
-//! Inbound blob streams are answered here — handed to [`crate::blob`], which owns the stream,
-//! the spawned task, and the only `libp2p-stream` usage in the workspace. **Outbound** ones are
-//! not: deciding what to download, from whom, and when to stop belongs to
-//! [`crate::peer_link`], because the answer depends on who is online, who holds what, and what
-//! a peer has already failed to deliver — none of which the file layer can see.
-//!
-//! What this does hand upward is [`RoundOutcome`]: whether a catalogue exchange for one group
-//! with one peer finished, or failed. That is the one fact the supervisor cannot work out on
-//! its own, because two peers who already agree exchange nothing and silence looks identical
-//! to a round that never started.
-
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -32,9 +9,10 @@ use ac_net::identity::Identity;
 use ac_net::roster::Roster;
 
 use ac_files::content::Content;
+use ac_files::path::RelPath;
 use ac_files::store::Files;
 use ac_files::sync::{FileAction, FileEvent, FileSync};
-use ac_files::wire::{ManifestRequest, ManifestResponse};
+use ac_files::wire::{ManifestRequest, ManifestResponse, holds};
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
 
@@ -43,30 +21,38 @@ use crate::daemon::ClientSwarm;
 
 /// What we asked a peer, kept so a bare reply can be matched back to it.
 enum Outbound {
-    /// "Which catalogues do you believe we share?" Carries nothing, so there is nothing to
-    /// remember about it beyond who was asked.
     Ask,
-    /// `after` is kept because the machine re-checks it before applying a page: a peer does
-    /// not get to decide what we asked for.
-    Changes { group: GroupId, after: u64 },
+    Changes {
+        group: GroupId,
+        after: u64,
+    },
+    /// The paths a holdings question named, kept because the answer is a bare bitmap: bit `i`
+    /// means nothing without the path that was at index `i` in the question.
+    Holdings {
+        group: GroupId,
+        paths: Vec<RelPath>,
+    },
 }
 
 /// How a catalogue exchange ended.
-///
-/// Reported upward rather than acted on. `ac_peers::sync` turns these into `Synced` and
-/// `OfferFailed`, which is what records a member as told and lets a drained peer be closed.
-/// Settling is per group, because an offer reconciles each group it names separately and they
-/// may finish pages apart. Failing is per peer, because a request that never arrived failed for
-/// every group it named at once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoundOutcome {
     Settled {
         peer: PeerId,
         group: GroupId,
     },
-    /// We asked this peer what they have, and the question is now answered — whatever the
-    /// answer was. Under a pull that is the whole of what the supervisor needs: it decides when
-    /// to ask again from the clock, not from what came back.
+    /// Which of the paths we named this peer holds, in the order we named them.
+    Holdings {
+        peer: PeerId,
+        group: GroupId,
+        paths: Vec<RelPath>,
+        held: Vec<bool>,
+    },
+    /// They would not answer, which is not the same as holding none of it.
+    HoldingsRefused {
+        peer: PeerId,
+        group: GroupId,
+    },
     Asked {
         peer: PeerId,
     },
@@ -75,31 +61,17 @@ pub enum RoundOutcome {
     },
 }
 
-/// The only place a swarm and `ac-files` are named together.
 pub struct FileLink {
     sync: FileSync,
     outbound: HashMap<request_response::OutboundRequestId, (PeerId, Outbound)>,
-    /// Round outcomes waiting to be handed to the supervisor, drained each tick.
     rounds: Vec<RoundOutcome>,
-    /// Where a spawned task opens its own handles.
     db: std::path::PathBuf,
 }
 
 /// How long a partial must sit untouched before a sweep will remove it.
-///
-/// Generous on purpose. The cost of waiting is disk that a crashed transfer left behind; the
-/// cost of being hasty is deleting a file some other task is mid-write on. Only one of those
-/// is worth avoiding.
 const STAGING_IDLE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Drop partials that no transfer could still resume into.
-///
-/// At startup, because that is where the orphans are: a partial left by a crash is never asked
-/// about again, since nothing enumerates staging and the only lookup there is goes forwards
-/// from a path the catalogue still names. Not on the tick — that would be a `read_dir` per
-/// group, for ever, to almost always find nothing.
-///
-/// Best-effort throughout. A node that cannot tidy its staging directory should still start.
 fn sweep_staging(files: &Files, content: &Content) {
     let Ok(dirs) = files.group_dirs() else {
         return;
@@ -124,9 +96,6 @@ impl FileLink {
 
         let files = Files::open(&path, me)
             .with_context(|| format!("opening the file index at {}", path.display()))?;
-        // A second handle on the same database. `FileSync` needs to ask `shared_with` who may
-        // see what, and nothing in this workspace shares a connection behind a lock —
-        // `ac-server` opens three for the same reason.
         let groups = Groups::open(&path, me)
             .with_context(|| format!("opening the group store at {}", path.display()))?;
 
@@ -143,26 +112,15 @@ impl FileLink {
         })
     }
 
-    /// The policy machine underneath, for setting up a scenario in tests.
     #[cfg(test)]
     pub(crate) fn sync(&mut self) -> &mut FileSync {
         &mut self.sync
     }
 
-    /// Everything the supervisor needs to know about rounds since it last asked.
     pub fn drain_rounds(&mut self) -> Vec<RoundOutcome> {
         std::mem::take(&mut self.rounds)
     }
 
-    /// Offer this peer our heads for every group we share with them, because the supervisor
-    /// decided it was time to talk to them.
-    ///
-    /// Answers whether anything went out. `false` means we share no group with them at all, in
-    /// which case there is nothing to wait for and the caller should not pretend otherwise.
-    ///
-    /// Ask this peer which catalogues they believe we share.
-    ///
-    /// Always goes out: the request carries nothing, so there is no "we had nothing to say" case.
     pub fn ask(&mut self, swarm: &mut ClientSwarm, peer: PeerId) {
         let id = swarm
             .behaviour_mut()
@@ -172,30 +130,26 @@ impl FileLink {
         self.outbound.insert(id, (peer, Outbound::Ask));
     }
 
-    /// Ask a peer which of these paths it holds. Correlated here, dispatched by the supervisor.
+    /// Ask a peer which of these paths it holds
     pub fn holdings(
         &mut self,
         swarm: &mut ClientSwarm,
         peer: PeerId,
         group: GroupId,
-        paths: Vec<String>,
-    ) -> request_response::OutboundRequestId {
-        swarm
-            .behaviour_mut()
-            .app
-            .manifests
-            .send_request(&peer, ManifestRequest::Holdings { group, paths })
+        paths: Vec<RelPath>,
+    ) {
+        let id = swarm.behaviour_mut().app.manifests.send_request(
+            &peer,
+            ManifestRequest::Holdings {
+                group,
+                paths: paths.iter().map(|p| p.to_string()).collect(),
+            },
+        );
+        self.outbound
+            .insert(id, (peer, Outbound::Holdings { group, paths }));
     }
 
     /// Whether a catalogue exchange with this peer is still outstanding.
-    ///
-    /// `FileSync` still starts offers of its own — on promotion, and when our digest moves —
-    /// so not every manifest request in flight is one the supervisor asked for. Hanging up on
-    /// one would cut a catalogue exchange the supervisor never knew had started.
-    ///
-    /// The other half of that — a peer admitted but not yet settled, whose transfer would run
-    /// on a circuit about to be replaced — is the roster's answer now, and `PeerLink::drained`
-    /// asks it there.
     pub fn busy_with(&self, peer: &PeerId) -> bool {
         self.outbound.values().any(|(p, _)| p == peer)
     }
@@ -239,10 +193,6 @@ impl FileLink {
                     },
                 ..
             } => {
-                // Answered here, in the same turn, while the channel is still on the stack.
-                // `on_request` is total — always exactly one response — so the channel is
-                // always consumed and can never be stranded. That is why `FileAction` has no
-                // `Respond` variant to defer.
                 let (response, actions) = self.sync.on_request(peer, request, roster);
                 let _ = swarm
                     .behaviour_mut()
@@ -273,10 +223,6 @@ impl FileLink {
                         self.rounds.push(RoundOutcome::Asked { peer });
                         self.sync.on(FileEvent::Heads { peer, heads }, roster)
                     }
-                    // An ask answered with anything else — a refusal, or a reply to a question
-                    // we did not put — reconciled nothing. `FileSync` sees such an answer as
-                    // nothing at all, so without this the exchange would stay outstanding for
-                    // ever and take a slot with it.
                     (Outbound::Ask, _) => {
                         self.rounds.push(RoundOutcome::Asked { peer });
                         self.rounds.push(RoundOutcome::Failed { peer });
@@ -306,8 +252,29 @@ impl FileLink {
                     (Outbound::Changes { group, .. }, ManifestResponse::Unavailable) => {
                         self.sync.on(FileEvent::Unavailable { peer, group }, roster)
                     }
-                    // Dropped rather than guessed at: the arms above are the only pairings the
-                    // protocol defines, and a peer does not choose what we asked.
+                    (
+                        Outbound::Holdings { group, paths },
+                        ManifestResponse::Holdings {
+                            group: answered,
+                            held,
+                        },
+                    ) if answered == group => {
+                        let held = (0..paths.len()).map(|i| holds(&held, i)).collect();
+                        self.rounds.push(RoundOutcome::Holdings {
+                            peer,
+                            group,
+                            paths,
+                            held,
+                        });
+                        return;
+                    }
+                    // Refused, or an answer about a group we did not ask about. They told us
+                    // nothing — which is not the same as holding none of it.
+                    (Outbound::Holdings { group, .. }, _) => {
+                        self.rounds
+                            .push(RoundOutcome::HoldingsRefused { peer, group });
+                        return;
+                    }
                     _ => return,
                 }
             }
@@ -321,6 +288,11 @@ impl FileLink {
                         self.rounds.push(RoundOutcome::Asked { peer });
                         self.rounds.push(RoundOutcome::Failed { peer });
                         None
+                    }
+                    Some((_, Outbound::Holdings { group, .. })) => {
+                        self.rounds
+                            .push(RoundOutcome::HoldingsRefused { peer, group });
+                        return;
                     }
                     _ => None,
                 };
