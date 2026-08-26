@@ -1,15 +1,3 @@
-//! `ac file` — put content into a group, and see what is there.
-//!
-//! Like `ac group`, every command here writes `state.sqlite` and returns; nothing talks to the
-//! network, so all of it works offline. Unlike `ac group`, it also writes the filesystem, and
-//! the ordering between the two is the thing to keep hold of: **bytes land, then the row
-//! commits**. The index is a cache of the disk, so a row that promised bytes which were never
-//! written would be a lie the rest of the node believes. The reverse — bytes with no row — is
-//! recoverable, and is what `ac file verify` reports.
-//!
-//! Adding is not admin-only. The group chain has one writer because membership needs one, but
-//! content does not: anybody in a group may contribute to it.
-
 use std::path::{Path, PathBuf};
 
 use ac_files::store::Recorded;
@@ -27,7 +15,6 @@ struct Session {
     content: Content,
     id: GroupId,
     row: GroupRow,
-    /// The group's directory name, allocated on first use.
     dir: String,
 }
 
@@ -50,9 +37,6 @@ fn session(paths: &Paths, needle: &str) -> Result<Session> {
 }
 
 /// Refuse the groups where adding content would be meaningless.
-///
-/// Not a membership check: this is about whether the group is still a going concern on *this*
-/// node. One we have left is one we have stopped taking part in.
 fn writable(row: &GroupRow) -> Result<()> {
     if row.state == State::Left {
         bail!(
@@ -83,8 +67,6 @@ pub fn add(
         );
     }
 
-    // Expand directories first, so a failure to read one is reported before anything is
-    // copied rather than half way through.
     let mut planned: Vec<(PathBuf, RelPath)> = Vec::new();
     for src in sources {
         let meta = std::fs::metadata(src).with_context(|| format!("reading {}", src.display()))?;
@@ -118,9 +100,6 @@ pub fn add(
         match add_one(&mut s, src, dest, force) {
             Ok(Recorded::Unchanged) => {
                 unchanged += 1;
-                // Said out loud only when there is nothing else to report. In a bulk add the
-                // summary covers it, but one file that silently did nothing reads as a
-                // command that failed quietly.
                 if single {
                     println!("{dest} is already there, unchanged");
                 }
@@ -130,8 +109,6 @@ pub fn add(
                 println!("added {dest}");
             }
             Err(e) => {
-                // One bad file must not abandon the rest of a bulk import: what succeeded is
-                // already durable, and stopping would leave the user to work out where.
                 failed += 1;
                 eprintln!("skipped {}: {e:#}", src.display());
             }
@@ -155,9 +132,6 @@ fn add_one(s: &mut Session, src: &Path, dest: &RelPath, force: bool) -> Result<R
         .stage(&s.dir, dest, src)
         .with_context(|| format!("copying {}", src.display()))?;
 
-    // A group keeps one copy of any content, and a fresh add is always the later one, so it
-    // would always lose. Saying so now beats accepting the file and having the next sync
-    // remove it — and it names where the content already is.
     if let Some(held) = s.files.path_of_hash(s.id, &staged.hash)?
         && held != *dest
     {
@@ -169,8 +143,6 @@ fn add_one(s: &mut Session, src: &Path, dest: &RelPath, force: bool) -> Result<R
         );
     }
 
-    // Decided before committing: overwriting the bytes and *then* refusing to record would
-    // destroy content to report a conflict.
     if let Some(existing) = s.files.get(s.id, dest)?
         && !existing.is_removed()
     {
@@ -192,9 +164,7 @@ fn add_one(s: &mut Session, src: &Path, dest: &RelPath, force: bool) -> Result<R
         added_at: now(),
         added_by: s.files.me(),
         removed_at: None,
-        // We are about to put the bytes there ourselves.
         have: true,
-        // The store assigns the log position; whatever is here is ignored.
         seen_seq: 0,
     };
 
@@ -225,8 +195,6 @@ fn collect(base: &Path, dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, RelPat
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        // Not `metadata`: following a symlink here would walk out of the tree the user named,
-        // and a link to a parent directory would loop forever.
         let meta = std::fs::symlink_metadata(&path)?;
 
         if meta.is_symlink() {
@@ -285,8 +253,6 @@ pub fn list(paths: &Paths, needle: &str, prefix: Option<&str>, removed: bool) ->
         .max()
         .unwrap_or(0);
     for row in &rows {
-        // What this node actually holds. Once a group is shared this is most of what a
-        // listing is for: the catalogue belongs to everyone, the bytes do not.
         let held = match (row.is_removed(), row.have) {
             (true, _) => "removed",
             (false, true) => "local",
@@ -400,8 +366,6 @@ pub fn verify(paths: &Paths, needle: &str) -> Result<()> {
         }
     }
 
-    // Anything on disk the index does not claim. A removed file's bytes are deleted, so bytes
-    // at a removed path count here too — which is right, since nothing is tracking them.
     let indexed: std::collections::BTreeSet<_> = rows.iter().map(|r| r.path.clone()).collect();
     let untracked: Vec<_> = s
         .content
@@ -433,9 +397,6 @@ pub fn verify(paths: &Paths, needle: &str) -> Result<()> {
 }
 
 /// How long ago a timestamp was, in the largest useful unit.
-///
-/// Relative rather than a date, matching `ac-server invite list`, and because rendering a
-/// calendar date correctly needs a timezone database this workspace has no reason to carry.
 fn ago(at: i64) -> String {
     let seconds = now() - at;
     match seconds {
@@ -474,8 +435,6 @@ mod tests {
         assert_eq!(ago(t - 300), "5m ago");
         assert_eq!(ago(t - 7_200), "2h ago");
         assert_eq!(ago(t - 172_800), "2d ago");
-        // A clock that went backwards, or a row written by a peer ahead of us. Saying
-        // something odd beats a negative duration formatted as if it were normal.
         assert_eq!(ago(t + 600), "in the future");
     }
 

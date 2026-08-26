@@ -1,5 +1,3 @@
-//! `ac run` — start the node.
-
 use anyhow::{Context, Result};
 use libp2p::Multiaddr;
 

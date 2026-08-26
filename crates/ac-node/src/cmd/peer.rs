@@ -1,11 +1,3 @@
-//! `ac peer` — the contact list, and what the supervisor is doing.
-//!
-//! `add` and `remove` edit the hand-written list, and only ever that. `list` shows the wider
-//! view from [`crate::directory`]: contacts *and* fellow group members, since both are people
-//! this node knows a name for, and a person looking for someone does not care which table the
-//! name came from. The `via` column keeps the distinction visible, because the two names come
-//! from different places and are trustworthy in different ways.
-
 use std::collections::HashMap;
 
 use ac_groups::store::Groups;
@@ -20,10 +12,6 @@ use crate::directory::{self, Source};
 use crate::status::Published;
 
 /// How stale a snapshot may be before it is reported as a stopped daemon.
-///
-/// The daemon publishes on the 5-second housekeeping tick, so anything past a minute means it
-/// is not running — which is the commonest answer to "why is nothing happening" and deserves
-/// to be the first line rather than something a person infers from empty columns.
 const STALE_AFTER: i64 = 60;
 
 fn open(paths: &Paths) -> Result<Contacts> {
@@ -32,12 +20,6 @@ fn open(paths: &Paths) -> Result<Contacts> {
 }
 
 pub fn add(paths: &Paths, peer: &PeerId, label: &str) -> Result<()> {
-    // Held to the username rules even though this list is local, because `ac group add`
-    // reuses a label as the username it writes into the group chain when `--username` is
-    // not given. A label that is merely a nice local name there becomes a signed, permanent
-    // record here — and refusing it at that point is refusing it long after it was typed,
-    // in an error about a chain entry the person never mentioned. `pi` is the case that
-    // showed it: a perfectly good label, one character short of a username.
     let label =
         attest::normalise_username(label).map_err(|e| anyhow!("unusable label {label:?}: {e}"))?;
 
@@ -84,8 +66,6 @@ pub fn list(paths: &Paths) -> Result<()> {
 
     let widest = known.iter().map(|k| k.name.len()).max().unwrap_or(0);
     for entry in known {
-        // Which kind of name this is, not decoration: a contact label was typed here, while a
-        // group username is whatever that group's admin wrote and can name anyone at all.
         let via = match entry.source {
             Source::Contact => "contact",
             Source::Group => "group",
@@ -95,12 +75,7 @@ pub fn list(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// `ac peer status` — why the supervisor is, or is not, doing anything.
-///
-/// Read from the snapshot the running daemon publishes, because none of it exists anywhere
-/// else: a backoff, a member believed offline and a suspended content pull are all in memory
-/// in another process. Names come from the same [`crate::directory`] view `list` uses, since a
-/// bare peer id answers nothing.
+/// `ac peer status`: why the supervisor is, or is not, doing anything.
 pub fn status(paths: &Paths) -> Result<()> {
     let key_path = paths.identity_file();
     let (identity, _) = Identity::load_or_generate(&key_path)
@@ -154,9 +129,6 @@ pub fn status(paths: &Paths) -> Result<()> {
 
         println!("{label} ({})", group.group.short());
         println!("  missing   {}", group.missing);
-        // Deliberately not "everyone has it": the count is who this node still means to call,
-        // and it reaches zero both by calling everybody and by giving up on somebody
-        // unreachable. Which of those happened is answered by the per-peer rows below.
         println!(
             "  news      {}",
             match group.owed {
@@ -167,9 +139,6 @@ pub fn status(paths: &Paths) -> Result<()> {
         );
         match group.source {
             Some(peer) => println!("  pulling   from {}", name(&peer)),
-            // Two different silences, and telling them apart is the point of the command: a
-            // suspended pull is working as designed after a fruitless rotation, while an idle
-            // one with files missing means nobody reachable has them.
             None if now < group.content_until => {
                 println!("  pulling   paused for {}s", group.content_until - now);
             }

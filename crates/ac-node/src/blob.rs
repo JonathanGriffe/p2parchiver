@@ -72,6 +72,15 @@ impl Transfers {
         }
     }
 
+    /// Wait for one transfer to end.
+    pub async fn finished(&mut self) -> Option<PeerEvent> {
+        let event = self.inbox.recv().await?;
+        if let PeerEvent::BlobDone { peer, .. } | PeerEvent::BlobFailed { peer, .. } = &event {
+            self.done(*peer);
+        }
+        Some(event)
+    }
+
     pub fn collect(&mut self) -> Vec<PeerEvent> {
         let mut out = Vec::new();
         while let Ok(event) = self.inbox.try_recv() {
@@ -89,7 +98,6 @@ impl Transfers {
         out
     }
 
-    /// How many transfers are running with this peer.
     pub fn running_with(&self, peer: &PeerId) -> usize {
         self.running.get(peer).copied().unwrap_or(0)
     }
@@ -107,7 +115,6 @@ impl Transfers {
         self.running.values().sum()
     }
 
-    /// Start a download, and say whether it started.
     #[must_use]
     pub fn fetch(
         &mut self,
@@ -301,7 +308,6 @@ async fn read_frame<T: serde::de::DeserializeOwned>(
     let mut len = [0u8; 4];
     stream.read_exact(&mut len).await?;
 
-    // Checked before allocating: the length comes from the other end.
     let len = u32::from_be_bytes(len) as usize;
     anyhow::ensure!(
         len <= limit,
