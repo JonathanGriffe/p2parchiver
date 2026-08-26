@@ -1,20 +1,3 @@
-//! The server's database: who may use it, and the invites that let them in.
-//!
-//! # What the connection-level gate actually checks
-//!
-//! It refuses **revoked** peers, not un-enrolled ones. That looks inconsistent with
-//! "the server has an allowlist" until you notice that enrolling *requires a
-//! connection* — gating connections on enrollment would be the same bootstrapping
-//! deadlock as the client-side trust list, one layer down.
-//!
-//! So the split is:
-//!
-//! - **Connection**: refuse peers explicitly revoked. Everyone else may connect, because
-//!   they might be about to enroll.
-//! - **Service** (relay reservation, rendezvous registration, stage 6): require
-//!   enrollment. This is where the server's bandwidth is actually spent — a connection
-//!   that never opens a circuit costs a handshake and a slot, nothing more.
-
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,9 +23,6 @@ pub enum Redemption {
     UnknownCode,
     AlreadyRedeemed,
     Expired,
-    /// The code was good, but the username belongs to somebody else. Distinct from every
-    /// other refusal because it is the only one the user can fix by choosing again — the
-    /// invite is still unspent.
     UsernameTaken,
 }
 
@@ -57,14 +37,8 @@ pub struct InviteRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientRecord {
     pub peer: PeerId,
-    /// The name this client chose at enrolment, and what its attestation asserts.
-    ///
-    /// `None` only for a row predating usernames whose legacy label could not be carried
-    /// over — see [`Store::migrate`]. Such a client must enrol again to get an attestation.
     pub username: Option<String>,
     pub enrolled_at: i64,
-    /// `None` while the client is active. Kept as a timestamp rather than a flag so a
-    /// revocation stays visible after the fact — the row is evidence, not just state.
     pub revoked_at: Option<i64>,
 }
 
@@ -118,16 +92,6 @@ impl Store {
     }
 
     /// Bring a database written before usernames existed up to date.
-    ///
-    /// Idempotent, and run on every open: `CREATE TABLE IF NOT EXISTS` above leaves an
-    /// older `clients` table exactly as it was, so the column has to be added separately.
-    ///
-    /// The backfill copies each client's old admin-chosen label into `username`, because
-    /// the alternative is that every already-enrolled client silently loses the ability to
-    /// obtain an attestation and has to re-enrol. `UPDATE OR IGNORE` is what makes that
-    /// safe: labels were never unique, so two clients called `laptop` would violate the
-    /// index. The first keeps the name, the rest are left `NULL` and must enrol again —
-    /// which is the honest outcome, since only one of them can have the name.
     fn migrate(&self) -> rusqlite::Result<()> {
         let has_username = self
             .db
@@ -138,9 +102,6 @@ impl Store {
                 .execute_batch("ALTER TABLE clients ADD COLUMN username TEXT;")?;
         }
 
-        // Partial, so the many legacy rows that end up `NULL` do not collide with each
-        // other — SQLite treats NULLs as distinct in a unique index, but being explicit
-        // here documents that it is intended rather than relied upon by accident.
         self.db.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS clients_username
                  ON clients(username) WHERE username IS NOT NULL;",
@@ -154,8 +115,6 @@ impl Store {
         }
         Ok(())
     }
-
-    // ---- invites ----
 
     /// Record a new invite. Only its hash is stored.
     pub fn create_invite(
@@ -187,14 +146,6 @@ impl Store {
     }
 
     /// Spend an invite and enroll `peer` under `username`.
-    ///
-    /// The read and both writes share one transaction, so two clients racing on the same
-    /// code cannot both win — single use is enforced by the database, not by timing. The
-    /// same transaction covers the username check, so two clients racing for one name
-    /// cannot both take it either.
-    ///
-    /// `username` is expected to be already normalised by
-    /// [`ac_net::attest::normalise_username`]; this enforces uniqueness, not shape.
     pub fn redeem(
         &self,
         code: &InviteCode,
@@ -223,8 +174,6 @@ impl Store {
             return Ok(Redemption::Expired);
         }
 
-        // Checked before the invite is spent, so a user who picks a taken name can try
-        // again with the same code rather than being told to ask for a new invite.
         let taken: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM clients WHERE username = ?1 AND peer_id <> ?2",
@@ -236,11 +185,6 @@ impl Store {
             return Ok(Redemption::UsernameTaken);
         }
 
-        // `redeemed_by IS NULL` repeats what the SELECT above already established, on
-        // purpose. Without it, single use would rest on transaction isolation — correct
-        // in WAL mode, but by way of a snapshot-conflict error rather than a clean
-        // refusal. With it, the statement itself carries the invariant: it either finds
-        // an unspent invite or changes nothing.
         let spent = tx.execute(
             "UPDATE invites SET redeemed_by = ?1, redeemed_at = ?2
              WHERE code_hash = ?3 AND redeemed_by IS NULL",
@@ -250,11 +194,6 @@ impl Store {
             // Another redemption committed between our read and this write.
             return Ok(Redemption::AlreadyRedeemed);
         }
-        // Deliberately does *not* clear `revoked_at`. A revoked peer is refused at
-        // connection establishment, so it can never reach this code — a clause here that
-        // "brings them back" would be unreachable, and would describe behaviour the
-        // server does not have. Reversing a revocation is [`Self::unrevoke`], an explicit
-        // admin action, matching the explicit action that caused it.
         tx.execute(
             "INSERT INTO clients (peer_id, username, enrolled_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(peer_id) DO UPDATE SET username = excluded.username",
@@ -292,10 +231,6 @@ impl Store {
     }
 
     /// The username to put in an attestation for `peer`.
-    ///
-    /// `None` for a peer with no client row, or one carried over from before usernames
-    /// existed whose label collided with another client's. Revoked clients are excluded —
-    /// belt and braces, since a revoked peer cannot reach the service listener to ask.
     pub fn username_of(&self, peer: &PeerId) -> rusqlite::Result<Option<String>> {
         self.db
             .query_row(
@@ -625,9 +560,6 @@ mod tests {
 
     #[test]
     fn redeeming_again_does_not_quietly_undo_a_revocation() {
-        // Unreachable in practice — a revoked peer cannot connect, so it can never
-        // redeem — but if that gate ever changes, re-enrolment must not become a back
-        // door around an admin's decision.
         let store = Store::in_memory().unwrap();
         let first = InviteCode::generate().unwrap();
         store.create_invite(&first, "bob", now() + HOUR).unwrap();
@@ -684,8 +616,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------- migration
-
     /// Build a `clients` table exactly as it looked before usernames existed.
     fn legacy_db(rows: &[(&str, &str)]) -> Connection {
         let db = Connection::open_in_memory().unwrap();
@@ -710,8 +640,6 @@ mod tests {
 
     #[test]
     fn an_existing_client_keeps_working_across_the_upgrade() {
-        // Without the backfill, every already-enrolled client would silently lose the
-        // ability to obtain an attestation and would have to re-enrol.
         let p = peer();
         let db = legacy_db(&[(&p.to_string(), "bobs-laptop")]);
 
@@ -725,8 +653,6 @@ mod tests {
 
     #[test]
     fn duplicate_legacy_labels_do_not_break_the_upgrade() {
-        // Labels were never unique. One client gets to keep the name; the others are left
-        // without one and must enrol again, which is the only honest outcome.
         let (a, b) = (peer(), peer());
         let db = legacy_db(&[(&a.to_string(), "laptop"), (&b.to_string(), "laptop")]);
 

@@ -1,5 +1,3 @@
-//! `ac-server invite` — mint and inspect invite codes.
-
 use anyhow::{Context, Result};
 
 use ac_net::config::Paths;
@@ -20,8 +18,6 @@ pub fn new(paths: &Paths, label: &str, ttl_hours: i64) -> Result<()> {
     let identity = Identity::load(&paths.identity_file())
         .context("loading the server identity; run `ac-server init` first")?;
 
-    // The code is shown exactly once. Only its hash is stored, so it cannot be recovered
-    // from the database if it is lost — that is the point, not a limitation.
     println!("invite  {code}");
     println!("label   {label}");
     println!("expires in {ttl_hours}h");
@@ -55,7 +51,6 @@ pub fn list(paths: &Paths) -> Result<()> {
             ),
             (None, false) => "expired".to_owned(),
         };
-        // The hash prefix identifies a row without being usable as a code.
         println!(
             "{:<widest$}  {}…  {status}",
             invite.label,

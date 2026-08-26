@@ -1,12 +1,3 @@
-//! Invite codes — the credential that lets a client enroll with this server.
-//!
-//! A code is a bearer secret: whoever holds it can enroll. That drives every choice
-//! here — enough entropy that guessing is hopeless, a hash rather than the code itself
-//! in the database, and single-use redemption enforced in [`crate::store`].
-//!
-//! The alphabet is Crockford base32, which omits `I`, `L`, `O`, and `U` so that a code
-//! read aloud or copied by hand does not turn into a different code.
-
 use std::fmt;
 
 use sha2::{Digest, Sha256};
@@ -18,11 +9,6 @@ const GROUPS: usize = 4;
 const GROUP_LEN: usize = 4;
 
 /// 16 characters over a 32-symbol alphabet: 80 bits.
-///
-/// Well beyond brute force even against a stolen database — at 10^10 hashes a second,
-/// 2^80 takes millions of years — and single-use redemption plus a TTL bound it further.
-/// That headroom is why a plain SHA-256 is appropriate here rather than a slow password
-/// KDF: those exist for low-entropy secrets, which this is not.
 const CODE_LEN: usize = GROUPS * GROUP_LEN;
 
 #[derive(Debug, thiserror::Error)]

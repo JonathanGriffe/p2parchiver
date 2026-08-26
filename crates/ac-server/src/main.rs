@@ -1,11 +1,3 @@
-//! `ac-server` — the rendezvous and relay server.
-//!
-//! Thin by design, like `ac`: parse a command, own one small database, and hand the
-//! swarm to `ac-net`. It never touches media, and it is never authoritative for group
-//! membership — its only say is who may consume its own bandwidth.
-
-// The workspace warns on unwrap/expect because a panic in the event loop takes the whole
-// daemon down. In tests a panic *is* the failure report, so let them through.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod cmd;
@@ -22,18 +14,9 @@ use libp2p::PeerId;
 use ac_net::config::Paths;
 
 /// The service listener's port: relay, rendezvous, AutoNAT, enrolled peers only.
-///
-/// **Fixed, and that is load-bearing.** A client is told this address once, when it
-/// enrols, and stores it permanently — there is no address refresh and no re-enrolment
-/// without a fresh invite. An ephemeral port would orphan every enrolled client the first
-/// time this server restarted. It is also the port an operator has to route, and a
-/// firewall rule cannot name a port the OS picks at random.
 pub const SERVICE_PORT: u16 = 4001;
 
 /// The enrolment listener's port: `/ac/enroll/2.0.0` only, open to anyone.
-///
-/// Fixed for the step-earlier version of the same reason: this is the address that goes
-/// into an invite the admin hands out.
 pub const ENROLL_PORT: u16 = 4002;
 
 /// Kept distinct from the client's directory so both can run on one host.

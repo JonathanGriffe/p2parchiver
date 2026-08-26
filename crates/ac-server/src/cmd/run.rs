@@ -1,5 +1,3 @@
-//! `ac-server run` — start the server.
-
 use anyhow::{Context, Result};
 
 use ac_net::config::{Config, Paths};
@@ -17,8 +15,6 @@ pub fn run(paths: &Paths) -> Result<()> {
     let config = Config::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
-    // One handle each: the daemon's, and one owned by each swarm's authorizer. See
-    // `daemon::run` for why they cannot be shared.
     let store = super::open_store(paths)?;
     let service_gate = Enrolled(super::open_store(paths)?);
     let enroll_gate = super::open_store(paths)?;

@@ -129,7 +129,7 @@ impl PeerLink {
         self.dispatch(swarm, files, groups, roster, actions);
     }
 
-    /// Wait for a transfer to end, and act on it.
+    /// Wait for a transfer to end.
     pub async fn next_transfer(&mut self) -> Option<PeerEvent> {
         self.transfers.finished().await
     }

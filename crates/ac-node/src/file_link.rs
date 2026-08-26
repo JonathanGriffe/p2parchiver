@@ -26,7 +26,7 @@ enum Outbound {
     Holdings { group: GroupId, paths: Vec<RelPath> },
 }
 
-/// How a catalogue exchange ended.
+/// How a manifest exchange ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoundOutcome {
     Settled {
@@ -139,7 +139,7 @@ impl FileLink {
             .insert(id, (peer, Outbound::Holdings { group, paths }));
     }
 
-    /// Whether a catalogue exchange with this peer is still outstanding.
+    /// Whether any question we put to this peer is still outstanding.
     pub fn busy_with(&self, peer: &PeerId) -> bool {
         self.outbound.values().any(|(p, _)| p == peer)
     }

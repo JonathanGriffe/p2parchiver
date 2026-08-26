@@ -1,5 +1,3 @@
-//! `ac-server init` — create this server's identity, database and starter config.
-
 use std::fs;
 
 use anyhow::{Context, Result};
@@ -10,9 +8,6 @@ use ac_net::identity::{Identity, Origin};
 use crate::{ENROLL_PORT, SERVICE_PORT};
 
 /// A starter `config.toml`, written on first init.
-///
-/// Hand-formatted rather than serialised, because `toml::to_string_pretty` cannot emit
-/// comments and both port choices need explaining to whoever opens this file next.
 fn starter_config() -> String {
     format!(
         r#"# archiverclient server configuration.
@@ -20,7 +15,7 @@ fn starter_config() -> String {
 # The service listener: relay, rendezvous, AutoNAT. Only enrolled clients may connect.
 #
 # The port is FIXED on purpose. Clients learn this address once, at enrolment, and store
-# it permanently — an ephemeral port would orphan every one of them on the next restart.
+# it permanently, an ephemeral port would orphan every one of them on the next restart.
 # This is the port to route or open in a firewall.
 listen = [
     "/ip4/0.0.0.0/udp/{SERVICE_PORT}/quic-v1",
@@ -39,7 +34,7 @@ listen_enroll = [
 ]
 
 # What this server tells clients to reach it at. Left empty, it announces whatever it
-# bound — right only when that is genuinely how the world reaches it.
+# bound, right only when that is genuinely how the world reaches it.
 #
 # Set this behind a cloud NAT or load balancer, where the public address differs from the
 # bound one. Prefer a DNS name over a literal IP: clients store what they are given, so a
@@ -87,8 +82,6 @@ pub fn run(paths: &Paths) -> Result<()> {
     println!();
     println!("Ports to route: {SERVICE_PORT} (services), {ENROLL_PORT} (enrolment).");
     println!();
-    // The peer id is half of what a client needs to trust this server; `ac join` prints
-    // the one it pinned so the two can be compared out of band, as with an SSH host key.
     println!("Clients pin this peer id on first contact. Compare it against what");
     println!("`ac join` reports to be sure they reached the right server.");
 
@@ -116,7 +109,6 @@ mod tests {
 
     #[test]
     fn no_listen_address_is_ephemeral() {
-        // Port 0 here would orphan every enrolled client on the next restart.
         let config: ac_net::config::Config = toml::from_str(&starter_config()).unwrap();
 
         for addr in config.listen.iter().chain(&config.listen_enroll) {

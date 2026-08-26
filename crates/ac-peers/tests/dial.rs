@@ -164,7 +164,7 @@ impl Node {
             .unwrap();
     }
 
-    /// Everyone online and connected, as a settled network would be.
+    /// Tick, then answer whatever circuit it opened and whatever hang-up it proposed.
     fn tick_connecting(&mut self, at: i64) -> Vec<PeerAction> {
         let actions = self.tick(at);
         let mut out = Vec::new();
@@ -209,6 +209,7 @@ impl Node {
         }
     }
 
+    /// Everyone reachable and nobody connected, which is the ordinary state here.
     fn all_online(&mut self, members: &[PeerId]) {
         self.peers.on(PeerEvent::Presence {
             asked: members.to_vec(),
@@ -216,6 +217,7 @@ impl Node {
         });
     }
 
+    /// Everyone online and connected, as a settled network would be.
     fn all_up(&mut self, members: &[PeerId]) -> Vec<PeerAction> {
         self.peers.on(PeerEvent::Presence {
             asked: members.to_vec(),
@@ -306,8 +308,8 @@ fn answered(node: &mut Node, at: i64, group: GroupId) -> Vec<PeerAction> {
 /// Answer every question the way the daemon would, on the protocol it was put on.
 ///
 /// Two events, because the links report two facts. `Asked` is the pull's own: the question was
-/// answered, so the exchange is over and the clock decides when to come back. `Synced` is what
-/// the reading side reports per group once there is nothing further to read from them.
+/// answered, so that half is over and the other follows on it. `Synced` is what the reading side
+/// reports per group once there is nothing further to read from them.
 ///
 /// Membership and the catalogue are separate exchanges, so a peer is reconciled in two steps;
 /// answering both as though they were the second leaves the first outstanding for ever.
@@ -909,7 +911,7 @@ fn every_member_is_asked_once_not_one_member_repeatedly() {
         "every member is asked: {distinct:?}"
     );
     // Twice each and no more: membership and the catalogue are separate exchanges, so a peer
-    // is reconciled in two, and the interval then holds them off.
+    // is reconciled in two and then has nothing further owed to it.
     for peer in &distinct {
         assert_eq!(
             asked.iter().filter(|p| *p == peer).count(),
@@ -965,10 +967,9 @@ fn membership_is_offered_before_the_catalogue() {
 
 #[test]
 fn a_settled_membership_round_does_not_write_off_the_catalogue() {
-    // Two exchanges, two records. A chain round carries who is in the group and not one file
-    // head, so it may discharge the membership and nothing else. Under the push this was easy
-    // to get wrong, because `seen` moved wholesale by either kind; the pull has no `seen`, but
-    // the two halves of what is outstanding are still separate and must stay so.
+    // Two exchanges, two halves. A chain round carries who is in the group and not one file
+    // head, so it may discharge the membership and nothing else — the catalogue is still
+    // outstanding and follows on the answer.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);

@@ -169,7 +169,7 @@ main() {
     if wait_for "$SETTLE" "bob to hold both files" bash -c \
         "$(declare -f ac group_id holds); LAB=$LAB AC=$AC; holds bob photo.jpg && holds bob notes.txt"
     then
-        ok "bob mirrored both files, with nobody running 'ac file get'"
+        ok "bob mirrored both files, with nobody having asked for them"
     else
         bad "bob did not mirror the group"
     fi

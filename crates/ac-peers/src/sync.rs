@@ -16,7 +16,7 @@ pub const HEARTBEAT: i64 = 4 * 3600;
 pub const MIN_BACKOFF: i64 = 15;
 pub const MAX_BACKOFF: i64 = 30 * 60;
 
-/// Dials to one member before they are taken off the lists they are on.
+/// Dials to one member before they are taken off the list they are on.
 pub const DIAL_ATTEMPTS: usize = 3;
 
 /// Circuits opened for *news* in one tick.
@@ -692,7 +692,7 @@ impl Peers {
         }
     }
 
-    /// Call peers in pending
+    /// Dial whoever we owe a call and cannot already reach.
     fn queue_dials(&mut self) -> Vec<PeerAction> {
         let mut peers_to_dial: Vec<PeerId> = self
             .pending
@@ -727,7 +727,7 @@ impl Peers {
         actions
     }
 
-    /// Record what an offer to this peer carries, and ask for it.
+    /// Record which groups an offer to this peer names, and ask for it.
     fn ask(&mut self, peer: PeerId, offering: Offering) -> PeerAction {
         let named = match offering {
             Offering::Chain => self.groups.log_shared_with(&peer),
@@ -880,7 +880,8 @@ impl Peers {
         }
     }
 
-    /// A batch of transfers finished. Ask this source for the next one, or let it go.
+    /// A batch of transfers finished. Ask this peer for the next of whatever it can still
+    /// serve, or let it go.
     fn continue_pull(&mut self, peer: PeerId) -> Vec<PeerAction> {
         if self.peers.get(&peer).is_some_and(|s| s.transfers > 0) {
             return Vec::new();
@@ -1126,7 +1127,7 @@ impl Peers {
         Vec::new()
     }
 
-    /// Every member has been asked and none could help.
+    /// Every member has been asked to the end of the backlog and none could help.
     fn exhaust_group(&mut self, group: GroupId, at: i64) -> Vec<PeerAction> {
         if let Ok(missing) = next_missing(&self.files, group, None, 1)
             && let Some((path, _)) = missing.into_iter().next()
@@ -1188,7 +1189,7 @@ impl Peers {
         Status { groups, peers }
     }
 
-    /// Let every group try again: whoever we gave up on, the set of members has changed.
+    /// Let every group try again: somebody we gave up on is back.
     fn reconsider_content(&mut self) {
         for state in self.state.values_mut() {
             state.content_until = 0;
@@ -1360,7 +1361,7 @@ impl Peers {
         vec![PeerAction::Dial { peer }]
     }
 
-    /// Take this peer off every group's list
+    /// Take this peer off the list
     fn give_up(&mut self, peer: PeerId) {
         self.pending.remove(&peer);
         if let Some(state) = self.peers.get_mut(&peer) {
@@ -1386,7 +1387,8 @@ impl Peers {
         let answered = self.answered_invite(group);
         let stranger = |p: &PeerId| !answered.contains(p);
 
-        // Strangers still come first among equals, so a newly added member is not left last.
+        // A member who has answered comes first among equals: a stranger holds the group
+        // `pending` rather than `active`, so a holdings query to them is refused.
         if let Some(peer) = members
             .iter()
             .find(|p| self.connected.contains(p) && !stranger(p))
