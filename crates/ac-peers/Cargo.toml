@@ -9,23 +9,8 @@ ac-net.workspace = true
 ac-groups.workspace = true
 ac-files.workspace = true
 serde.workspace = true
-getrandom.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-# Deliberately absent: `tokio` (this crate has no async), and `anyhow` (a library returns
-# typed errors; the binaries add context).
-#
-# `libp2p` is deliberately absent, which is the strongest of these. `wire.rs` once declared the
-# session behaviour and needed it; now it declares `/ac/session/1.0.0`, the two message types
-# and the size ceiling, and `ac-node` builds what carries them. Peers are named by the `PeerId`
-# that `ac-net` re-exports. So everything that decides *anything* — who to dial, what to ask,
-# when to hang up — cannot name a networking type even by accident, which is what lets the whole
-# supervisor be driven from a test with no socket. `tests/layering.rs` is a second line on top.
-#
-# `/ac/presence/1.0.0` is deliberately *not* here: it lives in `ac_net::proto` beside
-# attestation renewal, because the server answers it and the server must not compile the group
-# and file model to do so.
 
 [dev-dependencies]
 tempfile = "3"

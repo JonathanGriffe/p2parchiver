@@ -6,10 +6,11 @@ use ac_groups::store::StoreError;
 pub fn next_missing(
     files: &Files,
     group: GroupId,
+    after: Option<&RelPath>,
     limit: usize,
 ) -> Result<Vec<(RelPath, String)>, PeersError> {
     Ok(files
-        .missing(group, limit)?
+        .missing(group, after, limit)?
         .into_iter()
         .map(|row| (row.path, row.hash))
         .collect())
@@ -121,27 +122,6 @@ mod tests {
     }
 
     #[test]
-    fn wanted_files_come_first() {
-        // Under auto-mirror everything arrives eventually, so `ac file get` is a statement
-        // about order and nothing else. This is the whole of what it now does.
-        let mut node = Node::new();
-        let id = node.group();
-        node.learn(id, "a-early.jpg");
-        node.learn(id, "z-late.jpg");
-
-        let wanted = RelPath::parse("z-late.jpg").unwrap();
-        node.files.want(id, &wanted).unwrap();
-
-        let next = next_missing(&node.files, id, 10).unwrap();
-        assert_eq!(
-            next.first().map(|(p, _)| p.as_str()),
-            Some("z-late.jpg"),
-            "the wanted row jumps the queue despite sorting last"
-        );
-        assert_eq!(next.len(), 2, "and the rest still follow");
-    }
-
-    #[test]
     fn next_missing_honours_its_limit() {
         let mut node = Node::new();
         let id = node.group();
@@ -149,7 +129,7 @@ mod tests {
             node.learn(id, &format!("f{i}.jpg"));
         }
 
-        assert_eq!(next_missing(&node.files, id, 4).unwrap().len(), 4);
+        assert_eq!(next_missing(&node.files, id, None, 4).unwrap().len(), 4);
     }
 
     #[test]
@@ -160,6 +140,6 @@ mod tests {
         node.add(id, "b.jpg");
 
         assert_eq!(node.files.missing_count(id).unwrap(), 0);
-        assert!(next_missing(&node.files, id, 10).unwrap().is_empty());
+        assert!(next_missing(&node.files, id, None, 10).unwrap().is_empty());
     }
 }

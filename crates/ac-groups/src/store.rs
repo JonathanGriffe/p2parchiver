@@ -111,7 +111,8 @@ impl Groups {
                  head_hash        TEXT NOT NULL,
                  standings_digest TEXT NOT NULL,
                  first_seen       INTEGER NOT NULL,
-                 last_synced      INTEGER NOT NULL
+                 last_synced      INTEGER NOT NULL,
+                 news             INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS group_entries (
                  group_id  TEXT NOT NULL,
@@ -545,6 +546,7 @@ impl Groups {
             "UPDATE groups SET name = ?2, last_synced = ?3 WHERE group_id = ?1",
             params![group.to_string(), chain.name(), at],
         )?;
+        note_news(&tx, group)?;
         tx.commit()?;
         Ok(entry)
     }
@@ -588,11 +590,34 @@ impl Groups {
             "UPDATE groups SET state = ?2 WHERE group_id = ?1",
             params![group.to_string(), state.as_str()],
         )?;
+        note_news(&tx, group)?;
         tx.commit()?;
 
         // The digest changed, so recompute it outside the write path's hot loop.
         self.refresh_digest(group)?;
         Ok(standing)
+    }
+
+    /// Membership changes this node made that the group has not been told about.
+    pub fn news(&self, group: GroupId) -> Result<u64, StoreError> {
+        let n: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT news FROM groups WHERE group_id = ?1",
+                params![group.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(n.unwrap_or(0).max(0) as u64)
+    }
+
+    /// The group has been told. Anything after this is a fresh change.
+    pub fn news_told(&mut self, group: GroupId) -> Result<(), StoreError> {
+        self.db.execute(
+            "UPDATE groups SET news = 0 WHERE group_id = ?1",
+            params![group.to_string()],
+        )?;
+        Ok(())
     }
 
     pub fn set_state(&mut self, group: GroupId, state: State) -> Result<(), StoreError> {
@@ -809,8 +834,15 @@ fn rebuild_caches(
     Ok(())
 }
 
-/// How a [`Position`] is written to its column. Text rather than an integer so the table reads
-/// like `groups.state` does, and so an unknown value is obvious rather than plausible.
+/// Record that this node changed this group's membership.
+fn note_news(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE groups SET news = news + 1 WHERE group_id = ?1",
+        params![group.to_string()],
+    )?;
+    Ok(())
+}
+
 fn position_str(position: Position) -> &'static str {
     match position {
         Position::Unanswered => "unanswered",
@@ -911,6 +943,60 @@ mod tests {
         let mut store = Groups::in_memory(peer_of(&admin)).unwrap();
         let id = store.create(&admin, "family", "alice", AT).unwrap();
         (store, admin, id)
+    }
+
+    #[test]
+    fn a_membership_change_of_ours_is_news_and_one_we_adopt_is_not() {
+        // The head moves for an entry adopted from a peer exactly as it does for an op of ours,
+        // so a supervisor watching it cannot tell them apart. Re-telling a group what it just
+        // told us is one message per member per member, which is why the writer stamps this.
+        let (mut store, admin, id) = admin_store();
+        store.news_told(id).unwrap();
+
+        add(&mut store, &admin, id, peer_of(&key()), "bob");
+        assert_eq!(store.news(id).unwrap(), 1, "our own op is news");
+
+        store.news_told(id).unwrap();
+        assert_eq!(
+            store.news(id).unwrap(),
+            0,
+            "and is settled once the group is told"
+        );
+
+        // The same chain, arriving from somewhere else.
+        let entries: Vec<Entry> = store.chain(id).unwrap().entries().cloned().collect();
+        let mut theirs = Groups::in_memory(peer_of(&key())).unwrap();
+        theirs.adopt(&entries, &[], AT).unwrap();
+        assert_eq!(
+            theirs.news(id).unwrap(),
+            0,
+            "they did not change anything; the admin did"
+        );
+        assert!(
+            theirs.get(id).unwrap().is_some_and(|g| g.head_seq > 0),
+            "though the head did move"
+        );
+    }
+
+    #[test]
+    fn answering_an_invitation_is_news_the_group_must_hear() {
+        let member = key();
+        let (mut store, admin, id) = admin_store();
+        add(&mut store, &admin, id, peer_of(&member), "bob");
+
+        let entries: Vec<Entry> = store.chain(id).unwrap().entries().cloned().collect();
+        let mut theirs = Groups::in_memory(peer_of(&member)).unwrap();
+        theirs.adopt(&entries, &[], AT).unwrap();
+        assert_eq!(theirs.news(id).unwrap(), 0, "receiving it says nothing");
+
+        theirs
+            .author_standing(&member, id, Position::In, AT)
+            .unwrap();
+        assert_eq!(
+            theirs.news(id).unwrap(),
+            1,
+            "but accepting is ours to tell, or nobody learns we are in"
+        );
     }
 
     fn add(store: &mut Groups, admin: &Keypair, id: GroupId, peer: PeerId, name: &str) {

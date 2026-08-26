@@ -12,6 +12,7 @@
 
 use std::collections::HashSet;
 
+use ac_files::Content;
 use ac_files::path::RelPath;
 use ac_files::store::{FileRow, Files};
 use ac_groups::chain::Op;
@@ -21,10 +22,11 @@ use ac_groups::store::Groups;
 use ac_net::PeerId;
 use ac_net::identity::Keypair;
 use ac_peers::sync::{
-    DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_ROUND, DIALS_PER_WINDOW, HEARTBEAT, Limits,
-    MAX_TRANSFERS, MIN_BACKOFF, NoRoom, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent, Peers,
-    ROUND_TIMEOUT, SHARE_AFTER_IDLE,
+    CLOSE_TIMEOUT, DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_ROUND, DIALS_PER_WINDOW, HEARTBEAT,
+    Limits, MAX_TRANSFERS, MIN_BACKOFF, NoRoom, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent,
+    Peers, ROUND_TIMEOUT, SHARE_AFTER_IDLE,
 };
+use tempfile::TempDir;
 
 const AT: i64 = 1_000_000;
 
@@ -33,6 +35,9 @@ struct Node {
     peers: Peers,
     key: Keypair,
     me: PeerId,
+    /// Where `merge` would put bytes. Nothing in these tests transfers any, but a row that
+    /// arrives from a peer goes through the real merge path, and that is what it wants.
+    root: TempDir,
 }
 
 impl Node {
@@ -43,10 +48,13 @@ impl Node {
     fn with_limits(limits: Limits) -> Self {
         let key = Keypair::generate_ed25519();
         let me = key.public().to_peer_id();
+        let root = tempfile::tempdir().unwrap();
         Self {
+            root,
             peers: Peers::new(
                 Files::in_memory(me).unwrap(),
                 Groups::in_memory(me).unwrap(),
+                AT,
             )
             .with_limits(limits),
             key,
@@ -85,17 +93,31 @@ impl Node {
     }
 
     /// A row we know of and do not hold — what a catalogue sync leaves behind.
+    ///
+    /// Through `merge`, which is how such a row really arrives: `record` is the local edit path
+    /// and would both claim the row as our news and fail to mark it as something we now want.
     fn learn_file(&mut self, group: GroupId, path: &str) {
-        self.record(group, path, false);
+        let row = self.row(path, false);
+        let dir = self.peers.files_mut().dir_for(group, "holiday").unwrap();
+        let content = Content::new(self.root.path().to_path_buf());
+        self.peers
+            .files_mut()
+            .merge(group, &row, &content, &dir)
+            .unwrap();
     }
 
     fn record(&mut self, group: GroupId, path: &str, have: bool) {
+        let row = self.row(path, have);
+        self.peers.files_mut().record(group, &row, true).unwrap();
+    }
+
+    fn row(&self, path: &str, have: bool) -> FileRow {
         let path = RelPath::parse(path).unwrap();
         let mut hash = [0u8; 32];
         for (i, b) in path.as_str().bytes().enumerate() {
             hash[i % 32] ^= b;
         }
-        let row = FileRow {
+        FileRow {
             path: path.clone(),
             size: 1,
             hash: hex::encode(hash),
@@ -105,13 +127,6 @@ impl Node {
             removed_at: None,
             have,
             seen_seq: 0,
-        };
-        self.peers.files_mut().record(group, &row, true).unwrap();
-        if !have {
-            self.peers
-                .files_mut()
-                .mark_have(group, &path, false)
-                .unwrap();
         }
     }
 
@@ -167,14 +182,108 @@ impl Node {
     }
 
     /// Everyone online and connected, as a settled network would be.
-    fn all_up(&mut self, members: &[PeerId]) {
+    ///
+    /// **Settled includes the connect-time reconcile.** `Verified` puts the chain question on
+    /// the wire itself and the catalogue follows on its answer, so a helper that dropped those
+    /// would leave every peer looking mid-exchange for the rest of the test — and a peer with an
+    /// offer outstanding is one `start_rounds` skips.
+    /// Tick, then answer whatever circuit it opened.
+    ///
+    /// The question follows the connection now, not the tick that asked for one, so a test that
+    /// only ticks sees a `Dial` and nothing else. Returns the questions first, then the tick's
+    /// own actions, so `rounds` and `find(Ask)` read as they did.
+    fn tick_connecting(&mut self, at: i64) -> Vec<PeerAction> {
+        let actions = self.tick(at);
+        let mut out = Vec::new();
+        for action in &actions {
+            match action {
+                PeerAction::Dial { peer } => {
+                    out.extend(self.peers.on(PeerEvent::Verified { peer: *peer }));
+                }
+                // The other half of the lifecycle, and it matters now: a member is told nothing
+                // while we hold a connection to them, so the hang-up is what lets the next call
+                // deliver. A test that never closes never gets a second round.
+                PeerAction::ProposeClose { peer } => {
+                    out.extend(self.peers.on(PeerEvent::CloseAnswered {
+                        peer: *peer,
+                        ready: true,
+                    }));
+                }
+                PeerAction::Disconnect { peer } => {
+                    out.extend(self.peers.on(PeerEvent::Gone { peer: *peer }));
+                }
+                _ => {}
+            }
+        }
+        // A close answered inside the loop above yields the `Disconnect` that ends it.
+        let follow: Vec<PeerAction> = out.clone();
+        for action in &follow {
+            if let PeerAction::Disconnect { peer } = action {
+                self.peers.on(PeerEvent::Gone { peer: *peer });
+            }
+        }
+        out.extend(actions);
+        out
+    }
+
+    /// The connections close, as `closes` and the daemon would have them.
+    ///
+    /// A member is told nothing while we hold a connection to them, so a test that wants a
+    /// change delivered has to let the call end first.
+    fn hang_up(&mut self, members: &[PeerId]) {
+        for peer in members {
+            self.peers.on(PeerEvent::Gone { peer: *peer });
+        }
+    }
+
+    /// Everyone reachable but nobody connected — the ordinary state under sparse connections.
+    ///
+    /// What most propagation tests want: news is a reason to *dial*, and a member already on the
+    /// other end of a connection is one no dial can reach and no question can tell.
+    fn all_online(&mut self, members: &[PeerId]) {
         self.peers.on(PeerEvent::Presence {
             asked: members.to_vec(),
             online: members.to_vec(),
         });
+    }
+
+    /// Returns everything the connecting produced — the questions, and what their answers led to.
+    fn all_up(&mut self, members: &[PeerId]) -> Vec<PeerAction> {
+        self.peers.on(PeerEvent::Presence {
+            asked: members.to_vec(),
+            online: members.to_vec(),
+        });
+        let mut seen = Vec::new();
         for peer in members {
-            self.peers.on(PeerEvent::Verified { peer: *peer });
+            let actions = self.peers.on(PeerEvent::Verified { peer: *peer });
+            seen.extend(self.settle_all(&actions));
         }
+        seen
+    }
+
+    /// Answer every question in `actions`, and every question those answers produce.
+    ///
+    /// A settled catalogue is what opens a content pull, so what `Synced` hands back matters as
+    /// much as what the questions themselves did — dropping it loses the holdings query.
+    fn settle_all(&mut self, actions: &[PeerAction]) -> Vec<PeerAction> {
+        let groups = self.shared_groups();
+        let mut queue: Vec<PeerAction> = actions.to_vec();
+        let mut seen = Vec::new();
+
+        while let Some(action) = queue.pop() {
+            if let PeerAction::Ask { peer, offering } = action {
+                for group in &groups {
+                    queue.extend(self.peers.on(PeerEvent::Synced {
+                        peer,
+                        group: *group,
+                        offering,
+                    }));
+                }
+                queue.extend(self.peers.on(PeerEvent::Asked { peer, offering }));
+            }
+            seen.push(action);
+        }
+        seen
     }
 }
 
@@ -184,12 +293,48 @@ fn peers(n: usize) -> Vec<PeerId> {
         .collect()
 }
 
+/// One tick, answering every holdings query with exactly `held` of what it named.
+fn step_holding(node: &mut Node, at: i64, held: &[RelPath]) -> Vec<PeerAction> {
+    let mut seen = Vec::new();
+    let mut queue = node.tick_connecting(at);
+
+    while let Some(action) = queue.pop() {
+        match &action {
+            PeerAction::Ask { peer, offering } => {
+                for group in node.shared_groups() {
+                    queue.extend(node.peers.on(PeerEvent::Synced {
+                        peer: *peer,
+                        group,
+                        offering: *offering,
+                    }));
+                }
+                queue.extend(node.peers.on(PeerEvent::Asked {
+                    peer: *peer,
+                    offering: *offering,
+                }));
+            }
+            PeerAction::AskHoldings { peer, group, paths } => {
+                let answer: Vec<bool> = paths.iter().map(|p| held.contains(p)).collect();
+                queue.extend(node.peers.on(PeerEvent::Holdings {
+                    peer: *peer,
+                    group: *group,
+                    held: answer,
+                    paths: paths.clone(),
+                }));
+            }
+            _ => {}
+        }
+        seen.push(action);
+    }
+    seen
+}
+
 /// One tick, with any offer it starts reported as settled.
 ///
 /// A peer may have one offer outstanding, so a test that ticks several times without answering
 /// finds the peer busy and then looks quiet for the wrong reason.
 fn answered(node: &mut Node, at: i64, group: GroupId) -> Vec<PeerAction> {
-    let actions = node.tick(at);
+    let actions = node.tick_connecting(at);
     settle_offers(node, &actions, group);
     actions
 }
@@ -204,18 +349,19 @@ fn answered(node: &mut Node, at: i64, group: GroupId) -> Vec<PeerAction> {
 /// answering both as though they were the second leaves the first outstanding for ever.
 fn settle_offers(node: &mut Node, actions: &[PeerAction], group: GroupId) -> Vec<PeerId> {
     let mut asked = Vec::new();
-    for action in actions {
+    // A settled chain round hands back the catalogue round behind it, so the answering carries
+    // on from what the answer produced rather than waiting for another tick to be driven.
+    let mut queue: Vec<PeerAction> = actions.to_vec();
+
+    while let Some(action) = queue.pop() {
         if let PeerAction::Ask { peer, offering } = action {
             node.peers.on(PeerEvent::Synced {
-                peer: *peer,
+                peer,
                 group,
-                offering: *offering,
+                offering,
             });
-            node.peers.on(PeerEvent::Asked {
-                peer: *peer,
-                offering: *offering,
-            });
-            asked.push(*peer);
+            queue.extend(node.peers.on(PeerEvent::Asked { peer, offering }));
+            asked.push(peer);
         }
     }
     asked
@@ -296,6 +442,12 @@ fn step(node: &mut Node, at: i64, holds: bool) -> Vec<PeerAction> {
                     offering: *offering,
                 }));
             }
+            // A dial that is answered, which is what makes the question that follows it happen:
+            // the supervisor asks on `Verified`, not on the tick that opened the circuit.
+            PeerAction::Dial { peer } => {
+                queue.extend(node.peers.on(PeerEvent::Verified { peer: *peer }));
+            }
+
             PeerAction::AskHoldings { peer, group, paths } => {
                 queue.extend(node.peers.on(PeerEvent::Holdings {
                     peer: *peer,
@@ -370,9 +522,9 @@ fn a_node_that_knows_no_groups_still_asks_whoever_it_meets() {
         "this node is in no groups and so has nothing of its own to say"
     );
 
-    node.peers.on(PeerEvent::Verified { peer: stranger });
+    let met = node.peers.on(PeerEvent::Verified { peer: stranger });
     assert_eq!(
-        rounds(&node.tick(AT)),
+        rounds(&met),
         vec![stranger],
         "and must still put the question, or it can only ever answer one"
     );
@@ -412,15 +564,18 @@ fn adding_a_member_provokes_a_round_although_no_file_changed() {
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
-    node.all_up(&members);
+    node.all_online(&members);
     node.add_file(id, "a.jpg");
 
     // Settle: let the initial exchanges run themselves out.
     for _ in 0..8 {
-        let actions = node.tick(AT);
+        let actions = node.tick_connecting(AT);
         settle_offers(&mut node, &actions, id);
     }
-    assert!(rounds(&node.tick(AT)).is_empty(), "quiet before the change");
+    assert!(
+        rounds(&node.tick_connecting(AT)).is_empty(),
+        "quiet before the change"
+    );
 
     let key = node.key.clone();
     let newcomer = peers(1)[0];
@@ -440,9 +595,7 @@ fn adding_a_member_provokes_a_round_although_no_file_changed() {
         asked: vec![members[0], newcomer],
         online: vec![members[0], newcomer],
     });
-    node.peers.on(PeerEvent::Verified { peer: newcomer });
-
-    let actions = node.tick(AT);
+    let actions = node.tick_connecting(AT);
     assert!(
         !rounds(&actions).is_empty() || !dials(&actions).is_empty(),
         "a membership change is news: {actions:?}"
@@ -505,33 +658,124 @@ fn a_round_nobody_answers_does_not_wedge_the_node() {
     let members = peers(3);
     let id = node.group_with(&members);
     node.add_file(id, "a.jpg");
-    node.all_up(&members);
+    node.all_online(&members);
 
     // Start rounds and answer none of them.
     let mut started = Vec::new();
     for k in 0..4 {
-        started.extend(rounds(&node.tick(AT + k)));
+        started.extend(rounds(&node.tick_connecting(AT + k)));
     }
     assert!(!started.is_empty(), "rounds should have gone out");
     assert!(
-        rounds(&node.tick(AT + 5)).is_empty(),
+        rounds(&node.tick_connecting(AT + 5)).is_empty(),
         "the slots are full while they are outstanding"
     );
 
-    // Past the timeout they are written off. Rounds go to every connected member at once now,
-    // so one stall pauses them all together — and writing one off arms the retry backoff, which
-    // is why detecting the failure and acting on it are two different ticks.
+    // Past the timeout they are written off, which frees the slot without re-asking the peer
+    // that took it: they are still connected, and a member on the other end of a connection is
+    // never asked from a tick. Their retry waits for the call to end — what the tick may do
+    // meanwhile is reach somebody else.
     node.add_file(id, "b.jpg");
-    let swept = node.tick(AT + ROUND_TIMEOUT + 1);
+    let swept = node.tick_connecting(AT + ROUND_TIMEOUT + 1);
     assert!(
-        rounds(&swept).is_empty(),
-        "the tick that writes them off does not immediately re-ask: {swept:?}"
+        rounds(&swept).iter().all(|peer| !started.contains(peer)),
+        "a peer whose round was written off is not asked again on the same connection: {swept:?}"
     );
 
-    let actions = node.tick(AT + ROUND_TIMEOUT + MIN_BACKOFF + 2);
+    let actions = node.tick_connecting(AT + ROUND_TIMEOUT + MIN_BACKOFF + 2);
     assert!(
         !rounds(&actions).is_empty() || !dials(&actions).is_empty(),
         "a round nobody answered must not cost the slot for ever: {actions:?}"
+    );
+}
+
+#[test]
+fn a_backlog_larger_than_one_question_is_walked_rather_than_re_asked() {
+    // One question names at most `MAX_HOLDINGS_QUERY` paths, so an answer of "none of those"
+    // is about a page and not about the group. Reading "none" as "nothing at all" wrote a peer
+    // off for a backlog it had never been asked about, and — since every member was then asked
+    // the same first page — a group whose files all sorted after it reported them unobtainable.
+    const PAGE: usize = ac_files::wire::MAX_HOLDINGS_QUERY;
+
+    let mut node = Node::new();
+    let members = peers(1);
+    let id = node.group_with(&members);
+    // A page and a bit, so the second question is about paths the first never named.
+    for i in 0..PAGE + 10 {
+        node.learn_file(id, &format!("f{i:05}.bin"));
+    }
+    node.all_online(&members);
+
+    let mut asked: Vec<RelPath> = Vec::new();
+    let mut pages = 0;
+    for at in 0..20 {
+        for action in step_holding(&mut node, AT + at, &[]) {
+            if let PeerAction::AskHoldings { paths, .. } = action {
+                pages += 1;
+                asked.extend(paths);
+            }
+        }
+        if pages >= 2 {
+            break;
+        }
+    }
+
+    assert!(
+        pages >= 2,
+        "a backlog of {} needs more than one question",
+        PAGE + 10
+    );
+    let distinct: HashSet<&RelPath> = asked.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        asked.len(),
+        "no path is named twice: the walk moves on rather than re-reading from the top"
+    );
+}
+
+#[test]
+fn a_page_they_can_help_with_does_not_send_the_walk_back_to_the_start() {
+    // The other half: a productive page must move the cursor too. Otherwise fetching what they
+    // held would shrink the backlog by that much and the next question would name the same
+    // paths they had already refused, less the few that arrived.
+    const PAGE: usize = ac_files::wire::MAX_HOLDINGS_QUERY;
+
+    let mut node = Node::new();
+    let members = peers(1);
+    let id = node.group_with(&members);
+    for i in 0..PAGE + 10 {
+        node.learn_file(id, &format!("f{i:05}.bin"));
+    }
+    node.all_online(&members);
+
+    // They hold exactly the first ten of whatever they are asked about.
+    let mut first: Vec<RelPath> = Vec::new();
+    let mut second: Vec<RelPath> = Vec::new();
+    for at in 0..20 {
+        let held: Vec<RelPath> = if first.is_empty() {
+            Vec::new()
+        } else {
+            first.iter().take(10).cloned().collect()
+        };
+        for action in step_holding(&mut node, AT + at, &held) {
+            if let PeerAction::AskHoldings { paths, .. } = action {
+                if first.is_empty() {
+                    first = paths;
+                } else if second.is_empty() {
+                    second = paths;
+                }
+            }
+        }
+        if !second.is_empty() {
+            break;
+        }
+    }
+
+    assert!(!second.is_empty(), "a second question goes out");
+    let earlier: HashSet<&RelPath> = first.iter().collect();
+    assert!(
+        second.iter().all(|p| !earlier.contains(p)),
+        "the second question names none of what the first already did"
     );
 }
 
@@ -695,7 +939,7 @@ fn a_new_file_is_fetched_although_the_group_had_given_up_before() {
     let members = peers(1);
     let id = node.group_with(&members);
     node.learn_file(id, "nobody-has-this.jpg");
-    node.all_up(&members);
+    node.all_online(&members);
 
     // Exhaust the group: the one member holds nothing we want.
     let mut backed_off = false;
@@ -745,13 +989,12 @@ fn a_member_already_connected_is_asked_before_one_that_needs_a_circuit() {
         online: members.clone(),
     });
     let held = members[2];
-    node.peers.on(PeerEvent::Verified { peer: held });
 
-    let actions = node.tick(AT);
-    assert!(
-        dials(&actions).is_empty(),
-        "no circuit is worth spending while a connection is open: {actions:?}"
-    );
+    // The claim is about *who is spoken to*, not about the tick going quiet. News to the two
+    // members we cannot reach genuinely needs circuits — they cannot be told any other way — so
+    // a dial alongside this is right. The question to `held` rides the connection itself.
+    let mut actions = node.peers.on(PeerEvent::Verified { peer: held });
+    actions.extend(node.tick(AT));
     assert!(
         actions.iter().any(|a| matches!(
             a,
@@ -770,14 +1013,11 @@ fn every_member_is_asked_once_not_one_member_repeatedly() {
     // that was easiest to reach and left the rest unasked.
     let mut node = Node::new();
     let members = peers(3);
-    let id = node.group_with(&members);
-    node.all_up(&members);
+    node.group_with(&members);
 
-    let mut asked: Vec<PeerId> = Vec::new();
-    for k in 0..12 {
-        let actions = node.tick(AT + k);
-        asked.extend(settle_offers(&mut node, &actions, id));
-    }
+    // Connecting is what reconciles, so this is where the claim is made: every member asked,
+    // and no member asked twice over while another waits.
+    let asked = rounds(&node.all_up(&members));
 
     let distinct: HashSet<PeerId> = asked.iter().copied().collect();
     assert_eq!(
@@ -808,9 +1048,9 @@ fn membership_is_offered_before_the_catalogue() {
     let members = peers(1);
     let id = node.group_with(&members);
     node.add_file(id, "a.jpg");
-    node.all_up(&members);
+    node.all_online(&members);
 
-    let first = node.tick(AT);
+    let first = node.tick_connecting(AT);
     assert!(
         matches!(
             first.iter().find(|a| matches!(a, PeerAction::Ask { .. })),
@@ -831,12 +1071,13 @@ fn membership_is_offered_before_the_catalogue() {
             offering: Offering::Chain,
         });
     }
-    node.peers.on(PeerEvent::Asked {
+    let second = node.peers.on(PeerEvent::Asked {
         peer: members[0],
         offering: Offering::Chain,
     });
 
-    let second = node.tick(AT + 1);
+    // On the answer, not on the next tick: membership is what gates a catalogue answer, so the
+    // moment they have it is the moment the second question can be put.
     assert!(
         matches!(
             second.iter().find(|a| matches!(a, PeerAction::Ask { .. })),
@@ -859,31 +1100,42 @@ fn a_settled_membership_round_does_not_write_off_the_catalogue() {
     let members = peers(1);
     let id = node.group_with(&members);
     node.add_file(id, "a.jpg");
-    node.all_up(&members);
+    node.all_online(&members);
 
     // The first round of a fresh group goes at once.
-    let first = node.tick(AT);
+    let first = node.tick_connecting(AT);
     assert_eq!(rounds(&first), members, "the chain round goes first");
 
     // Answer only the chain half, exactly as a chain exchange would.
+    let mut followed = Vec::new();
     for peer in rounds(&first) {
         node.peers.on(PeerEvent::Synced {
             peer,
             group: id,
             offering: Offering::Chain,
         });
-        node.peers.on(PeerEvent::Asked {
+        followed.extend(node.peers.on(PeerEvent::Asked {
             peer,
             offering: Offering::Chain,
-        });
+        }));
     }
 
-    // The catalogue half was never on the wire, so it is still outstanding, and follows on the
-    // next tick rather than waiting for the group's next heartbeat.
+    // The catalogue half was never on the wire, so it is still outstanding — and follows on the
+    // answer itself, rather than on a later tick or the group's next heartbeat.
     assert_eq!(
-        rounds(&node.tick(AT + 1)),
+        rounds(&followed),
         members,
         "settling the chain must not write off the catalogue"
+    );
+    assert!(
+        matches!(
+            followed.first(),
+            Some(PeerAction::Ask {
+                offering: Offering::Catalogue,
+                ..
+            })
+        ),
+        "and what follows is the catalogue: {followed:?}"
     );
 }
 
@@ -898,9 +1150,10 @@ fn a_change_made_by_the_cli_in_another_process_is_offered_once() {
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
-    node.all_up(&members);
+    node.all_online(&members);
     let (settled, _) = settle(&mut node, AT);
 
+    node.hang_up(&members);
     node.add_file(id, "new.jpg");
 
     let at = after_editing_pause(&mut node, settled + 1);
@@ -908,7 +1161,7 @@ fn a_change_made_by_the_cli_in_another_process_is_offered_once() {
     assert_eq!(rounds(&actions), members, "the change is offered");
 
     assert!(
-        rounds(&node.tick(at + 1)).is_empty(),
+        rounds(&node.tick_connecting(at + 1)).is_empty(),
         "offered once, not every tick"
     );
 }
@@ -922,10 +1175,10 @@ fn a_member_we_have_never_asked_is_due_at_once() {
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
-    node.all_up(&members);
+    node.all_online(&members);
 
     assert_eq!(
-        rounds(&node.tick(AT)),
+        rounds(&node.tick_connecting(AT)),
         members,
         "never asked, so due on the first tick"
     );
@@ -943,23 +1196,21 @@ fn a_quiet_group_waits_for_its_heartbeat() {
     let members = peers(1);
     let id = node.group_with(&members);
     node.add_file(id, "a.jpg");
-    node.all_up(&members);
+    node.all_online(&members);
 
     // Everything outstanding, dealt with.
     let (settled, _) = settle(&mut node, AT);
     assert!(
-        rounds(&node.tick(settled + 1)).is_empty(),
+        rounds(&node.tick_connecting(settled + 1)).is_empty(),
         "nothing of ours left to say"
     );
 
-    // The jitter puts the heartbeat between three quarters and one and a quarter of the
-    // interval, so these are the bounds that hold whatever the roll was.
     assert!(
-        rounds(&node.tick(settled + HEARTBEAT / 2)).is_empty(),
+        rounds(&node.tick_connecting(settled + HEARTBEAT - 1)).is_empty(),
         "still inside the interval"
     );
     assert_eq!(
-        rounds(&node.tick(settled + 2 * HEARTBEAT)),
+        rounds(&node.tick_connecting(settled + HEARTBEAT + 1)),
         members,
         "and the group comes round once it has elapsed"
     );
@@ -981,10 +1232,10 @@ fn what_we_learn_from_a_peer_is_not_re_told_to_the_group() {
     let mut node = Node::new();
     let members = peers(2);
     let id = node.group_with(&members);
-    node.all_up(&members);
+    node.all_online(&members);
     let (settled, _) = settle(&mut node, AT);
     assert!(
-        rounds(&node.tick(settled)).is_empty(),
+        rounds(&node.tick_connecting(settled)).is_empty(),
         "quiet before they tell us anything"
     );
 
@@ -998,7 +1249,7 @@ fn what_we_learn_from_a_peer_is_not_re_told_to_the_group() {
 
     // Well past the pause a change of our own would have waited out.
     let at = after_editing_pause(&mut node, settled + 1);
-    let actions = node.tick(at);
+    let actions = node.tick_connecting(at);
     assert!(
         rounds(&actions).is_empty() && dials(&actions).is_empty(),
         "the author is telling them; saying it again is a message per member per member: \
@@ -1007,10 +1258,12 @@ fn what_we_learn_from_a_peer_is_not_re_told_to_the_group() {
 
     // And it is theirs alone that is quiet. Something *we* do is still news to everybody.
     node.add_file(id, "ours.jpg");
+    node.hang_up(&members);
     let at = after_editing_pause(&mut node, at + 1);
+    let actions = node.tick_connecting(at);
     assert!(
-        !rounds(&node.tick(at)).is_empty(),
-        "what we did ourselves still goes out"
+        !rounds(&actions).is_empty() || !dials(&actions).is_empty(),
+        "what we did ourselves still goes out: {actions:?}"
     );
 }
 
@@ -1120,7 +1373,9 @@ fn the_content_pull_still_waits_for_the_registry() {
         online: Vec::new(),
     });
 
-    let actions = step(&mut node, AT, true);
+    // Raw, not `step`: completing the dial would connect them, and a live connection vouches
+    // for a peer far better than the registry ever could — which is a different claim.
+    let actions = node.tick(AT);
     assert!(
         !actions
             .iter()
@@ -1128,17 +1383,19 @@ fn the_content_pull_still_waits_for_the_registry() {
         "nothing has vouched for them, so they are not made a source: {actions:?}"
     );
 
-    // The server changes its mind. Now they are worth pulling through.
-    node.all_up(&members);
-    let mut asked = false;
+    // The server changes its mind. Now they are worth pulling through — and connecting is what
+    // does the vouching, so the question goes out as that connection reconciles.
+    let opening = node.all_up(&members);
+    let mut asked = opening
+        .iter()
+        .any(|a| matches!(a, PeerAction::AskHoldings { .. }));
     for k in 1..10 {
-        if step(&mut node, AT + k, true)
-            .iter()
-            .any(|a| matches!(a, PeerAction::AskHoldings { .. }))
-        {
-            asked = true;
+        if asked {
             break;
         }
+        asked = step(&mut node, AT + k, true)
+            .iter()
+            .any(|a| matches!(a, PeerAction::AskHoldings { .. }));
     }
     assert!(asked, "once vouched for, they are asked what they hold");
 }
@@ -1156,9 +1413,12 @@ fn a_change_reaches_every_member_not_a_sample_of_them() {
     node.all_up(&members);
     node.add_file(id, "a.jpg");
 
+    // Long enough for the pause the catalogue waits out, and then a call to each member. The
+    // calls are what deliver: a question carries nothing, so a member hears about the change by
+    // being dialled and pulling it, which is why the connections must be allowed to close first.
     let mut told = HashSet::new();
-    for k in 0..(members.len() * 2 + 4) as i64 {
-        let actions = node.tick(AT + k);
+    for k in 0..SHARE_AFTER_IDLE + (members.len() * 4 + 8) as i64 {
+        let actions = node.tick_connecting(AT + k);
         told.extend(settle_offers(&mut node, &actions, id));
     }
 
@@ -1200,7 +1460,7 @@ fn an_unsatisfiable_want_backs_off_instead_of_rotating_for_ever() {
     let mut node = Node::new();
     let members = peers(4);
     let id = node.group_with(&members);
-    node.all_up(&members);
+    node.all_online(&members);
     node.learn_file(id, "nobody-has-this.bin");
 
     let ticks = 200;
@@ -1403,7 +1663,7 @@ fn a_stranger_is_called_before_a_familiar_member() {
     let keys: Vec<Keypair> = (0..5).map(|_| Keypair::generate_ed25519()).collect();
     let members: Vec<PeerId> = keys.iter().map(|k| k.public().to_peer_id()).collect();
     let id = node.group_with(&members);
-    node.all_up(&members);
+    node.all_online(&members);
     node.add_file(id, "a.jpg");
 
     // Everyone but the last has answered, and is therefore known.
@@ -1418,50 +1678,11 @@ fn a_stranger_is_called_before_a_familiar_member() {
         .set_cursor(id, &members[4], 7)
         .unwrap();
 
-    let actions = node.tick(AT);
+    let actions = node.tick_connecting(AT);
     assert_eq!(
         rounds(&actions).first(),
         Some(&members[4]),
         "the one we have never met is called first"
-    );
-}
-
-#[test]
-fn heartbeats_do_not_line_up() {
-    // Fifty members who joined a group together would otherwise ask within seconds of each
-    // other for ever, spending the whole dial budget at once and then going silent for hours.
-    //
-    // Each node is settled first, which is what makes this measure the schedule rather than the
-    // first ask a fresh group makes immediately: after settling there is nothing left to do, so
-    // the next thing the node does is come round again and nothing else. Sampling every ten
-    // minutes over the jittered window is enough to tell the schedules apart — the ±25% spread
-    // is two hours wide — and keeps the test to a few dozen ticks per node.
-    const SAMPLE: i64 = 600;
-    let mut seen = HashSet::new();
-
-    for _ in 0..12 {
-        let mut node = Node::new();
-        let members = peers(1);
-        node.group_with(&members);
-        node.all_up(&members);
-        let (settled, _) = settle(&mut node, AT);
-
-        // The jitter puts the next ask somewhere in 0.75–1.25 × HEARTBEAT, so walk a little
-        // past the far end.
-        let last = (HEARTBEAT * 5 / 4) / SAMPLE + 2;
-        for k in 1..=last {
-            let at = settled + k * SAMPLE;
-            let actions = node.tick(at);
-            if !rounds(&actions).is_empty() || !dials(&actions).is_empty() {
-                seen.insert(k);
-                break;
-            }
-        }
-    }
-
-    assert!(
-        seen.len() > 1,
-        "every node scheduled its heartbeat in the same ten-minute window: {seen:?}"
     );
 }
 
@@ -1560,6 +1781,37 @@ fn a_busy_answer_leaves_the_connection_alone() {
         ready: false,
     });
     assert!(actions.is_empty(), "they are busy, so nothing happens");
+}
+
+#[test]
+fn a_busy_answer_is_not_re_proposed_to_on_the_next_tick() {
+    // A refusal is the one answer that says the wait will be a long one, so it is paced like
+    // silence rather than faster than it. Clearing the proposal on `ready: false` put another
+    // on the wire every tick for as long as the peer had work for us.
+    let mut node = Node::new();
+    let members = peers(1);
+    node.group_with(&members);
+    node.all_up(&members);
+
+    let (at, seen) = settle(&mut node, AT);
+    assert!(proposed_close(&seen), "drained, so a close goes out");
+
+    node.peers.on(PeerEvent::CloseAnswered {
+        peer: members[0],
+        ready: false,
+    });
+
+    let soon = step(&mut node, at + 1, false);
+    assert!(
+        !proposed_close(&soon),
+        "the proposal still stands: {soon:?}"
+    );
+
+    let later = step(&mut node, at + CLOSE_TIMEOUT + 1, false);
+    assert!(
+        proposed_close(&later),
+        "and is offered again once it has timed out, like one nobody answered: {later:?}"
+    );
 }
 
 #[test]
@@ -1841,8 +2093,9 @@ fn nobody_reachable_is_not_the_same_as_nobody_having_it() {
     let id = node.group_with(&members);
     node.learn_file(id, "wanted.bin");
 
-    // Nobody online, nobody connected.
-    step(&mut node, AT, true);
+    // Nobody online, nobody connected — so the tick is taken raw, or the heartbeat's dial would
+    // be answered and there would be somebody connected after all.
+    node.tick(AT);
     assert!(
         node.peers
             .status()
@@ -1854,13 +2107,16 @@ fn nobody_reachable_is_not_the_same_as_nobody_having_it() {
 
     // A member turns up. The group must not be sitting in a backoff it should never have
     // entered — the file is asked for straight away.
-    node.all_up(&members[..1]);
-    let mut asked = false;
+    let opening = node.all_up(&members[..1]);
+    let mut asked = opening
+        .iter()
+        .any(|a| matches!(a, PeerAction::AskHoldings { .. }));
     for at in 1..10 {
         let actions = step(&mut node, AT + at, true);
-        if actions
-            .iter()
-            .any(|a| matches!(a, PeerAction::AskHoldings { .. }))
+        if asked
+            || actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::AskHoldings { .. }))
         {
             asked = true;
             break;

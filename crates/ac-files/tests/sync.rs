@@ -651,13 +651,12 @@ fn a_round_that_had_to_read_pages_settles_when_it_runs_out() {
 // ---- this machine is catalogue-only ----
 
 #[test]
-fn a_sync_moves_no_bytes_and_leaves_the_wanted_set_alone() {
+fn a_sync_moves_no_bytes() {
     let (mut alice, mut bob) = (Node::new(), Node::new());
     let id = share_group(&mut [&mut alice, &mut bob]);
     alice.add(id, "big.bin", b"a large file", AT);
 
     let path = RelPath::parse("big.bin").unwrap();
-    bob.sync.files_mut().want(id, &path).unwrap();
 
     connect(&mut alice, &mut bob);
 
@@ -668,12 +667,6 @@ fn a_sync_moves_no_bytes_and_leaves_the_wanted_set_alone() {
     assert!(
         !bob.sync.content().locate(&dir, &path).exists(),
         "nothing here may put a file on disk"
-    );
-
-    assert_eq!(
-        bob.sync.files().wants().unwrap(),
-        vec![(id, path)],
-        "the want is left standing for the supervisor to act on"
     );
 }
 

@@ -303,7 +303,6 @@ pub fn list(paths: &Paths, needle: &str, prefix: Option<&str>, removed: bool) ->
     if rows.iter().any(|r| !r.have && !r.is_removed()) {
         println!();
         println!("`remote` means this node knows the file exists but does not hold it.");
-        println!("Fetch one with: ac file get {} <path>", s.row.id.short());
     }
     Ok(())
 }
@@ -355,51 +354,10 @@ pub fn show(paths: &Paths, needle: &str, path: &str) -> Result<()> {
 
     if !row.is_removed() && !row.have {
         println!();
-        println!("Fetch it with: ac file get {needle} {}", row.path);
     } else if !row.is_removed() && !s.content.exists(&s.dir, &row.path) {
         println!();
         println!("The bytes are missing. `ac file verify {needle}` checks the whole group.");
     }
-    Ok(())
-}
-
-/// Ask for a file's bytes.
-///
-/// Records the want and returns; it does not transfer anything itself. The running `ac run` is
-/// what has the connections, and SQLite is the only channel between the two processes — the
-/// same arrangement `ac group add` uses. So this works with no daemon running, and the fetch
-/// happens whenever one is next up and a member holding the file is reachable.
-pub fn get(paths: &Paths, needle: &str, path: &str) -> Result<()> {
-    let mut s = session(paths, needle)?;
-    let path = RelPath::parse(path).map_err(|e| anyhow!("{e}"))?;
-
-    let row = s
-        .files
-        .get(s.id, &path)
-        .context("reading the file")?
-        .ok_or_else(|| {
-            anyhow!(
-                "{path} is not in {}; `ac file list {needle}` shows what is",
-                s.row.name
-            )
-        })?;
-
-    if row.is_removed() {
-        bail!("{path} was removed from {}", s.row.name);
-    }
-    if row.have {
-        println!("{path} is already here");
-        println!("  {}", s.content.locate(&s.dir, &path).display());
-        return Ok(());
-    }
-
-    s.files.want(s.id, &path).context("recording the want")?;
-
-    println!("asked for {path} ({})", human_size(row.size));
-    println!();
-    println!("A running `ac run` fetches it from a member who holds it, which may not be");
-    println!("now — nothing here dials, and the file only moves while you are both online.");
-    println!("`ac file list {needle}` shows `local` once it has arrived.");
     Ok(())
 }
 

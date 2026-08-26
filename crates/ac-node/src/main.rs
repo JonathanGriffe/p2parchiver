@@ -139,10 +139,6 @@ enum FileCommand {
         group: String,
         path: String,
     },
-    Get {
-        group: String,
-        path: String,
-    },
     Remove {
         group: String,
         path: String,
@@ -210,7 +206,6 @@ fn main() -> Result<()> {
             removed,
         }) => cmd::file::list(&paths, &group, prefix.as_deref(), removed),
         Command::File(FileCommand::Show { group, path }) => cmd::file::show(&paths, &group, &path),
-        Command::File(FileCommand::Get { group, path }) => cmd::file::get(&paths, &group, &path),
         Command::File(FileCommand::Remove { group, path }) => {
             cmd::file::remove(&paths, &group, &path)
         }

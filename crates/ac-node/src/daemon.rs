@@ -100,7 +100,6 @@ pub async fn run(
         tracing::info!(%addr, "dialling");
     }
 
-    // Each step waits for what the previous one produces — see `ServerLink`.
     let mut link = match &config.server {
         Some(server) => {
             swarm
@@ -121,7 +120,12 @@ pub async fn run(
 
     let mut groups = GroupLink::open(paths, identity)?;
     let mut files = FileLink::open(paths, identity)?;
-    let mut peers = PeerLink::open(paths, identity, link.as_ref().map(|l| l.server))?;
+    let mut peers = PeerLink::open(
+        paths,
+        identity,
+        link.as_ref().map(|l| l.server),
+        attest::now(),
+    )?;
 
     let mut blobs = FileLink::accept_blobs(&mut swarm)?;
     let mut connectivity = Connectivity::default();

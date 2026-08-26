@@ -174,7 +174,6 @@ async fn download(
         BlobReply::Unavailable => anyhow::bail!(Refusal::Unavailable),
     };
 
-    // Bytes first, row second — `Content` enforces the ordering, this just feeds it.
     let mut sink = content.resume(&want.dir, &want.path, resume)?;
     let mut buf = vec![0u8; CHUNK];
     let mut got = 0u64;
@@ -320,10 +319,6 @@ mod tests {
 
     #[test]
     fn a_severed_transfer_is_retryable_and_a_refusal_is_not() {
-        // The supervisor denies a peer a file on a terminal failure and resumes on a
-        // retryable one, so getting this backwards is either an unbounded retry loop or a
-        // large file that gives up the first time a relay circuit fills. Neither shows up as
-        // an error — one looks like a busy node, the other like a slow one.
         let severed = anyhow::anyhow!("transfer ended early after 12 of 4096 bytes");
         assert!(!terminal(&severed), "a cut circuit is the ordinary case");
 
@@ -337,9 +332,6 @@ mod tests {
 
     #[test]
     fn a_refusal_survives_the_context_a_caller_adds() {
-        // `anyhow`'s `context` wraps rather than replaces, and `downcast_ref` walks the chain.
-        // Asserted because the alternative — matching on the rendered message — is what this
-        // type exists to avoid, and a wrapped error is exactly where that would break.
         let wrapped =
             anyhow::Error::new(Refusal::WrongContent).context("fetching photos/beach.jpg");
         assert!(terminal(&wrapped));

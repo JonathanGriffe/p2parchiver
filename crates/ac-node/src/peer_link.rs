@@ -69,7 +69,12 @@ pub struct PeerLink {
 }
 
 impl PeerLink {
-    pub fn open(paths: &Paths, identity: &Identity, server: Option<PeerId>) -> Result<Self> {
+    pub fn open(
+        paths: &Paths,
+        identity: &Identity,
+        server: Option<PeerId>,
+        at: i64,
+    ) -> Result<Self> {
         let path = paths.db_file();
         let me = identity.peer_id();
 
@@ -89,7 +94,7 @@ impl PeerLink {
             // `storage_max` is a byte count in the file, so there is nothing to parse and no
             // way for it to be malformed without `Config::load` having already refused it.
             // `None` means no ceiling beyond the free-space floor `Limits::default` carries.
-            peers: Peers::new(files, groups).with_limits(Limits {
+            peers: Peers::new(files, groups, at).with_limits(Limits {
                 storage_max: config.storage_max,
                 ..Limits::default()
             }),
@@ -304,21 +309,14 @@ impl PeerLink {
                         held,
                     })
                 }
-                // Refused, or an answer about a group we did not ask about. Either way they
-                // told us nothing, which reads the same as holding none of it — the peer is
-                // spent for this group and the rotation moves on.
-                _ => self.peers.on(PeerEvent::Holdings {
+                _ => self.peers.on(PeerEvent::HoldingsRefused {
                     peer,
                     group: query.group,
-                    held: vec![false; query.paths.len()],
-                    paths: query.paths,
                 }),
             },
-            _ => self.peers.on(PeerEvent::Holdings {
+            _ => self.peers.on(PeerEvent::HoldingsRefused {
                 peer: query.peer,
                 group: query.group,
-                held: vec![false; query.paths.len()],
-                paths: query.paths,
             }),
         };
 
@@ -725,7 +723,7 @@ mod tests {
                 // No server in these tests, so the supervisor has no relay to build a circuit
                 // through and no one to ask about presence. It does not need either: both
                 // nodes are dialled directly, and `Verified` is what marks a peer usable.
-                peers: PeerLink::open(&paths, &identity, None).unwrap(),
+                peers: PeerLink::open(&paths, &identity, None, AT).unwrap(),
                 blobs,
                 roster: Roster::default(),
                 peer: identity.peer_id(),
@@ -1020,9 +1018,6 @@ mod tests {
         let want = path.clone();
         run_until(&mut alice, &mut bob, |_, b| b.row(id, &want).is_some()).await;
 
-        // Ask for the bytes exactly as `ac file get` does: through the store.
-        bob.link.sync().files_mut().want(id, &path).unwrap();
-
         let want = path.clone();
         run_until(&mut alice, &mut bob, |_, b| {
             b.row(id, &want).is_some_and(|r| r.have)
@@ -1033,10 +1028,6 @@ mod tests {
         assert_eq!(
             bob.row(id, &path).unwrap().hash,
             alice.row(id, &path).unwrap().hash
-        );
-        assert!(
-            bob.link.sync().files().wants().unwrap().is_empty(),
-            "the want is cleared once it is satisfied"
         );
     }
 
@@ -1062,8 +1053,6 @@ mod tests {
             alice.row(id, &path).unwrap().have,
             "the index has not noticed yet"
         );
-
-        bob.link.sync().files_mut().want(id, &path).unwrap();
 
         // Long enough for many retries if the loop still exists.
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -1127,7 +1116,6 @@ mod tests {
                 true,
             )
             .unwrap();
-        carol.link.sync().files_mut().want(id, &path).unwrap();
 
         // Long enough for a transfer to have happened if it were going to.
         let deadline = Instant::now() + Duration::from_secs(6);
@@ -1155,10 +1143,6 @@ mod tests {
         // The milestone in one test, and the two halves have to be checked together: a node
         // that mirrors but never hangs up looks fine until someone counts open connections,
         // and a node that hangs up before mirroring looks fine until someone counts files.
-        //
-        // Nobody runs `ac file get` here. Bob acquires the bytes because auto-mirror wants
-        // every file in every shared group, which is what the index's missing count reports and
-        // what the holdings query then resolves to a peer that actually holds them.
         let (mut alice, mut bob) = (Node::new(), Node::new());
         let id = share_group(&mut alice, &mut bob);
         let path = alice.add(id, "photos/beach.jpg", b"a photograph nobody asked for");

@@ -115,18 +115,14 @@ impl Files {
                  cursor   INTEGER NOT NULL,
                  PRIMARY KEY (group_id, peer)
              );
-             CREATE TABLE IF NOT EXISTS file_wants (
-                 group_id TEXT NOT NULL,
-                 path     TEXT NOT NULL,
-                 PRIMARY KEY (group_id, path)
-             );
              CREATE INDEX IF NOT EXISTS files_seen ON files(group_id, seen_seq);
              CREATE TABLE IF NOT EXISTS file_state (
                  group_id    TEXT PRIMARY KEY NOT NULL,
                  digest      BLOB,
                  digest_seq  INTEGER NOT NULL DEFAULT 0,
-                 noticed_seq INTEGER NOT NULL DEFAULT 0,
-                 last_change INTEGER NOT NULL DEFAULT 0
+                 last_change INTEGER NOT NULL DEFAULT 0,
+                 changes     INTEGER NOT NULL DEFAULT 0,
+                 wanted      INTEGER NOT NULL DEFAULT 0
              );",
         )?;
 
@@ -261,6 +257,7 @@ impl Files {
         };
 
         write_row(&tx, group, row, row.have)?;
+        note_local(&tx, group, row.added_at)?;
         tx.commit()?;
         Ok(outcome)
     }
@@ -333,6 +330,9 @@ impl Files {
                 .as_ref()
                 .is_some_and(|l| l.have && l.hash == settled.hash && l.path == settled.path);
             write_row(&tx, group, &settled, have)?;
+            if !have && !settled.is_removed() {
+                note_wanted(&tx, group)?;
+            }
         }
 
         if !settled.is_removed()
@@ -489,45 +489,6 @@ impl Files {
         Ok(())
     }
 
-    pub fn want(&mut self, group: GroupId, path: &RelPath) -> Result<(), FilesError> {
-        self.db.execute(
-            "INSERT INTO file_wants (group_id, path) VALUES (?1, ?2)
-             ON CONFLICT(group_id, path) DO NOTHING",
-            params![group.to_string(), path.as_str()],
-        )?;
-        Ok(())
-    }
-
-    /// Stop wanting a file: it arrived, or it went away.
-    pub fn unwant(&mut self, group: GroupId, path: &RelPath) -> Result<(), FilesError> {
-        self.db.execute(
-            "DELETE FROM file_wants WHERE group_id = ?1 AND path = ?2",
-            params![group.to_string(), path.as_str()],
-        )?;
-        Ok(())
-    }
-
-    /// Everything asked for and not yet held.
-    pub fn wants(&self) -> Result<Vec<(GroupId, RelPath)>, FilesError> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT group_id, path FROM file_wants ORDER BY group_id, path")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (group, path) = row?;
-            match (GroupId::from_str(&group), RelPath::parse(&path)) {
-                (Ok(group), Ok(path)) => out.push((group, path)),
-                _ => tracing::warn!(%group, %path, "skipping an unreadable want"),
-            }
-        }
-        Ok(out)
-    }
-
-    /// Fingerprint of a group's whole catalogue: "are our lists identical?", nothing more.
     pub fn digest(&self, group: GroupId) -> Result<[u8; 32], FilesError> {
         let tx = self.db.unchecked_transaction()?;
 
@@ -596,38 +557,50 @@ impl Files {
         seq_in(&tx, group)
     }
 
-    /// Stamp when this group's catalogue last moved, and answer when that was.
-    pub fn note_change(&mut self, group: GroupId, at: i64) -> Result<i64, FilesError> {
-        let tx = self
+    /// What this node has changed here since the group was last told: how many, and when last.
+    pub fn local_news(&self, group: GroupId) -> Result<(u64, i64), FilesError> {
+        let row: Option<(i64, i64)> = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        let seq = seq_in(&tx, group)?;
-        let state: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT noticed_seq, last_change FROM file_state WHERE group_id = ?1",
+                "SELECT changes, last_change FROM file_state WHERE group_id = ?1",
                 params![group.to_string()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let (changes, last) = row.unwrap_or((0, 0));
+        Ok((changes.max(0) as u64, last))
+    }
 
-        let (noticed, last) = state.unwrap_or((0, 0));
-        if noticed as u64 == seq {
-            return Ok(last);
-        }
+    /// Rows this group has gained that we do not hold, since the count was last taken.
+    pub fn wanted_news(&self, group: GroupId) -> Result<u64, FilesError> {
+        let n: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT wanted FROM file_state WHERE group_id = ?1",
+                params![group.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(n.unwrap_or(0).max(0) as u64)
+    }
 
-        tx.execute(
-            "INSERT INTO file_state (group_id, noticed_seq, last_change) VALUES (?1, ?2, ?3)
-             ON CONFLICT(group_id) DO UPDATE SET
-                 noticed_seq = excluded.noticed_seq, last_change = excluded.last_change",
-            params![
-                group.to_string(),
-                i64::try_from(seq).map_err(|_| FilesError::CorruptRow)?,
-                at,
-            ],
+    /// Taken account of: the group may ask around again.
+    pub fn wanted_seen(&mut self, group: GroupId) -> Result<(), FilesError> {
+        self.db.execute(
+            "UPDATE file_state SET wanted = 0 WHERE group_id = ?1",
+            params![group.to_string()],
         )?;
-        tx.commit()?;
-        Ok(at)
+        Ok(())
+    }
+
+    /// The group has been told. Anything after this is a fresh change.
+    pub fn news_told(&mut self, group: GroupId) -> Result<(), FilesError> {
+        self.db.execute(
+            "INSERT INTO file_state (group_id, changes) VALUES (?1, 0)
+             ON CONFLICT(group_id) DO UPDATE SET changes = 0",
+            params![group.to_string()],
+        )?;
+        Ok(())
     }
 
     /// How many live rows in this group we do not hold the bytes for.
@@ -651,19 +624,28 @@ impl Files {
         Ok(total.max(0) as u64)
     }
 
-    /// The next rows worth asking a peer for, wanted ones first.
-    pub fn missing(&self, group: GroupId, limit: usize) -> Result<Vec<FileRow>, FilesError> {
+    /// Rows we do not hold, in path order, starting after `after`.
+    pub fn missing(
+        &self,
+        group: GroupId,
+        after: Option<&RelPath>,
+        limit: usize,
+    ) -> Result<Vec<FileRow>, FilesError> {
         let mut stmt = self.db.prepare(
             "SELECT f.path, f.size, f.hash, f.modified, f.added_at, f.added_by,
                     f.removed_at, f.have, f.seen_seq
              FROM files f
-             LEFT JOIN file_wants w ON w.group_id = f.group_id AND w.path = f.path
              WHERE f.group_id = ?1 AND f.have = 0 AND f.removed_at IS NULL
-             ORDER BY (w.path IS NULL), f.path
+               AND (?3 IS NULL OR f.path > ?3)
+             ORDER BY f.path
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(
-            params![group.to_string(), i64::try_from(limit).unwrap_or(i64::MAX)],
+            params![
+                group.to_string(),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+                after.map(|p| p.as_str().to_owned()),
+            ],
             row_to_file,
         )?;
 
@@ -751,6 +733,9 @@ impl Files {
                 i64::try_from(seq).map_err(|_| FilesError::CorruptRow)?,
             ],
         )?;
+        if changed > 0 {
+            note_local(&tx, group, at)?;
+        }
         tx.commit()?;
         Ok(changed > 0)
     }
@@ -760,13 +745,7 @@ impl Files {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for table in [
-            "files",
-            "file_roots",
-            "file_sync",
-            "file_wants",
-            "file_state",
-        ] {
+        for table in ["files", "file_roots", "file_sync", "file_state"] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE group_id = ?1"),
                 params![group.to_string()],
@@ -866,6 +845,28 @@ fn read_twin(
     )
     .optional()?
     .transpose()
+}
+
+/// Record that this group gained a row we do not hold.
+fn note_wanted(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<(), FilesError> {
+    tx.execute(
+        "INSERT INTO file_state (group_id, wanted) VALUES (?1, 1)
+         ON CONFLICT(group_id) DO UPDATE SET wanted = file_state.wanted + 1",
+        params![group.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Record that this node changed this group's catalogue.
+fn note_local(tx: &rusqlite::Transaction<'_>, group: GroupId, at: i64) -> Result<(), FilesError> {
+    tx.execute(
+        "INSERT INTO file_state (group_id, last_change, changes) VALUES (?1, ?2, 1)
+         ON CONFLICT(group_id) DO UPDATE SET
+             last_change = excluded.last_change,
+             changes     = file_state.changes + 1",
+        params![group.to_string(), at],
+    )?;
+    Ok(())
 }
 
 fn next_seq(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<u64, FilesError> {
@@ -1250,20 +1251,77 @@ mod tests {
     }
 
     #[test]
-    fn the_pause_is_measured_from_the_change_not_from_noticing_twice() {
+    fn the_pause_is_measured_from_the_change_not_from_reading_it_twice() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+
+        let mut edit = row(me, "a.jpg", "aa");
+        edit.added_at = 100;
+        files.record(g, &edit, false).unwrap();
+        assert_eq!(
+            files.local_news(g).unwrap(),
+            (1, 100),
+            "the edit is news, stamped when it was made"
+        );
+        assert_eq!(
+            files.local_news(g).unwrap(),
+            (1, 100),
+            "and reading it again does not push the pause forward"
+        );
+
+        let mut second = row(me, "b.jpg", "bb");
+        second.added_at = 200;
+        files.record(g, &second, false).unwrap();
+        assert_eq!(files.local_news(g).unwrap(), (2, 200), "a second edit");
+
+        files.news_told(g).unwrap();
+        assert_eq!(
+            files.local_news(g).unwrap().0,
+            0,
+            "and nothing is owed once the group has been told"
+        );
+    }
+
+    #[test]
+    fn a_row_from_a_peer_is_not_our_news() {
+        // The whole reason the writer stamps this rather than the supervisor inferring it: the
+        // group's sequence moves for a merged row exactly as it does for an edit, so telling the
+        // group about what it just told us would be one message per member per member.
+        let (mut files, _me) = store();
+        let g = group_id(1);
+        let dir = files.dir_for(g, "holiday").unwrap();
+        let content = Content::new(tempfile::tempdir().unwrap().path().to_path_buf());
+
+        let theirs = row(PeerId::random(), "theirs.jpg", "cc");
+        files.merge(g, &theirs, &content, &dir).unwrap();
+
+        assert_eq!(
+            files.local_news(g).unwrap().0,
+            0,
+            "we did not change anything; they did"
+        );
+        assert!(files.seq(g).unwrap() > 0, "though the log did move");
+    }
+
+    #[test]
+    fn a_removal_is_news_like_any_other_change() {
         let (mut files, me) = store();
         let g = group_id(1);
 
         files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        assert_eq!(files.note_change(g, 100).unwrap(), 100, "the edit is news");
-        assert_eq!(
-            files.note_change(g, 160).unwrap(),
-            100,
-            "still the same edit sixty seconds later, so the pause has sixty seconds on it"
-        );
+        files.news_told(g).unwrap();
 
-        files.record(g, &row(me, "b.jpg", "bb"), false).unwrap();
-        assert_eq!(files.note_change(g, 200).unwrap(), 200, "a second edit");
+        assert!(
+            files
+                .remove(g, &RelPath::parse("a.jpg").unwrap(), 500)
+                .unwrap(),
+            "the row was there to remove"
+        );
+        assert_eq!(
+            files.local_news(g).unwrap(),
+            (1, 500),
+            "taking a file out is a change the group has to hear about"
+        );
     }
 
     #[test]
@@ -1303,18 +1361,11 @@ mod tests {
     fn forgetting_a_group_leaves_no_work_behind() {
         let (mut files, me) = store();
         let g = group_id(1);
-        let path = RelPath::parse("a.jpg").unwrap();
-
         files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        files.want(g, &path).unwrap();
         files.set_cursor(g, &me, 42).unwrap();
 
         files.forget_group(g).unwrap();
 
-        assert!(
-            files.wants().unwrap().is_empty(),
-            "a want for a forgotten group is work nobody can ever finish"
-        );
         assert_eq!(
             files.cursor(g, &me).unwrap(),
             0,

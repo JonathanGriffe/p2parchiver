@@ -1,43 +1,12 @@
-# Run from the repository root:
-#   docker compose -f deploy/compose.yaml up -d --build
-
 services:
   ac-server:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
-
-    # Host networking, deliberately.
-    #
-    # Under Docker's default bridge the container binds an address like 172.17.0.2 — and
-    # since the server announces whatever it bound, that is the address it hands to every
-    # client as the prefix of their relay circuit. Clients would be told to reach the relay
-    # at an address that exists only inside the container. Port publishing does not help:
-    # it translates packets, not the addresses the application talks about.
-    #
-    # Host networking removes the translation entirely. The server sees the machine's real
-    # interfaces, announces addresses that are actually reachable, and QUIC's UDP flows are
-    # not rewritten in flight.
-    #
-    # If you must use bridge networking instead, publish 4001/tcp, 4001/udp and 4002/udp,
-    # and set `external` in the config to the host's real address — see README.md.
     network_mode: host
-
-    # A *named* volume rather than a bind mount, because Docker copies the image's
-    # directory ownership into a fresh named volume, so /data arrives owned by the
-    # unprivileged uid the container runs as. A bind mount would need chowning to 10001 on
-    # the host first.
     volumes:
       - ac-server-data:/data
-
-    # The identity key is the trust anchor: clients pin this server's peer id at enrolment,
-    # and losing it means every one of them must re-enrol. Back this volume up.
-    #
-    # Admin commands run against the same volume:
-    #   docker compose -f deploy/compose.yaml exec ac-server ac-server invite new --label laptop
-    #   docker compose -f deploy/compose.yaml exec ac-server ac-server client list
-
     logging:
       driver: json-file
       options:
