@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ac_groups::id::GroupId;
@@ -22,7 +22,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ANSWERS_PER_TICK: u32 = 8;
 
 /// Catalogue reads outstanding at once, across all peers and groups.
-const MAX_INFLIGHT: usize = 8;
+pub const MAX_INFLIGHT: usize = 8;
+
+/// Groups waiting for a slot. Bounded, so a peer naming more than this node can hold does
+/// not turn a queue into a memory leak.
+pub const MAX_DEFERRED: usize = 256;
 
 /// What the machine wants done. The daemon is the only thing that can do any of it.
 #[derive(Debug, Clone, PartialEq)]
@@ -100,8 +104,22 @@ pub struct FileSync {
     dirs: HashMap<GroupId, String>,
     me: PeerId,
     inflight: HashMap<GroupId, InFlight>,
+    /// Groups there was no room to read yet, oldest first. Where to read from is worked out
+    /// when the request goes out, since the cursor moves while a group waits.
+    deferred: VecDeque<(PeerId, GroupId)>,
     budget: TickBudget,
     now_at: i64,
+}
+
+/// What [`FileSync::read`] did about a page it was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// The request is going out now.
+    Started,
+    /// No room for it yet; the group is queued and read when a slot frees.
+    Queued,
+    /// Somebody is already reading this group.
+    Busy,
 }
 
 impl FileSync {
@@ -114,6 +132,7 @@ impl FileSync {
             dirs: HashMap::new(),
             me,
             inflight: HashMap::new(),
+            deferred: VecDeque::new(),
             budget: TickBudget::new(ANSWERS_PER_TICK),
             now_at: 0,
         }
@@ -196,6 +215,15 @@ impl FileSync {
     }
 
     pub fn on(&mut self, event: FileEvent, roster: &Roster) -> Vec<FileAction> {
+        let mut actions = self.dispatch(event, roster);
+
+        // Any of those can end an episode and free a slot, and the tick expires the ones
+        // nobody ended. Draining in one place keeps the queue moving whatever made room.
+        self.drain_deferred(&mut actions, roster);
+        actions
+    }
+
+    fn dispatch(&mut self, event: FileEvent, roster: &Roster) -> Vec<FileAction> {
         match event {
             FileEvent::Heads { peer, heads } => {
                 if !roster.is_ready(&peer) {
@@ -245,12 +273,19 @@ impl FileSync {
                 continue;
             }
             let ours = self.files.digest(head.group).unwrap_or([0u8; 32]);
-            let started = ours != head.digest && {
-                let after = self.files.cursor(head.group, &peer).unwrap_or(0);
-                self.read(&mut actions, peer, head.group, after, false)
-            };
+            if ours == head.digest {
+                // Nothing between us: the round is over for this group.
+                actions.push(FileAction::Settled {
+                    peer,
+                    group: head.group,
+                });
+                continue;
+            }
 
-            if !started {
+            // We differ, so there is something to read. Queued is not settled: saying it was
+            // would have this node pull content against a catalogue it knows is short.
+            let after = self.files.cursor(head.group, &peer).unwrap_or(0);
+            if self.read(&mut actions, peer, head.group, after, false) == Reading::Busy {
                 actions.push(FileAction::Settled {
                     peer,
                     group: head.group,
@@ -327,7 +362,10 @@ impl FileSync {
             tracing::info!(%group, count = applied, "learned files");
         }
 
-        if more && self.read(&mut actions, peer, group, next, retried) {
+        if more {
+            // They told us there is more. Whether it goes out now or waits for a slot, this
+            // is not a catalogue we have finished reading.
+            self.read(&mut actions, peer, group, next, retried);
             return actions;
         }
 
@@ -335,9 +373,8 @@ impl FileSync {
         let ours = self.files.digest(group).unwrap_or([0u8; 32]);
         if ours != digest && !retried {
             let _ = self.files.set_cursor(group, &peer, 0);
-            if self.read(&mut actions, peer, group, 0, true) {
-                return actions;
-            }
+            self.read(&mut actions, peer, group, 0, true);
+            return actions;
         }
 
         actions.push(FileAction::Settled { peer, group });
@@ -370,9 +407,13 @@ impl FileSync {
         group: GroupId,
         after: u64,
         retried: bool,
-    ) -> bool {
-        if self.inflight.contains_key(&group) || self.inflight.len() >= MAX_INFLIGHT {
-            return false;
+    ) -> Reading {
+        if self.inflight.contains_key(&group) {
+            return Reading::Busy;
+        }
+        if self.inflight.len() >= MAX_INFLIGHT {
+            self.defer(peer, group);
+            return Reading::Queued;
         }
         self.inflight.insert(
             group,
@@ -384,7 +425,38 @@ impl FileSync {
             },
         );
         actions.push(FileAction::FetchChanges { peer, group, after });
-        true
+        Reading::Started
+    }
+
+    /// Remember a group there was no room to read yet.
+    fn defer(&mut self, peer: PeerId, group: GroupId) {
+        if self.deferred.iter().any(|(_, g)| *g == group) {
+            return;
+        }
+        if self.deferred.len() >= MAX_DEFERRED {
+            tracing::debug!(%group, "no room to read this catalogue and none to remember it");
+            return;
+        }
+        tracing::debug!(%peer, %group, "no room to read this catalogue yet; queued");
+        self.deferred.push_back((peer, group));
+    }
+
+    /// Start whatever the freed slots have room for.
+    fn drain_deferred(&mut self, actions: &mut Vec<FileAction>, roster: &Roster) {
+        while self.inflight.len() < MAX_INFLIGHT {
+            let Some((peer, group)) = self.deferred.pop_front() else {
+                return;
+            };
+
+            // Both can have moved on while it waited: the peer may be gone, and the group
+            // may already be being read from somebody else.
+            if !roster.is_admitted(&peer) || self.inflight.contains_key(&group) {
+                continue;
+            }
+
+            let after = self.files.cursor(group, &peer).unwrap_or(0);
+            self.read(actions, peer, group, after, false);
+        }
     }
 
     fn tick(&mut self, now: Instant, at: i64, roster: &Roster) -> Vec<FileAction> {
@@ -394,6 +466,7 @@ impl FileSync {
         // Abandon episodes that can no longer finish, so the group is free to try again:
         self.inflight
             .retain(|_, f| now < f.deadline && roster.is_ready(&f.peer));
+        self.deferred.retain(|(peer, _)| roster.is_admitted(peer));
         Vec::new()
     }
 
