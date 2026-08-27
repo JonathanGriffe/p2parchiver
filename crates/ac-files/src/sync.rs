@@ -158,7 +158,7 @@ impl FileSync {
         request: ManifestRequest,
         roster: &Roster,
     ) -> (ManifestResponse, Vec<FileAction>) {
-        if !roster.is_ready(&peer) || !self.budget.spend(peer) {
+        if !roster.is_admitted(&peer) || !self.budget.spend(peer) {
             return (ManifestResponse::Unavailable, Vec::new());
         }
 

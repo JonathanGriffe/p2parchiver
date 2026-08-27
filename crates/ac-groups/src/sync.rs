@@ -110,7 +110,7 @@ impl GroupSync {
         request: GroupRequest,
         roster: &Roster,
     ) -> (GroupResponse, Vec<GroupAction>) {
-        if !roster.is_ready(&peer) || !self.budget.spend(peer) {
+        if !roster.is_admitted(&peer) || !self.budget.spend(peer) {
             return (GroupResponse::Unavailable, Vec::new());
         }
 
