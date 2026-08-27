@@ -160,6 +160,11 @@ impl PeerLink {
         }
     }
 
+    /// Whether this peer's connection is ending by agreement rather than by accident.
+    pub fn close_was_agreed(&self, peer: &PeerId) -> bool {
+        self.peers.close_was_agreed(peer)
+    }
+
     /// Wait for a transfer to end.
     pub async fn next_transfer(&mut self) -> Option<PeerEvent> {
         self.transfers.finished().await
@@ -290,6 +295,11 @@ impl PeerLink {
                 ..
             } => {
                 let ready = self.drained(&peer, files, groups, roster);
+                if ready {
+                    tracing::debug!(%peer, "they asked to hang up; agreed");
+                } else {
+                    tracing::debug!(%peer, "they asked to hang up; still busy with them");
+                }
                 let _ = swarm.behaviour_mut().app.sessions.send_response(
                     channel,
                     if ready {
@@ -298,7 +308,7 @@ impl PeerLink {
                         SessionResponse::Busy
                     },
                 );
-                self.peers.on(PeerEvent::CloseProposed { peer })
+                self.peers.on(PeerEvent::CloseProposed { peer, ready })
             }
 
             Event::Message {

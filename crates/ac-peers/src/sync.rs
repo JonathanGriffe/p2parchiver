@@ -180,6 +180,7 @@ pub enum PeerEvent {
     },
     CloseProposed {
         peer: PeerId,
+        ready: bool,
     },
     CloseAnswered {
         peer: PeerId,
@@ -271,7 +272,8 @@ struct PeerState {
     denied: HashMap<GroupId, HashSet<RelPath>>,
     asked: HashMap<GroupId, RelPath>,
     closing: Option<i64>,
-    retry_round: Option<Retry>,
+    agreed_close: Option<i64>,
+    retry_round: Option<(Offering, Retry)>,
     retry_holdings: HashMap<GroupId, Retry>,
 }
 
@@ -545,7 +547,12 @@ impl Peers {
                 actions
             }
 
-            PeerEvent::CloseProposed { peer: _ } => Vec::new(),
+            PeerEvent::CloseProposed { peer, ready } => {
+                if ready {
+                    self.peers.entry(peer).or_default().agreed_close = Some(self.now);
+                }
+                Vec::new()
+            }
 
             PeerEvent::CloseAnswered { peer, ready } => {
                 if !ready {
@@ -559,6 +566,8 @@ impl Peers {
                     .is_some();
 
                 if proposed && self.drained(peer) {
+                    tracing::debug!(%peer, "they agreed to hang up; closing");
+                    self.peers.entry(peer).or_default().agreed_close = Some(self.now);
                     return vec![PeerAction::Disconnect { peer }];
                 }
                 Vec::new()
@@ -1177,6 +1186,15 @@ impl Peers {
         Vec::new()
     }
 
+    /// Whether the last thing settled with this peer was a hang-up both sides agreed to.
+    pub fn close_was_agreed(&self, peer: &PeerId) -> bool {
+        self.peers.get(peer).is_some_and(|state| {
+            state
+                .agreed_close
+                .is_some_and(|at| self.now - at < CLOSE_TIMEOUT)
+        })
+    }
+
     pub fn status(&self) -> Status {
         let groups = self
             .groups
@@ -1450,6 +1468,7 @@ impl Peers {
         ready
             .into_iter()
             .map(|peer| {
+                tracing::debug!(%peer, "nothing left to do with them; asking to hang up");
                 self.peers.entry(peer).or_default().closing = Some(now);
                 PeerAction::ProposeClose { peer }
             })

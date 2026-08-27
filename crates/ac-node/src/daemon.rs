@@ -160,6 +160,7 @@ pub async fn run(
 
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                         let still_connected = swarm.is_connected(&peer_id);
+                        let agreed = peers.close_was_agreed(&peer_id);
                         connectivity.disconnected(peer_id, still_connected);
 
                         admission.disconnected(&mut swarm, &mut roster, peer_id, still_connected);
@@ -170,7 +171,11 @@ pub async fn run(
                         if let Some(link) = &mut link {
                             link.on_disconnected(peer_id, still_connected);
                         }
-                        tracing::info!(peer = %peer_id, cause = ?cause, "disconnected");
+                        if agreed {
+                            tracing::info!(peer = %peer_id, "hung up, as agreed");
+                        } else {
+                            tracing::info!(peer = %peer_id, cause = ?cause, "disconnected");
+                        }
                     }
 
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {

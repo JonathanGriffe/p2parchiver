@@ -2021,3 +2021,106 @@ fn a_round_owed_when_the_line_drops_goes_back_on_the_dial_list() {
         "the round is still owed, so they are called"
     );
 }
+
+#[test]
+fn both_sides_of_an_agreed_hang_up_know_it_was_agreed() {
+    // The one hung up on sees a transport error and nothing else, so unless it records that
+    // it said yes, a clean close is indistinguishable in the log from a broken connection.
+    let mut them = Node::new();
+    let caller = peers(1)[0];
+    let _ = them.group_with(&[caller]);
+    them.peers.on(PeerEvent::Verified { peer: caller });
+
+    assert!(
+        !them.peers.close_was_agreed(&caller),
+        "nothing has been agreed yet"
+    );
+
+    them.peers.on(PeerEvent::CloseProposed {
+        peer: caller,
+        ready: true,
+    });
+    assert!(
+        them.peers.close_was_agreed(&caller),
+        "having said yes, the disconnect that follows is the ordinary end of a call"
+    );
+}
+
+#[test]
+fn refusing_to_hang_up_agrees_to_nothing() {
+    let mut them = Node::new();
+    let caller = peers(1)[0];
+    let _ = them.group_with(&[caller]);
+    them.peers.on(PeerEvent::Verified { peer: caller });
+
+    them.peers.on(PeerEvent::CloseProposed {
+        peer: caller,
+        ready: false,
+    });
+    assert!(
+        !them.peers.close_was_agreed(&caller),
+        "a refusal is not an agreement, and a close after one is worth the cause"
+    );
+}
+
+#[test]
+fn the_caller_records_the_agreement_it_asked_for() {
+    let mut node = Node::new();
+    let member = peers(1)[0];
+    let _ = node.group_with(&[member]);
+    node.peers.on(PeerEvent::Verified { peer: member });
+
+    // Let the rounds `Verified` opened finish, so there is nothing outstanding left.
+    for offering in [Offering::Chain, Offering::Catalogue] {
+        node.peers.on(PeerEvent::Asked {
+            peer: member,
+            offering,
+        });
+    }
+
+    // Drained, so the tick asks to hang up.
+    let proposed = node.tick(AT + 1);
+    assert!(
+        proposed
+            .iter()
+            .any(|a| matches!(a, PeerAction::ProposeClose { peer } if *peer == member)),
+        "a peer with nothing outstanding is asked to hang up: {proposed:?}"
+    );
+
+    let answered = node.peers.on(PeerEvent::CloseAnswered {
+        peer: member,
+        ready: true,
+    });
+    assert!(
+        answered
+            .iter()
+            .any(|a| matches!(a, PeerAction::Disconnect { peer } if *peer == member)),
+        "and hung up on once they agree"
+    );
+    assert!(
+        node.peers.close_was_agreed(&member),
+        "the side that asked knows it too, so neither log calls this a failure"
+    );
+}
+
+#[test]
+fn an_agreement_that_led_to_no_close_goes_stale() {
+    let mut them = Node::new();
+    let caller = peers(1)[0];
+    let _ = them.group_with(&[caller]);
+    them.peers.on(PeerEvent::Verified { peer: caller });
+
+    them.peers.on(PeerEvent::CloseProposed {
+        peer: caller,
+        ready: true,
+    });
+    assert!(them.peers.close_was_agreed(&caller));
+
+    // They asked, we agreed, and then they never hung up. Whatever ends the connection
+    // after that is not the hang-up we agreed to, and the cause is worth printing.
+    them.tick(AT + CLOSE_TIMEOUT);
+    assert!(
+        !them.peers.close_was_agreed(&caller),
+        "an agreement nobody acted on stops speaking for later failures"
+    );
+}
