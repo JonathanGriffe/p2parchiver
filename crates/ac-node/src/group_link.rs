@@ -117,7 +117,8 @@ impl GroupLink {
                     self.awaiting.insert(peer);
                     self.sync.on(GroupEvent::Heads { peer, heads }, roster)
                 }
-                (Some(Outbound::Ask { .. }), _) => {
+                (Some(Outbound::Ask { .. }), other) => {
+                    tracing::debug!(%peer, response = ?other, "a group round was refused");
                     self.rounds.push(RoundOutcome::Failed { peer });
                     Vec::new()
                 }
@@ -145,11 +146,16 @@ impl GroupLink {
                 _ => Vec::new(),
             },
 
-            Event::OutboundFailure { request_id, .. } => match self.outbound.remove(&request_id) {
-                Some(Outbound::Fetch { peer, group }) => self
-                    .sync
-                    .on(GroupEvent::FetchFailed { peer, group }, roster),
+            Event::OutboundFailure {
+                request_id, error, ..
+            } => match self.outbound.remove(&request_id) {
+                Some(Outbound::Fetch { peer, group }) => {
+                    tracing::debug!(%peer, %group, %error, "a group fetch went unanswered");
+                    self.sync
+                        .on(GroupEvent::FetchFailed { peer, group }, roster)
+                }
                 Some(Outbound::Ask { peer }) => {
+                    tracing::debug!(%peer, %error, "a group round went unanswered");
                     self.rounds.push(RoundOutcome::Asked { peer });
                     self.rounds.push(RoundOutcome::Failed { peer });
                     self.sync.on(GroupEvent::AskFailed { peer }, roster)

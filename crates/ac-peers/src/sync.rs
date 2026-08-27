@@ -348,12 +348,7 @@ impl Peers {
 
             PeerEvent::Tick { at } => self.tick(at),
 
-            PeerEvent::Discovered { peer } => {
-                self.online.insert(peer);
-
-                self.owe_invitation(peer);
-                Vec::new()
-            }
+            PeerEvent::Discovered { .. } => Vec::new(),
 
             PeerEvent::Presence { asked, online } => {
                 let up: HashSet<PeerId> = online.into_iter().collect();

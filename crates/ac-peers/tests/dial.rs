@@ -1119,7 +1119,7 @@ fn what_we_learn_from_a_peer_is_not_re_told_to_the_group() {
 }
 
 #[test]
-fn a_member_added_a_moment_ago_is_called_as_soon_as_they_are_seen() {
+fn a_member_added_a_moment_ago_is_called_once_the_server_says_they_are_up() {
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
@@ -1140,8 +1140,17 @@ fn a_member_added_a_moment_ago_is_called_as_soon_as_they_are_seen() {
         "adding them is not by itself a reason to call"
     );
 
-    // Now the registry mentions them, which is all it takes.
     node.peers.on(PeerEvent::Discovered { peer: newcomer });
+    assert!(
+        !dials(&answered(&mut node, settled + 2, id)).contains(&newcomer),
+        "being listed in the registry is a claim, not a pulse"
+    );
+
+    // The server saying it has them connected is.
+    node.peers.on(PeerEvent::Presence {
+        asked: vec![newcomer],
+        online: vec![newcomer],
+    });
     let mut called = None;
     for k in 2..8 {
         let actions = answered(&mut node, settled + k, id);
