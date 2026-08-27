@@ -695,6 +695,7 @@ mod tests {
             server: None,
             storage_root: None,
             storage_max: None,
+            bandwidth_max: None,
         }
     }
 

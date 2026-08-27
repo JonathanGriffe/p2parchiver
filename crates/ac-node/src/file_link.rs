@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -16,8 +17,11 @@ use ac_files::wire::{ManifestRequest, ManifestResponse, holds};
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
 
+use tokio::sync::Semaphore;
+
 use crate::blob;
 use crate::daemon::ClientSwarm;
+use crate::throttle::Throttle;
 
 /// What we asked a peer, kept so a bare reply can be matched back to it.
 enum Outbound {
@@ -56,6 +60,8 @@ pub struct FileLink {
     outbound: HashMap<request_response::OutboundRequestId, (PeerId, Outbound)>,
     rounds: Vec<RoundOutcome>,
     db: std::path::PathBuf,
+    up: Arc<Throttle>,
+    serving: Arc<Semaphore>,
 }
 
 /// How long a partial must sit untouched before a sweep will remove it.
@@ -99,6 +105,11 @@ impl FileLink {
             outbound: HashMap::new(),
             rounds: Vec::new(),
             db: path,
+            up: Arc::new(Throttle::from_config(
+                config.bandwidth_max,
+                blob::THROTTLE_BURST,
+            )),
+            serving: Arc::new(Semaphore::new(blob::MAX_SERVING)),
         })
     }
 
@@ -306,6 +317,8 @@ impl FileLink {
             self.sync.me(),
             peer,
             stream,
+            self.up.clone(),
+            self.serving.clone(),
         );
     }
 

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ac_files::content::Content;
 use ac_files::path::RelPath;
@@ -9,6 +10,9 @@ use ac_files::wire::{BLOB_PROTOCOL, BlobReply, BlobRequest};
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
 use ac_peers::sync::PeerEvent;
+use tokio::sync::Semaphore;
+
+use crate::throttle::Throttle;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{PeerId, StreamProtocol};
 use std::io::Read as _;
@@ -18,7 +22,15 @@ const CHUNK: usize = 64 * 1024;
 
 const MAX_HEADER_BYTES: usize = 4096;
 
+/// Transfers this node will pull at once, across every peer.
 const MAX_CONCURRENT: usize = 8;
+
+/// Transfers this node will serve at once, across every peer.
+pub const MAX_SERVING: usize = 64;
+
+/// Burst for the transfer rate limits: a second of allowance, floored so a whole chunk is
+/// always spendable.
+pub const THROTTLE_BURST: u64 = (2 * CHUNK) as u64;
 
 pub struct Wanted {
     pub peer: PeerId,
@@ -32,6 +44,7 @@ pub struct Wanted {
 pub enum Refusal {
     Unavailable,
     WrongContent,
+    Overlong,
 }
 
 impl std::fmt::Display for Refusal {
@@ -41,11 +54,17 @@ impl std::fmt::Display for Refusal {
             Refusal::WrongContent => {
                 write!(f, "the content did not match the hash it was asked for")
             }
+            Refusal::Overlong => write!(f, "the peer sent more than the size it announced"),
         }
     }
 }
 
 impl std::error::Error for Refusal {}
+
+/// Whether taking `n` more bytes would carry the transfer past what the sender announced.
+fn overruns(got: u64, n: usize, expected: u64) -> bool {
+    got.saturating_add(n as u64) > expected
+}
 
 fn terminal(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Refusal>().is_some()
@@ -58,10 +77,11 @@ pub struct Transfers {
     running: HashMap<PeerId, usize>,
     db: PathBuf,
     me: PeerId,
+    down: Arc<Throttle>,
 }
 
 impl Transfers {
-    pub fn new(db: PathBuf, me: PeerId) -> Self {
+    pub fn new(db: PathBuf, me: PeerId, bandwidth_max: Option<u64>) -> Self {
         let (outcomes, inbox) = mpsc::unbounded_channel();
         Self {
             outcomes,
@@ -69,6 +89,7 @@ impl Transfers {
             running: HashMap::new(),
             db,
             me,
+            down: Arc::new(Throttle::from_config(bandwidth_max, THROTTLE_BURST)),
         }
     }
 
@@ -130,11 +151,12 @@ impl Transfers {
         let outcomes = self.outcomes.clone();
         let db = self.db.clone();
         let me = self.me;
+        let down = self.down.clone();
         tokio::spawn(async move {
             let peer = want.peer;
             let group = want.group;
             let path = want.path.clone();
-            let event = match download(control, &content, &want, &db, me).await {
+            let event = match download(control, &content, &want, &db, me, &down).await {
                 Ok(()) => PeerEvent::BlobDone { peer, group, path },
                 Err(why) => PeerEvent::BlobFailed {
                     peer,
@@ -157,6 +179,7 @@ async fn download(
     want: &Wanted,
     db: &std::path::Path,
     me: PeerId,
+    down: &Throttle,
 ) -> anyhow::Result<()> {
     let mut hash = [0u8; 32];
     hex::decode_to_slice(&want.hash, &mut hash)?;
@@ -190,6 +213,14 @@ async fn download(
         if n == 0 {
             break;
         }
+
+        if overruns(got, n, expected) {
+            sink.park()?;
+            anyhow::bail!(Refusal::Overlong);
+        }
+
+        down.consume(n).await;
+
         sink.write(&buf[..n])?;
         got += n as u64;
     }
@@ -218,9 +249,22 @@ pub fn serve(
     me: PeerId,
     peer: PeerId,
     stream: libp2p::swarm::Stream,
+    up: Arc<Throttle>,
+    slots: Arc<Semaphore>,
 ) {
+    let Ok(slot) = slots.try_acquire_owned() else {
+        tracing::warn!(%peer, limit = MAX_SERVING, "already serving all we can; refusing");
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let _ = write_frame(&mut stream, &BlobReply::Unavailable).await;
+            let _ = stream.close().await;
+        });
+        return;
+    };
+
     tokio::spawn(async move {
-        if let Err(e) = answer(db, content, me, peer, stream).await {
+        let _slot = slot;
+        if let Err(e) = answer(db, content, me, peer, stream, &up).await {
             tracing::debug!(%peer, error = %e, "a blob request went unanswered");
         }
     });
@@ -232,6 +276,7 @@ async fn answer(
     me: PeerId,
     peer: PeerId,
     mut stream: libp2p::swarm::Stream,
+    up: &Throttle,
 ) -> anyhow::Result<()> {
     let request: BlobRequest = read_frame(&mut stream, MAX_HEADER_BYTES).await?;
     let path = RelPath::parse(&request.path).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -281,6 +326,7 @@ async fn answer(
         if n == 0 {
             break;
         }
+        up.consume(n).await;
         stream.write_all(&buf[..n]).await?;
     }
     stream.close().await?;
@@ -324,11 +370,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_transfer_may_take_exactly_what_was_announced_and_not_a_byte_more() {
+        // Exactly the announced size is the ordinary end of every honest transfer.
+        assert!(!overruns(0, 1000, 1000));
+        assert!(!overruns(936, 64, 1000));
+
+        // One byte past it is not, however small the overrun.
+        assert!(overruns(936, 65, 1000));
+        assert!(overruns(1000, 1, 1000));
+
+        // A sender that keeps going cannot wrap the counter into looking acceptable.
+        assert!(overruns(u64::MAX - 1, usize::MAX, 1000));
+    }
+
+    #[test]
+    fn nothing_is_announced_means_nothing_may_arrive() {
+        assert!(!overruns(0, 0, 0));
+        assert!(overruns(0, 1, 0));
+    }
+
+    #[test]
     fn a_severed_transfer_is_retryable_and_a_refusal_is_not() {
         let severed = anyhow::anyhow!("transfer ended early after 12 of 4096 bytes");
         assert!(!terminal(&severed), "a cut circuit is the ordinary case");
 
-        for refusal in [Refusal::Unavailable, Refusal::WrongContent] {
+        for refusal in [
+            Refusal::Unavailable,
+            Refusal::WrongContent,
+            Refusal::Overlong,
+        ] {
             assert!(
                 terminal(&anyhow::Error::new(refusal)),
                 "{refusal:?} cannot be fixed by asking again"

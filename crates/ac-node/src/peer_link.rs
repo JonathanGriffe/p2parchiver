@@ -76,7 +76,7 @@ impl PeerLink {
                 storage_max: config.storage_max,
                 ..Limits::default()
             }),
-            transfers: Transfers::new(path.clone(), me),
+            transfers: Transfers::new(path.clone(), me, config.bandwidth_max),
             proposals: HashMap::new(),
             presence: HashMap::new(),
             server,
@@ -584,6 +584,7 @@ mod tests {
                 server: None,
                 storage_root: None,
                 storage_max: None,
+                bandwidth_max: None,
             };
 
             let mut swarm = build(&identity, &config, Role::Client, AcceptAnyPeer, app()).unwrap();
