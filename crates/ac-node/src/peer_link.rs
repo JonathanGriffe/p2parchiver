@@ -21,6 +21,23 @@ use crate::file_link::{FileLink, RoundOutcome};
 use crate::group_link::GroupLink;
 use crate::status::Published;
 
+/// Candidate direct addresses kept per peer
+const MAX_DIRECT_ADDRS: usize = 8;
+
+/// Whether an address is worth ever dialling.
+fn dialable(addr: &Multiaddr) -> bool {
+    if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        // The relay path is the fallback, never a "direct" candidate.
+        return false;
+    }
+
+    !addr.iter().any(|p| match p {
+        Protocol::Ip4(ip) => ip.octets()[0] == 172 && (16..32).contains(&ip.octets()[1]),
+        Protocol::Ip6(ip) => (ip.segments()[0] & 0xffc0) == 0xfe80,
+        _ => false,
+    })
+}
+
 pub struct PeerLink {
     peers: Peers,
     transfers: Transfers,
@@ -28,7 +45,7 @@ pub struct PeerLink {
     presence: HashMap<request_response::OutboundRequestId, Vec<PeerId>>,
     server: Option<PeerId>,
     relay: Option<Multiaddr>,
-    direct: HashMap<PeerId, Multiaddr>,
+    direct: HashMap<PeerId, Vec<Multiaddr>>,
     content: Content,
     root: std::path::PathBuf,
     status: Published,
@@ -95,12 +112,16 @@ impl PeerLink {
         swarm: &mut ClientSwarm,
         roster: &Roster,
     ) {
-        if let Some(addr) = addresses
-            .iter()
-            .find(|a| !a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
-        {
-            self.direct.insert(peer, addr.clone());
+        let known = self.direct.entry(peer).or_default();
+        for addr in addresses.iter().filter(|a| dialable(a)) {
+            // Appended, not promoted: the head is whatever last worked, and letting a newly
+            // heard address take its place is how one dead record used to displace a live
+            // one for good.
+            if !known.contains(addr) && known.len() < MAX_DIRECT_ADDRS {
+                known.push(addr.clone());
+            }
         }
+
         let actions = self.peers.on(PeerEvent::Discovered { peer });
         self.dispatch(swarm, files, groups, roster, actions);
     }
@@ -125,8 +146,18 @@ impl PeerLink {
         roster: &Roster,
         peer: PeerId,
     ) {
+        self.demote(&peer);
         let actions = self.peers.on(PeerEvent::DialFailed { peer });
         self.dispatch(swarm, files, groups, roster, actions);
+    }
+
+    /// The address we just tried did not work, so try a different one next time.
+    fn demote(&mut self, peer: &PeerId) {
+        if let Some(known) = self.direct.get_mut(peer)
+            && known.len() > 1
+        {
+            known.rotate_left(1);
+        }
     }
 
     /// Wait for a transfer to end.
@@ -481,7 +512,7 @@ impl PeerLink {
 
     /// Where to dial this peer.
     fn address_of(&self, peer: &PeerId) -> Option<Multiaddr> {
-        if let Some(addr) = self.direct.get(peer) {
+        if let Some(addr) = self.direct.get(peer).and_then(|known| known.first()) {
             return Some(addr.clone());
         }
         Some(
@@ -824,6 +855,65 @@ mod tests {
             .author_standing(&member_key, id, Position::In, AT)
             .unwrap();
         id
+    }
+
+    #[test]
+    fn an_address_nobody_else_can_route_to_is_not_a_candidate() {
+        let yes: Multiaddr = "/ip4/192.168.1.140/tcp/4001".parse().unwrap();
+        let lan: Multiaddr = "/ip4/10.0.0.9/udp/4001/quic-v1".parse().unwrap();
+        assert!(dialable(&yes));
+        assert!(dialable(&lan));
+
+        for junk in [
+            "/ip4/172.17.0.1/tcp/4001", // docker0
+            "/ip4/172.19.0.1/tcp/4001", // a user-defined bridge
+            "/ip4/172.31.0.1/tcp/4001", // the top of the pool
+            "/ip6/fe80::1/tcp/4001",    // link-local, no zone survives a multiaddr
+        ] {
+            assert!(
+                !dialable(&junk.parse().unwrap()),
+                "{junk} should be refused"
+            );
+        }
+
+        // 172.15 and 172.32 are outside the pool and stay dialable.
+        assert!(dialable(&"/ip4/172.15.0.1/tcp/4001".parse().unwrap()));
+        assert!(dialable(&"/ip4/172.32.0.1/tcp/4001".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_dial_moves_on_rather_than_retrying_the_same_address() {
+        let mut n = Node::new();
+        let them = PeerId::random();
+        let first: Multiaddr = "/ip4/192.168.1.5/tcp/4001".parse().unwrap();
+        let second: Multiaddr = "/ip4/10.0.0.9/tcp/4001".parse().unwrap();
+
+        // Discovery hands them over one at a time, which is how the last one heard used to
+        // become the only one tried.
+        for addr in [&first, &second] {
+            n.peers.discovered(
+                them,
+                std::slice::from_ref(addr),
+                &mut n.link,
+                &mut n.groups,
+                &mut n.swarm,
+                &n.roster,
+            );
+        }
+
+        assert_eq!(n.peers.address_of(&them), Some(first.clone()));
+        n.peers.demote(&them);
+        assert_eq!(
+            n.peers.address_of(&them),
+            Some(second),
+            "a dial that failed gives the next candidate a turn"
+        );
+        n.peers.demote(&them);
+        assert_eq!(
+            n.peers.address_of(&them),
+            Some(first),
+            "and they come round again rather than running out"
+        );
     }
 
     #[tokio::test]
