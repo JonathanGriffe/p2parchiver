@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -26,6 +26,7 @@ pub struct GroupLink {
     sync: GroupSync,
     outbound: HashMap<request_response::OutboundRequestId, Outbound>,
     rounds: Vec<RoundOutcome>,
+    awaiting: HashSet<PeerId>,
 }
 
 impl GroupLink {
@@ -38,6 +39,7 @@ impl GroupLink {
             sync: GroupSync::new(store, identity.keypair().clone()),
             outbound: HashMap::new(),
             rounds: Vec::new(),
+            awaiting: HashSet::new(),
         })
     }
 
@@ -73,6 +75,7 @@ impl GroupLink {
     ) {
         let actions = self.sync.on(GroupEvent::Tick { now, at }, roster);
         self.dispatch(swarm, actions);
+        self.settle_rounds();
     }
 
     pub fn on_event(
@@ -111,12 +114,12 @@ impl GroupLink {
                 ..
             } => match (self.outbound.remove(&request_id), response) {
                 (Some(Outbound::Ask { .. }), GroupResponse::Heads(heads)) => {
-                    self.rounds.push(RoundOutcome::Asked { peer });
+                    self.awaiting.insert(peer);
                     self.sync.on(GroupEvent::Heads { peer, heads }, roster)
                 }
                 (Some(Outbound::Ask { .. }), _) => {
                     self.rounds.push(RoundOutcome::Failed { peer });
-                    return;
+                    Vec::new()
                 }
                 (
                     Some(Outbound::Fetch { group, .. }),
@@ -139,7 +142,7 @@ impl GroupLink {
                 (Some(Outbound::Fetch { group, .. }), GroupResponse::Unavailable) => self
                     .sync
                     .on(GroupEvent::Unavailable { peer, group }, roster),
-                _ => return,
+                _ => Vec::new(),
             },
 
             Event::OutboundFailure { request_id, .. } => match self.outbound.remove(&request_id) {
@@ -162,6 +165,22 @@ impl GroupLink {
         };
 
         self.dispatch(swarm, actions);
+        self.settle_rounds();
+    }
+
+    /// Finish the rounds whose last outstanding request has come back.
+    fn settle_rounds(&mut self) {
+        let done: Vec<PeerId> = self
+            .awaiting
+            .iter()
+            .copied()
+            .filter(|peer| !self.busy_with(peer))
+            .collect();
+
+        for peer in done {
+            self.awaiting.remove(&peer);
+            self.rounds.push(RoundOutcome::Asked { peer });
+        }
     }
 
     /// Perform what the group layer asked for
@@ -397,6 +416,37 @@ mod tests {
                 .unwrap()
                 .contains(&bob.peer),
             "and the fold that arrived over the wire names them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_round_is_not_finished_until_its_fetches_are() {
+        let mut alice = Node::new();
+        let mut bob = Node::new();
+        let id = group_with(&mut alice, &bob, 0);
+
+        let _ = connect(&mut alice, &mut bob).await;
+
+        let mut announced_early = false;
+        run_until(&mut alice, &mut bob, |_, b| {
+            let has_group = b.link.sync.store().get(id).ok().flatten().is_some();
+            let announced = b
+                .link
+                .rounds
+                .iter()
+                .any(|r| matches!(r, RoundOutcome::Asked { .. }));
+            announced_early |= announced && !has_group;
+            has_group
+        })
+        .await;
+
+        assert!(
+            !announced_early,
+            "the chain round called itself finished while its fetch was still in flight"
+        );
+        assert!(
+            !bob.link.busy_with(&alice.peer),
+            "and by the time it is finished, nothing is outstanding"
         );
     }
 

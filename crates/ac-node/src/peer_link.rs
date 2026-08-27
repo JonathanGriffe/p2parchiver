@@ -402,6 +402,7 @@ impl PeerLink {
 
                 PeerAction::Ask { peer, offering } => {
                     if groups.busy_with(&peer) {
+                        tracing::debug!(%peer, ?offering, "ask deferred; a chain exchange is still outstanding");
                         let actions = self.peers.on(PeerEvent::AskDeferred { peer });
                         self.dispatch(swarm, files, groups, roster, actions);
                         continue;
