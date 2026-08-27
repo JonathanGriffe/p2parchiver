@@ -214,7 +214,6 @@ impl FileLink {
                         self.sync.on(FileEvent::Heads { peer, heads }, roster)
                     }
                     (Outbound::Ask, _) => {
-                        self.rounds.push(RoundOutcome::Asked { peer });
                         self.rounds.push(RoundOutcome::Failed { peer });
                         return;
                     }
@@ -271,9 +270,14 @@ impl FileLink {
                 peer, request_id, ..
             } => {
                 let group = match self.outbound.remove(&request_id) {
-                    Some((_, Outbound::Changes { group, .. })) => Some(group),
+                    Some((_, Outbound::Changes { group, .. })) => {
+                        // A page that never came back leaves the catalogue half read. Saying
+                        // so puts the whole round on the retry, rather than reporting it
+                        // settled and pulling content against a list we know is short.
+                        self.rounds.push(RoundOutcome::Failed { peer });
+                        Some(group)
+                    }
                     Some((_, Outbound::Ask)) => {
-                        self.rounds.push(RoundOutcome::Asked { peer });
                         self.rounds.push(RoundOutcome::Failed { peer });
                         None
                     }

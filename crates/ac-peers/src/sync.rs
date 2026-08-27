@@ -52,6 +52,12 @@ pub const DIAL_WINDOW: i64 = 60;
 /// How long a question may be outstanding before it is written off.
 pub const ROUND_TIMEOUT: i64 = 60;
 
+/// How long to wait before asking again after a round was refused or deferred.
+pub const RETRY_AFTER: i64 = 5;
+
+/// How many times one round is retried before it is left to the next connection.
+pub const RETRY_ATTEMPTS: u8 = 2;
+
 /// Free space this node will not eat into, whatever the configured budget says.
 pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -265,6 +271,17 @@ struct PeerState {
     denied: HashMap<GroupId, HashSet<RelPath>>,
     asked: HashMap<GroupId, RelPath>,
     closing: Option<i64>,
+    retry_round: Option<Retry>,
+    retry_holdings: HashMap<GroupId, Retry>,
+}
+
+/// A question waiting to be put again.
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    /// When to put it, or `None` once it has been put and the answer is outstanding.
+    at: Option<i64>,
+    /// Goes remaining after the one now scheduled.
+    left: u8,
 }
 
 pub struct Peers {
@@ -387,6 +404,17 @@ impl Peers {
                 self.reconciled.retain(|(p, _)| *p != peer);
                 self.dialing.remove(&peer);
                 self.connected.remove(&peer);
+
+                // A round still owed when the line drops goes back on the dial list. Failing
+                // one takes a peer off it, on the grounds that the retry will see to them —
+                // which stops being true the moment the connection they were on has gone.
+                if self
+                    .peers
+                    .get(&peer)
+                    .is_some_and(|s| s.retry_round.is_some() || !s.retry_holdings.is_empty())
+                {
+                    self.pending.insert(peer);
+                }
                 self.peers.remove(&peer);
                 self.started.remove(&peer);
                 self.queued.remove(&peer);
@@ -433,6 +461,9 @@ impl Peers {
 
             PeerEvent::Asked { peer, offering } => {
                 self.started.remove(&peer);
+                if let Some(state) = self.peers.get_mut(&peer) {
+                    state.retry_round = None;
+                }
                 match offering {
                     Offering::Chain if self.connected.contains(&peer) => {
                         vec![self.ask(peer, Offering::Catalogue)]
@@ -446,12 +477,12 @@ impl Peers {
             }
 
             PeerEvent::AskDeferred { peer } => {
-                self.started.remove(&peer);
+                self.arm_retry(peer);
                 Vec::new()
             }
 
             PeerEvent::AskFailed { peer } => {
-                self.started.remove(&peer);
+                self.arm_retry(peer);
                 Vec::new()
             }
 
@@ -462,7 +493,7 @@ impl Peers {
                 held,
             } => self.on_holdings(peer, group, paths, held),
 
-            PeerEvent::HoldingsRefused { peer, group } => self.release_source(peer, group),
+            PeerEvent::HoldingsRefused { peer, group } => self.arm_holdings_retry(peer, group),
 
             PeerEvent::BlobDone { peer, group, path } => {
                 if let Some(state) = self.peers.get_mut(&peer) {
@@ -584,6 +615,7 @@ impl Peers {
             }
         }
 
+        actions.extend(self.retries(at));
         actions.extend(self.closes());
         actions
     }
@@ -969,6 +1001,12 @@ impl Peers {
             .cloned()
             .unwrap_or_default();
 
+        // They answered, so the run of refusals is over and the count starts again if it
+        // ever happens once more.
+        if let Some(state) = self.peers.get_mut(&peer) {
+            state.retry_holdings.remove(&group);
+        }
+
         let wanted: Vec<RelPath> = paths
             .into_iter()
             .enumerate()
@@ -1272,6 +1310,130 @@ impl Peers {
                     && self.members_of(row.id).contains(peer)
                     && self.files.missing_count(row.id).unwrap_or(0) > 0
             })
+    }
+
+    /// A round did not come off. Put it back on the list, unless it has had its goes.
+    fn arm_retry(&mut self, peer: PeerId) {
+        let Some(flight) = self.started.remove(&peer) else {
+            return;
+        };
+
+        if !self.connected.contains(&peer) {
+            return;
+        }
+
+        let left = match self.peers.get(&peer).and_then(|s| s.retry_round) {
+            // A retry that failed in turn: same round, one fewer go.
+            Some((offering, retry)) if offering == flight.offering => retry.left,
+            _ => RETRY_ATTEMPTS,
+        };
+
+        let at = Some(self.now + RETRY_AFTER);
+        let next = left.checked_sub(1);
+        self.peers.entry(peer).or_default().retry_round =
+            next.map(|left| (flight.offering, Retry { at, left }));
+
+        if next.is_none() {
+            // Out of goes. Off the dial list too, or the connection ending turns straight
+            // into a call back to try the same thing again. Presence, or a change to a group
+            // they are in, puts them on it again when there is a reason to.
+            self.pending.remove(&peer);
+        }
+    }
+
+    /// A holdings query was refused. Ask again shortly, and when the goes run out take this
+    /// peer out of the running for the group.
+    ///
+    /// Marking them spent is the point: a refusal used only to release the source, and
+    /// nothing else ever marks a refusing peer, so the rotation between members and the
+    /// backoff behind it were unreachable and the query repeated for as long as the
+    /// connection lasted.
+    fn arm_holdings_retry(&mut self, peer: PeerId, group: GroupId) -> Vec<PeerAction> {
+        self.drop_queued(peer, group);
+
+        let left = self
+            .peers
+            .get(&peer)
+            .and_then(|s| s.retry_holdings.get(&group))
+            .map_or(RETRY_ATTEMPTS, |retry| retry.left);
+
+        let Some(left) = left.checked_sub(1) else {
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.retry_holdings.remove(&group);
+            }
+            tracing::debug!(%peer, %group, "holdings refused too often; trying another member");
+            return self.spend_peer(peer, group);
+        };
+
+        // The source stays this peer for now, so nothing else claims the group while the
+        // question is still being put to them.
+        let at = Some(self.now + RETRY_AFTER);
+        self.peers
+            .entry(peer)
+            .or_default()
+            .retry_holdings
+            .insert(group, Retry { at, left });
+        Vec::new()
+    }
+
+    /// Ask again for the rounds whose wait is up.
+    fn retries(&mut self, at: i64) -> Vec<PeerAction> {
+        let rounds: Vec<(PeerId, Offering)> = self
+            .peers
+            .iter()
+            .filter_map(|(peer, state)| {
+                let (offering, retry) = state.retry_round?;
+                (retry.at.is_some_and(|due| at >= due)
+                    && self.connected.contains(peer)
+                    && !self.started.contains_key(peer))
+                .then_some((*peer, offering))
+            })
+            .collect();
+
+        let mut holdings: Vec<(PeerId, GroupId)> = Vec::new();
+        for (peer, state) in &self.peers {
+            if !self.connected.contains(peer) {
+                continue;
+            }
+            for (group, retry) in &state.retry_holdings {
+                if retry.at.is_some_and(|due| at >= due) {
+                    holdings.push((*peer, *group));
+                }
+            }
+        }
+
+        let mut actions = Vec::new();
+        for (peer, offering) in rounds {
+            tracing::debug!(%peer, ?offering, "asking again after a round did not come off");
+            self.disarm_round(peer);
+            actions.push(self.ask(peer, offering));
+        }
+        for (peer, group) in holdings {
+            tracing::debug!(%peer, %group, "asking again what they hold");
+            self.disarm_holdings(peer, group);
+            actions.extend(self.ask_holdings(peer, group));
+        }
+        actions
+    }
+
+    /// The question has gone back out, so stop counting down to sending it: the next answer,
+    /// or the next failure, decides what happens after this.
+    fn disarm_round(&mut self, peer: PeerId) {
+        if let Some(state) = self.peers.get_mut(&peer)
+            && let Some((_, retry)) = state.retry_round.as_mut()
+        {
+            retry.at = None;
+        }
+    }
+
+    fn disarm_holdings(&mut self, peer: PeerId, group: GroupId) {
+        if let Some(retry) = self
+            .peers
+            .get_mut(&peer)
+            .and_then(|s| s.retry_holdings.get_mut(&group))
+        {
+            retry.at = None;
+        }
     }
 
     fn closes(&mut self) -> Vec<PeerAction> {

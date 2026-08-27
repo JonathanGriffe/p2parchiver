@@ -831,7 +831,7 @@ fn an_unsolicited_page_is_ignored() {
 }
 
 #[test]
-fn a_refused_reading_still_reports_the_round_as_over() {
+fn a_refusal_ends_the_round_and_a_failure_does_not() {
     let (mut alice, mut bob) = (Node::new(), Node::new());
     let id = share_group(&mut [&mut alice, &mut bob]);
     connect(&mut alice, &mut bob);
@@ -847,15 +847,18 @@ fn a_refused_reading_still_reports_the_round_as_over() {
         "a refusal ends the round: {refused:?}"
     );
 
+    // A request that never arrived is a different thing entirely. Nobody said there was
+    // nothing more to read, so claiming the round settled would have this node pulling
+    // content against a catalogue it knows it only half read.
     let failed = alice.sync_on(FileEvent::RequestFailed {
         peer: bob.peer(),
         group: Some(id),
     });
     assert!(
-        failed
+        !failed
             .iter()
             .any(|a| matches!(a, FileAction::Settled { group, .. } if *group == id)),
-        "and so does a request that never arrived: {failed:?}"
+        "a page that never came back settles nothing: {failed:?}"
     );
 }
 

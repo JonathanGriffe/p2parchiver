@@ -151,12 +151,16 @@ impl GroupLink {
             } => match self.outbound.remove(&request_id) {
                 Some(Outbound::Fetch { peer, group }) => {
                     tracing::debug!(%peer, %group, %error, "a group fetch went unanswered");
+                    // The round was waiting on this. Without saying so it would settle the
+                    // moment nothing was outstanding and report itself finished, when what
+                    // actually happened is that the chain stopped arriving part way.
+                    self.awaiting.remove(&peer);
+                    self.rounds.push(RoundOutcome::Failed { peer });
                     self.sync
                         .on(GroupEvent::FetchFailed { peer, group }, roster)
                 }
                 Some(Outbound::Ask { peer }) => {
                     tracing::debug!(%peer, %error, "a group round went unanswered");
-                    self.rounds.push(RoundOutcome::Asked { peer });
                     self.rounds.push(RoundOutcome::Failed { peer });
                     self.sync.on(GroupEvent::AskFailed { peer }, roster)
                 }

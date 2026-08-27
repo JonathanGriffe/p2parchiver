@@ -224,8 +224,11 @@ impl FileSync {
                 let Some(group) = group else {
                     return Vec::new();
                 };
+                // Not `Settled`: settled means there is nothing further to read from them,
+                // and a request that failed says nothing of the sort. The link reports the
+                // failure to the supervisor, which is what puts the round back on.
                 self.finish(group, peer);
-                vec![FileAction::Settled { peer, group }]
+                Vec::new()
             }
 
             FileEvent::Tick { now, at } => self.tick(now, at, roster),

@@ -14,7 +14,7 @@ use ac_net::identity::Keypair;
 use ac_peers::sync::{
     CLOSE_TIMEOUT, DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_ROUND, DIALS_PER_WINDOW, HEARTBEAT,
     Limits, MAX_TRANSFERS, MIN_BACKOFF, NoRoom, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent,
-    Peers, ROUND_TIMEOUT, SHARE_AFTER_IDLE,
+    Peers, RETRY_AFTER, RETRY_ATTEMPTS, ROUND_TIMEOUT, SHARE_AFTER_IDLE,
 };
 use tempfile::TempDir;
 
@@ -1901,4 +1901,123 @@ fn nobody_reachable_is_not_the_same_as_nobody_having_it() {
         }
     }
     assert!(asked, "the first reachable member is asked at once");
+}
+
+/// The offerings put to `want` by these actions.
+fn asks_of(actions: &[PeerAction], want: PeerId) -> Vec<Offering> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            PeerAction::Ask { peer, offering } if *peer == want => Some(*offering),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_round_that_did_not_come_off_is_put_again() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+
+    // Verified opens a chain round; the link then reports it never landed.
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+
+    assert!(
+        asks_of(&node.tick(AT + RETRY_AFTER - 1), members[0]).is_empty(),
+        "not before the wait is up"
+    );
+    assert_eq!(
+        asks_of(&node.tick(AT + RETRY_AFTER), members[0]),
+        vec![Offering::Chain],
+        "and then the same round again"
+    );
+}
+
+#[test]
+fn a_retried_round_holds_the_connection_open_for_itself() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+
+    let actions = node.tick(AT + RETRY_AFTER);
+    assert_eq!(asks_of(&actions, members[0]), vec![Offering::Chain]);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, PeerAction::ProposeClose { peer } if *peer == members[0])),
+        "a peer with a round pending is not hung up on in the same breath"
+    );
+}
+
+#[test]
+fn a_round_is_put_again_only_so_many_times() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+
+    let mut asked = 0;
+    for k in 1..=(u32::from(RETRY_ATTEMPTS) + 2) {
+        node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+        let at = AT + RETRY_AFTER * i64::from(k);
+        asked += asks_of(&node.tick(at), members[0]).len();
+    }
+
+    assert_eq!(
+        asked,
+        usize::from(RETRY_ATTEMPTS),
+        "it gives up rather than asking a peer that keeps refusing for ever"
+    );
+}
+
+#[test]
+fn a_catalogue_that_failed_is_put_again_as_a_catalogue() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+
+    // Chain first, answered, which is what opens the catalogue round.
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+    node.peers.on(PeerEvent::Asked {
+        peer: members[0],
+        offering: Offering::Chain,
+    });
+    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+
+    assert_eq!(
+        asks_of(&node.tick(AT + RETRY_AFTER), members[0]),
+        vec![Offering::Catalogue],
+        "the round that failed is the round repeated, not the one before it"
+    );
+}
+
+#[test]
+fn a_round_owed_when_the_line_drops_goes_back_on_the_dial_list() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+    node.all_online(&members);
+
+    // Connected, asked, refused: the retry takes them off the dial list because it means to
+    // see to them on this connection.
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+    assert!(
+        dials(&node.tick(AT + 1)).is_empty(),
+        "no call while the retry still has a connection to do it on"
+    );
+
+    // The connection goes before the retry comes round. Now a call is the only way back.
+    node.peers.on(PeerEvent::Gone { peer: members[0] });
+    assert_eq!(
+        dials(&node.tick(AT + 2)),
+        vec![members[0]],
+        "the round is still owed, so they are called"
+    );
 }
