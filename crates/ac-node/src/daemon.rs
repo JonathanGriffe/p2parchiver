@@ -137,9 +137,8 @@ pub async fn run(
                 }
                 admission.housekeeping(&mut swarm, &mut roster, attest::now());
 
-                for peer in roster.promote(&connectivity) {
-                    peers.peer_ready(&mut swarm, &mut files, &mut groups, &roster, peer);
-                }
+                connectivity.expire_upgrades();
+                promote_ready(&mut swarm, &mut roster, &connectivity, &mut peers, &mut files, &mut groups);
 
                 groups.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
                 files.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
@@ -238,10 +237,13 @@ pub async fn run(
                                 tracing::info!(%peer, error = %e, "hole punch failed; staying relayed");
                             }
                         }
+
+                        promote_ready(&mut swarm, &mut roster, &connectivity, &mut peers, &mut files, &mut groups);
                     }
 
                     SwarmEvent::Behaviour(AcBehaviourEvent::PeerAttest(event)) => {
                         admission.on_peer_attest(&mut swarm, &mut roster, attest::now(), event);
+                        promote_ready(&mut swarm, &mut roster, &connectivity, &mut peers, &mut files, &mut groups);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::Attest(event)) => {
                         admission.on_renewal(&mut swarm, &mut roster, event);
@@ -286,7 +288,19 @@ pub async fn run(
     }
 }
 
-/// A connection, and which way it was opened.
+fn promote_ready(
+    swarm: &mut ClientSwarm,
+    roster: &mut Roster,
+    connectivity: &Connectivity,
+    peers: &mut PeerLink,
+    files: &mut FileLink,
+    groups: &mut GroupLink,
+) {
+    for peer in roster.promote(connectivity) {
+        peers.peer_ready(swarm, files, groups, roster, peer);
+    }
+}
+
 fn report_connected(peer: libp2p::PeerId, endpoint: &libp2p::core::ConnectedPoint) {
     tracing::info!(
         %peer,
