@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use ac_files::path::RelPath;
 use ac_files::store::{FileRow, Files};
-use ac_files::sync::{FileAction, FileEvent, FileSync, may_serve};
+use ac_files::sync::{FileAction, FileEvent, FileSync, MAX_INFLIGHT, may_serve};
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_files::{Content, ManifestEntry};
 use ac_groups::chain::Op;
@@ -831,7 +831,7 @@ fn an_unsolicited_page_is_ignored() {
 }
 
 #[test]
-fn a_refused_reading_still_reports_the_round_as_over() {
+fn a_refusal_ends_the_round_and_a_failure_does_not() {
     let (mut alice, mut bob) = (Node::new(), Node::new());
     let id = share_group(&mut [&mut alice, &mut bob]);
     connect(&mut alice, &mut bob);
@@ -847,15 +847,18 @@ fn a_refused_reading_still_reports_the_round_as_over() {
         "a refusal ends the round: {refused:?}"
     );
 
+    // A request that never arrived is a different thing entirely. Nobody said there was
+    // nothing more to read, so claiming the round settled would have this node pulling
+    // content against a catalogue it knows it only half read.
     let failed = alice.sync_on(FileEvent::RequestFailed {
         peer: bob.peer(),
         group: Some(id),
     });
     assert!(
-        failed
+        !failed
             .iter()
             .any(|a| matches!(a, FileAction::Settled { group, .. } if *group == id)),
-        "and so does a request that never arrived: {failed:?}"
+        "a page that never came back settles nothing: {failed:?}"
     );
 }
 
@@ -878,5 +881,105 @@ fn a_peer_that_disconnects_is_forgotten() {
         response,
         ManifestResponse::Unavailable,
         "a gone peer is not verified"
+    );
+}
+
+// ---- deferral ----
+
+fn reads(actions: &[FileAction]) -> Vec<GroupId> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            FileAction::FetchChanges { group, .. } => Some(*group),
+            FileAction::Settled { .. } => None,
+        })
+        .collect()
+}
+
+fn settled(actions: &[FileAction]) -> Vec<GroupId> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            FileAction::Settled { group, .. } => Some(*group),
+            FileAction::FetchChanges { .. } => None,
+        })
+        .collect()
+}
+
+/// Two nodes sharing `count` groups, each holding one file the other has never seen.
+fn shared_groups(alice: &mut Node, bob: &mut Node, count: usize) -> Vec<GroupId> {
+    let mut ids = Vec::new();
+    for i in 0..count {
+        let id = share_group(&mut [alice, bob]);
+        alice.add(id, &format!("f{i}.txt"), format!("body {i}").as_bytes(), AT);
+        ids.push(id);
+    }
+    alice.verify(bob.peer());
+    bob.verify(alice.peer());
+    ids
+}
+
+#[test]
+fn a_catalogue_there_was_no_room_to_read_is_not_called_settled() {
+    let (mut alice, mut bob) = (Node::new(), Node::new());
+    let wanted = MAX_INFLIGHT + 4;
+    shared_groups(&mut alice, &mut bob, wanted);
+
+    let ManifestResponse::Heads(heads) = alice.sync_on_request(bob.peer(), ManifestRequest::Ask).0
+    else {
+        panic!("the peer should name every catalogue it shares");
+    };
+    assert_eq!(heads.len(), wanted);
+
+    let opening = bob.sync_on(FileEvent::Heads {
+        peer: alice.peer(),
+        heads,
+    });
+
+    assert_eq!(
+        reads(&opening).len(),
+        MAX_INFLIGHT,
+        "only as many go out as there are slots"
+    );
+    assert!(
+        settled(&opening).is_empty(),
+        "settled means there is nothing further to read, and we know there is: {:?}",
+        settled(&opening)
+    );
+}
+
+#[test]
+fn catalogues_that_waited_are_read_once_there_is_room() {
+    let (mut alice, mut bob) = (Node::new(), Node::new());
+    let wanted = MAX_INFLIGHT + 4;
+    shared_groups(&mut alice, &mut bob, wanted);
+
+    let ManifestResponse::Heads(heads) = alice.sync_on_request(bob.peer(), ManifestRequest::Ask).0
+    else {
+        panic!("expected heads");
+    };
+    let opening = bob.sync_on(FileEvent::Heads {
+        peer: alice.peer(),
+        heads,
+    });
+    let mut seen = reads(&opening);
+
+    // Each refusal ends an episode and frees the slot the next one has been waiting for.
+    for group in seen.clone() {
+        let next = bob.sync_on(FileEvent::Unavailable {
+            peer: alice.peer(),
+            group,
+        });
+        seen.extend(reads(&next));
+    }
+
+    let before = seen.len();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), before, "no catalogue is read twice");
+    assert_eq!(
+        seen.len(),
+        wanted,
+        "and none is dropped for want of a slot: {seen:?}"
     );
 }

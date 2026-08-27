@@ -6,7 +6,7 @@ use ac_groups::chain::{Entry, Op};
 use ac_groups::id::GroupId;
 use ac_groups::standing::Position;
 use ac_groups::store::{Groups, State};
-use ac_groups::sync::{GroupAction, GroupEvent, GroupSync};
+use ac_groups::sync::{GroupAction, GroupEvent, GroupSync, MAX_INFLIGHT};
 use ac_groups::wire::{GroupHead, GroupRequest, GroupResponse};
 use ac_net::PeerId;
 use ac_net::connectivity::Connectivity;
@@ -651,5 +651,101 @@ fn a_stranger_offering_many_unknown_groups_writes_nothing() {
         fetches(&actions).len() <= 8,
         "the in-flight cap bounds the chase, got {}",
         fetches(&actions).len()
+    );
+}
+
+// ---- deferral ----
+
+#[test]
+fn more_groups_than_there_are_slots_wait_their_turn() {
+    let mut admin = Node::new();
+    let mut member = Node::new();
+
+    // Half again as many groups as there are slots, all new to the member.
+    let wanted = MAX_INFLIGHT + 4;
+    for i in 0..wanted {
+        let id = admin
+            .sync
+            .store_mut()
+            .create(&admin.key, &format!("g{i}"), "alice", AT)
+            .unwrap();
+        add(&mut admin, id, member.peer(), "bob");
+    }
+
+    admin.verify(member.peer());
+    member.verify(admin.peer());
+
+    let GroupResponse::Heads(heads) = admin.sync_on_request(member.peer(), GroupRequest::Ask).0
+    else {
+        panic!("the admin should name every group it shares");
+    };
+    assert_eq!(heads.len(), wanted);
+
+    let opening = member.sync_on(GroupEvent::Heads {
+        peer: admin.peer(),
+        heads,
+    });
+    let mut seen: Vec<GroupId> = fetches(&opening).into_iter().map(|(_, g, _)| g).collect();
+    assert_eq!(
+        seen.len(),
+        MAX_INFLIGHT,
+        "only as many go out at once as there are slots"
+    );
+
+    // Every answer ends an episode, and the group that has been waiting takes the slot.
+    for group in seen.clone() {
+        let next = member.sync_on(GroupEvent::Unavailable {
+            peer: admin.peer(),
+            group,
+        });
+        seen.extend(fetches(&next).into_iter().map(|(_, g, _)| g));
+    }
+
+    let before = seen.len();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), before, "no group is read twice");
+    assert_eq!(
+        seen.len(),
+        wanted,
+        "and the ones there was no room for are read once there is, not dropped"
+    );
+}
+
+#[test]
+fn a_group_already_being_read_is_not_queued_behind_itself() {
+    let (mut admin, mut member, id) = admin_and_member();
+    admin.verify(member.peer());
+    member.verify(admin.peer());
+
+    let GroupResponse::Heads(heads) = admin.sync_on_request(member.peer(), GroupRequest::Ask).0
+    else {
+        panic!("expected heads");
+    };
+
+    let first = member.sync_on(GroupEvent::Heads {
+        peer: admin.peer(),
+        heads: heads.clone(),
+    });
+    assert_eq!(fetches(&first).len(), 1, "one group, one read");
+
+    // The same heads again while that read is still outstanding.
+    let again = member.sync_on(GroupEvent::Heads {
+        peer: admin.peer(),
+        heads,
+    });
+    assert!(
+        fetches(&again).is_empty(),
+        "a group already being read is neither read again nor queued: {again:?}"
+    );
+
+    // And when the first read ends, nothing was hiding in the queue.
+    let after = member.sync_on(GroupEvent::Unavailable {
+        peer: admin.peer(),
+        group: id,
+    });
+    assert!(
+        fetches(&after).is_empty(),
+        "the queue was never given a duplicate to start: {after:?}"
     );
 }

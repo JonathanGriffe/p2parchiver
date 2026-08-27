@@ -2,7 +2,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use libp2p::futures::StreamExt;
-use libp2p::multiaddr::Protocol;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, rendezvous, request_response, upnp};
 
@@ -138,9 +137,8 @@ pub async fn run(
                 }
                 admission.housekeeping(&mut swarm, &mut roster, attest::now());
 
-                for peer in roster.promote(&connectivity) {
-                    peers.peer_ready(&mut swarm, &mut files, &mut groups, &roster, peer);
-                }
+                connectivity.expire_upgrades();
+                promote_ready(&mut swarm, &mut roster, &connectivity, &mut peers, &mut files, &mut groups);
 
                 groups.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
                 files.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
@@ -150,11 +148,7 @@ pub async fn run(
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                        let relayed = endpoint
-                            .get_remote_address()
-                            .iter()
-                            .any(|p| p == Protocol::P2pCircuit);
-                        connectivity.connected(peer_id, relayed);
+                        connectivity.connected(peer_id, endpoint.is_relayed());
 
                         admission.connected(&mut swarm, &mut roster, peer_id);
 
@@ -166,6 +160,7 @@ pub async fn run(
 
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                         let still_connected = swarm.is_connected(&peer_id);
+                        let agreed = peers.close_was_agreed(&peer_id);
                         connectivity.disconnected(peer_id, still_connected);
 
                         admission.disconnected(&mut swarm, &mut roster, peer_id, still_connected);
@@ -176,7 +171,11 @@ pub async fn run(
                         if let Some(link) = &mut link {
                             link.on_disconnected(peer_id, still_connected);
                         }
-                        tracing::info!(peer = %peer_id, cause = ?cause, "disconnected");
+                        if agreed {
+                            tracing::info!(peer = %peer_id, "hung up, as agreed");
+                        } else {
+                            tracing::info!(peer = %peer_id, cause = ?cause, "disconnected");
+                        }
                     }
 
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -243,10 +242,13 @@ pub async fn run(
                                 tracing::info!(%peer, error = %e, "hole punch failed; staying relayed");
                             }
                         }
+
+                        promote_ready(&mut swarm, &mut roster, &connectivity, &mut peers, &mut files, &mut groups);
                     }
 
                     SwarmEvent::Behaviour(AcBehaviourEvent::PeerAttest(event)) => {
                         admission.on_peer_attest(&mut swarm, &mut roster, attest::now(), event);
+                        promote_ready(&mut swarm, &mut roster, &connectivity, &mut peers, &mut files, &mut groups);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::Attest(event)) => {
                         admission.on_renewal(&mut swarm, &mut roster, event);
@@ -291,7 +293,19 @@ pub async fn run(
     }
 }
 
-/// A connection, and which way it was opened.
+fn promote_ready(
+    swarm: &mut ClientSwarm,
+    roster: &mut Roster,
+    connectivity: &Connectivity,
+    peers: &mut PeerLink,
+    files: &mut FileLink,
+    groups: &mut GroupLink,
+) {
+    for peer in roster.promote(connectivity) {
+        peers.peer_ready(swarm, files, groups, roster, peer);
+    }
+}
+
 fn report_connected(peer: libp2p::PeerId, endpoint: &libp2p::core::ConnectedPoint) {
     tracing::info!(
         %peer,

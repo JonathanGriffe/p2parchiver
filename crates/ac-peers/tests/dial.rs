@@ -14,7 +14,7 @@ use ac_net::identity::Keypair;
 use ac_peers::sync::{
     CLOSE_TIMEOUT, DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_ROUND, DIALS_PER_WINDOW, HEARTBEAT,
     Limits, MAX_TRANSFERS, MIN_BACKOFF, NoRoom, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent,
-    Peers, ROUND_TIMEOUT, SHARE_AFTER_IDLE,
+    Peers, RETRY_AFTER, RETRY_ATTEMPTS, ROUND_TIMEOUT, SHARE_AFTER_IDLE,
 };
 use tempfile::TempDir;
 
@@ -1119,7 +1119,7 @@ fn what_we_learn_from_a_peer_is_not_re_told_to_the_group() {
 }
 
 #[test]
-fn a_member_added_a_moment_ago_is_called_as_soon_as_they_are_seen() {
+fn a_member_added_a_moment_ago_is_called_once_the_server_says_they_are_up() {
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);
@@ -1140,8 +1140,17 @@ fn a_member_added_a_moment_ago_is_called_as_soon_as_they_are_seen() {
         "adding them is not by itself a reason to call"
     );
 
-    // Now the registry mentions them, which is all it takes.
     node.peers.on(PeerEvent::Discovered { peer: newcomer });
+    assert!(
+        !dials(&answered(&mut node, settled + 2, id)).contains(&newcomer),
+        "being listed in the registry is a claim, not a pulse"
+    );
+
+    // The server saying it has them connected is.
+    node.peers.on(PeerEvent::Presence {
+        asked: vec![newcomer],
+        online: vec![newcomer],
+    });
     let mut called = None;
     for k in 2..8 {
         let actions = answered(&mut node, settled + k, id);
@@ -1892,4 +1901,226 @@ fn nobody_reachable_is_not_the_same_as_nobody_having_it() {
         }
     }
     assert!(asked, "the first reachable member is asked at once");
+}
+
+/// The offerings put to `want` by these actions.
+fn asks_of(actions: &[PeerAction], want: PeerId) -> Vec<Offering> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            PeerAction::Ask { peer, offering } if *peer == want => Some(*offering),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_round_that_did_not_come_off_is_put_again() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+
+    // Verified opens a chain round; the link then reports it never landed.
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+
+    assert!(
+        asks_of(&node.tick(AT + RETRY_AFTER - 1), members[0]).is_empty(),
+        "not before the wait is up"
+    );
+    assert_eq!(
+        asks_of(&node.tick(AT + RETRY_AFTER), members[0]),
+        vec![Offering::Chain],
+        "and then the same round again"
+    );
+}
+
+#[test]
+fn a_retried_round_holds_the_connection_open_for_itself() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+
+    let actions = node.tick(AT + RETRY_AFTER);
+    assert_eq!(asks_of(&actions, members[0]), vec![Offering::Chain]);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, PeerAction::ProposeClose { peer } if *peer == members[0])),
+        "a peer with a round pending is not hung up on in the same breath"
+    );
+}
+
+#[test]
+fn a_round_is_put_again_only_so_many_times() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+
+    let mut asked = 0;
+    for k in 1..=(u32::from(RETRY_ATTEMPTS) + 2) {
+        node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+        let at = AT + RETRY_AFTER * i64::from(k);
+        asked += asks_of(&node.tick(at), members[0]).len();
+    }
+
+    assert_eq!(
+        asked,
+        usize::from(RETRY_ATTEMPTS),
+        "it gives up rather than asking a peer that keeps refusing for ever"
+    );
+}
+
+#[test]
+fn a_catalogue_that_failed_is_put_again_as_a_catalogue() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+
+    // Chain first, answered, which is what opens the catalogue round.
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+    node.peers.on(PeerEvent::Asked {
+        peer: members[0],
+        offering: Offering::Chain,
+    });
+    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+
+    assert_eq!(
+        asks_of(&node.tick(AT + RETRY_AFTER), members[0]),
+        vec![Offering::Catalogue],
+        "the round that failed is the round repeated, not the one before it"
+    );
+}
+
+#[test]
+fn a_round_owed_when_the_line_drops_goes_back_on_the_dial_list() {
+    let mut node = Node::new();
+    let members = peers(1);
+    let _ = node.group_with(&members);
+    node.all_online(&members);
+
+    // Connected, asked, refused: the retry takes them off the dial list because it means to
+    // see to them on this connection.
+    node.peers.on(PeerEvent::Verified { peer: members[0] });
+    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+    assert!(
+        dials(&node.tick(AT + 1)).is_empty(),
+        "no call while the retry still has a connection to do it on"
+    );
+
+    // The connection goes before the retry comes round. Now a call is the only way back.
+    node.peers.on(PeerEvent::Gone { peer: members[0] });
+    assert_eq!(
+        dials(&node.tick(AT + 2)),
+        vec![members[0]],
+        "the round is still owed, so they are called"
+    );
+}
+
+#[test]
+fn both_sides_of_an_agreed_hang_up_know_it_was_agreed() {
+    // The one hung up on sees a transport error and nothing else, so unless it records that
+    // it said yes, a clean close is indistinguishable in the log from a broken connection.
+    let mut them = Node::new();
+    let caller = peers(1)[0];
+    let _ = them.group_with(&[caller]);
+    them.peers.on(PeerEvent::Verified { peer: caller });
+
+    assert!(
+        !them.peers.close_was_agreed(&caller),
+        "nothing has been agreed yet"
+    );
+
+    them.peers.on(PeerEvent::CloseProposed {
+        peer: caller,
+        ready: true,
+    });
+    assert!(
+        them.peers.close_was_agreed(&caller),
+        "having said yes, the disconnect that follows is the ordinary end of a call"
+    );
+}
+
+#[test]
+fn refusing_to_hang_up_agrees_to_nothing() {
+    let mut them = Node::new();
+    let caller = peers(1)[0];
+    let _ = them.group_with(&[caller]);
+    them.peers.on(PeerEvent::Verified { peer: caller });
+
+    them.peers.on(PeerEvent::CloseProposed {
+        peer: caller,
+        ready: false,
+    });
+    assert!(
+        !them.peers.close_was_agreed(&caller),
+        "a refusal is not an agreement, and a close after one is worth the cause"
+    );
+}
+
+#[test]
+fn the_caller_records_the_agreement_it_asked_for() {
+    let mut node = Node::new();
+    let member = peers(1)[0];
+    let _ = node.group_with(&[member]);
+    node.peers.on(PeerEvent::Verified { peer: member });
+
+    // Let the rounds `Verified` opened finish, so there is nothing outstanding left.
+    for offering in [Offering::Chain, Offering::Catalogue] {
+        node.peers.on(PeerEvent::Asked {
+            peer: member,
+            offering,
+        });
+    }
+
+    // Drained, so the tick asks to hang up.
+    let proposed = node.tick(AT + 1);
+    assert!(
+        proposed
+            .iter()
+            .any(|a| matches!(a, PeerAction::ProposeClose { peer } if *peer == member)),
+        "a peer with nothing outstanding is asked to hang up: {proposed:?}"
+    );
+
+    let answered = node.peers.on(PeerEvent::CloseAnswered {
+        peer: member,
+        ready: true,
+    });
+    assert!(
+        answered
+            .iter()
+            .any(|a| matches!(a, PeerAction::Disconnect { peer } if *peer == member)),
+        "and hung up on once they agree"
+    );
+    assert!(
+        node.peers.close_was_agreed(&member),
+        "the side that asked knows it too, so neither log calls this a failure"
+    );
+}
+
+#[test]
+fn an_agreement_that_led_to_no_close_goes_stale() {
+    let mut them = Node::new();
+    let caller = peers(1)[0];
+    let _ = them.group_with(&[caller]);
+    them.peers.on(PeerEvent::Verified { peer: caller });
+
+    them.peers.on(PeerEvent::CloseProposed {
+        peer: caller,
+        ready: true,
+    });
+    assert!(them.peers.close_was_agreed(&caller));
+
+    // They asked, we agreed, and then they never hung up. Whatever ends the connection
+    // after that is not the hang-up we agreed to, and the cause is worth printing.
+    them.tick(AT + CLOSE_TIMEOUT);
+    assert!(
+        !them.peers.close_was_agreed(&caller),
+        "an agreement nobody acted on stops speaking for later failures"
+    );
 }

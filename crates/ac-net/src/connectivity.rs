@@ -122,6 +122,18 @@ impl Connectivity {
         }
     }
 
+    /// Retire upgrades that ran out of time, naming whoever moved.
+    pub fn expire_upgrades(&mut self) -> Vec<PeerId> {
+        let mut expired = Vec::new();
+        for (peer, state) in self.peers.iter_mut() {
+            if state.state == State::UpgradePending && state.since.elapsed() > UPGRADE_TIMEOUT {
+                state.enter(State::Relayed, "hole punch never reported");
+                expired.push(*peer);
+            }
+        }
+        expired
+    }
+
     /// Whether this peer's connection has stopped changing shape.
     pub fn is_settled(&self, peer: &PeerId) -> bool {
         !matches!(
@@ -198,6 +210,53 @@ mod tests {
         assert!(
             c.is_settled(&p),
             "the side that is never told a punch failed still stops waiting"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_that_never_reported_is_swept_up() {
+        let mut c = Connectivity::default();
+        let p = peer();
+        c.connected(p, true);
+
+        assert!(c.expire_upgrades().is_empty(), "it has only just started");
+
+        c.peers.get_mut(&p).unwrap().since =
+            Instant::now() - UPGRADE_TIMEOUT - Duration::from_secs(1);
+        assert_eq!(c.expire_upgrades(), vec![p], "named once it has run out");
+        assert_eq!(
+            c.state(&p),
+            State::Relayed,
+            "and moved for real, not on read"
+        );
+
+        assert!(
+            c.expire_upgrades().is_empty(),
+            "and not named again on the next sweep"
+        );
+    }
+
+    #[test]
+    fn a_punch_that_lands_after_the_sweep_is_still_timed_from_the_start() {
+        let mut c = Connectivity::default();
+        let p = peer();
+        c.connected(p, true);
+
+        // Both, because both are the moment the relayed connection came up.
+        let long_ago = Instant::now() - UPGRADE_TIMEOUT - Duration::from_secs(1);
+        let entry = c.peers.get_mut(&p).unwrap();
+        entry.since = long_ago;
+        entry.relayed_since = Some(long_ago);
+        c.expire_upgrades();
+
+        c.hole_punch(p, true);
+        assert_eq!(c.state(&p), State::Direct);
+        assert!(
+            c.get(&p)
+                .unwrap()
+                .upgrade_took()
+                .is_some_and(|d| d >= UPGRADE_TIMEOUT),
+            "measured from the relayed connection, not from the sweep"
         );
     }
 

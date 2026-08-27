@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use ac_net::PeerId;
@@ -19,7 +19,10 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const ANSWERS_PER_TICK: u32 = 8;
 
 /// Fetches we will have outstanding at once, across all peers and groups.
-const MAX_INFLIGHT: usize = 8;
+pub const MAX_INFLIGHT: usize = 8;
+
+/// Groups waiting for a slot
+pub const MAX_DEFERRED: usize = 256;
 
 /// How long a group we were invited to but never accepted is kept once the chain has stopped
 /// naming us. Long enough that a slow human is not punished for it.
@@ -77,6 +80,7 @@ pub struct GroupSync {
     me: PeerId,
     key: Keypair,
     inflight: HashMap<GroupId, InFlight>,
+    deferred: VecDeque<(PeerId, GroupId)>,
     budget: TickBudget,
     now_at: i64,
 }
@@ -89,6 +93,7 @@ impl GroupSync {
             me,
             key,
             inflight: HashMap::new(),
+            deferred: VecDeque::new(),
             budget: TickBudget::new(ANSWERS_PER_TICK),
             now_at: 0,
         }
@@ -110,7 +115,7 @@ impl GroupSync {
         request: GroupRequest,
         roster: &Roster,
     ) -> (GroupResponse, Vec<GroupAction>) {
-        if !roster.is_ready(&peer) || !self.budget.spend(peer) {
+        if !roster.is_admitted(&peer) || !self.budget.spend(peer) {
             return (GroupResponse::Unavailable, Vec::new());
         }
 
@@ -141,7 +146,7 @@ impl GroupSync {
     }
 
     pub fn on(&mut self, event: GroupEvent, roster: &Roster) -> Vec<GroupAction> {
-        match event {
+        let mut actions = match event {
             GroupEvent::Heads { peer, heads } => {
                 if !roster.is_ready(&peer) {
                     return Vec::new();
@@ -165,7 +170,10 @@ impl GroupSync {
             GroupEvent::AskFailed { .. } => Vec::new(),
 
             GroupEvent::Tick { now, at } => self.tick(now, at, roster),
-        }
+        };
+
+        self.drain_deferred(&mut actions, roster);
+        actions
     }
 
     /// Decide what to fetch from the heads a peer named, and from what they left out.
@@ -350,6 +358,7 @@ impl GroupSync {
         // Abandon episodes that can no longer finish, so the group is free to try again
         self.inflight
             .retain(|_, f| now < f.deadline && roster.is_ready(&f.peer));
+        self.deferred.retain(|(peer, _)| roster.is_admitted(peer));
 
         let actions = Vec::new();
 
@@ -377,7 +386,12 @@ impl GroupSync {
 
     /// Queue a fetch, unless this group already has an episode running or we are at capacity.
     fn fetch(&mut self, actions: &mut Vec<GroupAction>, peer: PeerId, group: GroupId, from: u64) {
-        if self.inflight.contains_key(&group) || self.inflight.len() >= MAX_INFLIGHT {
+        if self.inflight.contains_key(&group) {
+            return;
+        }
+
+        if self.inflight.len() >= MAX_INFLIGHT {
+            self.defer(peer, group);
             return;
         }
         self.inflight.insert(
@@ -389,6 +403,40 @@ impl GroupSync {
             },
         );
         actions.push(GroupAction::Fetch { peer, group, from });
+    }
+
+    /// Remember a group there was no room to read yet.
+    fn defer(&mut self, peer: PeerId, group: GroupId) {
+        if self.deferred.iter().any(|(_, g)| *g == group) {
+            return;
+        }
+        if self.deferred.len() >= MAX_DEFERRED {
+            tracing::debug!(%group, "no room to read this group and no room to remember it");
+            return;
+        }
+        tracing::debug!(%peer, %group, "no room to read this group yet; queued");
+        self.deferred.push_back((peer, group));
+    }
+
+    /// Start whatever the freed slots have room for.
+    fn drain_deferred(&mut self, actions: &mut Vec<GroupAction>, roster: &Roster) {
+        while self.inflight.len() < MAX_INFLIGHT {
+            let Some((peer, group)) = self.deferred.pop_front() else {
+                return;
+            };
+
+            if !roster.is_admitted(&peer) || self.inflight.contains_key(&group) {
+                continue;
+            }
+
+            let from = self
+                .store
+                .get(group)
+                .ok()
+                .flatten()
+                .map_or(0, |row| row.head_seq);
+            self.fetch(actions, peer, group, from);
+        }
     }
 
     fn finish(&mut self, group: GroupId, peer: PeerId) {

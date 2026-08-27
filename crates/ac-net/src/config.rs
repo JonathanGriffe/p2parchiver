@@ -6,6 +6,9 @@ use directories::ProjectDirs;
 use libp2p::Multiaddr;
 use serde::{Deserialize, Serialize};
 
+/// The slowest `bandwidth_max` worth honouring, in bytes per second.
+pub const MIN_BANDWIDTH: u64 = 8 * 1024;
+
 pub const CONFIG_FILENAME: &str = "config.toml";
 pub const DB_FILENAME: &str = "state.sqlite";
 pub const STORAGE_DIRNAME: &str = "files";
@@ -34,6 +37,17 @@ pub enum ConfigError {
     },
     #[error("could not serialize config")]
     Serialize(#[source] toml::ser::Error),
+    #[error(
+        "bandwidth_max in {path} is {bandwidth_max} bytes per second, below the {floor} \
+         this node will honour. A limit that slow stalls a transfer long enough to look \
+         like a dead connection. Raise it, or remove it for no limit."
+    )]
+    BandwidthTooLow {
+        path: PathBuf,
+        bandwidth_max: u64,
+        floor: u64,
+    },
+
     #[error(
         "storage_root in {path} must be an absolute path, but is {storage_root}. \
          Write it in full, like \"/mnt/archive\""
@@ -112,6 +126,9 @@ pub struct Config {
     /// the free-space floor the node keeps regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_max: Option<u64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth_max: Option<u64>,
 }
 
 impl Default for Config {
@@ -124,6 +141,7 @@ impl Default for Config {
             server: None,
             storage_root: None,
             storage_max: None,
+            bandwidth_max: None,
         }
     }
 }
@@ -153,6 +171,16 @@ impl Config {
             return Err(ConfigError::RelativeStorageRoot {
                 path: path.to_path_buf(),
                 storage_root: root.clone(),
+            });
+        }
+
+        if let Some(rate) = config.bandwidth_max
+            && rate < MIN_BANDWIDTH
+        {
+            return Err(ConfigError::BandwidthTooLow {
+                path: path.to_path_buf(),
+                bandwidth_max: rate,
+                floor: MIN_BANDWIDTH,
             });
         }
 
@@ -213,6 +241,49 @@ mod tests {
     }
 
     #[test]
+    fn a_bandwidth_limit_too_low_to_honour_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+
+        let config = Config {
+            bandwidth_max: Some(MIN_BANDWIDTH - 1),
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+
+        assert!(
+            matches!(
+                Config::load(&path),
+                Err(ConfigError::BandwidthTooLow { .. })
+            ),
+            "a rate that would stall a chunk past the idle timeout is a fault, not a limit"
+        );
+    }
+
+    #[test]
+    fn the_floor_itself_is_allowed_and_so_is_no_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+
+        let config = Config {
+            bandwidth_max: Some(MIN_BANDWIDTH),
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().bandwidth_max,
+            Some(MIN_BANDWIDTH)
+        );
+
+        Config::default().save(&path).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().bandwidth_max,
+            None,
+            "absent means no limit, which is the default"
+        );
+    }
+
+    #[test]
     fn round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CONFIG_FILENAME);
@@ -229,6 +300,7 @@ mod tests {
             ),
             storage_root: Some(PathBuf::from("/mnt/archive")),
             storage_max: Some(200 * 1024 * 1024 * 1024),
+            bandwidth_max: Some(5 * 1024 * 1024),
         };
         config.save(&path).unwrap();
 

@@ -52,6 +52,7 @@ fn loopback_config() -> Config {
         server: None,
         storage_root: None,
         storage_max: None,
+        bandwidth_max: None,
     }
 }
 

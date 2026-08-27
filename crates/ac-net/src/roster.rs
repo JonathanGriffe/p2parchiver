@@ -46,6 +46,11 @@ impl Roster {
     pub fn is_ready(&self, peer: &PeerId) -> bool {
         self.peers.get(peer) == Some(&Standing::Ready)
     }
+
+    /// Whether this peer's attestation checked out, settled or not.
+    pub fn is_admitted(&self, peer: &PeerId) -> bool {
+        self.peers.contains_key(peer)
+    }
 }
 
 #[cfg(test)]
@@ -66,6 +71,32 @@ mod tests {
 
         assert_eq!(roster.promote(&Connectivity::default()), vec![p]);
         assert!(roster.is_ready(&p));
+    }
+
+    #[test]
+    fn a_peer_still_settling_may_be_answered() {
+        let mut roster = Roster::default();
+        let p = peer();
+        roster.admitted(p);
+
+        let mut connectivity = Connectivity::default();
+        connectivity.connected(p, true);
+        assert!(
+            roster.promote(&connectivity).is_empty(),
+            "a punch is in flight"
+        );
+
+        assert!(!roster.is_ready(&p));
+        assert!(
+            roster.is_admitted(&p),
+            "answering waits on the attestation, not on the connection settling"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_was_never_admitted_is_answered_nothing() {
+        let roster = Roster::default();
+        assert!(!roster.is_admitted(&peer()));
     }
 
     #[test]
