@@ -92,11 +92,7 @@ async fn probe(
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
-                let relayed = endpoint
-                    .get_remote_address()
-                    .iter()
-                    .any(|p| p == Protocol::P2pCircuit);
-                connectivity.connected(*peer_id, relayed);
+                connectivity.connected(*peer_id, endpoint.is_relayed());
 
                 if *peer_id == server_peer && !reserved {
                     reserved = true;

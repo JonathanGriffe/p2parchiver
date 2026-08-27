@@ -2,7 +2,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use libp2p::futures::StreamExt;
-use libp2p::multiaddr::Protocol;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, rendezvous, request_response, upnp};
 
@@ -150,11 +149,7 @@ pub async fn run(
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                        let relayed = endpoint
-                            .get_remote_address()
-                            .iter()
-                            .any(|p| p == Protocol::P2pCircuit);
-                        connectivity.connected(peer_id, relayed);
+                        connectivity.connected(peer_id, endpoint.is_relayed());
 
                         admission.connected(&mut swarm, &mut roster, peer_id);
 
