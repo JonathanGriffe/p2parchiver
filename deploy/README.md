@@ -166,9 +166,14 @@ issuing a fresh invite: a revoked peer cannot even reach the enrolment listener,
 
 ## Relay bandwidth
 
-This is the operating cost. A circuit is capped at 128 KiB over two minutes, with per-peer
-and per-IP rate limits, sized for hole-punch coordination, not for carrying media. Two
-peers that fail to hole punch get a working connection, not a fast one.
+This is the operating cost. A circuit is capped at 8 MiB or ten minutes, whichever comes
+first, and one client may open 16 of them a minute (an IP, 64) — so a client's sustained
+ceiling is 128 MiB a minute. Sized for hole-punch coordination, not for carrying media:
+two peers that fail to hole punch get a working connection, not a fast one.
+
+The numbers live in `crates/ac-net/src/limits.rs`, which is the only place to change them.
+Note that libp2p's rate limiter takes the time to earn *one* slot rather than an allowance
+per window, so the interval it is given is the window divided by the allowance.
 
 That cap is deliberate and is the reason the server is cheap to run. Raising it to carry
 media would change both the bandwidth bill and the security requirements.

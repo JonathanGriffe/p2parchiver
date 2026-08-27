@@ -54,8 +54,31 @@ const MAX_CIRCUITS_PER_PEER: usize = 4;
 /// Circuits one client may *open* per [`RATE_WINDOW`].
 const CIRCUITS_PER_PEER_PER_WINDOW: NonZeroU32 = NonZeroU32::new(16).expect("nonzero");
 
-/// Window for [`CIRCUITS_PER_PEER_PER_WINDOW`].
+/// Circuits one source IP may open per [`RATE_WINDOW`], across every peer id behind it.
+const CIRCUITS_PER_IP_PER_WINDOW: NonZeroU32 = NonZeroU32::new(64).expect("nonzero");
+
+/// Window for the two allowances above.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+const fn refill(per_window: NonZeroU32) -> Duration {
+    match RATE_WINDOW.checked_div(per_window.get()) {
+        Some(interval) => interval,
+        None => unreachable!(),
+    }
+}
+
+/// A window that does not divide evenly would silently round the sustained rate.
+const _: () = assert!(
+    refill(CIRCUITS_PER_PEER_PER_WINDOW).as_nanos() * CIRCUITS_PER_PEER_PER_WINDOW.get() as u128
+        == RATE_WINDOW.as_nanos()
+);
+const _: () = assert!(
+    refill(CIRCUITS_PER_IP_PER_WINDOW).as_nanos() * CIRCUITS_PER_IP_PER_WINDOW.get() as u128
+        == RATE_WINDOW.as_nanos()
+);
+
+/// One IP must not be held to less than one client's share.
+const _: () = assert!(CIRCUITS_PER_IP_PER_WINDOW.get() >= CIRCUITS_PER_PEER_PER_WINDOW.get());
 
 const _: () = assert!(
     MAX_CIRCUIT_BYTES * CIRCUITS_PER_PEER_PER_WINDOW.get() as u64 == 128 * 1024 * 1024,
@@ -75,9 +98,17 @@ pub fn relay_config() -> relay::Config {
         max_circuit_duration: MAX_CIRCUIT_DURATION,
         max_circuits: MAX_CIRCUITS,
         max_circuits_per_peer: MAX_CIRCUITS_PER_PEER,
+        circuit_src_rate_limiters: Vec::new(),
         ..relay::Config::default()
     }
-    .circuit_src_per_peer(CIRCUITS_PER_PEER_PER_WINDOW, RATE_WINDOW)
+    .circuit_src_per_peer(
+        CIRCUITS_PER_PEER_PER_WINDOW,
+        refill(CIRCUITS_PER_PEER_PER_WINDOW),
+    )
+    .circuit_src_per_ip(
+        CIRCUITS_PER_IP_PER_WINDOW,
+        refill(CIRCUITS_PER_IP_PER_WINDOW),
+    )
 }
 
 #[cfg(test)]
@@ -89,5 +120,17 @@ mod tests {
         let _ = connection_limits();
         let _ = memory_limits();
         let _ = relay_config();
+    }
+
+    #[test]
+    fn the_allowance_is_per_window_not_per_interval() {
+        assert_eq!(
+            refill(CIRCUITS_PER_PEER_PER_WINDOW),
+            Duration::from_millis(3750)
+        );
+        assert_eq!(
+            refill(CIRCUITS_PER_IP_PER_WINDOW),
+            Duration::from_nanos(937_500_000)
+        );
     }
 }
