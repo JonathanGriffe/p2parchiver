@@ -175,7 +175,7 @@ mod imp {
 
     pub fn write(exe: &Path) -> Result<()> {
         key()?
-            .set_string(ENTRY, &command(exe))
+            .set_string(ENTRY, command(exe))
             .with_context(|| format!("writing HKCU\\{RUN_KEY}\\{ENTRY}"))
     }
 

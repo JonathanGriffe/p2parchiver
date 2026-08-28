@@ -26,6 +26,7 @@ impl Live {
         Self(Arc::new(AtomicBool::new(live)))
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn set(&self, live: bool) {
         self.0.store(live, Ordering::Relaxed);
     }

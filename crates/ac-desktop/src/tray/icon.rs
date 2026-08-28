@@ -1,3 +1,4 @@
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const SIZES: [u32; 4] = [16, 22, 32, 48];
 
 /// What the Windows tray is handed. It takes one image and scales it itself.
