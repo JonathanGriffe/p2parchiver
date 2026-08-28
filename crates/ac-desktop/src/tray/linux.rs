@@ -5,6 +5,7 @@ use slint::Weak;
 
 use super::{Live, icon};
 use crate::ui::MainWindow;
+use crate::work::Nudge;
 
 pub struct Tray {
     #[allow(dead_code)]
@@ -20,6 +21,7 @@ impl Tray {
 
 struct Item {
     window: Weak<MainWindow>,
+    nudge: Nudge,
     /// Mirrors the recorded entry, re-read after every change rather than assumed.
     autostart: bool,
     live: Live,
@@ -46,7 +48,7 @@ impl ksni::Tray for Item {
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
-        super::show(&self.window);
+        super::show(&self.window, &self.nudge);
     }
 
     fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
@@ -67,7 +69,7 @@ impl ksni::Tray for Item {
         vec![
             StandardItem {
                 label: "Open".into(),
-                activate: Box::new(|item: &mut Self| super::show(&item.window)),
+                activate: Box::new(|item: &mut Self| super::show(&item.window, &item.nudge)),
                 ..Default::default()
             }
             .into(),
@@ -96,11 +98,12 @@ impl Item {
     }
 }
 
-pub fn spawn(window: Weak<MainWindow>) -> Result<Tray> {
+pub fn spawn(window: Weak<MainWindow>, nudge: Nudge) -> Result<Tray> {
     let autostart = crate::autostart::state().is_ok_and(|s| s.is_on());
     let live = Live::new(true);
     let handle = Item {
         window,
+        nudge,
         autostart,
         live: live.clone(),
     }

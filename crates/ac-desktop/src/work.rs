@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
@@ -14,33 +16,76 @@ const POLL: Duration = Duration::from_secs(2);
 /// Asks the poller to read now rather than at the next tick, so what an action did shows up
 /// at once instead of up to [`POLL`] later.
 #[derive(Clone)]
-pub struct Nudge(Sender<()>);
+pub struct Nudge {
+    tx: Sender<()>,
+    visible: Arc<AtomicBool>,
+}
 
 impl Nudge {
     pub fn now(&self) {
         // A closed channel means the poller has already stopped, which is not a failure.
-        let _ = self.0.send(());
+        let _ = self.tx.send(());
+    }
+
+    /// The window is back. Wakes the poller, which has been waiting for exactly this.
+    pub fn shown(&self) {
+        self.visible.store(true, Ordering::Relaxed);
+        self.now();
+    }
+
+    /// The window is gone to the tray. Nothing reads until it comes back.
+    pub fn hidden(&self) {
+        self.visible.store(false, Ordering::Relaxed);
     }
 }
 
-pub fn poll(window: Weak<MainWindow>, paths: Paths, selection: Selection) -> Nudge {
+/// The handle the window holds, and the channel the poller waits on.
+pub fn nudge() -> (Nudge, Receiver<()>) {
     let (tx, rx) = channel();
-    std::thread::spawn(move || run(&window, &paths, &selection, &rx));
-    Nudge(tx)
+    let nudge = Nudge {
+        tx,
+        visible: Arc::new(AtomicBool::new(true)),
+    };
+    (nudge, rx)
 }
 
-fn run(window: &Weak<MainWindow>, paths: &Paths, selection: &Selection, rx: &Receiver<()>) {
-    loop {
-        let snapshot = view::read(paths, selection);
+pub fn poll(
+    window: Weak<MainWindow>,
+    paths: Paths,
+    selection: Selection,
+    nudge: &Nudge,
+    rx: Receiver<()>,
+) {
+    let visible = Arc::clone(&nudge.visible);
+    std::thread::spawn(move || run(&window, &paths, &selection, &visible, &rx));
+}
 
-        if window
-            .upgrade_in_event_loop(move |window| view::apply(&window, snapshot))
-            .is_err()
-        {
-            return;
+fn run(
+    window: &Weak<MainWindow>,
+    paths: &Paths,
+    selection: &Selection,
+    visible: &AtomicBool,
+    rx: &Receiver<()>,
+) {
+    loop {
+        if visible.load(Ordering::Relaxed) {
+            let snapshot = view::read(paths, selection);
+
+            if window
+                .upgrade_in_event_loop(move |window| view::apply(&window, snapshot))
+                .is_err()
+            {
+                return;
+            }
         }
 
-        match rx.recv_timeout(POLL) {
+        let waited = if visible.load(Ordering::Relaxed) {
+            rx.recv_timeout(POLL)
+        } else {
+            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        };
+
+        match waited {
             Ok(()) => {
                 // Several actions can finish while one read is in flight. Take the whole
                 // backlog, so they cost one extra read between them rather than one each.

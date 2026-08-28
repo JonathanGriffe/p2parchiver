@@ -76,9 +76,11 @@ fn main() -> Result<()> {
     let window = MainWindow::new().context("creating the window")?;
     describe_node(&window, &paths)?;
 
-    let _tray = tray::spawn(window.as_weak());
+    let (nudge, ticks) = work::nudge();
+    let _tray = tray::spawn(window.as_weak(), nudge.clone());
 
     let live = _tray.as_ref().map(tray::Tray::live);
+    let hidden = nudge.clone();
     window.window().on_close_requested(move || {
         if live.as_ref().is_none_or(|live| !live.get()) {
             // Nothing to reopen from, so closing the window is how you quit.
@@ -86,18 +88,31 @@ fn main() -> Result<()> {
                 tracing::warn!(error = %e, "could not stop the event loop");
             }
         }
+        hidden.hidden();
         slint::CloseRequestResponse::HideWindow
     });
 
+    // Settled before the poller starts, so starting in the tray never reads at all.
+    let showing = !cli.background || _tray.is_none();
+    if !showing {
+        nudge.hidden();
+    }
+
     let selection = selection::Selection::new();
-    let nudge = work::poll(window.as_weak(), paths.clone(), selection.clone());
+    work::poll(
+        window.as_weak(),
+        paths.clone(),
+        selection.clone(),
+        &nudge,
+        ticks,
+    );
     groups::wire(&window, &paths, &selection, &nudge);
     peers::wire(&window, &paths, &nudge);
     files::wire(&window, &paths, &selection, &nudge);
     settings::wire(&window, &paths, &node, &nudge);
     settings::load(&window, &paths);
 
-    if !cli.background || _tray.is_none() {
+    if showing {
         window.show().context("showing the window")?;
     }
 

@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use slint::{ComponentHandle, Weak};
 
 use crate::ui::MainWindow;
+use crate::work::Nudge;
 
 pub use backend::Tray;
 
@@ -37,8 +38,8 @@ impl Live {
 }
 
 /// Put an icon in the tray.
-pub fn spawn(window: Weak<MainWindow>) -> Option<Tray> {
-    match backend::spawn(window) {
+pub fn spawn(window: Weak<MainWindow>, nudge: Nudge) -> Option<Tray> {
+    match backend::spawn(window, nudge) {
         Ok(tray) => Some(tray),
         Err(e) => {
             tracing::warn!(
@@ -51,12 +52,16 @@ pub fn spawn(window: Weak<MainWindow>) -> Option<Tray> {
 }
 
 /// Bring the window back, from whichever thread the tray menu runs on.
-pub(crate) fn show(window: &Weak<MainWindow>) {
+pub(crate) fn show(window: &Weak<MainWindow>, nudge: &Nudge) {
     let window = window.clone();
+    let nudge = nudge.clone();
     let posted = slint::invoke_from_event_loop(move || {
         if let Some(window) = window.upgrade() {
             let _ = window.show();
             window.window().set_minimized(false);
+            // Reading resumes here, so the window is current rather than showing whatever it
+            // held when it was closed.
+            nudge.shown();
         }
     });
     if let Err(e) = posted {

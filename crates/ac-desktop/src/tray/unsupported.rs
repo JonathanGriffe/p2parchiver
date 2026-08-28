@@ -11,6 +11,6 @@ impl Tray {
     }
 }
 
-pub fn spawn(_window: Weak<MainWindow>) -> Result<Tray> {
+pub fn spawn(_window: Weak<MainWindow>, _nudge: crate::work::Nudge) -> Result<Tray> {
     bail!("no tray backend for this platform")
 }

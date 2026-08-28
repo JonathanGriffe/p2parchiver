@@ -5,6 +5,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use super::{Live, icon};
 use crate::ui::MainWindow;
+use crate::work::Nudge;
 
 pub struct Tray {
     #[allow(dead_code)]
@@ -21,7 +22,7 @@ impl Tray {
 
 const PUMP: std::time::Duration = std::time::Duration::from_millis(100);
 
-pub fn spawn(window: Weak<MainWindow>) -> Result<Tray> {
+pub fn spawn(window: Weak<MainWindow>, nudge: Nudge) -> Result<Tray> {
     let image = tray_icon::Icon::from_rgba(icon::rgba(icon::NATIVE), icon::NATIVE, icon::NATIVE)
         .context("building the tray icon")?;
 
@@ -54,7 +55,7 @@ pub fn spawn(window: Weak<MainWindow>) -> Result<Tray> {
     pump.start(slint::TimerMode::Repeated, PUMP, move || {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == open_id {
-                super::show(&window);
+                super::show(&window, &nudge);
             } else if event.id == startup_id {
                 super::set_autostart(startup.is_checked());
                 startup.set_checked(crate::autostart::state().is_ok_and(|s| s.is_on()));
@@ -64,7 +65,7 @@ pub fn spawn(window: Weak<MainWindow>) -> Result<Tray> {
         }
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
             if let TrayIconEvent::DoubleClick { .. } = event {
-                super::show(&window);
+                super::show(&window, &nudge);
             }
         }
     });
