@@ -1,10 +1,12 @@
 import { Theme, Card } from "theme.slint";
 import { StatusView, GroupRow, PeerRow } from "views/status.slint";
 import { GroupsView, GroupItem, MemberItem, LogItem } from "views/groups.slint";
+import { PeersView, PeerItem } from "views/peers.slint";
+import { FilesView, FileItem } from "views/files.slint";
 import { AboutView } from "views/about.slint";
 
 // Re-exported so slint-build generates the Rust structs the models are built from.
-export { GroupRow, PeerRow, GroupItem, MemberItem, LogItem }
+export { GroupRow, PeerRow, GroupItem, MemberItem, LogItem, PeerItem, FileItem }
 
 component NavItem inherits Rectangle {
     in property <string> label;
@@ -75,6 +77,17 @@ export component MainWindow inherits Window {
     in property <[MemberItem]> group-members;
     in property <[LogItem]> group-log;
 
+    // The Peers page.
+    in property <[PeerItem]> peer-items;
+
+    // The Files page.
+    in property <[string]> file-group-names;
+    in property <int> file-group-index;
+    in property <string> file-group-id;
+    in property <string> file-dir;
+    in property <[FileItem]> files;
+    in property <string> file-progress;
+
     // What the last action did, and whether it went wrong. Set by Rust, cleared when the
     // next one starts.
     in property <bool> busy;
@@ -92,6 +105,13 @@ export component MainWindow inherits Window {
     callback accept-group(string);
     callback leave-group(string);
     callback forget-group(string);
+    callback add-peer(string, string);
+    callback remove-peer(string);
+    callback pick-group(int);
+    callback filter(string, bool);
+    callback browse(bool);
+    callback remove-file(string);
+    callback verify();
 
     property <int> tab: 0;
 
@@ -123,9 +143,19 @@ export component MainWindow inherits Window {
                 chosen => { root.tab = 1; }
             }
             NavItem {
-                label: "About";
+                label: "Peers";
                 selected: root.tab == 2;
                 chosen => { root.tab = 2; }
+            }
+            NavItem {
+                label: "Files";
+                selected: root.tab == 3;
+                chosen => { root.tab = 3; }
+            }
+            NavItem {
+                label: "About";
+                selected: root.tab == 4;
+                chosen => { root.tab = 4; }
             }
 
             Rectangle { vertical-stretch: 1; }
@@ -168,7 +198,33 @@ export component MainWindow inherits Window {
                 forget(id) => { root.selected-group = ""; root.forget-group(id); }
             }
 
-            if root.tab == 2 : AboutView {
+            if root.tab == 2 : PeersView {
+                peers: root.peer-items;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                add(id, label) => { root.add-peer(id, label); }
+                remove(id) => { root.remove-peer(id); }
+            }
+
+            if root.tab == 3 : FilesView {
+                group-names: root.file-group-names;
+                group-index: root.file-group-index;
+                group-id: root.file-group-id;
+                dir: root.file-dir;
+                files: root.files;
+                progress: root.file-progress;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                pick-group(at) => { root.pick-group(at); }
+                filter(prefix, removed) => { root.filter(prefix, removed); }
+                browse(folder) => { root.browse(folder); }
+                remove(path) => { root.remove-file(path); }
+                verify() => { root.verify(); }
+            }
+
+            if root.tab == 4 : AboutView {
                 version: root.version;
                 peer-id: root.peer-id;
                 home: root.home;

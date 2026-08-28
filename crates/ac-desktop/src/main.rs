@@ -1,9 +1,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod autostart;
+mod files;
 mod groups;
 mod log;
 mod node;
+mod peers;
 mod selection;
 mod tray;
 mod view;
@@ -87,6 +89,8 @@ fn main() -> Result<()> {
     let selection = selection::Selection::new();
     let nudge = work::poll(window.as_weak(), paths.clone(), selection.clone());
     groups::wire(&window, &paths, &selection, &nudge);
+    peers::wire(&window, &paths, &nudge);
+    files::wire(&window, &paths, &selection, &nudge);
 
     if !cli.background || _tray.is_none() {
         window.show().context("showing the window")?;

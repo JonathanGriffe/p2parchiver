@@ -1,0 +1,213 @@
+import { ScrollView, Button, LineEdit, CheckBox, ComboBox } from "std-widgets.slint";
+import { Theme, Card } from "../theme.slint";
+
+// One row of `ac file list`. Sizes and times are already words by the time they arrive.
+export struct FileItem {
+    path: string,
+    size: string,
+    hash: string,
+    modified: string,
+    added_by: string,
+    // "local", "remote" or "removed", exactly as the CLI names the three states.
+    held: string,
+    removed: bool,
+    have: bool,
+}
+
+export component FilesView inherits VerticalLayout {
+    in property <[string]> group-names;
+    in property <int> group-index;
+    in property <string> group-id;
+    in property <string> dir;
+    in property <[FileItem]> files;
+    in property <bool> busy;
+    // What a long add is doing right now, so the window is never silently working.
+    in property <string> progress;
+
+    callback pick-group(int);
+    callback filter(string, bool);
+    callback browse(bool);
+    callback remove(string);
+    callback verify();
+
+    spacing: Theme.md;
+
+    Card {
+        VerticalLayout {
+            padding: Theme.md;
+            spacing: Theme.sm;
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+
+                ComboBox {
+                    model: root.group-names;
+                    current-index: root.group-index;
+                    enabled: root.group-names.length > 0;
+                    width: 200px;
+                    selected(_) => { root.pick-group(self.current-index); }
+                }
+
+                prefix := LineEdit {
+                    placeholder-text: "only under this path";
+                    horizontal-stretch: 1;
+                    edited => { root.filter(self.text, removed.checked); }
+                }
+
+                removed := CheckBox {
+                    text: "show removed";
+                    toggled => { root.filter(prefix.text, self.checked); }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+
+                Button {
+                    text: "Add files…";
+                    enabled: root.group-id != "" && !root.busy;
+                    clicked => { root.browse(false); }
+                }
+                Button {
+                    text: "Add a folder…";
+                    enabled: root.group-id != "" && !root.busy;
+                    clicked => { root.browse(true); }
+                }
+                Button {
+                    text: "Verify";
+                    enabled: root.group-id != "" && !root.busy;
+                    clicked => { root.verify(); }
+                }
+
+                Text {
+                    text: root.progress;
+                    color: Theme.dim;
+                    font-size: Theme.small-size;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            if root.dir != "" : Text {
+                text: root.dir;
+                color: Theme.faint;
+                font-size: Theme.small-size;
+                font-family: Theme.mono;
+                overflow: elide;
+            }
+        }
+    }
+
+    if root.group-id == "" : Card {
+        VerticalLayout {
+            padding: Theme.md;
+            Text {
+                text: "Choose a group to see what is in it.";
+                color: Theme.dim;
+                font-size: Theme.body-size;
+            }
+        }
+    }
+
+    if root.group-id != "" && root.files.length == 0 : Card {
+        VerticalLayout {
+            padding: Theme.md;
+            Text {
+                // The sentence the CLI prints for the same state.
+                text: "no files. add some with: ac file add <group> <path>...";
+                color: Theme.dim;
+                font-size: Theme.body-size;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    if root.files.length > 0 : ScrollView {
+        VerticalLayout {
+            spacing: 1px;
+
+            // A header, so the columns below mean something without a legend.
+            HorizontalLayout {
+                padding-left: Theme.sm;
+                padding-right: Theme.sm;
+                padding-bottom: Theme.xs;
+                spacing: Theme.sm;
+
+                Text { text: "PATH"; color: Theme.faint; font-size: 10px; font-weight: 700; horizontal-stretch: 1; }
+                Text { text: "SIZE"; color: Theme.faint; font-size: 10px; font-weight: 700; width: 70px; horizontal-alignment: right; }
+                Text { text: "MODIFIED"; color: Theme.faint; font-size: 10px; font-weight: 700; width: 90px; }
+                Text { text: "ADDED BY"; color: Theme.faint; font-size: 10px; font-weight: 700; width: 90px; }
+                Text { text: "HELD"; color: Theme.faint; font-size: 10px; font-weight: 700; width: 60px; }
+                Rectangle { width: 72px; }
+            }
+
+            for file in root.files : Rectangle {
+                background: row.has-hover ? Theme.raised.with-alpha(0.5) : transparent;
+                border-radius: Theme.radius;
+                height: self.preferred-height;
+
+                row := TouchArea {}
+
+                HorizontalLayout {
+                    padding: Theme.sm;
+                    spacing: Theme.sm;
+
+                    Text {
+                        text: file.path;
+                        color: file.removed ? Theme.faint : Theme.text;
+                        font-size: Theme.body-size;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: file.size;
+                        color: Theme.dim;
+                        font-size: Theme.small-size;
+                        width: 70px;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: file.modified;
+                        color: Theme.dim;
+                        font-size: Theme.small-size;
+                        width: 90px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: file.added_by;
+                        color: Theme.dim;
+                        font-size: Theme.small-size;
+                        width: 90px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: file.held;
+                        // Only "remote" is worth a colour: it is the one that means this node
+                        // knows the file exists but does not hold it.
+                        color: file.removed ? Theme.faint
+                             : file.have ? Theme.ok
+                             : Theme.warn;
+                        font-size: Theme.small-size;
+                        width: 60px;
+                        vertical-alignment: center;
+                    }
+
+                    if !file.removed : Button {
+                        text: "Remove";
+                        enabled: !root.busy;
+                        clicked => { root.remove(file.path); }
+                    }
+                    if file.removed : Rectangle { width: 72px; }
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+
+    Rectangle { vertical-stretch: 1; }
+}

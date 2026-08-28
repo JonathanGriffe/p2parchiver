@@ -20,6 +20,7 @@ tracing-appender.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 fontique = { version = "0.10", features = ["fontconfig-dlopen"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 [build-dependencies]
 slint-build.workspace = true

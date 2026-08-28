@@ -144,7 +144,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         let selection = selection.clone();
         let nudge = nudge.clone();
         move |id| {
-            selection.set(&id);
+            selection.set_group(&id);
             nudge.now();
         }
     });
@@ -191,7 +191,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         });
         move |id| {
             // The group is about to stop existing, so nothing should still be pointing at it.
-            selection.set("");
+            selection.set_group("");
             inner(id);
         }
     });
@@ -259,45 +259,26 @@ where
     let nudge = nudge.clone();
 
     move |a, b, c| {
-        if let Some(window) = weak.upgrade() {
-            // Every button on the page is disabled while one is in flight, so a slow SQLite
-            // write cannot be turned into a queue of them by an impatient second click.
-            window.set_busy(true);
-            window.set_message("".into());
-        }
+        work::begin(&weak);
 
         let paths = paths.clone();
         let nudge = nudge.clone();
         work::action(
             &weak,
             move || work(&paths, a.as_str(), b.as_str(), c.as_str()),
-            move |window, outcome| {
-                window.set_busy(false);
-                match outcome {
-                    Ok(said) => {
-                        window.set_message(said.into());
-                        window.set_message_bad(false);
-                    }
-                    Err(e) => {
-                        // `{:#}` so the reason comes through, not just the outermost context.
-                        window.set_message(format!("{e:#}").into());
-                        window.set_message_bad(true);
-                    }
-                }
-                nudge.now();
-            },
+            move |window, outcome| work::finish(window, outcome, &nudge),
         );
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     /// A node that has enrolled, since `ac group create` refuses to run on one that has not.
     /// Enrolment is an attestation on disk, so the test writes one rather than running a
     /// server to be handed it.
-    fn home(username: &str) -> (tempfile::TempDir, Paths) {
+    pub fn home(username: &str) -> (tempfile::TempDir, Paths) {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::rooted_at(tmp.path());
         std::fs::create_dir_all(&paths.root).unwrap();
@@ -318,7 +299,7 @@ mod tests {
     }
 
     /// A peer id belonging to somebody else.
-    fn somebody_else() -> ac_net::PeerId {
+    pub fn somebody_else() -> ac_net::PeerId {
         let elsewhere = tempfile::tempdir().unwrap();
         let (them, _) =
             ac_net::identity::Identity::load_or_generate(&elsewhere.path().join("key")).unwrap();

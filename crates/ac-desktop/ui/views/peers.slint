@@ -1,0 +1,138 @@
+import { ScrollView, Button, LineEdit } from "std-widgets.slint";
+import { Theme, Card, Dot } from "../theme.slint";
+
+// One row of `ac peer list`, with what `ac peer status` knows about the same peer folded in.
+export struct PeerItem {
+    name: string,
+    peer: string,
+    // "contact" or "group": whether this node was told about them or met them in a group.
+    via: string,
+    state: string,
+    // 0 idle, 1 working, 2 waiting, 3 unreachable. Kept a number so the words stay in Rust.
+    tone: int,
+    // Only a contact can be removed; a peer known through a group is not this node's to drop.
+    removable: bool,
+}
+
+export component PeersView inherits VerticalLayout {
+    in property <[PeerItem]> peers;
+    in property <bool> busy;
+
+    callback add(string, string);
+    callback remove(string);
+
+    spacing: Theme.md;
+
+    Card {
+        HorizontalLayout {
+            padding: Theme.md;
+            spacing: Theme.sm;
+
+            id := LineEdit {
+                placeholder-text: "peer id";
+                horizontal-stretch: 1;
+            }
+            label := LineEdit {
+                placeholder-text: "name";
+                width: 160px;
+            }
+            Button {
+                text: "Add contact";
+                enabled: id.text != "" && label.text != "" && !root.busy;
+                clicked => {
+                    root.add(id.text, label.text);
+                    id.text = "";
+                    label.text = "";
+                }
+            }
+        }
+    }
+
+    if root.peers.length == 0 : Card {
+        VerticalLayout {
+            padding: Theme.md;
+            spacing: Theme.xs;
+            // The two sentences the CLI prints for the same state.
+            Text {
+                text: "nobody yet. add someone with: ac peer add <peer-id> --label <name>";
+                color: Theme.dim;
+                font-size: Theme.body-size;
+                wrap: word-wrap;
+            }
+            Text {
+                text: "fellow members of your groups appear here too.";
+                color: Theme.dim;
+                font-size: Theme.body-size;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    if root.peers.length > 0 : ScrollView {
+        VerticalLayout {
+            spacing: Theme.sm;
+
+            for peer in root.peers : Card {
+                HorizontalLayout {
+                    padding: Theme.md;
+                    spacing: Theme.sm;
+
+                    Dot {
+                        tint: peer.tone == 1 ? Theme.accent
+                            : peer.tone == 2 ? Theme.warn
+                            : peer.tone == 3 ? Theme.faint
+                            : Theme.ok;
+                        y: (parent.height - self.height) / 2;
+                    }
+
+                    VerticalLayout {
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+
+                        HorizontalLayout {
+                            spacing: Theme.sm;
+                            Text {
+                                text: peer.name;
+                                color: Theme.text;
+                                font-size: Theme.body-size;
+                                font-weight: 700;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: peer.via;
+                                color: Theme.faint;
+                                font-size: Theme.small-size;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+
+                        Text {
+                            text: peer.peer;
+                            color: Theme.faint;
+                            font-size: Theme.small-size;
+                            font-family: Theme.mono;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: peer.state;
+                            color: Theme.dim;
+                            font-size: Theme.small-size;
+                        }
+                    }
+
+                    if peer.removable : Button {
+                        text: "Remove";
+                        enabled: !root.busy;
+                        clicked => { root.remove(peer.peer); }
+                    }
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+
+    Rectangle { vertical-stretch: 1; }
+}

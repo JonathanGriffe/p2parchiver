@@ -4,17 +4,20 @@ use ac_net::config::Paths;
 use ac_node::ops;
 use ac_node::ops::file::Storage;
 use ac_node::ops::format::human_size;
-use ac_node::ops::peer::{Liveness, StatusReport};
+use ac_node::ops::peer::{Liveness, PeerProgress, StatusReport};
 use slint::{ModelRc, VecModel};
 
+use crate::files;
 use crate::groups;
+use crate::peers;
 use crate::selection::Selection;
 use crate::ui::{GroupRow, MainWindow, PeerRow};
 
 const IDLE: i32 = 0;
 const WORKING: i32 = 1;
 const WAITING: i32 = 2;
-const QUIET: i32 = 3;
+/// Shared with the Peers page, so one number cannot drift from the other.
+pub const QUIET: i32 = 3;
 
 pub struct Snapshot {
     pub running: bool,
@@ -23,14 +26,20 @@ pub struct Snapshot {
     pub groups: Vec<GroupRow>,
     pub peers: Vec<PeerRow>,
     pub page: groups::Page,
+    pub directory: Vec<crate::ui::PeerItem>,
+    pub files: files::Page,
 }
 
 pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
-    let page = groups::read(paths, &selection.get());
+    let looking_at = selection.get();
+    let page = groups::read(paths, &looking_at.group);
+    let files = files::read(paths, &looking_at);
 
     match ops::peer::status(paths) {
         Ok(report) => Snapshot {
             page,
+            files,
+            directory: peers::read(paths, Some(&report)),
             ..present(&report, ops::file::storage(paths).ok().as_ref())
         },
         Err(e) => {
@@ -42,6 +51,8 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
                 groups: Vec::new(),
                 peers: Vec::new(),
                 page,
+                files,
+                directory: peers::read(paths, None),
             }
         }
     }
@@ -54,6 +65,8 @@ pub fn apply(window: &MainWindow, snapshot: Snapshot) {
     window.set_groups(ModelRc::from(Rc::new(VecModel::from(snapshot.groups))));
     window.set_peers(ModelRc::from(Rc::new(VecModel::from(snapshot.peers))));
     groups::apply(window, snapshot.page);
+    peers::apply(window, snapshot.directory);
+    files::apply(window, snapshot.files);
 }
 
 pub fn present(report: &StatusReport, storage: Option<&Storage>) -> Snapshot {
@@ -100,30 +113,7 @@ pub fn present(report: &StatusReport, storage: Option<&Storage>) -> Snapshot {
         .peers
         .iter()
         .map(|peer| {
-            let (tone, state) = if peer.connected {
-                let mut busy = Vec::new();
-                if peer.rounds > 0 {
-                    busy.push(format!("{} round(s)", peer.rounds));
-                }
-                if peer.transfers > 0 {
-                    busy.push(format!("{} transfer(s)", peer.transfers));
-                }
-                if peer.closing {
-                    busy.push("closing".to_owned());
-                }
-                if busy.is_empty() {
-                    (IDLE, "connected, idle".to_owned())
-                } else {
-                    (WORKING, format!("connected, {}", busy.join(", ")))
-                }
-            } else if now < peer.retry_at {
-                (WAITING, format!("backed off for {}s", peer.retry_at - now))
-            } else if peer.online {
-                (QUIET, "online, not connected".to_owned())
-            } else {
-                (QUIET, "not seen".to_owned())
-            };
-
+            let (tone, state) = describe_peer(peer, now);
             PeerRow {
                 name: peer.name.clone().into(),
                 state: state.into(),
@@ -139,6 +129,33 @@ pub fn present(report: &StatusReport, storage: Option<&Storage>) -> Snapshot {
         groups,
         peers,
         page: groups::Page::default(),
+        directory: Vec::new(),
+        files: files::Page::default(),
+    }
+}
+pub fn describe_peer(peer: &PeerProgress, now: i64) -> (i32, String) {
+    if peer.connected {
+        let mut busy = Vec::new();
+        if peer.rounds > 0 {
+            busy.push(format!("{} round(s)", peer.rounds));
+        }
+        if peer.transfers > 0 {
+            busy.push(format!("{} transfer(s)", peer.transfers));
+        }
+        if peer.closing {
+            busy.push("closing".to_owned());
+        }
+        if busy.is_empty() {
+            (IDLE, "connected, idle".to_owned())
+        } else {
+            (WORKING, format!("connected, {}", busy.join(", ")))
+        }
+    } else if now < peer.retry_at {
+        (WAITING, format!("backed off for {}s", peer.retry_at - now))
+    } else if peer.online {
+        (QUIET, "online, not connected".to_owned())
+    } else {
+        (QUIET, "not seen".to_owned())
     }
 }
 

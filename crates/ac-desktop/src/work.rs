@@ -52,6 +52,31 @@ fn run(window: &Weak<MainWindow>, paths: &Paths, selection: &Selection, rx: &Rec
     }
 }
 
+/// Shut the window's buttons while an action is in flight, and clear what was last said.
+pub fn begin(weak: &Weak<MainWindow>) {
+    if let Some(window) = weak.upgrade() {
+        window.set_busy(true);
+        window.set_message("".into());
+    }
+}
+
+/// Say what an action did, let the buttons go, and get the change on screen at once.
+pub fn finish(window: &MainWindow, outcome: anyhow::Result<String>, nudge: &Nudge) {
+    window.set_busy(false);
+    match outcome {
+        Ok(said) => {
+            window.set_message(said.into());
+            window.set_message_bad(false);
+        }
+        Err(e) => {
+            // `{:#}` so the reason comes through, not just the outermost context.
+            window.set_message(format!("{e:#}").into());
+            window.set_message_bad(true);
+        }
+    }
+    nudge.now();
+}
+
 /// Do one thing the user asked for, off the event loop, and report the outcome back on it.
 ///
 /// `done` is handed whatever `work` returned, error included: every action has to say
