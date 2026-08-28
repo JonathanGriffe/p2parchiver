@@ -80,7 +80,7 @@ impl ksni::Tray for Item {
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "Quit (stops syncing)".into(),
+                label: "Quit".into(),
                 activate: Box::new(|_: &mut Self| super::quit()),
                 ..Default::default()
             }

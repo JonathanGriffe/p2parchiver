@@ -29,5 +29,37 @@ export component AboutView inherits ScrollView {
                 Field { label: "logs"; value: root.log-dir; monospace: true; }
             }
         }
+
+        // The GPL asks that an interactive program carry its notice where a user can find it,
+        // and names the about box as the place for a GUI.
+        Card {
+            VerticalLayout {
+                padding: Theme.md;
+                spacing: Theme.sm;
+
+                Text {
+                    text: "Licence";
+                    color: Theme.dim;
+                    font-size: Theme.small-size;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "ArchiverClient is free software under the GNU General Public "
+                        + "License, version 3. It comes with absolutely no warranty. You may "
+                        + "redistribute it under the terms in the LICENSE file shipped beside "
+                        + "it.";
+                    color: Theme.dim;
+                    font-size: Theme.small-size;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Source: https://github.com/JonathanGriffe/archiverclient";
+                    color: Theme.faint;
+                    font-size: Theme.small-size;
+                    font-family: Theme.mono;
+                    wrap: char-wrap;
+                }
+            }
+        }
     }
 }

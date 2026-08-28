@@ -33,7 +33,7 @@ pub fn spawn(window: Weak<MainWindow>) -> Result<Tray> {
         crate::autostart::state().is_ok_and(|s| s.is_on()),
         None,
     );
-    let quit = MenuItem::new("Quit (stops syncing)", true, None);
+    let quit = MenuItem::new("Quit", true, None);
     menu.append(&open).context("building the tray menu")?;
     menu.append(&startup).context("building the tray menu")?;
     menu.append(&PredefinedMenuItem::separator())
