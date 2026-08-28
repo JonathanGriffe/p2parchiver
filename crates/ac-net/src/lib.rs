@@ -15,4 +15,4 @@ pub mod proto;
 pub mod roster;
 pub mod swarm;
 
-pub use libp2p::PeerId;
+pub use libp2p::{Multiaddr, PeerId};

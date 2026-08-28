@@ -3,6 +3,7 @@ import { StatusView, GroupRow, PeerRow } from "views/status.slint";
 import { GroupsView, GroupItem, MemberItem, LogItem } from "views/groups.slint";
 import { PeersView, PeerItem } from "views/peers.slint";
 import { FilesView, FileItem } from "views/files.slint";
+import { SettingsView } from "views/settings.slint";
 import { AboutView } from "views/about.slint";
 
 // Re-exported so slint-build generates the Rust structs the models are built from.
@@ -88,6 +89,18 @@ export component MainWindow inherits Window {
     in property <[FileItem]> files;
     in property <string> file-progress;
 
+    // The Settings page. Loaded once and after each save, never on the poll.
+    in-out property <string> listen;
+    in-out property <string> external;
+    in-out property <bool> mdns;
+    in-out property <string> config-storage-root;
+    in-out property <string> storage-max;
+    in-out property <string> bandwidth-max;
+    in-out property <string> server;
+    in-out property <bool> enrolled;
+    in-out property <bool> autostart;
+    in-out property <string> autostart-warning;
+
     // What the last action did, and whether it went wrong. Set by Rust, cleared when the
     // next one starts.
     in property <bool> busy;
@@ -112,6 +125,11 @@ export component MainWindow inherits Window {
     callback browse(bool);
     callback remove-file(string);
     callback verify();
+    callback save(string, string, bool, string, string, string);
+    callback set-autostart(bool);
+    callback open-logs();
+    callback restart();
+    callback join(string, string, string);
 
     property <int> tab: 0;
 
@@ -153,9 +171,14 @@ export component MainWindow inherits Window {
                 chosen => { root.tab = 3; }
             }
             NavItem {
-                label: "About";
+                label: "Settings";
                 selected: root.tab == 4;
                 chosen => { root.tab = 4; }
+            }
+            NavItem {
+                label: "About";
+                selected: root.tab == 5;
+                chosen => { root.tab = 5; }
             }
 
             Rectangle { vertical-stretch: 1; }
@@ -224,7 +247,28 @@ export component MainWindow inherits Window {
                 verify() => { root.verify(); }
             }
 
-            if root.tab == 4 : AboutView {
+            if root.tab == 4 : SettingsView {
+                listen: root.listen;
+                external: root.external;
+                mdns: root.mdns;
+                storage-root: root.config-storage-root;
+                storage-max: root.storage-max;
+                bandwidth-max: root.bandwidth-max;
+                server: root.server;
+                enrolled: root.enrolled;
+                autostart: root.autostart;
+                autostart-warning: root.autostart-warning;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                save(l, e, m, r, s, b) => { root.save(l, e, m, r, s, b); }
+                set-autostart(on) => { root.set-autostart(on); }
+                open-logs() => { root.open-logs(); }
+                restart() => { root.restart(); }
+                join(a, c, u) => { root.join(a, c, u); }
+            }
+
+            if root.tab == 5 : AboutView {
                 version: root.version;
                 peer-id: root.peer-id;
                 home: root.home;

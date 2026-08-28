@@ -7,6 +7,7 @@ mod log;
 mod node;
 mod peers;
 mod selection;
+mod settings;
 mod tray;
 mod view;
 mod work;
@@ -17,6 +18,7 @@ mod ui {
 }
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use ac_net::config::{Config, Paths};
 use ac_node::ops;
@@ -68,7 +70,8 @@ fn main() -> Result<()> {
         return node::run_here(paths);
     }
 
-    let mut node = node::Node::start(paths.clone())?;
+    // Shared so the Settings page can restart it, always off the event loop since that joins.
+    let node: settings::Shared = Arc::new(Mutex::new(node::Node::start(paths.clone())?));
 
     let window = MainWindow::new().context("creating the window")?;
     describe_node(&window, &paths)?;
@@ -91,6 +94,8 @@ fn main() -> Result<()> {
     groups::wire(&window, &paths, &selection, &nudge);
     peers::wire(&window, &paths, &nudge);
     files::wire(&window, &paths, &selection, &nudge);
+    settings::wire(&window, &paths, &node, &nudge);
+    settings::load(&window, &paths);
 
     if !cli.background || _tray.is_none() {
         window.show().context("showing the window")?;
@@ -98,7 +103,12 @@ fn main() -> Result<()> {
 
     slint::run_event_loop_until_quit().context("running the window")?;
 
-    node.stop()
+    match node.lock() {
+        Ok(mut node) => node.stop(),
+        // A poisoned lock means a restart panicked mid-swap. The thread is gone either way,
+        // and the process is on its way out.
+        Err(_) => Ok(()),
+    }
 }
 
 /// The facts that do not change while the app is open.

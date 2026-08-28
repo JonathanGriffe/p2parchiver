@@ -69,3 +69,34 @@ fn run(paths: Paths, stopped: oneshot::Receiver<()>) -> Result<()> {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_node_can_be_stopped_and_started_again_on_the_same_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted_at(tmp.path());
+
+        let mut node = Node::start(paths.clone()).unwrap();
+        // Long enough for the swarm to bind and open the database, which is where a
+        // still-held resource would show up.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        node.stop().unwrap();
+
+        let mut again = Node::start(paths.clone()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        again.stop().unwrap();
+    }
+
+    #[test]
+    fn stopping_twice_is_not_an_error() {
+        // `stop` runs from the Restart button, from enrolling, and again from Drop.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut node = Node::start(Paths::rooted_at(tmp.path())).unwrap();
+
+        node.stop().unwrap();
+        node.stop().unwrap();
+    }
+}
