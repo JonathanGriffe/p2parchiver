@@ -20,7 +20,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
 name = "ac-desktop"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ac-net",
  "ac-node",
@@ -29,6 +29,7 @@ dependencies = [
  "directories",
  "fontique",
  "ksni",
+ "png 0.18.1",
  "rfd",
  "slint",
  "slint-build",
@@ -43,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "ac-files"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ac-groups",
  "ac-net",
@@ -59,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "ac-groups"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ac-net",
  "ciborium",
@@ -75,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "ac-net"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ciborium",
  "directories",
@@ -91,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "ac-node"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ac-files",
  "ac-groups",
@@ -116,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "ac-peers"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ac-files",
  "ac-groups",
@@ -131,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "ac-server"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ac-net",
  "anyhow",

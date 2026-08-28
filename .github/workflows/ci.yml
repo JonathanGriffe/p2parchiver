@@ -98,6 +98,50 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  package:
+    name: package (${{ matrix.os }})
+    needs: [test, release]
+    if: always() && needs.test.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            formats: deb,appimage
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            formats: nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+
+      - name: Stamp the released version
+        if: needs.release.outputs.version != ''
+        shell: bash
+        run: |
+          version='${{ needs.release.outputs.version }}'
+          sed -i "s/^version = \"0.0.0\"/version = \"$version\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
+      - name: Build
+        run: cargo build --release -p ac-desktop -p ac-node
+
+      - name: Package
+        working-directory: crates/ac-desktop
+        run: cargo packager --release --formats ${{ matrix.formats }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.os }}
+          path: target/packages/*
+          if-no-files-found: error
+
   deploy:
     name: deploy
     needs: release
