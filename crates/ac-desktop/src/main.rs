@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod autostart;
 mod log;
 mod node;
 mod tray;
@@ -38,6 +39,11 @@ struct Cli {
     home: Option<PathBuf>,
     #[arg(long)]
     headless: bool,
+
+    /// Start in the tray with no window. What the autostart entry uses, so logging in does
+    /// not put a window in front of you.
+    #[arg(long)]
+    background: bool,
 }
 
 fn main() -> Result<()> {
@@ -50,6 +56,11 @@ fn main() -> Result<()> {
     let _logging = log::init(&paths, cli.headless)?;
 
     let _lock = NodeLock::take(&paths)?;
+
+    // Cheaper than explaining why autostart quietly stopped working after a rebuild.
+    if let Err(e) = autostart::repair() {
+        tracing::warn!(error = %e, "could not check the autostart entry");
+    }
 
     // No window, so nothing needs the main thread and the daemon can have it.
     if cli.headless {
@@ -106,7 +117,11 @@ fn main() -> Result<()> {
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, POLL, refresh);
 
-    window.run().context("running the window")?;
+    if !cli.background || _tray.is_none() {
+        window.show().context("showing the window")?;
+    }
+
+    slint::run_event_loop_until_quit().context("running the window")?;
 
     node.stop()
 }

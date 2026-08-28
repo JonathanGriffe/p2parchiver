@@ -18,10 +18,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 anyhow.workspace = true
+directories.workspace = true
 fontique = { version = "0.10", features = ["fontconfig-dlopen"] }
 
 [build-dependencies]
 slint-build.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "deny"
@@ -35,3 +39,4 @@ ksni = { version = "0.3", default-features = false, features = ["blocking", "asy
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tray-icon = "0.21"
+windows-registry = "0.6"

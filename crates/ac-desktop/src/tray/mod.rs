@@ -63,7 +63,17 @@ pub(crate) fn show(window: &Weak<MainWindow>) {
     }
 }
 
-/// Stop the app. The daemon is stopped by `main` once the event loop returns.
+pub(crate) fn set_autostart(wanted: bool) {
+    let result = if wanted {
+        crate::autostart::enable()
+    } else {
+        crate::autostart::disable()
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, wanted, "could not change whether this starts at login");
+    }
+}
+
 pub(crate) fn quit() {
     if let Err(e) = slint::invoke_from_event_loop(|| {
         if let Err(e) = slint::quit_event_loop() {

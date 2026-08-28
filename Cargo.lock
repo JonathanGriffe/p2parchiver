@@ -26,15 +26,18 @@ dependencies = [
  "ac-node",
  "anyhow",
  "clap",
+ "directories",
  "fontique",
  "ksni",
  "slint",
  "slint-build",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "tray-icon",
+ "windows-registry",
 ]
 
 [[package]]
