@@ -19,12 +19,17 @@ const WAITING: i32 = 2;
 /// Shared with the Peers page, so one number cannot drift from the other.
 pub const QUIET: i32 = 3;
 
-pub struct Snapshot {
+/// What the daemon last published, in the words the window shows
+pub struct Status {
     pub running: bool,
     pub node_state: String,
     pub storage: String,
     pub groups: Vec<GroupRow>,
     pub peers: Vec<PeerRow>,
+}
+
+pub struct Snapshot {
+    pub status: Status,
     pub page: groups::Page,
     pub directory: Vec<crate::ui::PeerItem>,
     pub files: files::Page,
@@ -35,41 +40,53 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
     let page = groups::read(paths, &looking_at.group);
     let files = files::read(paths, &looking_at);
 
-    match ops::peer::status(paths) {
-        Ok(report) => Snapshot {
-            page,
-            files,
-            directory: peers::read(paths, Some(&report)),
-            ..present(&report, ops::file::storage(paths).ok().as_ref())
-        },
+    let (status, directory) = match ops::peer::status(paths) {
+        Ok(report) => (
+            present(&report, ops::file::storage(paths).ok().as_ref()),
+            peers::read(paths, Some(&report)),
+        ),
         Err(e) => {
             tracing::warn!(error = %e, "could not read the node's status");
-            Snapshot {
-                running: false,
-                node_state: format!("could not read status: {e}"),
-                storage: String::new(),
-                groups: Vec::new(),
-                peers: Vec::new(),
-                page,
-                files,
-                directory: peers::read(paths, None),
-            }
+            (
+                Status {
+                    running: false,
+                    node_state: format!("could not read status: {e}"),
+                    storage: String::new(),
+                    groups: Vec::new(),
+                    peers: Vec::new(),
+                },
+                peers::read(paths, None),
+            )
         }
+    };
+
+    Snapshot {
+        status,
+        page,
+        directory,
+        files,
     }
 }
 
 pub fn apply(window: &MainWindow, snapshot: Snapshot) {
-    window.set_running(snapshot.running);
-    window.set_node_state(snapshot.node_state.into());
-    window.set_storage(snapshot.storage.into());
-    window.set_groups(ModelRc::from(Rc::new(VecModel::from(snapshot.groups))));
-    window.set_peers(ModelRc::from(Rc::new(VecModel::from(snapshot.peers))));
-    groups::apply(window, snapshot.page);
-    peers::apply(window, snapshot.directory);
-    files::apply(window, snapshot.files);
+    let Snapshot {
+        status,
+        page,
+        directory,
+        files,
+    } = snapshot;
+
+    window.set_running(status.running);
+    window.set_node_state(status.node_state.into());
+    window.set_storage(status.storage.into());
+    window.set_groups(ModelRc::from(Rc::new(VecModel::from(status.groups))));
+    window.set_peers(ModelRc::from(Rc::new(VecModel::from(status.peers))));
+    groups::apply(window, page);
+    peers::apply(window, directory);
+    files::apply(window, files);
 }
 
-pub fn present(report: &StatusReport, storage: Option<&Storage>) -> Snapshot {
+pub fn present(report: &StatusReport, storage: Option<&Storage>) -> Status {
     let now = report.now;
 
     let (running, node_state) = match report.liveness {
@@ -122,17 +139,15 @@ pub fn present(report: &StatusReport, storage: Option<&Storage>) -> Snapshot {
         })
         .collect();
 
-    Snapshot {
+    Status {
         running,
         node_state,
         storage: describe_storage(storage),
         groups,
         peers,
-        page: groups::Page::default(),
-        directory: Vec::new(),
-        files: files::Page::default(),
     }
 }
+
 pub fn describe_peer(peer: &PeerProgress, now: i64) -> (i32, String) {
     if peer.connected {
         let mut busy = Vec::new();
