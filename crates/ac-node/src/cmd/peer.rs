@@ -1,45 +1,23 @@
-use std::collections::HashMap;
-
-use ac_groups::store::Groups;
 use ac_net::PeerId;
-use ac_net::attest;
 use ac_net::config::Paths;
-use ac_net::identity::Identity;
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 
-use crate::contacts::Contacts;
-use crate::directory::{self, Source};
-use crate::status::Published;
-
-/// How stale a snapshot may be before it is reported as a stopped daemon.
-const STALE_AFTER: i64 = 60;
-
-fn open(paths: &Paths) -> Result<Contacts> {
-    let path = paths.db_file();
-    Contacts::open(&path).with_context(|| format!("opening contacts at {}", path.display()))
-}
+use crate::ops::peer::Liveness;
+use crate::ops::{self, Source};
 
 pub fn add(paths: &Paths, peer: &PeerId, label: &str) -> Result<()> {
-    let label =
-        attest::normalise_username(label).map_err(|e| anyhow!("unusable label {label:?}: {e}"))?;
+    let added = ops::peer::add(paths, peer, label)?;
 
-    let added = open(paths)?
-        .add(peer, &label)
-        .with_context(|| format!("adding contact {peer}"))?;
-
-    if added {
-        println!("added {label} ({peer})");
+    if added.was_new {
+        println!("added {} ({})", added.label, added.peer);
     } else {
-        println!("relabelled {peer} to {label}");
+        println!("relabelled {} to {}", added.peer, added.label);
     }
     Ok(())
 }
 
 pub fn remove(paths: &Paths, peer: &PeerId) -> Result<()> {
-    if open(paths)?
-        .remove(peer)
-        .with_context(|| format!("removing contact {peer}"))?
-    {
+    if ops::peer::remove(paths, peer)? {
         println!("removed {peer}");
     } else {
         println!("no such contact: {peer}");
@@ -48,15 +26,7 @@ pub fn remove(paths: &Paths, peer: &PeerId) -> Result<()> {
 }
 
 pub fn list(paths: &Paths) -> Result<()> {
-    let key_path = paths.identity_file();
-    let (identity, _) = Identity::load_or_generate(&key_path)
-        .with_context(|| format!("loading identity from {}", key_path.display()))?;
-
-    let db = paths.db_file();
-    let groups = Groups::open(&db, identity.peer_id())
-        .with_context(|| format!("opening the group store at {}", db.display()))?;
-
-    let known = directory::everyone(&open(paths)?, &groups, identity.peer_id())?;
+    let known = ops::peer::list(paths)?;
 
     if known.is_empty() {
         println!("nobody yet. add someone with: ac peer add <peer-id> --label <name>");
@@ -77,57 +47,27 @@ pub fn list(paths: &Paths) -> Result<()> {
 
 /// `ac peer status`: why the supervisor is, or is not, doing anything.
 pub fn status(paths: &Paths) -> Result<()> {
-    let key_path = paths.identity_file();
-    let (identity, _) = Identity::load_or_generate(&key_path)
-        .with_context(|| format!("loading identity from {}", key_path.display()))?;
+    let report = ops::peer::status(paths)?;
+    let now = report.now;
 
-    let db = paths.db_file();
-    let published = Published::open(&db).with_context(|| format!("opening {}", db.display()))?;
-    let snapshot = published
-        .read()
-        .context("reading the supervisor's status")?;
-
-    let now = attest::now();
-    match snapshot.at {
-        None => {
+    match report.liveness {
+        Liveness::Never => {
             println!("the node has never run. start it with: ac run");
             return Ok(());
         }
-        Some(at) if now - at > STALE_AFTER => {
-            println!("last seen {}s ago, the node is not running.", now - at);
+        Liveness::Stale { seconds } => {
+            println!("last seen {seconds}s ago, the node is not running.");
             println!("  start it with: ac run");
             println!();
         }
-        Some(_) => {}
+        Liveness::Live => {}
     }
 
-    let groups = Groups::open(&db, identity.peer_id())
-        .with_context(|| format!("opening the group store at {}", db.display()))?;
-    let contacts = open(paths)?;
-    let names: HashMap<PeerId, String> =
-        directory::everyone(&contacts, &groups, identity.peer_id())?
-            .into_iter()
-            .map(|entry| (entry.peer, entry.name))
-            .collect();
-    let name = |peer: &PeerId| {
-        names
-            .get(peer)
-            .cloned()
-            .unwrap_or_else(|| peer.to_base58()[..8].to_owned())
-    };
-
-    if snapshot.groups.is_empty() {
+    if report.groups.is_empty() {
         println!("no groups. create one with: ac group create --name <name>");
     }
-    for group in &snapshot.groups {
-        let label = groups
-            .get(group.group)
-            .ok()
-            .flatten()
-            .map(|row| row.name)
-            .unwrap_or_else(|| group.group.short());
-
-        println!("{label} ({})", group.group.short());
+    for group in &report.groups {
+        println!("{} ({})", group.label, group.group.short());
         println!("  missing   {}", group.missing);
         println!(
             "  news      {}",
@@ -137,32 +77,27 @@ pub fn status(paths: &Paths) -> Result<()> {
                 n => format!("{n} members to call"),
             }
         );
-        match group.source {
-            Some(peer) => println!("  pulling   from {}", name(&peer)),
+        match &group.source {
+            Some(name) => println!("  pulling   from {name}"),
             None if now < group.content_until => {
                 println!("  pulling   paused for {}s", group.content_until - now);
             }
             None if group.missing > 0 => println!("  pulling   nobody has offered them"),
             None => println!("  pulling   nothing to fetch"),
         }
-        if let Some(peer) = group.next {
-            println!("  next      {}", name(&peer));
+        if let Some(name) = &group.next {
+            println!("  next      {name}");
         }
         println!("  heartbeat in {}s", (group.heartbeat_at - now).max(0));
     }
 
-    if snapshot.peers.is_empty() {
+    if report.peers.is_empty() {
         return Ok(());
     }
     println!();
-    let widest = snapshot
-        .peers
-        .iter()
-        .map(|p| name(&p.peer).len())
-        .max()
-        .unwrap_or(0);
+    let widest = report.peers.iter().map(|p| p.name.len()).max().unwrap_or(0);
 
-    for peer in &snapshot.peers {
+    for peer in &report.peers {
         let state = if peer.connected {
             let mut busy = Vec::new();
             if peer.rounds > 0 {
@@ -186,7 +121,7 @@ pub fn status(paths: &Paths) -> Result<()> {
         } else {
             "not seen".to_owned()
         };
-        println!("{:<widest$}  {}", name(&peer.peer), state);
+        println!("{:<widest$}  {}", peer.name, state);
     }
     Ok(())
 }

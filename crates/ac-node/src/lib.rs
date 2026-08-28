@@ -2,6 +2,7 @@
 
 pub mod cmd;
 pub mod daemon;
+pub mod ops;
 
 // puts them in a signature, so they stay in.
 mod blob;
