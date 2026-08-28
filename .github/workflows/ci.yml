@@ -16,16 +16,21 @@ env:
 
 jobs:
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       # Reads rust-toolchain.toml, so the CI toolchain is the pinned one by construction
-      # rather than by a version repeated here and left to drift.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
+      # Formatting does not vary by platform, so checking it once is enough.
       - name: Format
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
       # `--all-targets` covers tests and examples, not just the library and binaries.

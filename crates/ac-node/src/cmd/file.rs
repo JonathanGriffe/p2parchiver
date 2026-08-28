@@ -476,6 +476,8 @@ mod tests {
         assert_eq!(out[0].1.as_str(), "docs/n.md");
     }
 
+    // Creating a symlink on Windows needs a privilege this test cannot assume.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_in_the_source_tree_is_not_followed() {
         let tmp = tempfile::tempdir().unwrap();

@@ -547,6 +547,8 @@ mod tests {
         );
     }
 
+    // Creating a symlink on Windows needs a privilege this test cannot assume.
+    #[cfg(unix)]
     #[test]
     fn walking_does_not_follow_a_symlink_out_of_the_root() {
         let (content, tmp) = content();
