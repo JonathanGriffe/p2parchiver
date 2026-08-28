@@ -129,12 +129,9 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         move || {
             let (paths, nudge) = (paths.clone(), nudge.clone());
             let group = selection.get().group;
-            work::begin(&weak);
-            work::action(
-                &weak,
-                move || Ok(describe_verify(&ops::file::verify(&paths, &group)?)),
-                move |window, outcome| work::finish(window, outcome, &nudge),
-            );
+            work::run(&weak, &nudge, move || {
+                Ok(describe_verify(&ops::file::verify(&paths, &group)?))
+            });
         }
     });
 
@@ -147,15 +144,10 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             let (paths, nudge) = (paths.clone(), nudge.clone());
             let group = selection.get().group;
             let path = path.to_string();
-            work::begin(&weak);
-            work::action(
-                &weak,
-                move || {
-                    let gone = ops::file::remove(&paths, &group, &path)?;
-                    Ok(format!("removed {gone}"))
-                },
-                move |window, outcome| work::finish(window, outcome, &nudge),
-            );
+            work::run(&weak, &nudge, move || {
+                let gone = ops::file::remove(&paths, &group, &path)?;
+                Ok(format!("removed {gone}"))
+            });
         }
     });
 

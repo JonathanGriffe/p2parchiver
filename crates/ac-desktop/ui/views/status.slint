@@ -1,5 +1,5 @@
 import { ScrollView } from "std-widgets.slint";
-import { Theme, Card, Dot } from "../theme.slint";
+import { Theme, Card, Dot, ToneDot } from "../theme.slint";
 
 // One group's sync progress, already worded by Rust. The UI decides colour and layout; it
 // does not decide what a number means.
@@ -161,11 +161,8 @@ export component StatusView inherits VerticalLayout {
                     spacing: Theme.sm;
                     for peer in root.peers : HorizontalLayout {
                         spacing: Theme.sm;
-                        Dot {
-                            tint: peer.tone == 1 ? Theme.accent
-                                : peer.tone == 2 ? Theme.warn
-                                : peer.tone == 3 ? Theme.faint
-                                : Theme.ok;
+                        ToneDot {
+                            tone: peer.tone;
                             y: (parent.height - self.height) / 2;
                         }
                         Text {

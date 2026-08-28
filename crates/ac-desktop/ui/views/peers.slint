@@ -1,5 +1,5 @@
 import { ScrollView, Button, LineEdit } from "std-widgets.slint";
-import { Theme, Card, Dot } from "../theme.slint";
+import { Theme, Card, ToneDot } from "../theme.slint";
 
 // One row of `ac peer list`, with what `ac peer status` knows about the same peer folded in.
 export struct PeerItem {
@@ -77,11 +77,8 @@ export component PeersView inherits VerticalLayout {
                     padding: Theme.md;
                     spacing: Theme.sm;
 
-                    Dot {
-                        tint: peer.tone == 1 ? Theme.accent
-                            : peer.tone == 2 ? Theme.warn
-                            : peer.tone == 3 ? Theme.faint
-                            : Theme.ok;
+                    ToneDot {
+                        tone: peer.tone;
                         y: (parent.height - self.height) / 2;
                     }
 

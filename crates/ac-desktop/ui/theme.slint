@@ -80,3 +80,11 @@ export component Dot inherits Rectangle {
     border-radius: 4px;
     background: root.tint;
 }
+
+export component ToneDot inherits Dot {
+    in property <int> tone;
+    tint: root.tone == 1 ? Theme.accent
+        : root.tone == 2 ? Theme.warn
+        : root.tone == 3 ? Theme.faint
+        : Theme.ok;
+}

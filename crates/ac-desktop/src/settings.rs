@@ -151,12 +151,9 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
         let nudge = nudge.clone();
         move || {
             let (paths, node, nudge) = (paths.clone(), node.clone(), nudge.clone());
-            work::begin(&weak);
-            work::action(
-                &weak,
-                move || restart(&node, &paths).map(|()| "the node restarted".to_owned()),
-                move |window, outcome| work::finish(window, outcome, &nudge),
-            );
+            work::run(&weak, &nudge, move || {
+                restart(&node, &paths).map(|()| "the node restarted".to_owned())
+            });
         }
     });
 

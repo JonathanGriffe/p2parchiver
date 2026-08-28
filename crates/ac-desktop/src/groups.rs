@@ -259,15 +259,10 @@ where
     let nudge = nudge.clone();
 
     move |a, b, c| {
-        work::begin(&weak);
-
         let paths = paths.clone();
-        let nudge = nudge.clone();
-        work::action(
-            &weak,
-            move || work(&paths, a.as_str(), b.as_str(), c.as_str()),
-            move |window, outcome| work::finish(window, outcome, &nudge),
-        );
+        work::run(&weak, &nudge, move || {
+            work(&paths, a.as_str(), b.as_str(), c.as_str())
+        });
     }
 }
 

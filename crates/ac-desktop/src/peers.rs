@@ -60,21 +60,16 @@ pub fn wire(window: &MainWindow, paths: &Paths, nudge: &Nudge) {
         move |id, label| {
             let (paths, nudge) = (paths.clone(), nudge.clone());
             let (id, label) = (id.to_string(), label.to_string());
-            work::begin(&weak);
-            work::action(
-                &weak,
-                move || {
-                    let peer = ac_net::PeerId::from_str(&id)
-                        .with_context(|| format!("{id} is not a peer id"))?;
-                    let added = ops::peer::add(&paths, &peer, &label)?;
-                    Ok(if added.was_new {
-                        format!("added {} ({})", added.label, added.peer)
-                    } else {
-                        format!("relabelled {} to {}", added.peer, added.label)
-                    })
-                },
-                move |window, outcome| work::finish(window, outcome, &nudge),
-            );
+            work::run(&weak, &nudge, move || {
+                let peer = ac_net::PeerId::from_str(&id)
+                    .with_context(|| format!("{id} is not a peer id"))?;
+                let added = ops::peer::add(&paths, &peer, &label)?;
+                Ok(if added.was_new {
+                    format!("added {} ({})", added.label, added.peer)
+                } else {
+                    format!("relabelled {} to {}", added.peer, added.label)
+                })
+            });
         }
     });
 
@@ -84,20 +79,15 @@ pub fn wire(window: &MainWindow, paths: &Paths, nudge: &Nudge) {
         move |id| {
             let (paths, nudge) = (paths.clone(), nudge.clone());
             let id = id.to_string();
-            work::begin(&weak);
-            work::action(
-                &weak,
-                move || {
-                    let peer = ac_net::PeerId::from_str(&id)
-                        .with_context(|| format!("{id} is not a peer id"))?;
-                    Ok(if ops::peer::remove(&paths, &peer)? {
-                        format!("removed {peer}")
-                    } else {
-                        format!("no such contact: {peer}")
-                    })
-                },
-                move |window, outcome| work::finish(window, outcome, &nudge),
-            );
+            work::run(&weak, &nudge, move || {
+                let peer = ac_net::PeerId::from_str(&id)
+                    .with_context(|| format!("{id} is not a peer id"))?;
+                Ok(if ops::peer::remove(&paths, &peer)? {
+                    format!("removed {peer}")
+                } else {
+                    format!("no such contact: {peer}")
+                })
+            });
         }
     });
 }

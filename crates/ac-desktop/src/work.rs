@@ -57,10 +57,10 @@ pub fn poll(
     rx: Receiver<()>,
 ) {
     let visible = Arc::clone(&nudge.visible);
-    std::thread::spawn(move || run(&window, &paths, &selection, &visible, &rx));
+    std::thread::spawn(move || polling(&window, &paths, &selection, &visible, &rx));
 }
 
-fn run(
+fn polling(
     window: &Weak<MainWindow>,
     paths: &Paths,
     selection: &Selection,
@@ -103,6 +103,19 @@ pub fn begin(weak: &Weak<MainWindow>) {
         window.set_busy(true);
         window.set_message("".into());
     }
+}
+
+/// The whole of what a page button does: shut the buttons, run off the event loop, then say
+/// what happened and get the change on screen.
+pub fn run<F>(weak: &Weak<MainWindow>, nudge: &Nudge, work: F)
+where
+    F: FnOnce() -> anyhow::Result<String> + Send + 'static,
+{
+    begin(weak);
+    let nudge = nudge.clone();
+    action(weak, work, move |window, outcome| {
+        finish(window, outcome, &nudge)
+    });
 }
 
 /// Say what an action did, let the buttons go, and get the change on screen at once.
