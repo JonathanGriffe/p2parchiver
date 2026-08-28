@@ -1,8 +1,15 @@
+use std::rc::Rc;
+
+use ac_net::config::Paths;
+use ac_node::ops;
 use ac_node::ops::file::Storage;
 use ac_node::ops::format::human_size;
 use ac_node::ops::peer::{Liveness, StatusReport};
+use slint::{ModelRc, VecModel};
 
-use crate::ui::{GroupRow, PeerRow};
+use crate::groups;
+use crate::selection::Selection;
+use crate::ui::{GroupRow, MainWindow, PeerRow};
 
 const IDLE: i32 = 0;
 const WORKING: i32 = 1;
@@ -15,6 +22,38 @@ pub struct Snapshot {
     pub storage: String,
     pub groups: Vec<GroupRow>,
     pub peers: Vec<PeerRow>,
+    pub page: groups::Page,
+}
+
+pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
+    let page = groups::read(paths, &selection.get());
+
+    match ops::peer::status(paths) {
+        Ok(report) => Snapshot {
+            page,
+            ..present(&report, ops::file::storage(paths).ok().as_ref())
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the node's status");
+            Snapshot {
+                running: false,
+                node_state: format!("could not read status: {e}"),
+                storage: String::new(),
+                groups: Vec::new(),
+                peers: Vec::new(),
+                page,
+            }
+        }
+    }
+}
+
+pub fn apply(window: &MainWindow, snapshot: Snapshot) {
+    window.set_running(snapshot.running);
+    window.set_node_state(snapshot.node_state.into());
+    window.set_storage(snapshot.storage.into());
+    window.set_groups(ModelRc::from(Rc::new(VecModel::from(snapshot.groups))));
+    window.set_peers(ModelRc::from(Rc::new(VecModel::from(snapshot.peers))));
+    groups::apply(window, snapshot.page);
 }
 
 pub fn present(report: &StatusReport, storage: Option<&Storage>) -> Snapshot {
@@ -99,6 +138,7 @@ pub fn present(report: &StatusReport, storage: Option<&Storage>) -> Snapshot {
         storage: describe_storage(storage),
         groups,
         peers,
+        page: groups::Page::default(),
     }
 }
 

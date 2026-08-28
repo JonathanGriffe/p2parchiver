@@ -1,0 +1,463 @@
+import { ScrollView, Button, LineEdit } from "std-widgets.slint";
+import { Theme, Card, Dot } from "../theme.slint";
+
+// One row of `ac group list`. The words are Rust's; this file only decides where they sit.
+export struct GroupItem {
+    name: string,
+    id: string,
+    short: string,
+    state: string,
+    members: string,
+    admin: bool,
+    removed: bool,
+}
+
+export struct MemberItem {
+    username: string,
+    peer: string,
+    note: string,
+    departed: bool,
+}
+
+export struct LogItem {
+    seq: string,
+    text: string,
+}
+
+// A destructive action explains itself before it happens, in the same words the CLI uses
+// when it has already happened. That prose is the product; it should not be lost to buttons.
+export component Confirm inherits Rectangle {
+    in property <string> title;
+    in property <string> body;
+    in property <string> verb;
+    callback confirmed();
+    callback dismissed();
+
+    background: #000000.with-alpha(0.45);
+
+    // Swallows clicks so nothing behind the sheet can be reached while it is up.
+    TouchArea {
+        clicked => { root.dismissed(); }
+    }
+
+    Card {
+        width: min(440px, parent.width - 2 * Theme.lg);
+        height: self.preferred-height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+
+        // Clicks on the sheet itself must not count as clicks on the backdrop.
+        TouchArea {}
+
+        VerticalLayout {
+            padding: Theme.lg;
+            spacing: Theme.md;
+
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: Theme.heading-size;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: root.body;
+                color: Theme.dim;
+                font-size: Theme.body-size;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+                alignment: end;
+
+                Button {
+                    text: "Cancel";
+                    clicked => { root.dismissed(); }
+                }
+                Button {
+                    text: root.verb;
+                    primary: true;
+                    clicked => { root.confirmed(); }
+                }
+            }
+        }
+    }
+}
+
+component Badge inherits Rectangle {
+    in property <string> label;
+    in property <brush> tint;
+
+    background: root.tint.with-alpha(0.16);
+    border-radius: 4px;
+    height: 16px;
+
+    HorizontalLayout {
+        padding-left: Theme.xs;
+        padding-right: Theme.xs;
+        Text {
+            text: root.label;
+            color: root.tint;
+            font-size: 10px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component GroupItemRow inherits Rectangle {
+    in property <GroupItem> group;
+    in property <bool> selected;
+    callback chosen();
+
+    height: self.preferred-height;
+    border-radius: Theme.radius;
+    background: root.selected ? Theme.raised : touch.has-hover ? Theme.raised.with-alpha(0.5) : transparent;
+
+    touch := TouchArea {
+        clicked => { root.chosen(); }
+        mouse-cursor: pointer;
+    }
+
+    VerticalLayout {
+        padding: Theme.sm;
+        spacing: 2px;
+
+        HorizontalLayout {
+            spacing: Theme.xs;
+            Text {
+                text: group.name;
+                color: Theme.text;
+                font-size: Theme.body-size;
+                font-weight: root.selected ? 700 : 400;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            if group.admin : Badge { label: "ADMIN"; tint: Theme.accent; }
+            if group.removed : Badge { label: "REMOVED"; tint: Theme.danger; }
+        }
+
+        HorizontalLayout {
+            spacing: Theme.sm;
+            Text {
+                text: group.short;
+                color: Theme.faint;
+                font-size: Theme.small-size;
+                font-family: Theme.mono;
+            }
+            Text {
+                text: group.state + " · " + group.members;
+                color: Theme.dim;
+                font-size: Theme.small-size;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}
+
+export component GroupsView inherits Rectangle {
+    in property <[GroupItem]> groups;
+    in property <string> selected;
+    in property <string> detail-name;
+    in property <string> detail-id;
+    in property <string> detail-state;
+    in property <string> detail-entries;
+    in property <bool> detail-admin;
+    in property <[MemberItem]> members;
+    in property <[LogItem]> log;
+    in property <bool> busy;
+
+    callback select(string);
+    callback create(string);
+    callback add-member(string, string, string);
+    callback remove-member(string, string);
+    callback accept(string);
+    callback leave(string);
+    callback forget(string);
+
+    // 0 none, 1 leave, 2 forget, 3 remove-member
+    property <int> asking: 0;
+    property <string> asking-peer;
+    property <string> asking-peer-name;
+
+    HorizontalLayout {
+        spacing: Theme.md;
+
+        // The list, and the one control that does not need a group selected first.
+        VerticalLayout {
+            width: 260px;
+            spacing: Theme.sm;
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+                height: 30px;
+
+                name := LineEdit {
+                    placeholder-text: "new group name";
+                    horizontal-stretch: 1;
+                    accepted => {
+                        if (self.text != "") { root.create(self.text); self.text = ""; }
+                    }
+                }
+                Button {
+                    text: "Create";
+                    enabled: name.text != "" && !root.busy;
+                    clicked => { root.create(name.text); name.text = ""; }
+                }
+            }
+
+            if root.groups.length == 0 : Card {
+                VerticalLayout {
+                    padding: Theme.md;
+                    Text {
+                        // The sentence the CLI prints for the same state.
+                        text: "no groups. create one with: ac group create --name <name>";
+                        color: Theme.dim;
+                        font-size: Theme.body-size;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            ScrollView {
+                VerticalLayout {
+                    spacing: 2px;
+                    for group in root.groups : GroupItemRow {
+                        group: group;
+                        selected: group.id == root.selected;
+                        chosen => { root.select(group.id); }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+        }
+
+        Rectangle { width: 1px; background: Theme.line; }
+
+        // The selected group.
+        if root.selected == "" : VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            Text {
+                text: root.groups.length == 0
+                    ? "Create a group to get started."
+                    : "Choose a group to see its members.";
+                color: Theme.dim;
+                font-size: Theme.body-size;
+                horizontal-alignment: center;
+            }
+        }
+
+        if root.selected != "" : ScrollView {
+            horizontal-stretch: 1;
+
+            VerticalLayout {
+                spacing: Theme.md;
+
+                Card {
+                    VerticalLayout {
+                        padding: Theme.md;
+                        spacing: Theme.sm;
+
+                        HorizontalLayout {
+                            spacing: Theme.sm;
+                            Text {
+                                text: root.detail-name;
+                                color: Theme.text;
+                                font-size: Theme.title-size;
+                                font-weight: 700;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            if root.detail-admin : Badge { label: "ADMIN"; tint: Theme.accent; }
+                        }
+
+                        Text {
+                            text: root.detail-id;
+                            color: Theme.faint;
+                            font-size: Theme.small-size;
+                            font-family: Theme.mono;
+                            wrap: char-wrap;
+                        }
+
+                        Text {
+                            text: root.detail-state + " · " + root.detail-entries + " entries";
+                            color: Theme.dim;
+                            font-size: Theme.small-size;
+                        }
+
+                        HorizontalLayout {
+                            spacing: Theme.sm;
+                            Button {
+                                text: "Accept";
+                                enabled: !root.busy;
+                                clicked => { root.accept(root.selected); }
+                            }
+                            Button {
+                                text: "Leave";
+                                enabled: !root.busy;
+                                clicked => { root.asking = 1; }
+                            }
+                            Button {
+                                text: "Forget";
+                                enabled: !root.busy;
+                                clicked => { root.asking = 2; }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                    }
+                }
+
+                // Adding a member is the admin's job, so the control only appears for one.
+                if root.detail-admin : Card {
+                    HorizontalLayout {
+                        padding: Theme.md;
+                        spacing: Theme.sm;
+
+                        peer := LineEdit {
+                            placeholder-text: "peer id to add";
+                            horizontal-stretch: 1;
+                        }
+                        who := LineEdit {
+                            placeholder-text: "name (optional)";
+                            width: 140px;
+                        }
+                        Button {
+                            text: "Add";
+                            enabled: peer.text != "" && !root.busy;
+                            clicked => {
+                                root.add-member(root.selected, peer.text, who.text);
+                                peer.text = "";
+                                who.text = "";
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "MEMBERS";
+                    color: Theme.dim;
+                    font-size: Theme.small-size;
+                    font-weight: 700;
+                }
+
+                Card {
+                    VerticalLayout {
+                        padding: Theme.md;
+                        spacing: Theme.sm;
+
+                        for member in root.members : HorizontalLayout {
+                            spacing: Theme.sm;
+
+                            Dot {
+                                tint: member.departed ? Theme.faint : Theme.ok;
+                                y: (parent.height - self.height) / 2;
+                            }
+                            Text {
+                                text: member.username;
+                                color: member.departed ? Theme.dim : Theme.text;
+                                font-size: Theme.body-size;
+                                width: 120px;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: member.peer;
+                                color: Theme.faint;
+                                font-size: Theme.small-size;
+                                font-family: Theme.mono;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: member.note;
+                                color: Theme.dim;
+                                font-size: Theme.small-size;
+                                vertical-alignment: center;
+                            }
+                            if root.detail-admin && !member.departed : Button {
+                                text: "Remove";
+                                enabled: !root.busy;
+                                clicked => {
+                                    root.asking-peer = member.peer;
+                                    root.asking-peer-name = member.username;
+                                    root.asking = 3;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.log.length > 0 : Text {
+                    text: "LOG";
+                    color: Theme.dim;
+                    font-size: Theme.small-size;
+                    font-weight: 700;
+                }
+
+                if root.log.length > 0 : Card {
+                    VerticalLayout {
+                        padding: Theme.md;
+                        spacing: Theme.xs;
+                        for line in root.log : HorizontalLayout {
+                            spacing: Theme.sm;
+                            Text {
+                                text: line.seq;
+                                color: Theme.faint;
+                                font-size: Theme.small-size;
+                                font-family: Theme.mono;
+                                width: 32px;
+                                horizontal-alignment: right;
+                            }
+                            Text {
+                                text: line.text;
+                                color: Theme.dim;
+                                font-size: Theme.small-size;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+            }
+        }
+    }
+
+    if root.asking == 1 : Confirm {
+        title: "Leave " + root.detail-name + "?";
+        // What `ac group leave` says once it has done it.
+        body: "This node stops sharing that group immediately, whatever anyone else believes. "
+            + "The others are told when they next connect, and the admin then makes it "
+            + "official. Being added again will not undo this, you would accept afresh.";
+        verb: "Leave";
+        confirmed => { root.asking = 0; root.leave(root.selected); }
+        dismissed => { root.asking = 0; }
+    }
+
+    if root.asking == 2 : Confirm {
+        title: "Forget " + root.detail-name + "?";
+        // What `ac group forget` says, for the case that is not the admin's.
+        body: "Nothing is told to anyone. The others still list you, and will keep offering "
+            + "it, use Leave instead if you meant to tell them. Files already on disk are "
+            + "left there, no longer indexed.";
+        verb: "Forget";
+        confirmed => { root.asking = 0; root.forget(root.selected); }
+        dismissed => { root.asking = 0; }
+    }
+
+    if root.asking == 3 : Confirm {
+        title: "Remove " + root.asking-peer-name + "?";
+        // What `ac group remove` says once it has done it.
+        body: "They stop being served by every member that has seen this, and will find out "
+            + "themselves next time they ask. It does not reach back: anything already shared "
+            + "with them is theirs, and no membership change can undo that.";
+        verb: "Remove";
+        confirmed => { root.asking = 0; root.remove-member(root.selected, root.asking-peer); }
+        dismissed => { root.asking = 0; }
+    }
+}

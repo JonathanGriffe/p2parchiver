@@ -1,10 +1,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod autostart;
+mod groups;
 mod log;
 mod node;
+mod selection;
 mod tray;
 mod view;
+mod work;
 
 mod ui {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
@@ -12,24 +15,19 @@ mod ui {
 }
 
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::time::Duration;
 
 use ac_net::config::{Config, Paths};
 use ac_node::ops;
 use ac_node::ops::lock::NodeLock;
 use anyhow::{Context, Result};
 use clap::Parser;
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::ComponentHandle;
 
-use crate::ui::{GroupRow, MainWindow, PeerRow};
+use crate::ui::MainWindow;
 
 /// Matches `ac`, so both halves of the app find the same home.
 const APP: &str = "archiverclient";
 const HOME_ENV: &str = "AC_HOME";
-
-/// The snapshot is republished every 5s, so polling faster only costs a SQLite read.
-const POLL: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
 #[command(name = "ac-desktop", version, about = "archiverclient, with a window")]
@@ -86,36 +84,9 @@ fn main() -> Result<()> {
         slint::CloseRequestResponse::HideWindow
     });
 
-    let groups = Rc::new(VecModel::<GroupRow>::from(Vec::new()));
-    let peers = Rc::new(VecModel::<PeerRow>::from(Vec::new()));
-    window.set_groups(ModelRc::from(groups.clone()));
-    window.set_peers(ModelRc::from(peers.clone()));
-
-    let refresh = {
-        let window = window.as_weak();
-        let paths = paths.clone();
-        move || {
-            let Some(window) = window.upgrade() else {
-                return;
-            };
-            match ops::peer::status(&paths) {
-                Ok(report) => {
-                    let storage = ops::file::storage(&paths).ok();
-                    let snapshot = view::present(&report, storage.as_ref());
-                    apply(&window, snapshot, &groups, &peers);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "could not read the node's status");
-                    window.set_node_state(format!("could not read status: {e}").into());
-                    window.set_running(false);
-                }
-            }
-        }
-    };
-
-    refresh();
-    let timer = slint::Timer::default();
-    timer.start(slint::TimerMode::Repeated, POLL, refresh);
+    let selection = selection::Selection::new();
+    let nudge = work::poll(window.as_weak(), paths.clone(), selection.clone());
+    groups::wire(&window, &paths, &selection, &nudge);
 
     if !cli.background || _tray.is_none() {
         window.show().context("showing the window")?;
@@ -124,19 +95,6 @@ fn main() -> Result<()> {
     slint::run_event_loop_until_quit().context("running the window")?;
 
     node.stop()
-}
-
-fn apply(
-    window: &MainWindow,
-    snapshot: view::Snapshot,
-    groups: &Rc<VecModel<GroupRow>>,
-    peers: &Rc<VecModel<PeerRow>>,
-) {
-    window.set_running(snapshot.running);
-    window.set_node_state(snapshot.node_state.into());
-    window.set_storage(snapshot.storage.into());
-    groups.set_vec(snapshot.groups);
-    peers.set_vec(snapshot.peers);
 }
 
 /// The facts that do not change while the app is open.

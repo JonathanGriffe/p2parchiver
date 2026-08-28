@@ -1,9 +1,10 @@
-import { Theme } from "theme.slint";
+import { Theme, Card } from "theme.slint";
 import { StatusView, GroupRow, PeerRow } from "views/status.slint";
+import { GroupsView, GroupItem, MemberItem, LogItem } from "views/groups.slint";
 import { AboutView } from "views/about.slint";
 
 // Re-exported so slint-build generates the Rust structs the models are built from.
-export { GroupRow, PeerRow }
+export { GroupRow, PeerRow, GroupItem, MemberItem, LogItem }
 
 component NavItem inherits Rectangle {
     in property <string> label;
@@ -64,6 +65,34 @@ export component MainWindow inherits Window {
     in property <string> storage-root;
     in property <string> log-dir;
 
+    // The Groups page.
+    in property <[GroupItem]> group-items;
+    in property <string> group-name;
+    in property <string> group-id;
+    in property <string> group-state;
+    in property <string> group-entries;
+    in property <bool> group-admin;
+    in property <[MemberItem]> group-members;
+    in property <[LogItem]> group-log;
+
+    // What the last action did, and whether it went wrong. Set by Rust, cleared when the
+    // next one starts.
+    in property <bool> busy;
+    in property <string> message;
+    in property <bool> message-bad;
+
+    // Which group the Groups page is showing. Rust owns it too, since the poller needs to
+    // know what to read; this copy is what the list highlights.
+    property <string> selected-group;
+
+    callback select-group(string);
+    callback create-group(string);
+    callback add-member(string, string, string);
+    callback remove-member(string, string);
+    callback accept-group(string);
+    callback leave-group(string);
+    callback forget-group(string);
+
     property <int> tab: 0;
 
     HorizontalLayout {
@@ -89,9 +118,14 @@ export component MainWindow inherits Window {
                 chosen => { root.tab = 0; }
             }
             NavItem {
-                label: "About";
+                label: "Groups";
                 selected: root.tab == 1;
                 chosen => { root.tab = 1; }
+            }
+            NavItem {
+                label: "About";
+                selected: root.tab == 2;
+                chosen => { root.tab = 2; }
             }
 
             Rectangle { vertical-stretch: 1; }
@@ -99,22 +133,65 @@ export component MainWindow inherits Window {
 
         Rectangle { width: 1px; background: Theme.line; }
 
-        if root.tab == 0 : StatusView {
-            running: root.running;
-            node-state: root.node-state;
-            storage: root.storage;
-            groups: root.groups;
-            peers: root.peers;
+        VerticalLayout {
             horizontal-stretch: 1;
-        }
+            spacing: Theme.md;
 
-        if root.tab == 1 : AboutView {
-            version: root.version;
-            peer-id: root.peer-id;
-            home: root.home;
-            storage-root: root.storage-root;
-            log-dir: root.log-dir;
-            horizontal-stretch: 1;
+            if root.tab == 0 : StatusView {
+                running: root.running;
+                node-state: root.node-state;
+                storage: root.storage;
+                groups: root.groups;
+                peers: root.peers;
+                vertical-stretch: 1;
+            }
+
+            if root.tab == 1 : GroupsView {
+                groups: root.group-items;
+                selected: root.selected-group;
+                detail-name: root.group-name;
+                detail-id: root.group-id;
+                detail-state: root.group-state;
+                detail-entries: root.group-entries;
+                detail-admin: root.group-admin;
+                members: root.group-members;
+                log: root.group-log;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                select(id) => { root.selected-group = id; root.select-group(id); }
+                create(name) => { root.create-group(name); }
+                add-member(id, peer, who) => { root.add-member(id, peer, who); }
+                remove-member(id, peer) => { root.remove-member(id, peer); }
+                accept(id) => { root.accept-group(id); }
+                leave(id) => { root.leave-group(id); }
+                forget(id) => { root.selected-group = ""; root.forget-group(id); }
+            }
+
+            if root.tab == 2 : AboutView {
+                version: root.version;
+                peer-id: root.peer-id;
+                home: root.home;
+                storage-root: root.storage-root;
+                log-dir: root.log-dir;
+                vertical-stretch: 1;
+            }
+
+            // One line for what just happened, shared by every page. Colour repeats what the
+            // words already say, so it is never the only signal.
+            if root.message != "" : Card {
+                background: root.message-bad ? Theme.danger.with-alpha(0.12) : Theme.raised;
+                HorizontalLayout {
+                    padding: Theme.sm;
+                    Text {
+                        text: root.message;
+                        color: root.message-bad ? Theme.danger : Theme.dim;
+                        font-size: Theme.small-size;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
         }
     }
 }
