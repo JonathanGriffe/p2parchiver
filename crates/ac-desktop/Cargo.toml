@@ -29,3 +29,9 @@ unsafe_code = "deny"
 [lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = "0.21"

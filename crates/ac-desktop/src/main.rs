@@ -2,6 +2,7 @@
 
 mod log;
 mod node;
+mod tray;
 mod view;
 
 mod ui {
@@ -60,6 +61,19 @@ fn main() -> Result<()> {
 
     let window = MainWindow::new().context("creating the window")?;
     describe_node(&window, &paths)?;
+
+    let _tray = tray::spawn(window.as_weak());
+
+    let live = _tray.as_ref().map(tray::Tray::live);
+    window.window().on_close_requested(move || {
+        if live.as_ref().is_none_or(|live| !live.get()) {
+            // Nothing to reopen from, so closing the window is how you quit.
+            if let Err(e) = slint::quit_event_loop() {
+                tracing::warn!(error = %e, "could not stop the event loop");
+            }
+        }
+        slint::CloseRequestResponse::HideWindow
+    });
 
     let groups = Rc::new(VecModel::<GroupRow>::from(Vec::new()));
     let peers = Rc::new(VecModel::<PeerRow>::from(Vec::new()));

@@ -1,0 +1,62 @@
+use anyhow::{Context, Result};
+use slint::Weak;
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+use super::{Live, icon};
+use crate::ui::MainWindow;
+
+pub struct Tray {
+    #[allow(dead_code)]
+    icon: TrayIcon,
+    #[allow(dead_code)]
+    pump: slint::Timer,
+}
+
+impl Tray {
+    pub fn live(&self) -> Live {
+        Live::new(true)
+    }
+}
+
+const PUMP: std::time::Duration = std::time::Duration::from_millis(100);
+
+pub fn spawn(window: Weak<MainWindow>) -> Result<Tray> {
+    let image = tray_icon::Icon::from_rgba(icon::rgba(icon::NATIVE), icon::NATIVE, icon::NATIVE)
+        .context("building the tray icon")?;
+
+    let menu = Menu::new();
+    let open = MenuItem::new("Open", true, None);
+    let quit = MenuItem::new("Quit (stops syncing)", true, None);
+    menu.append(&open).context("building the tray menu")?;
+    menu.append(&PredefinedMenuItem::separator())
+        .context("building the tray menu")?;
+    menu.append(&quit).context("building the tray menu")?;
+
+    let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
+
+    let icon = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("ArchiverClient")
+        .with_icon(image)
+        .build()
+        .context("adding an icon to the tray")?;
+
+    let pump = slint::Timer::default();
+    pump.start(slint::TimerMode::Repeated, PUMP, move || {
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == open_id {
+                super::show(&window);
+            } else if event.id == quit_id {
+                super::quit();
+            }
+        }
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::DoubleClick { .. } = event {
+                super::show(&window);
+            }
+        }
+    });
+
+    Ok(Tray { icon, pump })
+}
