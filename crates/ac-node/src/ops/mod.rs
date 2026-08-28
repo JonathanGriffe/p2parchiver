@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow};
 pub mod file;
 pub mod format;
 pub mod group;
+pub mod lock;
 pub mod peer;
 
 pub use crate::directory::{Known, Source};

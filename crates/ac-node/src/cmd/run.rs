@@ -5,8 +5,13 @@ use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
 
 use crate::daemon;
+use crate::ops::lock::NodeLock;
 
 pub fn run(paths: &Paths, dial: &[Multiaddr]) -> Result<()> {
+    // Before anything is opened: a second daemon on this home would share the identity and
+    // the database with the first. Held until this function returns.
+    let _lock = NodeLock::take(paths)?;
+
     let key_path = paths.identity_file();
     let (identity, _) = Identity::load_or_generate(&key_path)
         .with_context(|| format!("loading identity from {}", key_path.display()))?;
