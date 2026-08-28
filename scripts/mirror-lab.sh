@@ -5,6 +5,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AC="$REPO/target/release/ac"
 ACS="$REPO/target/release/ac-server"
+ACD="$REPO/target/release/ac-desktop"
 LAB="${LAB_DIR:-/tmp/ac-mirror-lab}"
 
 NODE_LOG="${RUST_LOG:-ac=debug,ac_net=info,libp2p=warn}"
@@ -42,6 +43,7 @@ cleanup() {
     [[ "${KEEP:-}" == "yes" ]] && { echo "leaving nodes running; kill with: pkill -f target/release/ac"; return; }
     pkill -f "$REPO/target/release/ac " 2>/dev/null || true
     pkill -f "$REPO/target/release/ac-server" 2>/dev/null || true
+    pkill -f "$REPO/target/release/ac-desktop" 2>/dev/null || true
     sleep 0.5
 }
 trap cleanup EXIT
@@ -51,7 +53,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------- the network
 
 need_binaries() {
-    [[ -x "$AC" && -x "$ACS" ]] || {
+    [[ -x "$AC" && -x "$ACS" && -x "$ACD" ]] || {
         echo "build first: cargo build --release" >&2
         exit 1
     }
@@ -100,6 +102,15 @@ run_node() {
     echo $! > "$LAB/$who.pid"
 }
 
+# The same node, started the other way. `--headless` skips the window and the tray, which is
+# all that separates the desktop app from `ac run`: underneath, it is the same daemon reached
+# through the same call. Without a $DISPLAY the windowed path would fail outright anyway.
+run_desktop_node() {
+    local who=$1
+    RUST_LOG="$NODE_LOG" AC_HOME="$LAB/$who" "$ACD" --headless > "$LAB/$who.log" 2>&1 &
+    echo $! > "$LAB/$who.pid"
+}
+
 stop_node() {
     local who=$1
     [[ -f "$LAB/$who.pid" ]] || return 0
@@ -121,6 +132,7 @@ main() {
 
     pkill -x ac-server 2>/dev/null || true
     pkill -x ac 2>/dev/null || true
+    pkill -x ac-desktop 2>/dev/null || true
     wait_for 15 "port 45001 to be free" \
         bash -c '! ss -lun 2>/dev/null | grep -q "127.0.0.1:45001"'
 
@@ -129,11 +141,15 @@ main() {
     start_server
 
     say "enrolling"
-    enrol alice; enrol bob; enrol carol; enrol dave
+    # Erin is enrolled here but joins nothing until section 10. Everything from 1 to 9 is
+    # calibrated on this network, and section 5 in particular asserts that it falls silent —
+    # a fifth node mirroring a group is exactly the noise that test exists to not see.
+    enrol alice; enrol bob; enrol carol; enrol dave; enrol erin
 
     BOB=$(ac bob id)
     CAROL=$(ac carol id)
     DAVE=$(ac dave id)
+    ERIN=$(ac erin id)
 
     say "1. they find each other, unprompted"
     run_node alice; run_node bob; run_node carol
@@ -257,6 +273,71 @@ main() {
     else
         bad "status printed nothing useful"
         ac bob peer status | sed 's/^/       /'
+    fi
+
+    say "10. the node inside the desktop app is the same node"
+    # What the desktop app rests on: `ac run` and the app's daemon thread are one
+    # implementation, not two. So erin joins on the terms bob and carol did, started the other
+    # way, and has to end up in the same place — the group learned with no --dial, both files
+    # mirrored unasked, byte for byte.
+    #
+    # Alice was stopped in section 8 and is the only member who can admit anyone, so she comes
+    # back first. Everything already asserted has been asserted by now.
+    run_node alice
+    run_desktop_node erin
+    sleep 2
+    ac alice group add "$GROUP" "$ERIN" --username erin >/dev/null
+
+    if wait_for "$SETTLE" "erin to hear about the group" in_group erin; then
+        ok "the desktop app's node learned the group, with no --dial and no window"
+    else
+        bad "the desktop app's node never learned the group"
+    fi
+
+    ac erin group accept "$GROUP" >/dev/null 2>&1 || true
+
+    if wait_for "$SETTLE" "erin to hold both files" bash -c \
+        "$(declare -f ac group_id holds); LAB=$LAB AC=$AC; holds erin photo.jpg && holds erin notes.txt"
+    then
+        ok "the desktop app's node mirrored the group, exactly as ac run did"
+    else
+        bad "the desktop app's node did not mirror the group"
+    fi
+
+    got=$(find "$LAB/erin/files" -name photo.jpg -print -quit 2>/dev/null)
+    if [[ -n "$got" ]] && cmp -s "$got" "$LAB/content/photo.jpg"; then
+        ok "and its copy is byte-identical too"
+    else
+        bad "the desktop app's copy differs or is missing"
+    fi
+
+    say "11. one daemon per home, whichever way it is started"
+    # Two daemons on one AC_HOME share an identity, a database and a storage root, and neither
+    # would know about the other. Nothing prevented that before the desktop app existed, and
+    # the app makes it likely: a tray icon started at login and an `ac run` in a terminal are
+    # the same node twice.
+    if refused=$(ac alice run 2>&1); then
+        bad "a second ac run on alice's home was allowed"
+    elif grep -q "another node is already using" <<< "$refused"; then
+        ok "a second ac run was refused, and said why"
+    else
+        bad "a second ac run failed, but not on the lock: $refused"
+    fi
+
+    # The same lock from the other binary, which is the likelier half of the mistake.
+    if refused=$(AC_HOME="$LAB/erin" "$ACD" --headless 2>&1); then
+        bad "a second desktop node on erin's home was allowed"
+    elif grep -q "another node is already using" <<< "$refused"; then
+        ok "a second desktop node was refused on the same terms"
+    else
+        bad "the second desktop node failed for another reason: $refused"
+    fi
+
+    # Refusing is only worth anything if the node already running is left alone.
+    if in_group alice && in_group erin; then
+        ok "both running nodes carried on through the refusals"
+    else
+        bad "a refused start disturbed a running node"
     fi
 
     say "result"
