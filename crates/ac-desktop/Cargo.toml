@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-description = "Distributed file sharing apps meant for sharing pictures and serving as distributed backup."
+description = "Peer-to-peer file sharing for a group's pictures, doubling as a distributed backup"
 
 [[bin]]
 name = "ac-desktop"
