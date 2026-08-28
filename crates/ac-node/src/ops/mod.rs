@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow};
 pub mod file;
 pub mod format;
 pub mod group;
+pub mod join;
 pub mod lock;
 pub mod peer;
 
