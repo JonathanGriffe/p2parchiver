@@ -18,10 +18,27 @@ pub fn now() -> i64 {
     attest::now()
 }
 
-pub fn open(paths: &Paths) -> Result<(Identity, Groups)> {
+/// This node's key, generated the first time anything asks for it.
+pub fn identity(paths: &Paths) -> Result<Identity> {
     let key_path = paths.identity_file();
     let (identity, _) = Identity::load_or_generate(&key_path)
         .with_context(|| format!("loading identity from {}", key_path.display()))?;
+    Ok(identity)
+}
+
+/// What a daemon needs before it can start: who this node is, and how it is configured.
+pub fn startup(paths: &Paths) -> Result<(Identity, Config)> {
+    let identity = identity(paths)?;
+
+    let config_path = paths.config_file();
+    let config = Config::load(&config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+
+    Ok((identity, config))
+}
+
+pub fn open(paths: &Paths) -> Result<(Identity, Groups)> {
+    let identity = identity(paths)?;
 
     let db = paths.db_file();
     let groups = Groups::open(&db, identity.peer_id())

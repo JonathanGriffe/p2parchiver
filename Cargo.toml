@@ -7,6 +7,7 @@ members = [
     "crates/ac-net",
     "crates/ac-node",
     "crates/ac-server",
+    "crates/ac-desktop",
 ]
 
 [workspace.package]
@@ -25,6 +26,9 @@ ac-files = { path = "crates/ac-files" }
 # The supervisor. Depends on everything below it and nothing depends on it but the binary:
 # deciding who to call needs to see membership and content at once.
 ac-peers = { path = "crates/ac-peers" }
+# The binary with a window. Depends on `ac-node` for both halves of a node: the daemon loop
+# it runs on a thread, and the `ops` layer the CLI dispatches through.
+ac-node = { path = "crates/ac-node" }
 
 libp2p = { version = "0.56", features = [
     "ed25519", "serde", "macros", "tokio",
@@ -55,7 +59,16 @@ getrandom = "0.4"
 sha2 = "0.10"
 hex = "0.4"
 
+# The desktop UI, compiled from .slint markup into this binary. Chosen over a webview so a
+# node ships as one file: the same reason SQLite is bundled above.
+slint = { version = "1.17", default-features = false, features = [
+    "compat-1-2", "std", "backend-winit", "renderer-software", "accessibility",
+] }
+slint-build = "1.17"
+
 tracing = "0.1"
+# A desktop app has no console to log to, and an unattended one needs its log capped.
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 # Ping is mounted per connection via `Either`; see `ac_net::keepalive`.

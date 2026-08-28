@@ -1,0 +1,120 @@
+import { Theme } from "theme.slint";
+import { StatusView, GroupRow, PeerRow } from "views/status.slint";
+import { AboutView } from "views/about.slint";
+
+// Re-exported so slint-build generates the Rust structs the models are built from.
+export { GroupRow, PeerRow }
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback chosen();
+
+    height: 34px;
+    border-radius: Theme.radius;
+    background: root.selected ? Theme.raised : touch.has-hover ? Theme.raised.darker(0.02) : transparent;
+
+    touch := TouchArea {
+        clicked => { root.chosen(); }
+        mouse-cursor: pointer;
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.sm;
+        padding-right: Theme.sm;
+        spacing: Theme.sm;
+
+        // A selected item is marked twice, by weight and by a bar, so it does not rely on
+        // colour alone.
+        Rectangle {
+            width: 3px;
+            border-radius: 1.5px;
+            background: root.selected ? Theme.accent : transparent;
+        }
+
+        Text {
+            text: root.label;
+            color: root.selected ? Theme.text : Theme.dim;
+            font-size: Theme.body-size;
+            font-weight: root.selected ? 700 : 400;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "ArchiverClient";
+    background: Theme.canvas;
+    preferred-width: 880px;
+    preferred-height: 620px;
+    min-width: 560px;
+    min-height: 420px;
+
+    // Everything below is written by Rust once per poll.
+    in property <bool> running;
+    in property <string> node-state: "starting…";
+    in property <string> storage;
+    in property <[GroupRow]> groups;
+    in property <[PeerRow]> peers;
+
+    in property <string> version;
+    in property <string> peer-id;
+    in property <string> home;
+    in property <string> storage-root;
+    in property <string> log-dir;
+
+    property <int> tab: 0;
+
+    HorizontalLayout {
+        padding: Theme.md;
+        spacing: Theme.md;
+
+        VerticalLayout {
+            width: 168px;
+            spacing: Theme.xs;
+
+            Text {
+                text: "ARCHIVERCLIENT";
+                color: Theme.faint;
+                font-size: Theme.small-size;
+                font-weight: 700;
+                height: 34px;
+                vertical-alignment: center;
+            }
+
+            NavItem {
+                label: "Status";
+                selected: root.tab == 0;
+                chosen => { root.tab = 0; }
+            }
+            NavItem {
+                label: "About";
+                selected: root.tab == 1;
+                chosen => { root.tab = 1; }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        Rectangle { width: 1px; background: Theme.line; }
+
+        if root.tab == 0 : StatusView {
+            running: root.running;
+            node-state: root.node-state;
+            storage: root.storage;
+            groups: root.groups;
+            peers: root.peers;
+            horizontal-stretch: 1;
+        }
+
+        if root.tab == 1 : AboutView {
+            version: root.version;
+            peer-id: root.peer-id;
+            home: root.home;
+            storage-root: root.storage-root;
+            log-dir: root.log-dir;
+            horizontal-stretch: 1;
+        }
+    }
+}

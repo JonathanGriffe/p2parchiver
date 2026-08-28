@@ -4,7 +4,7 @@ use ac_files::store::Recorded;
 use ac_files::{Content, FileRow, Files, RelPath};
 use ac_groups::id::GroupId;
 use ac_groups::store::{GroupRow, State};
-use ac_net::config::Paths;
+use ac_net::config::{Config, Paths};
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::{now, open, open_files, resolve};
@@ -196,6 +196,40 @@ fn file_name_of(src: &Path) -> Result<String> {
         .and_then(|n| n.to_str())
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("{} has no usable file name", src.display()))
+}
+
+/// What this node is holding, and what it has room for.
+pub struct Storage {
+    pub root: PathBuf,
+    pub held: u64,
+    /// Absent when the volume could not be measured.
+    pub free: Option<u64>,
+    /// The ceiling from config, if one is set.
+    pub max: Option<u64>,
+}
+
+pub fn storage(paths: &Paths) -> Result<Storage> {
+    let (identity, _) = open(paths)?;
+    let (files, _) = open_files(paths, &identity)?;
+    let config = Config::load(&paths.config_file())
+        .with_context(|| format!("reading the config at {}", paths.config_file().display()))?;
+
+    let root = config.storage_root(paths);
+    // A storage root that does not exist yet still sits on a volume worth measuring.
+    let probe = if root.exists() {
+        Some(root.clone())
+    } else {
+        root.parent().map(Path::to_path_buf)
+    };
+
+    Ok(Storage {
+        held: files
+            .held_bytes()
+            .context("measuring what this node holds")?,
+        free: probe.and_then(|p| fs4::available_space(&p).ok()),
+        max: config.storage_max,
+        root,
+    })
 }
 
 pub struct Listing {

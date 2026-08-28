@@ -1,0 +1,193 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme, Card, Dot } from "../theme.slint";
+
+// One group's sync progress, already worded by Rust. The UI decides colour and layout; it
+// does not decide what a number means.
+export struct GroupRow {
+    name: string,
+    id: string,
+    missing: string,
+    news: string,
+    pulling: string,
+    next: string,
+    heartbeat: string,
+    waiting: bool,
+}
+
+export struct PeerRow {
+    name: string,
+    state: string,
+    // 0 idle, 1 working, 2 waiting, 3 unreachable. Kept a number so the words stay in Rust.
+    tone: int,
+}
+
+component SectionTitle inherits Text {
+    color: Theme.dim;
+    font-size: Theme.small-size;
+    font-weight: 700;
+}
+
+component GroupCard inherits Card {
+    in property <GroupRow> group;
+
+    VerticalLayout {
+        padding: Theme.md;
+        spacing: Theme.sm;
+
+        HorizontalLayout {
+            spacing: Theme.sm;
+            height: 24px;
+            Text {
+                text: group.name;
+                color: Theme.text;
+                font-size: Theme.heading-size;
+                font-weight: 700;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: group.id;
+                color: Theme.faint;
+                font-size: Theme.small-size;
+                font-family: Theme.mono;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle { height: 1px; background: Theme.line; }
+
+        for line in [
+            { k: "missing", v: group.missing },
+            { k: "news", v: group.news },
+            { k: "pulling", v: group.pulling },
+            { k: "next", v: group.next },
+            { k: "heartbeat", v: group.heartbeat },
+        ] : HorizontalLayout {
+            spacing: Theme.md;
+            height: line.v == "" ? 0px : 20px;
+            visible: line.v != "";
+            Text {
+                text: line.k;
+                color: Theme.faint;
+                font-size: Theme.small-size;
+                width: 76px;
+            }
+            Text {
+                text: line.v;
+                color: Theme.text;
+                font-size: Theme.body-size;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}
+
+export component StatusView inherits VerticalLayout {
+    in property <bool> running;
+    in property <string> node-state;
+    in property <string> storage;
+    in property <[GroupRow]> groups;
+    in property <[PeerRow]> peers;
+
+    spacing: Theme.md;
+
+    // Whether the node is actually running is the first question this page answers.
+    Card {
+        background: root.running ? Theme.surface : Theme.raised;
+        HorizontalLayout {
+            padding: Theme.md;
+            spacing: Theme.sm;
+            Dot {
+                tint: root.running ? Theme.ok : Theme.warn;
+                y: (parent.height - self.height) / 2;
+            }
+            Text {
+                text: root.node-state;
+                color: Theme.text;
+                font-size: Theme.body-size;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Text {
+                text: root.storage;
+                color: Theme.dim;
+                font-size: Theme.small-size;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    ScrollView {
+        VerticalLayout {
+            spacing: Theme.md;
+
+            SectionTitle { text: "GROUPS"; }
+
+            if root.groups.length == 0 : Card {
+                VerticalLayout {
+                    padding: Theme.md;
+                    Text {
+                        // The sentence the CLI prints for the same state.
+                        text: "no groups. create one with: ac group create --name <name>";
+                        color: Theme.dim;
+                        font-size: Theme.body-size;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            for group in root.groups : GroupCard { group: group; }
+
+            SectionTitle { text: "PEERS"; }
+
+            if root.peers.length == 0 : Card {
+                VerticalLayout {
+                    padding: Theme.md;
+                    Text {
+                        text: "nobody yet. fellow members of your groups appear here too.";
+                        color: Theme.dim;
+                        font-size: Theme.body-size;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            if root.peers.length > 0 : Card {
+                VerticalLayout {
+                    padding: Theme.md;
+                    spacing: Theme.sm;
+                    for peer in root.peers : HorizontalLayout {
+                        spacing: Theme.sm;
+                        Dot {
+                            tint: peer.tone == 1 ? Theme.accent
+                                : peer.tone == 2 ? Theme.warn
+                                : peer.tone == 3 ? Theme.faint
+                                : Theme.ok;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        Text {
+                            text: peer.name;
+                            color: Theme.text;
+                            font-size: Theme.body-size;
+                            width: 140px;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: peer.state;
+                            color: Theme.dim;
+                            font-size: Theme.body-size;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+
+            // Absorbs the slack, so cards keep their natural height instead of growing.
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+}
