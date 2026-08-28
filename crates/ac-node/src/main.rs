@@ -1,16 +1,3 @@
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
-mod blob;
-mod cmd;
-mod contacts;
-mod daemon;
-mod directory;
-mod file_link;
-mod group_link;
-mod peer_link;
-mod status;
-mod throttle;
-
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -18,6 +5,7 @@ use clap::{Parser, Subcommand};
 use libp2p::{Multiaddr, PeerId};
 
 use ac_net::config::Paths;
+use ac_node::{DEFAULT_LOG, cmd};
 
 /// Application name used for the per-OS data directory, which is a node's whole home.
 const APP: &str = "archiverclient";
@@ -219,8 +207,7 @@ fn main() -> Result<()> {
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("ac=info,ac_net=info,libp2p=warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG));
 
     fmt()
         .with_env_filter(filter)
