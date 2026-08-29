@@ -24,7 +24,11 @@ fn peer_of(k: &Keypair) -> PeerId {
 }
 
 fn sync_for(k: &Keypair) -> GroupSync {
-    GroupSync::new(Groups::in_memory(peer_of(k)).unwrap(), k.clone())
+    GroupSync::new(
+        Groups::in_memory(peer_of(k)).unwrap(),
+        k.clone(),
+        "someone".to_owned(),
+    )
 }
 
 /// Everything one side needs to be driven: its machine and its own key.
@@ -215,7 +219,6 @@ fn admin_and_member() -> (Node, Node, GroupId) {
             id,
             Op::Add {
                 peer: member.peer().to_base58(),
-                username: "bob".into(),
             },
             AT,
         )
@@ -224,7 +227,7 @@ fn admin_and_member() -> (Node, Node, GroupId) {
 }
 
 /// Add `peer` to `id` as the admin.
-fn add(admin: &mut Node, id: GroupId, peer: PeerId, name: &str) {
+fn add(admin: &mut Node, id: GroupId, peer: PeerId, _name: &str) {
     admin
         .sync
         .store_mut()
@@ -233,7 +236,6 @@ fn add(admin: &mut Node, id: GroupId, peer: PeerId, name: &str) {
             id,
             Op::Add {
                 peer: peer.to_base58(),
-                username: name.into(),
             },
             AT,
         )
@@ -245,7 +247,7 @@ fn join(admin: &mut Node, member: &mut Node, id: GroupId) {
     member
         .sync
         .store_mut()
-        .author_standing(&member.key, id, Position::In, AT)
+        .author_standing(&member.key, id, Position::In, "someone", AT)
         .unwrap();
 }
 
@@ -300,22 +302,33 @@ fn receiving_an_invitation_is_answered_in_writing_and_only_once() {
         State::Pending,
         "still not accepted"
     );
+    // The admin's own standing arrived with the chain, so the member's is one of two.
     let standings = member.sync.store().standings(id).unwrap();
-    assert_eq!(standings.len(), 1, "it has spoken for itself, once");
-    let body = standings[0].verify(id).unwrap();
+    let mine: Vec<_> = standings
+        .iter()
+        .filter(|s| s.subject().unwrap() == member.peer())
+        .collect();
+    assert_eq!(mine.len(), 1, "it has spoken for itself, once");
+    let body = mine[0].verify(id).unwrap();
     assert_eq!(body.peer, member.peer().to_base58());
     assert_eq!(body.position, Position::Unanswered);
     assert_eq!(body.seq, 1);
 
     // Syncing again must not spend another seq: having spoken at all is the condition.
     connect(&mut admin, &mut member);
-    let after = member.sync.store().standings(id).unwrap();
-    assert_eq!(after.len(), 1);
-    assert_eq!(after[0].verify(id).unwrap().seq, 1);
+    let mine_of = |node: &Node| {
+        node.sync
+            .store()
+            .standings(id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.subject().unwrap() == member.peer())
+            .expect("the member's own standing")
+    };
+    assert_eq!(mine_of(&member).verify(id).unwrap().seq, 1);
 
-    let seen = admin.sync.store().standings(id).unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].verify(id).unwrap().position, Position::Unanswered);
+    let seen = mine_of(&admin).verify(id).unwrap();
+    assert_eq!(seen.position, Position::Unanswered);
     assert!(
         admin.sync.store().departed(id).unwrap().is_empty(),
         "an unanswered invitation is not a departure"
@@ -487,7 +500,7 @@ fn the_admin_ratifies_a_departure_exactly_once() {
     member
         .sync
         .store_mut()
-        .author_standing(&member.key, id, Position::Out, AT)
+        .author_standing(&member.key, id, Position::Out, "someone", AT)
         .unwrap();
 
     // Three reconnections, as a restart or a digest repair would produce. The chain is what
@@ -528,7 +541,7 @@ fn a_non_admin_notes_a_departure_but_does_not_ratify_it() {
 
     bob.sync
         .store_mut()
-        .author_standing(&bob.key, id, Position::Out, AT)
+        .author_standing(&bob.key, id, Position::Out, "someone", AT)
         .unwrap();
 
     let head_before = carol.sync.store().get(id).unwrap().unwrap().head_seq;
@@ -561,7 +574,7 @@ fn a_node_that_has_left_still_answers_so_its_departure_can_travel() {
     member
         .sync
         .store_mut()
-        .author_standing(&member.key, id, Position::Out, AT)
+        .author_standing(&member.key, id, Position::Out, "someone", AT)
         .unwrap();
 
     assert_eq!(
@@ -589,7 +602,12 @@ fn a_node_that_has_left_still_answers_so_its_departure_can_travel() {
     let GroupResponse::Entries { standings, .. } = response else {
         panic!("a node that has left must still answer a member, got {response:?}");
     };
-    assert_eq!(standings.len(), 1, "and hands over its own standing");
+    assert!(
+        standings
+            .iter()
+            .any(|s| s.subject().unwrap() == member.peer()),
+        "and hands over its own standing"
+    );
 }
 
 #[test]

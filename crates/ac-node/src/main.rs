@@ -1,16 +1,3 @@
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
-mod blob;
-mod cmd;
-mod contacts;
-mod daemon;
-mod directory;
-mod file_link;
-mod group_link;
-mod peer_link;
-mod status;
-mod throttle;
-
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -18,6 +5,7 @@ use clap::{Parser, Subcommand};
 use libp2p::{Multiaddr, PeerId};
 
 use ac_net::config::Paths;
+use ac_node::{DEFAULT_LOG, cmd};
 
 /// Application name used for the per-OS data directory, which is a node's whole home.
 const APP: &str = "archiverclient";
@@ -40,9 +28,10 @@ struct Cli {
 enum Command {
     Id,
 
+    /// Enrol with a server, using the token its operator gave you.
     Join {
-        server: Multiaddr,
-        code: String,
+        /// The invite token, as `ac-server invite new` printed it.
+        token: String,
         #[arg(long)]
         username: String,
     },
@@ -96,8 +85,6 @@ enum GroupCommand {
     Add {
         group: String,
         peer: PeerId,
-        #[arg(long)]
-        username: Option<String>,
     },
     Remove {
         group: String,
@@ -160,11 +147,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Id => cmd::id::run(&paths),
-        Command::Join {
-            server,
-            code,
-            username,
-        } => cmd::join::run(&paths, &server, &code, &username),
+        Command::Join { token, username } => cmd::join::run(&paths, &token, &username),
         Command::Run { dial } => cmd::run::run(&paths, &dial),
         Command::Probe { peer } => cmd::probe::run(&paths, peer),
         Command::Peer(PeerCommand::Add { peer, label }) => cmd::peer::add(&paths, &peer, &label),
@@ -174,11 +157,7 @@ fn main() -> Result<()> {
         Command::Group(GroupCommand::Create { name }) => cmd::group::create(&paths, &name),
         Command::Group(GroupCommand::List) => cmd::group::list(&paths),
         Command::Group(GroupCommand::Show { group, log }) => cmd::group::show(&paths, &group, log),
-        Command::Group(GroupCommand::Add {
-            group,
-            peer,
-            username,
-        }) => cmd::group::add(&paths, &group, &peer, username.as_deref()),
+        Command::Group(GroupCommand::Add { group, peer }) => cmd::group::add(&paths, &group, &peer),
         Command::Group(GroupCommand::Remove { group, peer }) => {
             cmd::group::remove(&paths, &group, &peer)
         }
@@ -219,8 +198,7 @@ fn main() -> Result<()> {
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("ac=info,ac_net=info,libp2p=warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG));
 
     fmt()
         .with_env_filter(filter)

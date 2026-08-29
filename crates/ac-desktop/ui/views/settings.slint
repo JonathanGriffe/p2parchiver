@@ -1,0 +1,219 @@
+import { ScrollView, Button, LineEdit, CheckBox } from "std-widgets.slint";
+import { Theme, Card } from "../theme.slint";
+
+component Row inherits VerticalLayout {
+    in property <string> label;
+    in property <string> hint;
+    spacing: Theme.xs;
+
+    Text {
+        text: root.label;
+        color: Theme.text;
+        font-size: Theme.small-size;
+        font-weight: 700;
+    }
+
+    @children
+
+    if root.hint != "" : Text {
+        text: root.hint;
+        color: Theme.faint;
+        font-size: Theme.small-size;
+        wrap: word-wrap;
+    }
+}
+
+component SectionTitle inherits Text {
+    color: Theme.dim;
+    font-size: Theme.small-size;
+    font-weight: 700;
+}
+
+export component SettingsView inherits ScrollView {
+    // Loaded once and after each save, never on the poll: refreshing these every two seconds
+    // would overwrite whatever is half-typed.
+    in property <string> listen;
+    in property <string> external;
+    in property <bool> mdns;
+    in property <string> storage-root;
+    in property <string> storage-max;
+    in property <string> bandwidth-max;
+    in property <string> server;
+
+    in property <bool> autostart;
+    in property <string> autostart-warning;
+    in property <bool> busy;
+    in property <bool> enrolled;
+
+    callback save(string, string, bool, string, string, string);
+    callback set-autostart(bool);
+    callback open-logs();
+    callback restart();
+    callback join(string, string);
+
+    VerticalLayout {
+        spacing: Theme.md;
+
+        SectionTitle { text: "NETWORK"; }
+
+        Card {
+            VerticalLayout {
+                padding: Theme.md;
+                spacing: Theme.md;
+
+                Row {
+                    label: "Listen on";
+                    hint: "One multiaddr per line. Port 0 asks the system for a free one.";
+                    listen := LineEdit { text: root.listen; }
+                }
+
+                Row {
+                    label: "Announce as";
+                    hint: "Addresses to advertise beyond the ones discovered. Usually empty.";
+                    external := LineEdit { text: root.external; }
+                }
+
+                mdns := CheckBox {
+                    text: "Find peers on the local network (mDNS)";
+                    checked: root.mdns;
+                }
+            }
+        }
+
+        SectionTitle { text: "STORAGE"; }
+
+        Card {
+            VerticalLayout {
+                padding: Theme.md;
+                spacing: Theme.md;
+
+                Row {
+                    label: "Keep files in";
+                    hint: "Empty means the default inside this node's home.";
+                    root-dir := LineEdit { text: root.storage-root; }
+                }
+
+                Row {
+                    label: "Stop mirroring past";
+                    hint: "Like 500 GB. Say \"unlimited\" for no ceiling beyond the free-space floor the node keeps anyway.";
+                    max := LineEdit { text: root.storage-max; }
+                }
+
+                Row {
+                    label: "Bandwidth limit";
+                    hint: "Per second, like 10 MB. Say \"unlimited\" for no limit.";
+                    bandwidth := LineEdit { text: root.bandwidth-max; }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Theme.sm;
+            Button {
+                text: "Save";
+                primary: true;
+                enabled: !root.busy;
+                clicked => {
+                    root.save(
+                        listen.text, external.text, mdns.checked,
+                        root-dir.text, max.text, bandwidth.text,
+                    );
+                }
+            }
+            Button {
+                text: "Restart the node";
+                enabled: !root.busy;
+                clicked => { root.restart(); }
+            }
+            Text {
+                // Said before the click, not after: the node reads its config once, at start.
+                text: "Saved settings apply when the node next starts.";
+                color: Theme.faint;
+                font-size: Theme.small-size;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+        }
+
+        SectionTitle { text: "SERVER"; }
+
+        Card {
+            VerticalLayout {
+                padding: Theme.md;
+                spacing: Theme.md;
+
+                if root.enrolled : Row {
+                    label: "Enrolled with";
+                    hint: "Pinned. A different server at the same address will fail to connect.";
+                    Text {
+                        text: root.server;
+                        color: Theme.dim;
+                        font-size: Theme.small-size;
+                        font-family: Theme.mono;
+                        wrap: char-wrap;
+                    }
+                }
+
+                if !root.enrolled : Text {
+                    // What the daemon warns about a node in this state.
+                    text: "This node has not enrolled, so it can verify nobody and can prove "
+                        + "nothing about itself. Every peer connection will be closed.";
+                    color: Theme.warn;
+                    font-size: Theme.small-size;
+                    wrap: word-wrap;
+                }
+
+                Row {
+                    label: root.enrolled ? "Enrol again" : "Enrol";
+                    hint: "The token carries the server's address and peer id. Enrolling restarts the node.";
+                    VerticalLayout {
+                        spacing: Theme.sm;
+                        token := LineEdit { placeholder-text: "invite token"; }
+                        HorizontalLayout {
+                            spacing: Theme.sm;
+                            who := LineEdit { placeholder-text: "username"; horizontal-stretch: 1; }
+                            Button {
+                                text: "Enrol";
+                                enabled: token.text != "" && who.text != "" && !root.busy;
+                                clicked => { root.join(token.text, who.text); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        SectionTitle { text: "THIS APP"; }
+
+        Card {
+            VerticalLayout {
+                padding: Theme.md;
+                spacing: Theme.sm;
+
+                CheckBox {
+                    text: "Start when I log in";
+                    checked: root.autostart;
+                    enabled: !root.busy;
+                    toggled => { root.set-autostart(self.checked); }
+                }
+
+                if root.autostart-warning != "" : Text {
+                    text: root.autostart-warning;
+                    color: Theme.warn;
+                    font-size: Theme.small-size;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: start;
+                    Button {
+                        text: "Open the log folder";
+                        clicked => { root.open-logs(); }
+                    }
+                }
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+    }
+}

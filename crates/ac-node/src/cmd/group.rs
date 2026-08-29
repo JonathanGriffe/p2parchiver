@@ -1,45 +1,30 @@
-use ac_groups::chain::Op;
-use ac_groups::standing::Position;
-use ac_groups::store::{GroupRow, State};
 use ac_net::PeerId;
-use ac_net::attest;
 use ac_net::config::Paths;
-use ac_net::identity::Identity;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Result;
 
-use super::{now, open, open_files, resolve};
-use crate::contacts::Contacts;
+use crate::ops::format::state_name;
+use crate::ops::group::{Accepted, Departed, LogLine};
+use crate::ops::{self};
 
 pub fn create(paths: &Paths, name: &str) -> Result<()> {
-    let (identity, mut groups) = open(paths)?;
+    let created = ops::group::create(paths, name)?;
 
-    let attestation = attest::load(&paths.attestation_file())
-        .context("reading this node's attestation")?
-        .ok_or_else(|| anyhow!("this node has not enrolled with a server; run `ac join` first"))?;
-    let username = attestation
-        .statement()
-        .map_err(|e| anyhow!("{e}"))
-        .context("reading the stored attestation")?
-        .username;
-
-    let id = groups
-        .create(identity.keypair(), name, &username, now())
-        .with_context(|| format!("creating group {name:?}"))?;
-
-    println!("created {name} ({})", id.short());
-    println!("id    {id}");
-    println!("admin {} (this node)", identity.peer_id());
+    println!("created {} ({})", created.name, created.id.short());
+    println!("id    {}", created.id);
+    println!("admin {} (this node)", created.admin);
     println!();
     println!("You are this group's only admin: nobody else can add or remove members, and");
     println!("that cannot be transferred, so losing this node's key freezes the group.");
     println!();
-    println!("Add someone with: ac group add {} <peer-id>", id.short());
+    println!(
+        "Add someone with: ac group add {} <peer-id>",
+        created.id.short()
+    );
     Ok(())
 }
 
 pub fn list(paths: &Paths) -> Result<()> {
-    let (identity, groups) = open(paths)?;
-    let rows = groups.list().context("listing groups")?;
+    let rows = ops::group::list(paths)?;
 
     if rows.is_empty() {
         println!("no groups. create one with: ac group create --name <name>");
@@ -48,13 +33,11 @@ pub fn list(paths: &Paths) -> Result<()> {
 
     let widest = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
     for row in rows {
-        let members = groups.members(row.id).unwrap_or_default();
         let mut notes = Vec::new();
-
-        if row.admin == identity.peer_id() {
+        if row.is_admin {
             notes.push("admin".to_owned());
         }
-        if !members.contains(&identity.peer_id()) {
+        if row.removed_by_admin {
             notes.push("removed by admin".to_owned());
         }
 
@@ -68,45 +51,45 @@ pub fn list(paths: &Paths) -> Result<()> {
             row.name,
             row.id.short(),
             state_name(row.state),
-            members.len(),
+            row.members,
         );
     }
     Ok(())
 }
 
 pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<()> {
-    let (identity, groups) = open(paths)?;
-    let (id, row) = resolve(&groups, needle)?;
-
-    let members = groups.members(id).context("reading members")?;
-    let departed = groups.departed(id).context("reading departures")?;
+    let detail = ops::group::show(paths, needle, log)?;
+    let row = &detail.row;
 
     println!("id      {}", row.id);
     println!("name    {}", row.name);
     println!(
         "admin   {}{}",
         row.admin,
-        if row.admin == identity.peer_id() {
-            "  (this node)"
-        } else {
-            ""
-        }
+        if detail.is_admin { "  (this node)" } else { "" }
     );
     println!("state   {}", state_name(row.state));
     println!("entries {}", row.head_seq);
 
     println!();
     println!("members");
-    let widest = members.iter().map(|m| m.username.len()).max().unwrap_or(0);
-    for member in members.iter() {
+    // A member who has not published a standing yet has told us no name at all.
+    let named = |m: &ops::group::MemberView| m.username.clone().unwrap_or_else(|| "?".to_owned());
+    let widest = detail
+        .members
+        .iter()
+        .map(|m| named(m).len())
+        .max()
+        .unwrap_or(0);
+    for member in &detail.members {
         let mut notes = Vec::new();
         if member.is_admin {
             notes.push("admin");
         }
-        if member.peer == identity.peer_id() {
+        if member.is_me {
             notes.push("this node");
         }
-        if departed.contains(&member.peer) {
+        if member.departed {
             notes.push("has left, awaiting removal");
         }
         let note = if notes.is_empty() {
@@ -114,65 +97,26 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<()> {
         } else {
             format!("  ({})", notes.join(", "))
         };
-        println!("  {:<widest$}  {}{note}", member.username, member.peer);
+        println!("  {:<widest$}  {}{note}", named(member), member.peer);
     }
 
-    if log {
+    if let Some(log) = detail.log {
         println!();
         println!("log");
-        let chain = groups.chain(id).context("reading the log")?;
-        for (seq, entry) in chain.entries().enumerate() {
-            match entry.body() {
-                Ok(body) => println!("  {seq:>3}  {}", describe(&body.op)),
-                Err(e) => println!("  {seq:>3}  <unreadable: {e}>"),
+        for (seq, line) in log.iter().enumerate() {
+            match line {
+                LogLine::Said(said) => println!("  {seq:>3}  {said}"),
+                LogLine::Unreadable(why) => println!("  {seq:>3}  <unreadable: {why}>"),
             }
         }
     }
     Ok(())
 }
 
-pub fn add(paths: &Paths, needle: &str, peer: &PeerId, username: Option<&str>) -> Result<()> {
-    let (identity, mut groups) = open(paths)?;
-    let (id, row) = resolve(&groups, needle)?;
-    require_admin(&row, &identity, "add members")?;
+pub fn add(paths: &Paths, needle: &str, peer: &PeerId) -> Result<()> {
+    let added = ops::group::add(paths, needle, peer)?;
 
-    let (raw, source) = match username {
-        Some(name) => (name.to_owned(), "username"),
-        None => (
-            Contacts::open(&paths.db_file())
-                .ok()
-                .and_then(|c| c.get(peer).ok().flatten())
-                .map(|c| c.label)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no name for {peer}; pass --username, or add them first with \
-                         `ac peer add {peer} --label <name>`"
-                    )
-                })?,
-            "contact label",
-        ),
-    };
-
-    let username = attest::normalise_username(&raw).map_err(|e| {
-        anyhow!(
-            "unusable {source} {raw:?}: {e}\n\
-             pass --username <name> with a name that fits"
-        )
-    })?;
-
-    groups
-        .author(
-            identity.keypair(),
-            id,
-            Op::Add {
-                peer: peer.to_base58(),
-                username: username.clone(),
-            },
-            now(),
-        )
-        .with_context(|| format!("adding {peer} to {needle}"))?;
-
-    println!("added {username} ({peer})");
+    println!("added {}", added.peer);
     println!();
     println!("They will be told the next time this node and theirs are both online and");
     println!("connected. Being added is an invitation: they choose whether to accept.");
@@ -180,20 +124,7 @@ pub fn add(paths: &Paths, needle: &str, peer: &PeerId, username: Option<&str>) -
 }
 
 pub fn remove(paths: &Paths, needle: &str, peer: &PeerId) -> Result<()> {
-    let (identity, mut groups) = open(paths)?;
-    let (id, row) = resolve(&groups, needle)?;
-    require_admin(&row, &identity, "remove members")?;
-
-    groups
-        .author(
-            identity.keypair(),
-            id,
-            Op::Remove {
-                peer: peer.to_base58(),
-            },
-            now(),
-        )
-        .with_context(|| format!("removing {peer} from {needle}"))?;
+    ops::group::remove(paths, needle, peer)?;
 
     println!("removed {peer}");
     println!();
@@ -204,53 +135,22 @@ pub fn remove(paths: &Paths, needle: &str, peer: &PeerId) -> Result<()> {
 }
 
 pub fn accept(paths: &Paths, needle: &str) -> Result<()> {
-    let (identity, mut groups) = open(paths)?;
-    let (id, row) = resolve(&groups, needle)?;
-
-    if !groups
-        .members(id)
-        .context("reading members")?
-        .contains(&identity.peer_id())
-    {
-        bail!(
-            "this group does not list you; ask its admin to add you, then try again \
-             (`ac group show {needle}` shows who is in it)"
-        );
+    match ops::group::accept(paths, needle)? {
+        Accepted::Already(name) => println!("already a member of {name}"),
+        Accepted::Joined(name) => println!("joined {name}"),
     }
-    if row.state == State::Active {
-        println!("already a member of {}", row.name);
-        return Ok(());
-    }
-
-    groups
-        .author_standing(identity.keypair(), id, Position::In, now())
-        .with_context(|| format!("accepting {needle}"))?;
-
-    println!("joined {}", row.name);
     Ok(())
 }
 
 pub fn leave(paths: &Paths, needle: &str) -> Result<()> {
-    let (identity, mut groups) = open(paths)?;
-    let (id, row) = resolve(&groups, needle)?;
-
-    if row.admin == identity.peer_id() {
-        bail!(
-            "you created {}, and a group cannot outlive its only admin. To stop holding it \
-             on this node, use `ac group forget {needle}`, which tells nobody.",
-            row.name
-        );
-    }
-    if row.state == State::Left {
-        println!("already left {}", row.name);
-        return Ok(());
+    match ops::group::leave(paths, needle)? {
+        Departed::Already(name) => {
+            println!("already left {name}");
+            return Ok(());
+        }
+        Departed::Left(name) => println!("left {name}"),
     }
 
-    groups
-        .author_standing(identity.keypair(), id, Position::Out, now())
-        .with_context(|| format!("leaving {needle}"))?;
-
-    println!("left {}", row.name);
     println!();
     println!("This node stops sharing that group immediately, whatever anyone else believes.");
     println!("The others are told when they next connect, and the admin then makes it");
@@ -259,35 +159,20 @@ pub fn leave(paths: &Paths, needle: &str) -> Result<()> {
 }
 
 pub fn forget(paths: &Paths, needle: &str) -> Result<()> {
-    let (identity, mut groups) = open(paths)?;
-    let (id, row) = resolve(&groups, needle)?;
-    let admin = row.admin == identity.peer_id();
+    let forgotten = ops::group::forget(paths, needle)?;
 
-    let (mut files, content) = open_files(paths, &identity)?;
-    let held = files.list(id, None, false).unwrap_or_default().len();
-    let dir = files.dir_of(id).ok().flatten();
-
-    if let Some(dir) = &dir {
-        let _ = content.sweep_staging(dir, &[], std::time::Duration::ZERO);
-    }
-
-    files
-        .forget_group(id)
-        .with_context(|| format!("forgetting the files of {needle}"))?;
-
-    groups
-        .forget(id)
-        .with_context(|| format!("forgetting {needle}"))?;
-
-    println!("forgot {} locally", row.name);
-    if held > 0 {
+    println!("forgot {} locally", forgotten.name);
+    if forgotten.held > 0 {
         println!();
-        println!("{held} file(s) were left on disk, no longer indexed:");
-        if let Some(dir) = dir {
-            println!("  {}", content.group_dir(&dir).display());
+        println!(
+            "{} file(s) were left on disk, no longer indexed:",
+            forgotten.held
+        );
+        if let Some(dir) = forgotten.dir {
+            println!("  {}", dir.display());
         }
     }
-    if admin {
+    if forgotten.was_admin {
         println!();
         println!("You were this group's admin, so nobody can change its membership again.");
         println!("Other members keep their copy and can still reach each other with it.");
@@ -297,31 +182,4 @@ pub fn forget(paths: &Paths, needle: &str) -> Result<()> {
         println!("offering it, use `ac group leave` instead if you meant to tell them.");
     }
     Ok(())
-}
-
-fn require_admin(row: &GroupRow, identity: &Identity, what: &str) -> Result<()> {
-    if row.admin != identity.peer_id() {
-        bail!(
-            "only {} can {what} in {}; this node is not its admin",
-            row.admin,
-            row.name
-        );
-    }
-    Ok(())
-}
-
-fn state_name(state: State) -> &'static str {
-    match state {
-        State::Pending => "invited",
-        State::Active => "member",
-        State::Left => "left",
-    }
-}
-
-fn describe(op: &Op) -> String {
-    match op {
-        Op::Create { name, admin, .. } => format!("created {name:?} by {admin}"),
-        Op::Add { peer, username } => format!("added {username} ({peer})"),
-        Op::Remove { peer } => format!("removed {peer}"),
-    }
 }

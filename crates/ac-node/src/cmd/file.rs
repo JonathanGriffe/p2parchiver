@@ -1,52 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ac_files::store::Recorded;
-use ac_files::{Content, FileRow, Files, RelPath};
-use ac_groups::id::GroupId;
-use ac_groups::store::{GroupRow, State};
 use ac_net::config::Paths;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, bail};
 
-use super::{now, open, open_files, resolve};
-
-/// Everything the file commands need, opened together.
-struct Session {
-    files: Files,
-    content: Content,
-    id: GroupId,
-    row: GroupRow,
-    dir: String,
-}
-
-fn session(paths: &Paths, needle: &str) -> Result<Session> {
-    let (identity, groups) = open(paths)?;
-    let (id, row) = resolve(&groups, needle)?;
-    let (mut files, content) = open_files(paths, &identity)?;
-
-    let dir = files
-        .dir_for(id, &row.name)
-        .with_context(|| format!("choosing a directory for {}", row.name))?;
-
-    Ok(Session {
-        files,
-        content,
-        id,
-        row,
-        dir,
-    })
-}
-
-/// Refuse the groups where adding content would be meaningless.
-fn writable(row: &GroupRow) -> Result<()> {
-    if row.state == State::Left {
-        bail!(
-            "you have left {}; rejoin with `ac group accept {}` before adding to it",
-            row.name,
-            row.id.short()
-        );
-    }
-    Ok(())
-}
+use crate::ops::format::{ago, human_size};
+use crate::ops::{self};
 
 pub fn add(
     paths: &Paths,
@@ -57,47 +16,23 @@ pub fn add(
     recursive: bool,
     force: bool,
 ) -> Result<()> {
-    let mut s = session(paths, needle)?;
-    writable(&s.row)?;
+    let mut s = ops::file::session(paths, needle)?;
+    ops::file::writable(&s.row)?;
 
-    if rename.is_some() && sources.len() != 1 {
-        bail!(
-            "--as names one destination, but {} sources were given; use --to <dir> instead",
-            sources.len()
-        );
+    let planned = ops::file::plan(sources, to, rename, recursive)?;
+    for note in &planned.skipped {
+        eprintln!("{note}");
     }
 
-    let mut planned: Vec<(PathBuf, RelPath)> = Vec::new();
-    for src in sources {
-        let meta = std::fs::metadata(src).with_context(|| format!("reading {}", src.display()))?;
-
-        if meta.is_dir() {
-            if !recursive {
-                bail!(
-                    "{} is a directory; pass --recursive to add what is in it",
-                    src.display()
-                );
-            }
-            expand_dir(src, to.unwrap_or(""), &mut planned)?;
-        } else {
-            let dest = match rename {
-                Some(exact) => RelPath::parse(exact),
-                None => RelPath::under(to.unwrap_or(""), &file_name_of(src)?),
-            }
-            .with_context(|| format!("working out where {} should go", src.display()))?;
-            planned.push((src.clone(), dest));
-        }
-    }
-
-    if planned.is_empty() {
+    if planned.items.is_empty() {
         println!("nothing to add");
         return Ok(());
     }
 
-    let single = planned.len() == 1;
+    let single = planned.items.len() == 1;
     let (mut added, mut unchanged, mut failed) = (0usize, 0usize, 0usize);
-    for (src, dest) in &planned {
-        match add_one(&mut s, src, dest, force) {
+    for (src, dest) in &planned.items {
+        match ops::file::add_one(&mut s, src, dest, force) {
             Ok(Recorded::Unchanged) => {
                 unchanged += 1;
                 if single {
@@ -115,144 +50,43 @@ pub fn add(
         }
     }
 
-    if planned.len() > 1 || failed > 0 {
+    if planned.items.len() > 1 || failed > 0 {
         println!();
         println!("{added} added, {unchanged} unchanged, {failed} skipped");
     }
     if failed > 0 {
-        bail!("{failed} of {} file(s) could not be added", planned.len());
-    }
-    Ok(())
-}
-
-/// Copy one file in, then record it. Never the other way round.
-fn add_one(s: &mut Session, src: &Path, dest: &RelPath, force: bool) -> Result<Recorded> {
-    let staged = s
-        .content
-        .stage(&s.dir, dest, src)
-        .with_context(|| format!("copying {}", src.display()))?;
-
-    if let Some(held) = s.files.path_of_hash(s.id, &staged.hash)?
-        && held != *dest
-    {
-        s.content.discard(staged).ok();
         bail!(
-            "these bytes are already in {}, at {held}\n\
-             Nothing was added: a group keeps one copy of any file.",
-            s.row.name
+            "{failed} of {} file(s) could not be added",
+            planned.items.len()
         );
     }
-
-    if let Some(existing) = s.files.get(s.id, dest)?
-        && !existing.is_removed()
-    {
-        if existing.hash == staged.hash {
-            s.content.discard(staged).ok();
-            return Ok(Recorded::Unchanged);
-        }
-        if !force {
-            s.content.discard(staged).ok();
-            bail!("{dest} already holds different content; pass --force to replace it");
-        }
-    }
-
-    let row = FileRow {
-        path: dest.clone(),
-        size: staged.size,
-        hash: staged.hash.clone(),
-        modified: staged.modified,
-        added_at: now(),
-        added_by: s.files.me(),
-        removed_at: None,
-        have: true,
-        seen_seq: 0,
-    };
-
-    s.content
-        .commit(staged)
-        .with_context(|| format!("putting {dest} in place"))?;
-    Ok(s.files.record(s.id, &row, force)?)
-}
-
-/// Every regular file under `dir`, destined for `<to>/<dir-name>/<relative path>`.
-fn expand_dir(dir: &Path, to: &str, out: &mut Vec<(PathBuf, RelPath)>) -> Result<()> {
-    let base = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow!("{} has no usable name", dir.display()))?;
-
-    let prefix = if to.trim_matches('/').is_empty() {
-        base.to_owned()
-    } else {
-        format!("{}/{base}", to.trim_matches('/'))
-    };
-    collect(dir, dir, &prefix, out)
-}
-
-fn collect(base: &Path, dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, RelPath)>) -> Result<()> {
-    let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path)?;
-
-        if meta.is_symlink() {
-            eprintln!("skipping symlink {}", path.display());
-            continue;
-        }
-        if meta.is_dir() {
-            collect(base, &path, prefix, out)?;
-        } else if meta.is_file() {
-            let rel = path
-                .strip_prefix(base)
-                .ok()
-                .and_then(|p| p.to_str())
-                .ok_or_else(|| anyhow!("{} has an unusable name", path.display()))?;
-            let dest = RelPath::under(prefix, rel)
-                .with_context(|| format!("working out where {} should go", path.display()))?;
-            out.push((path, dest));
-        } else {
-            eprintln!("skipping {} (not a regular file)", path.display());
-        }
-    }
     Ok(())
-}
-
-fn file_name_of(src: &Path) -> Result<String> {
-    src.file_name()
-        .and_then(|n| n.to_str())
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("{} has no usable file name", src.display()))
 }
 
 pub fn list(paths: &Paths, needle: &str, prefix: Option<&str>, removed: bool) -> Result<()> {
-    let s = session(paths, needle)?;
-    let rows = s
-        .files
-        .list(s.id, prefix, removed)
-        .context("listing files")?;
+    let listing = ops::file::list(paths, needle, prefix, removed)?;
 
-    println!("{}", s.content.group_dir(&s.dir).display());
+    println!("{}", listing.dir.display());
     println!();
 
-    if rows.is_empty() {
+    if listing.rows.is_empty() {
         match prefix {
             Some(p) => println!("nothing under {p:?}"),
             None => println!(
                 "no files. add some with: ac file add {} <path>...",
-                s.row.id.short()
+                listing.group.id.short()
             ),
         }
         return Ok(());
     }
 
-    let widest = rows
+    let widest = listing
+        .rows
         .iter()
         .map(|r| r.path.as_str().len())
         .max()
         .unwrap_or(0);
-    for row in &rows {
+    for row in &listing.rows {
         let held = match (row.is_removed(), row.have) {
             (true, _) => "removed",
             (false, true) => "local",
@@ -266,7 +100,7 @@ pub fn list(paths: &Paths, needle: &str, prefix: Option<&str>, removed: bool) ->
         );
     }
 
-    if rows.iter().any(|r| !r.have && !r.is_removed()) {
+    if listing.rows.iter().any(|r| !r.have && !r.is_removed()) {
         println!();
         println!("`remote` means this node knows the file exists but does not hold it.");
     }
@@ -274,28 +108,16 @@ pub fn list(paths: &Paths, needle: &str, prefix: Option<&str>, removed: bool) ->
 }
 
 pub fn show(paths: &Paths, needle: &str, path: &str) -> Result<()> {
-    let s = session(paths, needle)?;
-    let path = RelPath::parse(path).map_err(|e| anyhow!("{e}"))?;
+    let detail = ops::file::show(paths, needle, path)?;
+    let row = &detail.row;
 
-    let row = s
-        .files
-        .get(s.id, &path)
-        .context("reading the file")?
-        .ok_or_else(|| {
-            anyhow!(
-                "{path} is not in {}; `ac file list {needle}` shows what is",
-                s.row.name
-            )
-        })?;
-
-    let me = s.files.me();
     println!("path      {}", row.path);
     println!("size      {} ({} bytes)", human_size(row.size), row.size);
     println!("hash      {}", row.hash);
     println!(
         "added     {} by {}",
         ago(row.added_at),
-        if row.added_by == me {
+        if detail.added_by_me {
             "this node".to_owned()
         } else {
             row.added_by.to_string()
@@ -304,10 +126,7 @@ pub fn show(paths: &Paths, needle: &str, path: &str) -> Result<()> {
     if let Some(at) = row.removed_at {
         println!("removed   {}", ago(at));
     }
-    println!(
-        "location  {}",
-        s.content.locate(&s.dir, &row.path).display()
-    );
+    println!("location  {}", detail.location.display());
 
     println!(
         "held      {}",
@@ -320,7 +139,7 @@ pub fn show(paths: &Paths, needle: &str, path: &str) -> Result<()> {
 
     if !row.is_removed() && !row.have {
         println!();
-    } else if !row.is_removed() && !s.content.exists(&s.dir, &row.path) {
+    } else if !row.is_removed() && !detail.bytes_present {
         println!();
         println!("The bytes are missing. `ac file verify {needle}` checks the whole group.");
     }
@@ -328,15 +147,7 @@ pub fn show(paths: &Paths, needle: &str, path: &str) -> Result<()> {
 }
 
 pub fn remove(paths: &Paths, needle: &str, path: &str) -> Result<()> {
-    let mut s = session(paths, needle)?;
-    let path = RelPath::parse(path).map_err(|e| anyhow!("{e}"))?;
-
-    if !s.files.remove(s.id, &path, now()).context("removing")? {
-        bail!("{path} is not in {}", s.row.name);
-    }
-    s.content
-        .remove(&s.dir, &path)
-        .with_context(|| format!("deleting {path}"))?;
+    let path = ops::file::remove(paths, needle, path)?;
 
     println!("removed {path}");
     println!();
@@ -346,151 +157,29 @@ pub fn remove(paths: &Paths, needle: &str, path: &str) -> Result<()> {
 }
 
 pub fn verify(paths: &Paths, needle: &str) -> Result<()> {
-    let s = session(paths, needle)?;
-    let rows = s.files.list(s.id, None, false).context("listing files")?;
+    let report = ops::file::verify(paths, needle)?;
 
-    let mut missing = Vec::new();
-    let mut changed = Vec::new();
-    for row in &rows {
-        if !s.content.exists(&s.dir, &row.path) {
-            missing.push(row.path.clone());
-            continue;
-        }
-        match s.content.hash_at(&s.dir, &row.path) {
-            Ok(hash) if hash != row.hash => changed.push(row.path.clone()),
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("could not read {}: {e}", row.path);
-                missing.push(row.path.clone());
-            }
-        }
+    for (path, why) in &report.unreadable {
+        eprintln!("could not read {path}: {why}");
     }
 
-    let indexed: std::collections::BTreeSet<_> = rows.iter().map(|r| r.path.clone()).collect();
-    let untracked: Vec<_> = s
-        .content
-        .walk(&s.dir)
-        .with_context(|| format!("reading {}", s.content.group_dir(&s.dir).display()))?
-        .into_iter()
-        .filter(|p| !indexed.contains(p))
-        .collect();
-
-    println!("{} file(s) checked", rows.len());
-    for path in &missing {
+    println!("{} file(s) checked", report.checked);
+    for path in &report.missing {
         println!("  missing    {path}");
     }
-    for path in &changed {
+    for path in &report.changed {
         println!("  changed    {path}");
     }
-    for path in &untracked {
+    for path in &report.untracked {
         println!("  untracked  {path}");
     }
 
-    if missing.is_empty() && changed.is_empty() && untracked.is_empty() {
+    if report.everything_matches() {
         println!("everything matches");
-    } else if !untracked.is_empty() {
+    } else if !report.untracked.is_empty() {
         println!();
         println!("Untracked files are bytes this node holds but does not index, usually an");
         println!("add that was interrupted after the copy. They are not shared with anyone.");
     }
     Ok(())
-}
-
-/// How long ago a timestamp was, in the largest useful unit.
-fn ago(at: i64) -> String {
-    let seconds = now() - at;
-    match seconds {
-        s if s < 0 => "in the future".to_owned(),
-        s if s < 60 => "just now".to_owned(),
-        s if s < 3_600 => format!("{}m ago", s / 60),
-        s if s < 86_400 => format!("{}h ago", s / 3_600),
-        s => format!("{}d ago", s / 86_400),
-    }
-}
-
-/// Sizes at a glance. Binary units, because that is what a filesystem reports.
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn times_read_in_the_largest_useful_unit() {
-        let t = now();
-        assert_eq!(ago(t), "just now");
-        assert_eq!(ago(t - 300), "5m ago");
-        assert_eq!(ago(t - 7_200), "2h ago");
-        assert_eq!(ago(t - 172_800), "2d ago");
-        assert_eq!(ago(t + 600), "in the future");
-    }
-
-    #[test]
-    fn sizes_read_the_way_a_person_would_say_them() {
-        assert_eq!(human_size(0), "0 B");
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1024), "1.0 KiB");
-        assert_eq!(human_size(1536), "1.5 KiB");
-        assert_eq!(human_size(4 * 1024 * 1024), "4.0 MiB");
-    }
-
-    #[test]
-    fn a_directory_expands_under_its_own_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("holiday");
-        std::fs::create_dir_all(src.join("2024")).unwrap();
-        std::fs::write(src.join("a.jpg"), b"a").unwrap();
-        std::fs::write(src.join("2024/b.jpg"), b"b").unwrap();
-
-        let mut out = Vec::new();
-        expand_dir(&src, "raw", &mut out).unwrap();
-        out.sort_by(|a, b| a.1.cmp(&b.1));
-
-        let dests: Vec<_> = out.iter().map(|(_, d)| d.as_str()).collect();
-        assert_eq!(dests, vec!["raw/holiday/2024/b.jpg", "raw/holiday/a.jpg"]);
-    }
-
-    #[test]
-    fn expanding_without_a_destination_keeps_the_directory_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("docs");
-        std::fs::create_dir(&src).unwrap();
-        std::fs::write(src.join("n.md"), b"n").unwrap();
-
-        let mut out = Vec::new();
-        expand_dir(&src, "", &mut out).unwrap();
-
-        assert_eq!(out[0].1.as_str(), "docs/n.md");
-    }
-
-    #[test]
-    fn a_symlink_in_the_source_tree_is_not_followed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let outside = tmp.path().join("secret.txt");
-        std::fs::write(&outside, b"not yours").unwrap();
-
-        let src = tmp.path().join("docs");
-        std::fs::create_dir(&src).unwrap();
-        std::fs::write(src.join("real.md"), b"r").unwrap();
-        std::os::unix::fs::symlink(&outside, src.join("link.txt")).unwrap();
-
-        let mut out = Vec::new();
-        expand_dir(&src, "", &mut out).unwrap();
-
-        assert_eq!(out.len(), 1, "only the real file");
-        assert_eq!(out[0].1.as_str(), "docs/real.md");
-    }
 }

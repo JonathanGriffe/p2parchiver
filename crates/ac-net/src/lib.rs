@@ -8,6 +8,7 @@ pub mod budget;
 pub mod config;
 pub mod connectivity;
 pub mod identity;
+pub mod invite;
 pub mod keepalive;
 pub mod limits;
 pub mod link;
@@ -15,4 +16,5 @@ pub mod proto;
 pub mod roster;
 pub mod swarm;
 
-pub use libp2p::PeerId;
+pub use libp2p::multiaddr::Protocol;
+pub use libp2p::{Multiaddr, PeerId};

@@ -17,7 +17,9 @@ pub enum Source {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Known {
     pub peer: PeerId,
-    pub name: String,
+    /// The best name we have. `None` for someone met through a group who has not yet published
+    /// a standing: the chain names nobody, so there is genuinely nothing to show.
+    pub name: Option<String>,
     pub source: Source,
 }
 
@@ -41,8 +43,9 @@ pub fn everyone(contacts: &Contacts, groups: &Groups, me: PeerId) -> Result<Vec<
                 continue;
             }
             known.entry(member.peer).or_insert_with(|| Known {
-                peer: member.peer,
+                // Their own claim, once it reaches us, and nothing at all until then.
                 name: member.username.clone(),
+                peer: member.peer,
                 source: Source::Group,
             });
         }
@@ -53,14 +56,18 @@ pub fn everyone(contacts: &Contacts, groups: &Groups, me: PeerId) -> Result<Vec<
             contact.peer,
             Known {
                 peer: contact.peer,
-                name: contact.label,
+                name: Some(contact.label),
                 source: Source::Contact,
             },
         );
     }
 
     let mut out: Vec<Known> = known.into_values().collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.peer.cmp(&b.peer)));
+    // Named first and alphabetically, then whoever has told us nothing, by id. A `None`
+    // sorting before every name would put the strangers at the top of the list.
+    out.sort_by(|a, b| {
+        (a.name.is_none(), &a.name, a.peer).cmp(&(b.name.is_none(), &b.name, b.peer))
+    });
     Ok(out)
 }
 
@@ -84,14 +91,13 @@ mod tests {
     fn group_with(me: PeerId, admin: &Keypair, members: &[(PeerId, &str)]) -> Groups {
         let mut groups = Groups::in_memory(me).unwrap();
         let id = groups.create(admin, "family", "admin", AT).unwrap();
-        for (peer, username) in members {
+        for (peer, _) in members {
             groups
                 .author(
                     admin,
                     id,
                     Op::Add {
                         peer: peer.to_base58(),
-                        username: (*username).to_owned(),
                     },
                     AT,
                 )
@@ -100,8 +106,11 @@ mod tests {
         groups
     }
 
+    /// A fellow member turns up in the directory on the strength of the chain alone. What
+    /// they are called is not in the chain, so until their own standing arrives they are
+    /// listed with no name rather than one the admin made up for them.
     #[test]
-    fn group_members_appear_without_being_added() {
+    fn group_members_appear_without_being_added_but_unnamed_until_they_speak() {
         let admin = key();
         let me = peer_of(&admin);
         let bob = peer_of(&key());
@@ -114,7 +123,7 @@ mod tests {
             known,
             vec![Known {
                 peer: bob,
-                name: "bob".to_owned(),
+                name: None,
                 source: Source::Group,
             }]
         );
@@ -135,7 +144,7 @@ mod tests {
 
         let known = everyone(&contacts, &groups, me).unwrap();
         assert_eq!(known.len(), 1, "one row, not two");
-        assert_eq!(known[0].name, "bobs-laptop");
+        assert_eq!(known[0].name.as_deref(), Some("bobs-laptop"));
         assert_eq!(known[0].source, Source::Contact);
     }
 
@@ -197,7 +206,7 @@ mod tests {
         let known = everyone(&contacts, &groups, me).unwrap();
         assert_eq!(known.len(), 1);
         assert_eq!(known[0].source, Source::Contact);
-        assert_eq!(known[0].name, "bobs-laptop");
+        assert_eq!(known[0].name.as_deref(), Some("bobs-laptop"));
     }
 
     #[test]
@@ -207,12 +216,37 @@ mod tests {
         let (a, b, c) = (peer_of(&key()), peer_of(&key()), peer_of(&key()));
 
         let groups = group_with(me, &admin, &[(a, "carol"), (b, "alice"), (c, "bob")]);
-        let names: Vec<String> = everyone(&Contacts::in_memory().unwrap(), &groups, me)
+        // Named here rather than in the group: the chain carries no names, so a contact label
+        // is the only name a member has until their own standing arrives.
+        let contacts = Contacts::in_memory().unwrap();
+        contacts.add(&a, "carol").unwrap();
+        contacts.add(&b, "alice").unwrap();
+        contacts.add(&c, "bob").unwrap();
+
+        let names: Vec<String> = everyone(&contacts, &groups, me)
             .unwrap()
             .into_iter()
-            .map(|k| k.name)
+            .filter_map(|k| k.name)
             .collect();
 
         assert_eq!(names, ["alice", "bob", "carol"]);
+    }
+
+    /// Whoever has told us nothing sorts after everyone who has. Ordering by an absent name
+    /// would put every stranger at the top of the list, above the people you know.
+    #[test]
+    fn the_unnamed_sort_after_the_named() {
+        let admin = key();
+        let me = peer_of(&admin);
+        let (a, b) = (peer_of(&key()), peer_of(&key()));
+
+        let groups = group_with(me, &admin, &[(a, "zoe"), (b, "unknown")]);
+        let contacts = Contacts::in_memory().unwrap();
+        contacts.add(&a, "zoe").unwrap();
+
+        let known = everyone(&contacts, &groups, me).unwrap();
+
+        assert_eq!(known[0].name.as_deref(), Some("zoe"));
+        assert_eq!(known[1].name, None, "the silent one comes last");
     }
 }

@@ -1,0 +1,139 @@
+import { ScrollView, Button, LineEdit } from "std-widgets.slint";
+import { Theme, Card, ToneDot } from "../theme.slint";
+
+// One row of `ac peer list`, with what `ac peer status` knows about the same peer folded in.
+// Which section a row is in says how this node knows them, so no row carries that itself.
+export struct PeerItem {
+    name: string,
+    peer: string,
+    state: string,
+    // 0 idle, 1 working, 2 waiting, 3 unreachable. Kept a number so the words stay in Rust.
+    tone: int,
+}
+
+// Matches the Status and Settings pages, so a heading means the same thing wherever it appears.
+component SectionTitle inherits Text {
+    color: Theme.dim;
+    font-size: Theme.small-size;
+    font-weight: 700;
+}
+
+// One person, drawn the same way however this node came to know them.
+component PeerCard inherits Card {
+    in property <PeerItem> peer;
+    in property <bool> busy;
+    // Only a contact is this node's to drop, so whether there is a button is the list's call.
+    in property <bool> removable;
+    callback remove(string);
+
+    HorizontalLayout {
+        padding: Theme.md;
+        spacing: Theme.sm;
+
+        ToneDot {
+            tone: root.peer.tone;
+            y: (parent.height - self.height) / 2;
+        }
+
+        VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.peer.name;
+                color: Theme.text;
+                font-size: Theme.body-size;
+                font-weight: 700;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.peer.peer;
+                color: Theme.faint;
+                font-size: Theme.small-size;
+                font-family: Theme.mono;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.peer.state;
+                color: Theme.dim;
+                font-size: Theme.small-size;
+            }
+        }
+
+        if root.removable : Button {
+            text: "Remove";
+            enabled: !root.busy;
+            clicked => { root.remove(root.peer.peer); }
+        }
+    }
+}
+
+export component PeersView inherits VerticalLayout {
+    in property <[PeerItem]> contacts;
+    in property <[PeerItem]> discovered;
+    in property <bool> busy;
+
+    callback add(string, string);
+    callback remove(string);
+
+    spacing: Theme.md;
+
+    Card {
+        HorizontalLayout {
+            padding: Theme.md;
+            spacing: Theme.sm;
+
+            id := LineEdit {
+                placeholder-text: "peer id";
+                horizontal-stretch: 1;
+            }
+            label := LineEdit {
+                placeholder-text: "name";
+                width: 160px;
+            }
+            Button {
+                text: "Add contact";
+                enabled: id.text != "" && label.text != "" && !root.busy;
+                clicked => {
+                    root.add(id.text, label.text);
+                    id.text = "";
+                    label.text = "";
+                }
+            }
+        }
+    }
+
+    if root.contacts.length > 0 || root.discovered.length > 0 : ScrollView {
+        VerticalLayout {
+            spacing: Theme.sm;
+
+            if root.contacts.length > 0 : SectionTitle { text: "CONTACTS"; }
+
+            for peer in root.contacts : PeerCard {
+                peer: peer;
+                busy: root.busy;
+                removable: true;
+                remove(id) => { root.remove(id); }
+            }
+
+            if root.contacts.length > 0 && root.discovered.length > 0 : Rectangle {
+                height: 1px;
+                background: Theme.line;
+            }
+
+            if root.discovered.length > 0 : SectionTitle { text: "DISCOVERED FROM GROUPS"; }
+
+            for peer in root.discovered : PeerCard {
+                peer: peer;
+                busy: root.busy;
+                removable: false;
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+
+    Rectangle { vertical-stretch: 1; }
+}

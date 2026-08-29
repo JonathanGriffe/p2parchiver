@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Longest single component, in bytes. 255 is the limit on ext4, APFS and NTFS alike.
 const MAX_COMPONENT: usize = 255;
@@ -51,6 +51,35 @@ impl RelPath {
         }
 
         Ok(Self(raw.to_owned()))
+    }
+
+    /// Read a relative filesystem path as a group path.
+    ///
+    /// The separator is the platform's going in and always `/` coming out. A group path
+    /// travels to other machines, and `photos\b.jpg` names nothing on the far end of one.
+    pub fn from_fs(rel: &Path) -> Result<Self, PathError> {
+        let mut parts = Vec::new();
+        for component in rel.components() {
+            match component {
+                Component::Normal(name) => {
+                    parts.push(name.to_str().ok_or_else(|| PathError::NotUtf8 {
+                        component: name.to_string_lossy().into_owned(),
+                    })?)
+                }
+                Component::ParentDir => {
+                    return Err(PathError::Traversal {
+                        component: "..".to_owned(),
+                    });
+                }
+                Component::CurDir => {
+                    return Err(PathError::Traversal {
+                        component: ".".to_owned(),
+                    });
+                }
+                Component::RootDir | Component::Prefix(_) => return Err(PathError::Absolute),
+            }
+        }
+        Self::parse(&parts.join("/"))
     }
 
     /// Join this path beneath `dir`.
@@ -125,6 +154,8 @@ pub enum PathError {
     EmptyComponent,
     #[error("a path cannot contain a backslash")]
     Backslash,
+    #[error("{component:?} is not valid UTF-8")]
+    NotUtf8 { component: String },
     #[error("a path cannot contain the control character {found:?}")]
     Control { found: char },
     #[error("a path of {bytes} bytes is too long (limit {MAX_PATH})")]
@@ -168,6 +199,33 @@ mod tests {
         ] {
             assert!(RelPath::parse(raw).is_err(), "{raw:?} should be refused");
         }
+    }
+
+    /// The separator a walk hands back is the platform's: on Windows this path arrives as
+    /// `photos\2024\beach.jpg`, and stored that way it would name nothing on any other node.
+    #[test]
+    fn a_path_off_the_filesystem_comes_back_slash_separated() {
+        let walked = Path::new("photos").join("2024").join("beach.jpg");
+
+        assert_eq!(
+            RelPath::from_fs(&walked).unwrap().as_str(),
+            "photos/2024/beach.jpg"
+        );
+    }
+
+    #[test]
+    fn a_filesystem_path_that_could_escape_is_refused() {
+        assert_eq!(
+            RelPath::from_fs(Path::new("a").join("..").as_path()),
+            Err(PathError::Traversal {
+                component: "..".to_owned()
+            })
+        );
+        assert_eq!(
+            RelPath::from_fs(Path::new("/etc/passwd")),
+            Err(PathError::Absolute)
+        );
+        assert_eq!(RelPath::from_fs(Path::new("")), Err(PathError::Empty));
     }
 
     #[test]

@@ -624,6 +624,26 @@ impl Files {
         Ok(total.max(0) as u64)
     }
 
+    pub fn held_bytes_by_group(&self) -> Result<Vec<(String, u64)>, FilesError> {
+        let mut stmt = self.db.prepare(
+            "SELECT group_id, SUM(size) FROM files
+             WHERE have = 1 AND removed_at IS NULL
+             GROUP BY group_id
+             HAVING SUM(size) > 0
+             ORDER BY SUM(size) DESC",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let group: String = row.get(0)?;
+                let bytes: i64 = row.get(1)?;
+                Ok((group, bytes.max(0) as u64))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
     /// Rows we do not hold, in path order, starting after `after`.
     pub fn missing(
         &self,
@@ -1322,6 +1342,51 @@ mod tests {
             (1, 500),
             "taking a file out is a change the group has to hear about"
         );
+    }
+
+    #[test]
+    fn held_bytes_by_group_splits_the_same_total() {
+        let (mut files, me) = store();
+        let (g, other) = (group_id(1), group_id(2));
+
+        let mut big = row(me, "big.jpg", "aa");
+        big.size = 900;
+        files.record(g, &big, true).unwrap();
+
+        let mut small = row(me, "small.jpg", "bb");
+        small.size = 100;
+        files.record(other, &small, true).unwrap();
+
+        // Largest first, so the bar reads left to right in the order it is drawn.
+        let split = files.held_bytes_by_group().unwrap();
+        assert_eq!(
+            split,
+            vec![(g.to_string(), 900), (other.to_string(), 100)],
+            "largest group first"
+        );
+
+        let total: u64 = split.iter().map(|(_, bytes)| bytes).sum();
+        assert_eq!(
+            total,
+            files.held_bytes().unwrap(),
+            "the parts are the whole"
+        );
+    }
+
+    #[test]
+    fn a_group_holding_nothing_is_left_out_rather_than_listed_as_zero() {
+        // A segment of zero width would draw nothing but still take a legend row.
+        let (mut files, me) = store();
+        let g = group_id(1);
+
+        let mut known = row(me, "elsewhere.jpg", "aa");
+        known.size = 900;
+        files.record(g, &known, true).unwrap();
+        files
+            .mark_have(g, &RelPath::parse("elsewhere.jpg").unwrap(), false)
+            .unwrap();
+
+        assert!(files.held_bytes_by_group().unwrap().is_empty());
     }
 
     #[test]

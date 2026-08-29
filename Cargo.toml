@@ -7,12 +7,14 @@ members = [
     "crates/ac-net",
     "crates/ac-node",
     "crates/ac-server",
+    "crates/ac-desktop",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 ac-net = { path = "crates/ac-net" }
@@ -25,6 +27,9 @@ ac-files = { path = "crates/ac-files" }
 # The supervisor. Depends on everything below it and nothing depends on it but the binary:
 # deciding who to call needs to see membership and content at once.
 ac-peers = { path = "crates/ac-peers" }
+# The binary with a window. Depends on `ac-node` for both halves of a node: the daemon loop
+# it runs on a thread, and the `ops` layer the CLI dispatches through.
+ac-node = { path = "crates/ac-node" }
 
 libp2p = { version = "0.56", features = [
     "ed25519", "serde", "macros", "tokio",
@@ -52,10 +57,22 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Invite codes: OS randomness, and a hash so a leaked database backup does
 # not hand over live invites.
 getrandom = "0.4"
+# Invite tokens: the alphabet peer ids already use, plus the checksum that catches a token
+# which lost a character between the operator and whoever they sent it to.
+bs58 = { version = "0.5", features = ["check"] }
 sha2 = "0.10"
 hex = "0.4"
 
+# The desktop UI, compiled from .slint markup into this binary. Chosen over a webview so a
+# node ships as one file: the same reason SQLite is bundled above.
+slint = { version = "1.17", default-features = false, features = [
+    "compat-1-2", "std", "backend-winit", "renderer-software", "accessibility",
+] }
+slint-build = "1.17"
+
 tracing = "0.1"
+# A desktop app has no console to log to, and an unattended one needs its log capped.
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 # Ping is mounted per connection via `Either`; see `ac_net::keepalive`.

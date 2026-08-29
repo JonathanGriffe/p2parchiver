@@ -1,0 +1,77 @@
+[package]
+name = "ac-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "Peer-to-peer file sharing for a group's pictures, doubling as a distributed backup"
+
+[[bin]]
+name = "ac-desktop"
+path = "src/main.rs"
+
+[package.metadata.packager]
+product-name = "ArchiverClient"
+identifier = "com.github.jonathangriffe.archiverclient"
+authors = ["Jonathan Griffe"]
+homepage = "https://github.com/JonathanGriffe/archiverclient"
+license-file = "../../LICENSE"
+icons = ["packaging/icons/*.png", "packaging/icons/icon.ico"]
+out-dir = "../../target/packages"
+category = "Utility"
+binaries = [
+  { path = "ac-desktop", main = true },
+  { path = "ac", main = false },
+]
+long-description = """
+ArchiverClient keeps the files a group shares mirrored across the machines that hold them,
+peer to peer, with no copy on anyone's server. It runs in the background from login and puts
+an icon in the system tray; the window shows what it is doing and drives everything the `ac`
+command can, which is installed alongside it.
+"""
+
+resources = [
+  { src = "../../LICENSE", target = "LICENSE" },
+]
+
+[package.metadata.packager.deb]
+depends = ["libxkbcommon0", "libfontconfig1"]
+
+[package.metadata.packager.appimage]
+libs = ["libxkbcommon.so.0", "libfontconfig.so.1"]
+
+[dependencies]
+ac-node.workspace = true
+ac-net.workspace = true
+slint.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+anyhow.workspace = true
+directories.workspace = true
+fontique = { version = "0.10", features = ["fontconfig-dlopen"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
+[build-dependencies]
+slint-build.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+png = "0.18"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = "0.21"
+windows-registry = "0.6"

@@ -1,0 +1,59 @@
+import { Button, LineEdit } from "std-widgets.slint";
+import { Theme, Card } from "../theme.slint";
+
+// Shown once, on the way in, to a node that has never enrolled.
+//
+// Nothing works before this: a node with no attestation can prove nothing about itself and
+// every peer connection it makes is closed. Saying so at the door is kinder than letting
+// someone create a group and wonder why it never reaches anyone.
+export component EnrolDialog inherits Rectangle {
+    in property <bool> busy;
+    callback enrol(string, string);
+    callback dismissed();
+
+    background: #000000.with-alpha(0.45);
+
+    // Swallows clicks so the page behind cannot be used while this is up.
+    TouchArea {}
+
+    Card {
+        width: min(480px, parent.width - 2 * Theme.lg);
+        height: self.preferred-height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+
+        TouchArea {}
+
+        VerticalLayout {
+            padding: Theme.lg;
+            spacing: Theme.md;
+
+            Text {
+                text: "Enrol this node";
+                color: Theme.text;
+                font-size: Theme.heading-size;
+                font-weight: 700;
+            }
+
+            token := LineEdit { placeholder-text: "invite token"; }
+            who := LineEdit { placeholder-text: "username"; }
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+                alignment: end;
+
+                Button {
+                    text: "Not now";
+                    enabled: !root.busy;
+                    clicked => { root.dismissed(); }
+                }
+                Button {
+                    text: "Enrol";
+                    primary: true;
+                    enabled: token.text != "" && who.text != "" && !root.busy;
+                    clicked => { root.enrol(token.text, who.text); }
+                }
+            }
+        }
+    }
+}

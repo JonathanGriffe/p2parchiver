@@ -1,5 +1,4 @@
 use ac_net::PeerId;
-use ac_net::attest::normalise_username;
 use ac_net::identity::{Keypair, public_key_of};
 use serde::{Deserialize, Serialize};
 
@@ -26,13 +25,11 @@ pub struct EntryBody {
 pub enum Op {
     Create {
         admin: String,
-        username: String,
         nonce: [u8; 16],
         name: String,
     },
     Add {
         peer: String,
-        username: String,
     },
     Remove {
         peer: String,
@@ -98,13 +95,7 @@ pub struct Chain {
 
 impl Chain {
     /// Create a group. This node becomes its one permanent writer.
-    pub fn create(
-        key: &Keypair,
-        name: &str,
-        username: &str,
-        nonce: [u8; 16],
-        at: i64,
-    ) -> Result<Self, ChainError> {
+    pub fn create(key: &Keypair, name: &str, nonce: [u8; 16], at: i64) -> Result<Self, ChainError> {
         let admin = key.public().to_peer_id();
         let body = EntryBody {
             group: GroupId::ZERO,
@@ -113,7 +104,6 @@ impl Chain {
             at,
             op: Op::Create {
                 admin: admin.to_base58(),
-                username: username.to_owned(),
                 nonce,
                 name: name.to_owned(),
             },
@@ -248,16 +238,14 @@ impl Chain {
         let mut members = Members::default();
         for e in self.entries.iter() {
             match &e.body.op {
-                Op::Create {
-                    admin, username, ..
-                } => {
+                Op::Create { admin, .. } => {
                     if let Ok(peer) = admin.parse() {
-                        members.insert(peer, username.clone(), true);
+                        members.insert(peer, true);
                     }
                 }
-                Op::Add { peer, username } => {
+                Op::Add { peer } => {
                     if let Ok(peer) = peer.parse() {
-                        members.insert(peer, username.clone(), false);
+                        members.insert(peer, false);
                     }
                 }
                 Op::Remove { peer } => {
@@ -290,17 +278,10 @@ impl Chain {
             return Err(ChainError::MalformedGenesis);
         }
 
-        let Op::Create {
-            admin,
-            username,
-            name,
-            ..
-        } = &body.op
-        else {
+        let Op::Create { admin, name, .. } = &body.op else {
             return Err(ChainError::NoGenesis);
         };
         check_name(name, 0)?;
-        check_username(username, 0)?;
 
         let admin: PeerId = admin.parse().map_err(|_| ChainError::UnparseablePeer {
             seq: 0,
@@ -345,9 +326,8 @@ impl Chain {
         // Everything below is now known to be what the admin signed.
         match &body.op {
             Op::Create { .. } => return Err(ChainError::SecondGenesis { seq }),
-            Op::Add { peer, username } => {
+            Op::Add { peer } => {
                 let peer = parse_peer(peer, seq)?;
-                check_username(username, seq)?;
                 // A peer whose key cannot be recovered could never sign a standing, so it
                 // could never leave. Refusing the `Add` is kinder than admitting someone who
                 // can never get out.
@@ -403,12 +383,6 @@ fn check_name(name: &str, seq: u64) -> Result<(), ChainError> {
     Ok(())
 }
 
-fn check_username(username: &str, seq: u64) -> Result<(), ChainError> {
-    normalise_username(username)
-        .map(|_| ())
-        .map_err(|_| ChainError::BadUsername { seq })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChainError {
     #[error("the entry is not valid CBOR")]
@@ -445,8 +419,6 @@ pub enum ChainError {
     NotAMember { seq: u64, peer: String },
     #[error("entry {seq} carries an unusable group name")]
     BadName { seq: u64 },
-    #[error("entry {seq} carries an unusable username")]
-    BadUsername { seq: u64 },
     #[error("this node does not hold the admin key for this group")]
     NotAdmin,
 }
@@ -477,13 +449,12 @@ mod tests {
     }
 
     fn group(admin: &Keypair) -> Chain {
-        Chain::create(admin, "family", "alice", [1u8; 16], AT).unwrap()
+        Chain::create(admin, "family", [1u8; 16], AT).unwrap()
     }
 
     fn filler() -> Op {
         Op::Add {
             peer: peer().to_base58(),
-            username: "bob".into(),
         }
     }
 
@@ -502,8 +473,8 @@ mod tests {
     #[test]
     fn the_nonce_keeps_two_identical_creations_apart() {
         let admin = key();
-        let a = Chain::create(&admin, "family", "alice", [1u8; 16], AT).unwrap();
-        let b = Chain::create(&admin, "family", "alice", [2u8; 16], AT).unwrap();
+        let a = Chain::create(&admin, "family", [1u8; 16], AT).unwrap();
+        let b = Chain::create(&admin, "family", [2u8; 16], AT).unwrap();
 
         assert_ne!(a.id(), b.id());
     }
@@ -532,18 +503,20 @@ mod tests {
                 &admin,
                 Op::Add {
                     peer: bob.to_base58(),
-                    username: "bob".into(),
                 },
                 AT,
             )
             .unwrap();
 
-        // Re-encode the decoded body with a different username, keeping the signature.
+        // Re-encode the decoded body naming somebody else, keeping the signature. This is the
+        // whole point of carrying the signed bytes verbatim rather than re-encoding them.
         let entries: Vec<Entry> = chain.entries().cloned().collect();
         let mut body = entries[1].body().unwrap();
         body.op = Op::Add {
-            peer: bob.to_base58(),
-            username: "mallory".into(),
+            peer: Keypair::generate_ed25519()
+                .public()
+                .to_peer_id()
+                .to_base58(),
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&body, &mut bytes).unwrap();
@@ -596,7 +569,7 @@ mod tests {
     #[test]
     fn an_entry_from_another_group_is_refused() {
         let admin = key();
-        let mut theirs = Chain::create(&admin, "other", "alice", [9u8; 16], AT).unwrap();
+        let mut theirs = Chain::create(&admin, "other", [9u8; 16], AT).unwrap();
         let foreign = theirs.author(&admin, filler(), AT).unwrap();
 
         let mut ours = group(&admin);
@@ -616,7 +589,6 @@ mod tests {
                 &admin,
                 Op::Create {
                     admin: admin.public().to_peer_id().to_base58(),
-                    username: "alice".into(),
                     nonce: [3u8; 16],
                     name: "again".into(),
                 },
@@ -673,7 +645,6 @@ mod tests {
                 &admin,
                 Op::Add {
                     peer: opaque_peer().to_base58(),
-                    username: "ghost".into(),
                 },
                 AT,
             ),
@@ -703,13 +674,12 @@ mod tests {
         let (bob, carol) = (peer(), peer());
         let mut chain = group(&admin);
 
-        for (p, name) in [(bob, "bob"), (carol, "carol")] {
+        for p in [bob, carol] {
             chain
                 .author(
                     &admin,
                     Op::Add {
                         peer: p.to_base58(),
-                        username: name.into(),
                     },
                     AT,
                 )
@@ -743,7 +713,6 @@ mod tests {
                 &admin,
                 Op::Add {
                     peer: bob.to_base58(),
-                    username: "bob".into(),
                 },
                 AT,
             )
@@ -775,7 +744,6 @@ mod tests {
                 &admin,
                 Op::Add {
                     peer: bob.to_base58(),
-                    username: "bob".into(),
                 },
                 AT + 5_000,
             )
@@ -827,7 +795,6 @@ mod tests {
                     &admin,
                     Op::Add {
                         peer: bob.to_base58(),
-                        username: "bob".into(),
                     },
                     AT,
                 )
@@ -861,7 +828,6 @@ mod tests {
                 &admin,
                 Op::Add {
                     peer: bob.to_base58(),
-                    username: "bob".into(),
                 },
                 AT,
             )
@@ -896,14 +862,12 @@ mod tests {
         for op in [
             Op::Add {
                 peer: bob.to_base58(),
-                username: "bob".into(),
             },
             Op::Remove {
                 peer: bob.to_base58(),
             },
             Op::Add {
                 peer: bob.to_base58(),
-                username: "bob".into(),
             },
         ] {
             chain.author(&admin, op, AT).unwrap();
@@ -950,7 +914,6 @@ mod tests {
                 &admin,
                 Op::Add {
                     peer: peer().to_base58(),
-                    username: "bob".into(),
                 },
                 AT,
             )

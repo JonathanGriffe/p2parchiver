@@ -1,0 +1,126 @@
+import { Palette } from "std-widgets.slint";
+
+// Every colour and measurement the views use. Nothing outside this file names a literal, so
+// the whole app can be restyled here, and light and dark stay in step by construction.
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+
+    // Surfaces, back to front.
+    out property <brush> canvas: dark ? #101215 : #f6f7f9;
+    out property <brush> surface: dark ? #191c21 : #ffffff;
+    out property <brush> raised: dark ? #21252c : #f0f2f5;
+    out property <brush> line: dark ? #2b3038 : #e2e5ea;
+
+    // Text, loudest first.
+    out property <brush> text: dark ? #e8eaee : #1b1e23;
+    out property <brush> dim: dark ? #9aa1ad : #667085;
+    out property <brush> faint: dark ? #6b7280 : #98a2b3;
+
+    // Reserved for state, never decoration: one meaning each.
+    out property <brush> accent: dark ? #6ea8fe : #2563eb;
+    out property <brush> ok: dark ? #5ec26a : #23924a;
+    out property <brush> warn: dark ? #e0a94a : #b7791f;
+    out property <brush> danger: dark ? #e57373 : #c0392b;
+
+    // A 4px rhythm, so spacing is chosen from a scale rather than invented per view.
+    out property <length> xs: 4px;
+    out property <length> sm: 8px;
+    out property <length> md: 16px;
+    out property <length> lg: 24px;
+    out property <length> xl: 32px;
+
+    out property <length> radius: 10px;
+
+    out property <length> title-size: 20px;
+    out property <length> heading-size: 15px;
+    out property <length> body-size: 13px;
+    out property <length> small-size: 12px;
+
+    // Ids and hashes are compared character by character, so they get a fixed pitch.
+    out property <string> mono: "monospace";
+}
+
+export component DangerButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 30px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.danger.with-alpha(0.45);
+    // Tinted rather than filled: a solid red block reads as an error message, not a control.
+    background: touch.pressed ? Theme.danger.with-alpha(0.26)
+        : touch.has-hover ? Theme.danger.with-alpha(0.16)
+        : Theme.danger.with-alpha(0.09);
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.md;
+        padding-right: Theme.md;
+
+        Text {
+            text: root.label;
+            color: Theme.danger;
+            font-size: Theme.body-size;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// A labelled value, the shape most of this app's information takes.
+export component Field inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> monospace: false;
+    spacing: Theme.md;
+
+    Text {
+        text: root.label;
+        color: Theme.dim;
+        font-size: Theme.body-size;
+        width: 92px;
+    }
+
+    Text {
+        text: root.value;
+        color: Theme.text;
+        font-size: Theme.body-size;
+        font-family: root.monospace ? Theme.mono : "";
+        overflow: elide;
+        horizontal-stretch: 1;
+    }
+}
+
+// A panel. Used for every grouping, so the app has one idea of what a box looks like.
+export component Card inherits Rectangle {
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.line;
+}
+
+// A small round state marker. Colour is the message, so the text beside it always repeats it.
+export component Dot inherits Rectangle {
+    in property <brush> tint: Theme.faint;
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: root.tint;
+}
+
+export component ToneDot inherits Dot {
+    in property <int> tone;
+    tint: root.tone == 1 ? Theme.accent
+        : root.tone == 2 ? Theme.warn
+        : root.tone == 3 ? Theme.faint
+        : Theme.ok;
+}

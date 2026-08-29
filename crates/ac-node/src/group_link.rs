@@ -36,7 +36,13 @@ impl GroupLink {
             .with_context(|| format!("opening the group store at {}", path.display()))?;
 
         Ok(Self {
-            sync: GroupSync::new(store, identity.keypair().clone()),
+            // Empty when this node has not enrolled, which is also a node that cannot have
+            // reached anyone; `Standing::author` refuses it rather than signing a blank name.
+            sync: GroupSync::new(
+                store,
+                identity.keypair().clone(),
+                crate::ops::group::my_username(paths).unwrap_or_default(),
+            ),
             outbound: HashMap::new(),
             rounds: Vec::new(),
             awaiting: HashSet::new(),
@@ -372,13 +378,12 @@ mod tests {
                     key,
                     Op::Add {
                         peer: member.peer.to_base58(),
-                        username: "bob".into(),
                     },
                     AT,
                 )
                 .unwrap(),
         ];
-        for i in 0..extra {
+        for _ in 0..extra {
             batch.push(
                 chain
                     .author(
@@ -388,7 +393,6 @@ mod tests {
                                 .public()
                                 .to_peer_id()
                                 .to_base58(),
-                            username: format!("filler{i}"),
                         },
                         AT,
                     )
@@ -419,14 +423,26 @@ mod tests {
             ac_groups::store::State::Pending,
             "being added is an invitation, not consent"
         );
+        let members = bob.link.sync.store().members(id).unwrap();
         assert!(
-            bob.link
-                .sync
-                .store()
-                .members(id)
-                .unwrap()
-                .contains(&bob.peer),
+            members.contains(&bob.peer),
             "and the fold that arrived over the wire names them"
+        );
+
+        // The whole point of moving names out of the chain: alice's name reached bob inside
+        // her own signed standing, which travelled beside the entries. Nothing alice wrote
+        // about bob names him, so he is still nameless here until his own standing is made.
+        let alice_row = members.get(&alice.peer).unwrap();
+        assert_eq!(
+            alice_row.username.as_deref(),
+            Some("alice"),
+            "her own claim, carried in her own standing"
+        );
+        assert!(alice_row.is_admin);
+        assert_eq!(
+            members.get(&bob.peer).unwrap().username,
+            None,
+            "the chain that added him says nothing about what he is called"
         );
     }
 
@@ -520,10 +536,10 @@ mod tests {
             .0;
         let store = bob.link.sync.store_mut();
         store
-            .author_standing(key.keypair(), id, Position::In, AT)
+            .author_standing(key.keypair(), id, Position::In, "someone", AT)
             .unwrap();
         store
-            .author_standing(key.keypair(), id, Position::Out, AT)
+            .author_standing(key.keypair(), id, Position::Out, "someone", AT)
             .unwrap();
         assert!(
             alice

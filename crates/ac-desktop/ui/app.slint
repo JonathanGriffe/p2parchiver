@@ -1,0 +1,322 @@
+import { Theme, Card } from "theme.slint";
+import { StatusView, StorageSlice, TrafficRow } from "views/status.slint";
+import { GroupsView, GroupItem, MemberItem } from "views/groups.slint";
+import { PeersView, PeerItem } from "views/peers.slint";
+import { FilesView, FileItem } from "views/files.slint";
+import { SettingsView } from "views/settings.slint";
+import { AboutView } from "views/about.slint";
+import { EnrolDialog } from "views/enrol.slint";
+
+// Re-exported so slint-build generates the Rust structs the models are built from.
+export { GroupItem, MemberItem, PeerItem, FileItem, StorageSlice, TrafficRow }
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback chosen();
+
+    height: 34px;
+    border-radius: Theme.radius;
+    background: root.selected ? Theme.raised : touch.has-hover ? Theme.raised.darker(0.02) : transparent;
+
+    touch := TouchArea {
+        clicked => { root.chosen(); }
+        mouse-cursor: pointer;
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.sm;
+        padding-right: Theme.sm;
+        spacing: Theme.sm;
+
+        // A selected item is marked twice, by weight and by a bar, so it does not rely on
+        // colour alone.
+        Rectangle {
+            width: 3px;
+            border-radius: 1.5px;
+            background: root.selected ? Theme.accent : transparent;
+        }
+
+        Text {
+            text: root.label;
+            color: root.selected ? Theme.text : Theme.dim;
+            font-size: Theme.body-size;
+            font-weight: root.selected ? 700 : 400;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "ArchiverClient";
+    background: Theme.canvas;
+    preferred-width: 1040px;
+    preferred-height: 740px;
+    min-width: 560px;
+    min-height: 420px;
+
+    // Everything below is written by Rust once per poll.
+    in property <bool> running;
+    in property <string> node-state: "starting…";
+    in property <string> groups-line;
+    in property <[StorageSlice]> storage-slices;
+    in property <string> storage-free;
+    in property <string> storage-used;
+    in property <int> storage-free-room;
+    in property <int> storage-used-room;
+    in property <[TrafficRow]> traffic;
+    in property <string> server-host;
+
+    in property <string> version;
+    in property <string> username;
+    in property <string> peer-id;
+    in property <string> home;
+    in property <string> storage-root;
+    in property <string> log-dir;
+
+    // The Groups page.
+    in property <[GroupItem]> group-items;
+    in property <string> group-name;
+    in property <string> group-id;
+    in property <string> group-state;
+    // 0 invited, 1 member, 2 gone. `groups::INVITED` and friends.
+    in property <int> group-membership;
+    in property <string> group-entries;
+    in property <bool> group-admin;
+    in property <[MemberItem]> group-members;
+
+    in property <[PeerItem]> peer-contacts;
+    in property <[PeerItem]> peer-discovered;
+
+    // The Files page.
+    in property <[string]> file-group-names;
+    in property <int> file-group-index;
+    in property <string> file-group-id;
+    in property <string> file-dir;
+    in property <[FileItem]> files;
+    in property <string> file-progress;
+
+    // The Settings page. Loaded once and after each save, never on the poll.
+    in-out property <string> listen;
+    in-out property <string> external;
+    in-out property <bool> mdns;
+    in-out property <string> config-storage-root;
+    in-out property <string> storage-max;
+    in-out property <string> bandwidth-max;
+    in-out property <string> server;
+    in-out property <bool> enrolled;
+    // Raised once at startup for a node that has never enrolled, and lowered for good the
+    // moment it has or the moment it is waved away.
+    in-out property <bool> show-enrol;
+    in-out property <bool> autostart;
+    in-out property <string> autostart-warning;
+
+    // What the last action did, and whether it went wrong. Set by Rust, cleared when the
+    // next one starts.
+    in property <bool> busy;
+    in property <string> message;
+    in property <bool> message-bad;
+
+    // Which group the Groups page is showing. Rust owns it too, since the poller needs to
+    // know what to read; this copy is what the list highlights.
+    property <string> selected-group;
+
+    callback select-group(string);
+    callback create-group(string);
+    callback add-member(string, string, string);
+    callback remove-member(string, string);
+    callback accept-group(string);
+    callback leave-group(string);
+    callback forget-group(string);
+    callback add-peer(string, string);
+    callback remove-peer(string);
+    callback pick-group(int);
+    callback filter(string, bool);
+    callback browse(bool);
+    callback remove-file(string);
+    callback verify();
+    callback save(string, string, bool, string, string, string);
+    callback set-autostart(bool);
+    callback open-logs();
+    callback restart();
+    callback join(string, string);
+
+    property <int> tab: 0;
+
+    HorizontalLayout {
+        padding: Theme.md;
+        spacing: Theme.md;
+
+        VerticalLayout {
+            width: 168px;
+            spacing: Theme.xs;
+
+            Text {
+                text: "ARCHIVERCLIENT";
+                color: Theme.faint;
+                font-size: Theme.small-size;
+                font-weight: 700;
+                height: 34px;
+                vertical-alignment: center;
+            }
+
+            NavItem {
+                label: "Status";
+                selected: root.tab == 0;
+                chosen => { root.tab = 0; }
+            }
+            NavItem {
+                label: "Groups";
+                selected: root.tab == 1;
+                chosen => { root.tab = 1; }
+            }
+            NavItem {
+                label: "Peers";
+                selected: root.tab == 2;
+                chosen => { root.tab = 2; }
+            }
+            NavItem {
+                label: "Files";
+                selected: root.tab == 3;
+                chosen => { root.tab = 3; }
+            }
+            NavItem {
+                label: "Settings";
+                selected: root.tab == 4;
+                chosen => { root.tab = 4; }
+            }
+            NavItem {
+                label: "About";
+                selected: root.tab == 5;
+                chosen => { root.tab = 5; }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        Rectangle { width: 1px; background: Theme.line; }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: Theme.md;
+
+            if root.tab == 0 : StatusView {
+                running: root.running;
+                node-state: root.node-state;
+                username: root.username;
+                peer-id: root.peer-id;
+                server: root.server-host;
+                groups-line: root.groups-line;
+                storage-slices: root.storage-slices;
+                storage-free: root.storage-free;
+                storage-used: root.storage-used;
+                storage-free-room: root.storage-free-room;
+                storage-used-room: root.storage-used-room;
+                traffic: root.traffic;
+                vertical-stretch: 1;
+            }
+
+            if root.tab == 1 : GroupsView {
+                groups: root.group-items;
+                selected: root.selected-group;
+                detail-name: root.group-name;
+                detail-id: root.group-id;
+                detail-state: root.group-state;
+                detail-membership: root.group-membership;
+                detail-entries: root.group-entries;
+                detail-admin: root.group-admin;
+                members: root.group-members;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                select(id) => { root.selected-group = id; root.select-group(id); }
+                create(name) => { root.create-group(name); }
+                add-member(id, peer, who) => { root.add-member(id, peer, who); }
+                remove-member(id, peer) => { root.remove-member(id, peer); }
+                accept(id) => { root.accept-group(id); }
+                leave(id) => { root.leave-group(id); }
+                forget(id) => { root.selected-group = ""; root.forget-group(id); }
+            }
+
+            if root.tab == 2 : PeersView {
+                contacts: root.peer-contacts;
+                discovered: root.peer-discovered;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                add(id, label) => { root.add-peer(id, label); }
+                remove(id) => { root.remove-peer(id); }
+            }
+
+            if root.tab == 3 : FilesView {
+                group-names: root.file-group-names;
+                group-index: root.file-group-index;
+                group-id: root.file-group-id;
+                dir: root.file-dir;
+                files: root.files;
+                progress: root.file-progress;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                pick-group(at) => { root.pick-group(at); }
+                filter(prefix, removed) => { root.filter(prefix, removed); }
+                browse(folder) => { root.browse(folder); }
+                remove(path) => { root.remove-file(path); }
+                verify() => { root.verify(); }
+            }
+
+            if root.tab == 4 : SettingsView {
+                listen: root.listen;
+                external: root.external;
+                mdns: root.mdns;
+                storage-root: root.config-storage-root;
+                storage-max: root.storage-max;
+                bandwidth-max: root.bandwidth-max;
+                server: root.server;
+                enrolled: root.enrolled;
+                autostart: root.autostart;
+                autostart-warning: root.autostart-warning;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                save(l, e, m, r, s, b) => { root.save(l, e, m, r, s, b); }
+                set-autostart(on) => { root.set-autostart(on); }
+                open-logs() => { root.open-logs(); }
+                restart() => { root.restart(); }
+                join(t, u) => { root.join(t, u); }
+            }
+
+            if root.tab == 5 : AboutView {
+                version: root.version;
+                peer-id: root.peer-id;
+                home: root.home;
+                storage-root: root.storage-root;
+                log-dir: root.log-dir;
+                vertical-stretch: 1;
+            }
+
+            // One line for what just happened, shared by every page. Colour repeats what the
+            // words already say, so it is never the only signal.
+            if root.message != "" : Card {
+                background: root.message-bad ? Theme.danger.with-alpha(0.12) : Theme.raised;
+                HorizontalLayout {
+                    padding: Theme.sm;
+                    Text {
+                        text: root.message;
+                        color: root.message-bad ? Theme.danger : Theme.dim;
+                        font-size: Theme.small-size;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if root.show-enrol : EnrolDialog {
+        busy: root.busy;
+        enrol(t, u) => { root.join(t, u); }
+        dismissed => { root.show-enrol = false; }
+    }
+}

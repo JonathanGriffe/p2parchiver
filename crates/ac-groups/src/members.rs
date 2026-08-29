@@ -5,11 +5,12 @@ use sha2::{Digest, Sha256};
 
 use crate::standing::StandingSet;
 
-/// One member, as the admin's log describes them.
+/// One member. The chain says only who they are; what they are called is their own claim,
+/// carried in their standing, so a member who has not spoken yet has no name at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     pub peer: PeerId,
-    pub username: String,
+    pub username: Option<String>,
     pub is_admin: bool,
 }
 
@@ -22,16 +23,29 @@ pub struct Members {
 }
 
 impl Members {
-    /// Add a member, or update the advisory username of one already present.
-    pub fn insert(&mut self, peer: PeerId, username: String, is_admin: bool) {
-        self.by_peer
-            .entry(peer)
-            .and_modify(|m| m.username = username.clone())
-            .or_insert(Member {
-                peer,
-                username,
-                is_admin,
-            });
+    /// Add a member. Re-adding one already present changes nothing: the chain carries no name
+    /// to update, and admin-ness is settled by the genesis.
+    pub fn insert(&mut self, peer: PeerId, is_admin: bool) {
+        self.by_peer.entry(peer).or_insert(Member {
+            peer,
+            username: None,
+            is_admin,
+        });
+    }
+
+    /// Set one member's name directly, for a caller reading a cache rather than the standings.
+    pub fn set_username(&mut self, peer: &PeerId, username: Option<String>) {
+        if let Some(member) = self.by_peer.get_mut(peer) {
+            member.username = username;
+        }
+    }
+
+    /// Fill in what each member has called itself. Anyone whose standing has not reached this
+    /// node keeps no name, rather than borrowing one from somewhere it was never claimed.
+    pub fn name_from(&mut self, standings: &StandingSet) {
+        for member in self.by_peer.values_mut() {
+            member.username = standings.username(&member.peer).map(str::to_owned);
+        }
     }
 
     pub fn remove(&mut self, peer: &PeerId) -> bool {
@@ -67,6 +81,12 @@ impl Members {
                 hasher.update(member.peer.to_bytes());
                 hasher.update(seq.to_le_bytes());
                 hasher.update([position.tag()]);
+                // The name is part of what a member has said about itself. Left out, two nodes
+                // holding different names for the same peer would agree they are in step and
+                // never reconcile. Length-prefixed so no two names can run together.
+                let name = standings.username(&member.peer).unwrap_or_default();
+                hasher.update((name.len() as u64).to_le_bytes());
+                hasher.update(name.as_bytes());
             }
         }
         hasher.finalize().into()
@@ -83,12 +103,13 @@ mod tests {
         Keypair::generate_ed25519().public().to_peer_id()
     }
 
-    fn standing(seq: u64, position: Position) -> crate::standing::Standing {
+    fn standing(seq: u64, position: Position, username: &str) -> crate::standing::Standing {
         crate::standing::Standing::author(
             &Keypair::generate_ed25519(),
             crate::id::GroupId::ZERO,
             seq,
             position,
+            username,
             0,
         )
         .unwrap()
@@ -99,14 +120,59 @@ mod tests {
     }
 
     #[test]
-    fn re_adding_updates_the_name_rather_than_duplicating_the_member() {
+    fn re_adding_the_same_member_does_not_duplicate_them() {
         let mut m = Members::default();
         let p = peer();
-        m.insert(p, "alice".into(), false);
-        m.insert(p, "alice-laptop".into(), false);
+        m.insert(p, false);
+        m.insert(p, false);
 
-        assert_eq!(m.get(&p).unwrap().username, "alice-laptop");
         assert_eq!(m.len(), 1);
+    }
+
+    /// The chain says who is in; only the member says what they are called. Anyone whose
+    /// standing has not arrived has no name at all rather than a borrowed one.
+    #[test]
+    fn a_member_is_nameless_until_their_own_standing_arrives() {
+        let mut m = Members::default();
+        let p = peer();
+        m.insert(p, false);
+        assert_eq!(m.get(&p).unwrap().username, None);
+
+        let mut set = StandingSet::default();
+        set.insert(
+            p,
+            standing(1, Position::In, "alice"),
+            1,
+            Position::In,
+            "alice".to_owned(),
+        );
+        m.name_from(&set);
+
+        assert_eq!(m.get(&p).unwrap().username.as_deref(), Some("alice"));
+    }
+
+    /// Two nodes holding the same members and standings but different names for one of them
+    /// must not agree they are in step, or neither will ever fetch the other's view.
+    #[test]
+    fn the_standings_digest_follows_the_name_a_member_claims() {
+        let p = peer();
+        let mut members = Members::default();
+        members.insert(p, false);
+
+        let digest_for = |name: &str| {
+            let mut set = StandingSet::default();
+            set.insert(
+                p,
+                standing(1, Position::In, name),
+                1,
+                Position::In,
+                name.to_owned(),
+            );
+            members.standings_digest(&set)
+        };
+
+        assert_ne!(digest_for("alice"), digest_for("alicia"));
+        assert_eq!(digest_for("alice"), digest_for("alice"));
     }
 
     #[test]
@@ -114,7 +180,7 @@ mod tests {
         let mut m = Members::default();
         let p = peer();
         assert!(!m.remove(&p));
-        m.insert(p, "alice".into(), false);
+        m.insert(p, false);
         assert!(m.remove(&p));
         assert!(!m.contains(&p));
     }
@@ -127,20 +193,32 @@ mod tests {
 
         let mut forwards = Members::default();
         let mut backwards = Members::default();
-        for (i, p) in peers.iter().enumerate() {
-            forwards.insert(*p, format!("u{i}"), false);
+        for p in &peers {
+            forwards.insert(*p, false);
         }
-        for (i, p) in peers.iter().enumerate().rev() {
-            backwards.insert(*p, format!("u{i}"), false);
+        for p in peers.iter().rev() {
+            backwards.insert(*p, false);
         }
 
         let mut a = StandingSet::default();
         let mut b = StandingSet::default();
         for (i, p) in peers.iter().enumerate() {
-            a.insert(*p, standing(1, pos(i % 2 == 0)), 1, pos(i % 2 == 0));
+            a.insert(
+                *p,
+                standing(1, pos(i % 2 == 0), "someone"),
+                1,
+                pos(i % 2 == 0),
+                "someone".to_owned(),
+            );
         }
         for (i, p) in peers.iter().enumerate().rev() {
-            b.insert(*p, standing(1, pos(i % 2 == 0)), 1, pos(i % 2 == 0));
+            b.insert(
+                *p,
+                standing(1, pos(i % 2 == 0), "someone"),
+                1,
+                pos(i % 2 == 0),
+                "someone".to_owned(),
+            );
         }
 
         assert_eq!(
@@ -154,14 +232,32 @@ mod tests {
         // Junk one node happens to hold must not keep the two of them re-syncing forever.
         let mut members = Members::default();
         let alice = peer();
-        members.insert(alice, "alice".into(), true);
+        members.insert(alice, true);
 
         let mut lean = StandingSet::default();
-        lean.insert(alice, standing(1, Position::In), 1, Position::In);
+        lean.insert(
+            alice,
+            standing(1, Position::In, "someone"),
+            1,
+            Position::In,
+            "someone".to_owned(),
+        );
 
         let mut cluttered = lean.clone();
-        cluttered.insert(peer(), standing(4, Position::Out), 4, Position::Out);
-        cluttered.insert(peer(), standing(9, Position::In), 9, Position::In);
+        cluttered.insert(
+            peer(),
+            standing(4, Position::Out, "someone"),
+            4,
+            Position::Out,
+            "someone".to_owned(),
+        );
+        cluttered.insert(
+            peer(),
+            standing(9, Position::In, "someone"),
+            9,
+            Position::In,
+            "someone".to_owned(),
+        );
 
         assert_eq!(
             members.standings_digest(&lean),
@@ -173,12 +269,24 @@ mod tests {
     fn the_standings_digest_notices_a_changed_position() {
         let mut members = Members::default();
         let alice = peer();
-        members.insert(alice, "alice".into(), true);
+        members.insert(alice, true);
 
         let mut before = StandingSet::default();
-        before.insert(alice, standing(1, Position::In), 1, Position::In);
+        before.insert(
+            alice,
+            standing(1, Position::In, "someone"),
+            1,
+            Position::In,
+            "someone".to_owned(),
+        );
         let mut after = StandingSet::default();
-        after.insert(alice, standing(2, Position::Out), 2, Position::Out);
+        after.insert(
+            alice,
+            standing(2, Position::Out, "someone"),
+            2,
+            Position::Out,
+            "someone".to_owned(),
+        );
 
         assert_ne!(
             members.standings_digest(&before),
@@ -192,8 +300,8 @@ mod tests {
         // the same members must iterate them the same way or their digests diverge.
         let mut m = Members::default();
         let peers: Vec<_> = (0..8).map(|_| peer()).collect();
-        for (i, p) in peers.iter().enumerate() {
-            m.insert(*p, format!("user{i}"), false);
+        for p in &peers {
+            m.insert(*p, false);
         }
 
         let seen: Vec<_> = m.iter().map(|x| x.peer).collect();

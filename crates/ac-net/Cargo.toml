@@ -3,11 +3,13 @@ name = "ac-net"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 libp2p.workspace = true
 serde.workspace = true
 ciborium.workspace = true
+bs58.workspace = true
 toml.workspace = true
 directories.workspace = true
 tracing.workspace = true

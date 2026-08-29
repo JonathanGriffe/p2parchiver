@@ -9,6 +9,18 @@ use serde::{Deserialize, Serialize};
 /// The slowest `bandwidth_max` worth honouring, in bytes per second.
 pub const MIN_BANDWIDTH: u64 = 8 * 1024;
 
+/// How much a node holds before it stops mirroring, unless its config says otherwise. Enough
+/// to be a useful mirror, little enough that installing this does not quietly fill a laptop.
+pub const DEFAULT_STORAGE_MAX: u64 = 500_000_000_000;
+
+/// How fast it moves that content, unless its config says otherwise. A background sync that
+/// takes the whole line is one people uninstall.
+pub const DEFAULT_BANDWIDTH_MAX: u64 = 10_000_000;
+
+/// What a limit of zero means on disk. A missing key takes the default, so a config that
+/// wants no limit at all needs a way to say so.
+const NO_LIMIT: u64 = 0;
+
 pub const CONFIG_FILENAME: &str = "config.toml";
 pub const DB_FILENAME: &str = "state.sqlite";
 pub const STORAGE_DIRNAME: &str = "files";
@@ -122,12 +134,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_root: Option<PathBuf>,
 
-    /// Stop mirroring once this node holds this many bytes. Absent means no ceiling beyond
-    /// the free-space floor the node keeps regardless.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Stop mirroring once this node holds this many bytes. Absent takes
+    /// [`DEFAULT_STORAGE_MAX`]; `0` asks for no ceiling beyond the free-space floor the node
+    /// keeps regardless. Both attributes are deliberately missing: the container's `default`
+    /// is what makes an absent key mean the default rather than `None`, and writing the key
+    /// out every time is what lets `0` survive a round trip.
     pub storage_max: Option<u64>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Bytes a second. Absent takes [`DEFAULT_BANDWIDTH_MAX`]; `0` asks for no limit.
     pub bandwidth_max: Option<u64>,
 }
 
@@ -140,8 +154,8 @@ impl Default for Config {
             mdns: true,
             server: None,
             storage_root: None,
-            storage_max: None,
-            bandwidth_max: None,
+            storage_max: Some(DEFAULT_STORAGE_MAX),
+            bandwidth_max: Some(DEFAULT_BANDWIDTH_MAX),
         }
     }
 }
@@ -160,10 +174,16 @@ impl Config {
             }
         };
 
-        let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        let mut config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
+
+        // Past here a limit is either a number to honour or nothing at all, so the file's way
+        // of asking for no limit is turned into one before anything else looks at it — the
+        // bandwidth floor below included, which a literal zero would otherwise fail.
+        config.storage_max = config.storage_max.filter(|n| *n != NO_LIMIT);
+        config.bandwidth_max = config.bandwidth_max.filter(|n| *n != NO_LIMIT);
 
         if let Some(root) = &config.storage_root
             && !root.is_absolute()
@@ -196,7 +216,14 @@ impl Config {
 
     /// Write the config file, creating parent directories as needed.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        let text = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
+        // Written as a number either way. Leaving the key out for "no limit" would read back
+        // as the default, which is the one thing the person setting it did not ask for.
+        let written = Self {
+            storage_max: Some(self.storage_max.unwrap_or(NO_LIMIT)),
+            bandwidth_max: Some(self.bandwidth_max.unwrap_or(NO_LIMIT)),
+            ..self.clone()
+        };
+        let text = toml::to_string_pretty(&written).map_err(ConfigError::Serialize)?;
 
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|source| ConfigError::Write {
@@ -228,6 +255,14 @@ fn default_listen_addrs() -> Vec<Multiaddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An absolute path in the platform's own terms. Windows reads `/mnt/archive` as the
+    /// root of whichever drive happens to be current, which is exactly the ambiguity
+    /// `storage_root` refuses, so there it has to name a drive.
+    #[cfg(windows)]
+    const ABSOLUTE_ROOT: &str = "C:/mnt/archive";
+    #[cfg(not(windows))]
+    const ABSOLUTE_ROOT: &str = "/mnt/archive";
 
     #[test]
     fn missing_file_yields_defaults() {
@@ -278,9 +313,81 @@ mod tests {
         Config::default().save(&path).unwrap();
         assert_eq!(
             Config::load(&path).unwrap().bandwidth_max,
-            None,
-            "absent means no limit, which is the default"
+            Some(DEFAULT_BANDWIDTH_MAX),
+            "the default is a limit, not the absence of one"
         );
+    }
+
+    /// The floor rejects anything below 8 KB/s, and no limit at all is written as `0`. One
+    /// has to be read as the other before the check runs, or asking for no limit fails as
+    /// though it were an absurdly slow one.
+    #[test]
+    fn no_limit_is_not_mistaken_for_a_limit_below_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+        fs::write(&path, "listen = []\nmdns = true\nbandwidth_max = 0\n").unwrap();
+
+        assert_eq!(Config::load(&path).unwrap().bandwidth_max, None);
+    }
+
+    #[test]
+    fn asking_for_no_limit_survives_a_round_trip_rather_than_reverting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+
+        let config = Config {
+            storage_max: None,
+            bandwidth_max: None,
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+
+        let read = Config::load(&path).unwrap();
+        assert_eq!(read.storage_max, None, "not quietly back to 500 GB");
+        assert_eq!(read.bandwidth_max, None);
+    }
+
+    /// The on-disk contract, for whoever opens config.toml in an editor: both keys are always
+    /// present, and `0` is the way to write "no limit".
+    #[test]
+    fn the_written_file_states_both_limits_outright() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+
+        Config::default().save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(&format!("storage_max = {DEFAULT_STORAGE_MAX}")),
+            "got {text}"
+        );
+        assert!(
+            text.contains(&format!("bandwidth_max = {DEFAULT_BANDWIDTH_MAX}")),
+            "got {text}"
+        );
+
+        Config {
+            storage_max: None,
+            bandwidth_max: None,
+            ..Config::default()
+        }
+        .save(&path)
+        .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("storage_max = 0"), "got {text}");
+        assert!(text.contains("bandwidth_max = 0"), "got {text}");
+    }
+
+    /// The case that matters most: a config file written before these keys existed. Its
+    /// silence has to read as the default, not as no limit.
+    #[test]
+    fn a_config_that_predates_the_limits_picks_them_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+        fs::write(&path, "listen = []\nmdns = true\n").unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.storage_max, Some(DEFAULT_STORAGE_MAX));
+        assert_eq!(config.bandwidth_max, Some(DEFAULT_BANDWIDTH_MAX));
     }
 
     #[test]
@@ -298,7 +405,7 @@ mod tests {
                     .parse()
                     .unwrap(),
             ),
-            storage_root: Some(PathBuf::from("/mnt/archive")),
+            storage_root: Some(PathBuf::from(ABSOLUTE_ROOT)),
             storage_max: Some(200 * 1024 * 1024 * 1024),
             bandwidth_max: Some(5 * 1024 * 1024),
         };
@@ -326,11 +433,11 @@ mod tests {
     fn an_absolute_storage_root_is_taken_as_given() {
         let paths = Paths::rooted_at("/tmp/ac-test-root");
         let config = Config {
-            storage_root: Some(PathBuf::from("/mnt/archive")),
+            storage_root: Some(PathBuf::from(ABSOLUTE_ROOT)),
             ..Config::default()
         };
 
-        assert_eq!(config.storage_root(&paths), PathBuf::from("/mnt/archive"));
+        assert_eq!(config.storage_root(&paths), PathBuf::from(ABSOLUTE_ROOT));
     }
 
     #[test]
@@ -349,11 +456,11 @@ mod tests {
     fn an_absolute_storage_root_loads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CONFIG_FILENAME);
-        fs::write(&path, "storage_root = \"/mnt/archive\"\n").unwrap();
+        fs::write(&path, format!("storage_root = \"{ABSOLUTE_ROOT}\"\n")).unwrap();
 
         assert_eq!(
             Config::load(&path).unwrap().storage_root,
-            Some(PathBuf::from("/mnt/archive"))
+            Some(PathBuf::from(ABSOLUTE_ROOT))
         );
     }
 
@@ -395,7 +502,16 @@ mod tests {
 
         let paths = Paths::discover("archiverclient-test", UNSET_ENV).unwrap();
 
-        assert!(paths.root.ends_with("archiverclient-test"));
+        // Under a directory of the app's own, but not necessarily the last one: on Windows
+        // the OS convention puts the data in `…\archiverclient-test\data`.
+        assert!(
+            paths
+                .root
+                .components()
+                .any(|c| c.as_os_str() == "archiverclient-test"),
+            "{} is not under a directory named for the app",
+            paths.root.display()
+        );
         assert_eq!(paths.identity_file(), paths.root.join("identity.key"));
     }
 
@@ -421,8 +537,9 @@ mod tests {
     }
 
     #[test]
-    fn a_config_without_a_ceiling_says_so() {
-        assert_eq!(Config::default().storage_max, None);
+    fn a_node_told_nothing_still_holds_a_ceiling_and_a_rate() {
+        assert_eq!(Config::default().storage_max, Some(DEFAULT_STORAGE_MAX));
+        assert_eq!(Config::default().bandwidth_max, Some(DEFAULT_BANDWIDTH_MAX));
     }
 
     #[test]

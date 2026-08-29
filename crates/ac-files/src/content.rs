@@ -67,6 +67,18 @@ impl Sink {
     }
 }
 
+/// Flush the directory entry itself, so a rename that has landed stays landed.
+///
+/// Unix only. Windows refuses to open a directory as a file at all, and journals the
+/// metadata for us.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// Unix seconds, for the mtime a downloaded file gets.
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -154,7 +166,7 @@ impl Content {
         // Without this the rename can be lost even though the data was flushed, leaving the
         // staging file and no destination.
         if let Some(parent) = staged.dest.parent() {
-            File::open(parent)?.sync_all()?;
+            sync_dir(parent)?;
         }
         Ok(())
     }
@@ -278,7 +290,7 @@ impl Content {
         }
         fs::rename(&source, &dest)?;
         if let Some(parent) = dest.parent() {
-            File::open(parent)?.sync_all()?;
+            sync_dir(parent)?;
         }
 
         // The source's directories may now be empty. Same sweep as `remove`, and it stops at
@@ -370,8 +382,7 @@ fn walk_into(base: &Path, dir: &Path, out: &mut Vec<RelPath>) -> io::Result<()> 
             walk_into(base, &path, out)?;
         } else if meta.is_file()
             && let Ok(rel) = path.strip_prefix(base)
-            && let Some(text) = rel.to_str()
-            && let Ok(rel) = RelPath::parse(text)
+            && let Ok(rel) = RelPath::from_fs(rel)
         {
             out.push(rel);
         }
@@ -547,6 +558,8 @@ mod tests {
         );
     }
 
+    // Creating a symlink on Windows needs a privilege this test cannot assume.
+    #[cfg(unix)]
     #[test]
     fn walking_does_not_follow_a_symlink_out_of_the_root() {
         let (content, tmp) = content();
