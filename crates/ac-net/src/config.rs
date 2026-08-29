@@ -256,6 +256,14 @@ fn default_listen_addrs() -> Vec<Multiaddr> {
 mod tests {
     use super::*;
 
+    /// An absolute path in the platform's own terms. Windows reads `/mnt/archive` as the
+    /// root of whichever drive happens to be current, which is exactly the ambiguity
+    /// `storage_root` refuses, so there it has to name a drive.
+    #[cfg(windows)]
+    const ABSOLUTE_ROOT: &str = "C:/mnt/archive";
+    #[cfg(not(windows))]
+    const ABSOLUTE_ROOT: &str = "/mnt/archive";
+
     #[test]
     fn missing_file_yields_defaults() {
         let dir = tempfile::tempdir().unwrap();
@@ -397,7 +405,7 @@ mod tests {
                     .parse()
                     .unwrap(),
             ),
-            storage_root: Some(PathBuf::from("/mnt/archive")),
+            storage_root: Some(PathBuf::from(ABSOLUTE_ROOT)),
             storage_max: Some(200 * 1024 * 1024 * 1024),
             bandwidth_max: Some(5 * 1024 * 1024),
         };
@@ -425,11 +433,11 @@ mod tests {
     fn an_absolute_storage_root_is_taken_as_given() {
         let paths = Paths::rooted_at("/tmp/ac-test-root");
         let config = Config {
-            storage_root: Some(PathBuf::from("/mnt/archive")),
+            storage_root: Some(PathBuf::from(ABSOLUTE_ROOT)),
             ..Config::default()
         };
 
-        assert_eq!(config.storage_root(&paths), PathBuf::from("/mnt/archive"));
+        assert_eq!(config.storage_root(&paths), PathBuf::from(ABSOLUTE_ROOT));
     }
 
     #[test]
@@ -448,11 +456,11 @@ mod tests {
     fn an_absolute_storage_root_loads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CONFIG_FILENAME);
-        fs::write(&path, "storage_root = \"/mnt/archive\"\n").unwrap();
+        fs::write(&path, format!("storage_root = \"{ABSOLUTE_ROOT}\"\n")).unwrap();
 
         assert_eq!(
             Config::load(&path).unwrap().storage_root,
-            Some(PathBuf::from("/mnt/archive"))
+            Some(PathBuf::from(ABSOLUTE_ROOT))
         );
     }
 
@@ -494,7 +502,16 @@ mod tests {
 
         let paths = Paths::discover("archiverclient-test", UNSET_ENV).unwrap();
 
-        assert!(paths.root.ends_with("archiverclient-test"));
+        // Under a directory of the app's own, but not necessarily the last one: on Windows
+        // the OS convention puts the data in `…\archiverclient-test\data`.
+        assert!(
+            paths
+                .root
+                .components()
+                .any(|c| c.as_os_str() == "archiverclient-test"),
+            "{} is not under a directory named for the app",
+            paths.root.display()
+        );
         assert_eq!(paths.identity_file(), paths.root.join("identity.key"));
     }
 

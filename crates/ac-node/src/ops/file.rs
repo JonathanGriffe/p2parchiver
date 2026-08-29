@@ -175,12 +175,11 @@ fn collect(base: &Path, dir: &Path, prefix: &str, out: &mut Planned) -> Result<(
         if meta.is_dir() {
             collect(base, &path, prefix, out)?;
         } else if meta.is_file() {
-            let rel = path
+            let dest = path
                 .strip_prefix(base)
-                .ok()
-                .and_then(|p| p.to_str())
-                .ok_or_else(|| anyhow!("{} has an unusable name", path.display()))?;
-            let dest = RelPath::under(prefix, rel)
+                .map_err(|_| anyhow!("{} is not under {}", path.display(), base.display()))
+                .and_then(|rel| RelPath::from_fs(rel).map_err(|e| anyhow!("{e}")))
+                .and_then(|rel| RelPath::under(prefix, rel.as_str()).map_err(|e| anyhow!("{e}")))
                 .with_context(|| format!("working out where {} should go", path.display()))?;
             out.items.push((path, dest));
         } else {

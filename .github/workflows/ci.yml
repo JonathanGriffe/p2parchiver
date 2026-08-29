@@ -37,8 +37,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # `--no-fail-fast` because cargo otherwise stops at the first crate that fails, and
+      # on a platform still being brought up that turns one red run into several.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
   release:
     name: release
