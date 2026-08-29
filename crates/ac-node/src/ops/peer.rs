@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use super::{Known, now, open};
 use crate::contacts::Contacts;
 use crate::directory;
+pub use crate::status::Bandwidth;
 use crate::status::Published;
 
 /// How stale a snapshot may be before it is reported as a stopped daemon.
@@ -94,6 +95,7 @@ pub struct StatusReport {
     pub now: i64,
     pub groups: Vec<GroupProgress>,
     pub peers: Vec<PeerProgress>,
+    pub bandwidth: Bandwidth,
 }
 
 /// Why the supervisor is, or is not, doing anything.
@@ -167,5 +169,6 @@ pub fn status(paths: &Paths) -> Result<StatusReport> {
         now: at,
         groups: group_rows,
         peers: peer_rows,
+        bandwidth: snapshot.bandwidth,
     })
 }

@@ -1,13 +1,13 @@
 import { Theme, Card } from "theme.slint";
-import { StatusView, GroupRow, PeerRow } from "views/status.slint";
-import { GroupsView, GroupItem, MemberItem, LogItem } from "views/groups.slint";
+import { StatusView, StorageSlice, TrafficRow } from "views/status.slint";
+import { GroupsView, GroupItem, MemberItem } from "views/groups.slint";
 import { PeersView, PeerItem } from "views/peers.slint";
 import { FilesView, FileItem } from "views/files.slint";
 import { SettingsView } from "views/settings.slint";
 import { AboutView } from "views/about.slint";
 
 // Re-exported so slint-build generates the Rust structs the models are built from.
-export { GroupRow, PeerRow, GroupItem, MemberItem, LogItem, PeerItem, FileItem }
+export { GroupItem, MemberItem, PeerItem, FileItem, StorageSlice, TrafficRow }
 
 component NavItem inherits Rectangle {
     in property <string> label;
@@ -50,19 +50,25 @@ component NavItem inherits Rectangle {
 export component MainWindow inherits Window {
     title: "ArchiverClient";
     background: Theme.canvas;
-    preferred-width: 880px;
-    preferred-height: 620px;
+    preferred-width: 1040px;
+    preferred-height: 740px;
     min-width: 560px;
     min-height: 420px;
 
     // Everything below is written by Rust once per poll.
     in property <bool> running;
     in property <string> node-state: "starting…";
-    in property <string> storage;
-    in property <[GroupRow]> groups;
-    in property <[PeerRow]> peers;
+    in property <string> groups-line;
+    in property <[StorageSlice]> storage-slices;
+    in property <string> storage-free;
+    in property <string> storage-used;
+    in property <int> storage-free-room;
+    in property <int> storage-used-room;
+    in property <[TrafficRow]> traffic;
+    in property <string> server-host;
 
     in property <string> version;
+    in property <string> username;
     in property <string> peer-id;
     in property <string> home;
     in property <string> storage-root;
@@ -73,13 +79,14 @@ export component MainWindow inherits Window {
     in property <string> group-name;
     in property <string> group-id;
     in property <string> group-state;
+    // 0 invited, 1 member, 2 gone. `groups::INVITED` and friends.
+    in property <int> group-membership;
     in property <string> group-entries;
     in property <bool> group-admin;
     in property <[MemberItem]> group-members;
-    in property <[LogItem]> group-log;
 
-    // The Peers page.
-    in property <[PeerItem]> peer-items;
+    in property <[PeerItem]> peer-contacts;
+    in property <[PeerItem]> peer-discovered;
 
     // The Files page.
     in property <[string]> file-group-names;
@@ -193,9 +200,16 @@ export component MainWindow inherits Window {
             if root.tab == 0 : StatusView {
                 running: root.running;
                 node-state: root.node-state;
-                storage: root.storage;
-                groups: root.groups;
-                peers: root.peers;
+                username: root.username;
+                peer-id: root.peer-id;
+                server: root.server-host;
+                groups-line: root.groups-line;
+                storage-slices: root.storage-slices;
+                storage-free: root.storage-free;
+                storage-used: root.storage-used;
+                storage-free-room: root.storage-free-room;
+                storage-used-room: root.storage-used-room;
+                traffic: root.traffic;
                 vertical-stretch: 1;
             }
 
@@ -205,10 +219,10 @@ export component MainWindow inherits Window {
                 detail-name: root.group-name;
                 detail-id: root.group-id;
                 detail-state: root.group-state;
+                detail-membership: root.group-membership;
                 detail-entries: root.group-entries;
                 detail-admin: root.group-admin;
                 members: root.group-members;
-                log: root.group-log;
                 busy: root.busy;
                 vertical-stretch: 1;
 
@@ -222,7 +236,8 @@ export component MainWindow inherits Window {
             }
 
             if root.tab == 2 : PeersView {
-                peers: root.peer-items;
+                contacts: root.peer-contacts;
+                discovered: root.peer-discovered;
                 busy: root.busy;
                 vertical-stretch: 1;
 

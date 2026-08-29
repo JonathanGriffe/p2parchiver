@@ -206,6 +206,8 @@ pub struct Storage {
     pub free: Option<u64>,
     /// The ceiling from config, if one is set.
     pub max: Option<u64>,
+    /// `held`, split by group id and largest first. Groups holding nothing are absent.
+    pub by_group: Vec<(String, u64)>,
 }
 
 pub fn storage(paths: &Paths) -> Result<Storage> {
@@ -226,6 +228,9 @@ pub fn storage(paths: &Paths) -> Result<Storage> {
         held: files
             .held_bytes()
             .context("measuring what this node holds")?,
+        by_group: files
+            .held_bytes_by_group()
+            .context("measuring what each group holds")?,
         free: probe.and_then(|p| fs4::available_space(&p).ok()),
         max: config.storage_max,
         root,

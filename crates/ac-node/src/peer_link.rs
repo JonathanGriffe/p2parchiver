@@ -19,7 +19,7 @@ use crate::blob::{self, Transfers};
 use crate::daemon::ClientSwarm;
 use crate::file_link::{FileLink, RoundOutcome};
 use crate::group_link::GroupLink;
-use crate::status::Published;
+use crate::status::{Bandwidth, Published};
 
 /// Candidate direct addresses kept per peer
 const MAX_DIRECT_ADDRS: usize = 8;
@@ -49,6 +49,9 @@ pub struct PeerLink {
     content: Content,
     root: std::path::PathBuf,
     status: Published,
+    /// Bytes down, bytes up and the clock, as of the last publish. A rate is the difference
+    /// between two of these, so the first tick after startup has nothing to compare against.
+    moved_at: Option<(u64, u64, i64)>,
 }
 
 impl PeerLink {
@@ -86,6 +89,7 @@ impl PeerLink {
             root,
             status: Published::open(&path)
                 .with_context(|| format!("opening the status table at {}", path.display()))?,
+            moved_at: None,
         })
     }
 
@@ -254,8 +258,39 @@ impl PeerLink {
         let actions = self.peers.on(PeerEvent::Tick { at });
         self.dispatch(swarm, files, groups, roster, actions);
 
-        if let Err(e) = self.status.publish(&self.peers.status(), at) {
+        let bandwidth = self.bandwidth(files, at);
+        if let Err(e) = self.status.publish(&self.peers.status(), at, &bandwidth) {
             tracing::debug!(error = %e, "could not publish supervisor status");
+        }
+    }
+
+    /// Content moved, with a rate measured across the gap since the last publish.
+    ///
+    /// Measured here rather than by whoever displays it: this runs on a fixed tick and never
+    /// stops, where a reader can be closed, asleep or looking at another page for an hour.
+    fn bandwidth(&mut self, files: &FileLink, at: i64) -> Bandwidth {
+        let down = self.transfers.moved_down();
+        let up = files.moved_up();
+
+        let rates = match self.moved_at {
+            Some((wasdown, wasup, then)) if at > then => {
+                let span = (at - then) as u64;
+                (
+                    down.saturating_sub(wasdown) / span,
+                    up.saturating_sub(wasup) / span,
+                )
+            }
+            // Nothing to measure against yet, and a total already answers "has it moved
+            // anything". Guessing a rate off one sample would just be the total again.
+            _ => (0, 0),
+        };
+        self.moved_at = Some((down, up, at));
+
+        Bandwidth {
+            down,
+            up,
+            down_rate: rates.0,
+            up_rate: rates.1,
         }
     }
 
@@ -968,6 +1003,20 @@ mod tests {
         assert_eq!(
             bob.row(id, &path).unwrap().hash,
             alice.row(id, &path).unwrap().hash
+        );
+
+        // The counters the Status page reports saw the same transfer the index did. Neither
+        // node has a limit configured, which is the case that would have gone unmeasured had
+        // the count lived under the throttle's early return.
+        assert_eq!(
+            bob.peers.transfers.moved_down(),
+            content.len() as u64,
+            "bob counted every byte he fetched"
+        );
+        assert_eq!(
+            alice.link.moved_up(),
+            content.len() as u64,
+            "and alice counted every byte she served"
         );
     }
 

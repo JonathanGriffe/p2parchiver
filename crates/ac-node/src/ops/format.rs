@@ -2,7 +2,7 @@
 //! thing about the same number.
 
 use ac_groups::chain::Op;
-use ac_groups::store::State;
+pub use ac_groups::store::State;
 
 use super::now;
 
@@ -18,13 +18,14 @@ pub fn ago(at: i64) -> String {
     }
 }
 
-/// Sizes at a glance. Binary units, because that is what a filesystem reports.
+/// Sizes at a glance. Decimal units, because that is what the drive was sold as and what the
+/// desktop's own file manager shows beside it.
 pub fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
     let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
+    while size >= 1000.0 && unit < UNITS.len() - 1 {
+        size /= 1000.0;
         unit += 1;
     }
     if unit == 0 {
@@ -69,8 +70,10 @@ mod tests {
     fn sizes_read_the_way_a_person_would_say_them() {
         assert_eq!(human_size(0), "0 B");
         assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1024), "1.0 KiB");
-        assert_eq!(human_size(1536), "1.5 KiB");
-        assert_eq!(human_size(4 * 1024 * 1024), "4.0 MiB");
+        assert_eq!(human_size(999), "999 B", "still bytes right up to the unit");
+        assert_eq!(human_size(1_000), "1.0 KB");
+        assert_eq!(human_size(1_500), "1.5 KB");
+        assert_eq!(human_size(4_000_000), "4.0 MB");
+        assert_eq!(human_size(500_000_000_000), "500.0 GB");
     }
 }

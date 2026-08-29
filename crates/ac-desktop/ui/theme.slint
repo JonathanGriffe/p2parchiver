@@ -40,6 +40,42 @@ export global Theme {
     out property <string> mono: "monospace";
 }
 
+export component DangerButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 30px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.danger.with-alpha(0.45);
+    // Tinted rather than filled: a solid red block reads as an error message, not a control.
+    background: touch.pressed ? Theme.danger.with-alpha(0.26)
+        : touch.has-hover ? Theme.danger.with-alpha(0.16)
+        : Theme.danger.with-alpha(0.09);
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.md;
+        padding-right: Theme.md;
+
+        Text {
+            text: root.label;
+            color: Theme.danger;
+            font-size: Theme.body-size;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+}
+
 // A labelled value, the shape most of this app's information takes.
 export component Field inherits HorizontalLayout {
     in property <string> label;

@@ -95,13 +95,13 @@ export component SettingsView inherits ScrollView {
 
                 Row {
                     label: "Stop mirroring past";
-                    hint: "Bytes. Empty means no ceiling beyond the free-space floor the node keeps anyway.";
+                    hint: "Like 500 GB. Say \"unlimited\" for no ceiling beyond the free-space floor the node keeps anyway.";
                     max := LineEdit { text: root.storage-max; }
                 }
 
                 Row {
                     label: "Bandwidth limit";
-                    hint: "Bytes per second. Empty means unlimited.";
+                    hint: "Per second, like 10 MB. Say \"unlimited\" for no limit.";
                     bandwidth := LineEdit { text: root.bandwidth-max; }
                 }
             }

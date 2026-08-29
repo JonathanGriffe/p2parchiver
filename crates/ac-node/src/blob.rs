@@ -93,6 +93,11 @@ impl Transfers {
         }
     }
 
+    /// Bytes of content fetched since this node started.
+    pub fn moved_down(&self) -> u64 {
+        self.down.moved()
+    }
+
     /// Wait for one transfer to end.
     pub async fn finished(&mut self) -> Option<PeerEvent> {
         let event = self.inbox.recv().await?;

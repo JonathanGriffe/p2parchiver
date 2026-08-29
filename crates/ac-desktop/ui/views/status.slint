@@ -1,190 +1,264 @@
-import { ScrollView } from "std-widgets.slint";
-import { Theme, Card, Dot, ToneDot } from "../theme.slint";
+import { Theme, Card, Dot } from "../theme.slint";
 
-// One group's sync progress, already worded by Rust. The UI decides colour and layout; it
-// does not decide what a number means.
-export struct GroupRow {
-    name: string,
-    id: string,
-    missing: string,
-    news: string,
-    pulling: string,
-    next: string,
-    heartbeat: string,
-    waiting: bool,
+// One group's share of the storage bar. Rust lays these out, including where each starts:
+// Slint cannot accumulate a running total across a `for`.
+export struct StorageSlice {
+    label: string,
+    size: string,
+    // Both are fractions of the whole bar, 0 to 1.
+    offset: float,
+    fraction: float,
+    // How far to fade the one accent colour, so groups read as slices of one thing.
+    shade: float,
 }
 
-export struct PeerRow {
-    name: string,
-    state: string,
-    // 0 idle, 1 working, 2 waiting, 3 unreachable. Kept a number so the words stay in Rust.
-    tone: int,
+// One direction's traffic: what has moved through it, and what is moving now.
+export struct TrafficRow {
+    label: string,
+    total: string,
+    rate: string,
+    // The configured ceiling, empty when there is none.
+    limit: string,
+    // Whether anything is moving this way right now.
+    live: bool,
 }
 
+// A storage headline, coloured by how much room is left rather than by how much is used.
+component RoomLine inherits Text {
+    in property <int> room;
+
+    color: root.room == 0 ? Theme.ok
+        : root.room == 1 ? Theme.warn
+        : root.room == 2 ? Theme.danger
+        : Theme.text;
+    // Small and light, so the numbers read as a caption to the bar rather than competing
+    // with the group names beside it.
+    font-size: Theme.small-size;
+    font-weight: 300;
+    // Fixed, or the surrounding layout hands these its slack and leaves a gap between them.
+    height: 18px;
+    vertical-alignment: center;
+}
+
+// Matches the Settings page, so a heading means the same thing wherever it appears.
 component SectionTitle inherits Text {
     color: Theme.dim;
     font-size: Theme.small-size;
     font-weight: 700;
 }
 
-component GroupCard inherits Card {
-    in property <GroupRow> group;
-
-    VerticalLayout {
-        padding: Theme.md;
-        spacing: Theme.sm;
-
-        HorizontalLayout {
-            spacing: Theme.sm;
-            height: 24px;
-            Text {
-                text: group.name;
-                color: Theme.text;
-                font-size: Theme.heading-size;
-                font-weight: 700;
-                vertical-alignment: center;
-                overflow: elide;
-                horizontal-stretch: 1;
-            }
-            Text {
-                text: group.id;
-                color: Theme.faint;
-                font-size: Theme.small-size;
-                font-family: Theme.mono;
-                vertical-alignment: center;
-            }
-        }
-
-        Rectangle { height: 1px; background: Theme.line; }
-
-        for line in [
-            { k: "missing", v: group.missing },
-            { k: "news", v: group.news },
-            { k: "pulling", v: group.pulling },
-            { k: "next", v: group.next },
-            { k: "heartbeat", v: group.heartbeat },
-        ] : HorizontalLayout {
-            spacing: Theme.md;
-            height: line.v == "" ? 0px : 20px;
-            visible: line.v != "";
-            Text {
-                text: line.k;
-                color: Theme.faint;
-                font-size: Theme.small-size;
-                width: 76px;
-            }
-            Text {
-                text: line.v;
-                color: Theme.text;
-                font-size: Theme.body-size;
-                overflow: elide;
-                horizontal-stretch: 1;
-            }
-        }
-    }
-}
-
 export component StatusView inherits VerticalLayout {
     in property <bool> running;
     in property <string> node-state;
-    in property <string> storage;
-    in property <[GroupRow]> groups;
-    in property <[PeerRow]> peers;
+    in property <string> username;
+    in property <string> peer-id;
+    in property <string> server;
+    in property <string> groups-line;
+    in property <[StorageSlice]> storage-slices;
+    in property <string> storage-free;
+    in property <string> storage-used;
+    // How much room is left: 0 ample, 1 low, 2 nearly full, 3 not measurable.
+    in property <int> storage-free-room;
+    in property <int> storage-used-room;
+    in property <[TrafficRow]> traffic;
 
     spacing: Theme.md;
 
-    // Whether the node is actually running is the first question this page answers.
+    SectionTitle { text: "THIS NODE"; }
+
     Card {
         background: root.running ? Theme.surface : Theme.raised;
-        HorizontalLayout {
+
+        VerticalLayout {
             padding: Theme.md;
             spacing: Theme.sm;
-            Dot {
-                tint: root.running ? Theme.ok : Theme.warn;
-                y: (parent.height - self.height) / 2;
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+                height: 24px;
+                Text {
+                    text: root.username == "" ? "this node" : root.username;
+                    color: Theme.text;
+                    font-size: Theme.heading-size;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: root.peer-id;
+                    color: Theme.faint;
+                    font-size: Theme.small-size;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
             }
-            Text {
-                text: root.node-state;
-                color: Theme.text;
-                font-size: Theme.body-size;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-                overflow: elide;
+
+            Rectangle { height: 1px; background: Theme.line; }
+
+            // Whether the node is actually running is the first question this page answers.
+            HorizontalLayout {
+                spacing: Theme.sm;
+                height: 20px;
+                VerticalLayout {
+                    alignment: center;
+                    Dot { tint: root.running ? Theme.ok : Theme.warn; }
+                }
+                Text {
+                    text: root.node-state;
+                    color: Theme.text;
+                    font-size: Theme.body-size;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
             }
-            Text {
-                text: root.storage;
-                color: Theme.dim;
-                font-size: Theme.small-size;
-                vertical-alignment: center;
+
+            for line in [
+                { k: "groups", v: root.groups-line },
+                { k: "server", v: root.server },
+            ] : HorizontalLayout {
+                spacing: Theme.md;
+                height: line.v == "" ? 0px : 20px;
+                visible: line.v != "";
+                Text {
+                    text: line.k;
+                    color: Theme.faint;
+                    font-size: Theme.small-size;
+                    width: 76px;
+                }
+                Text {
+                    text: line.v;
+                    color: Theme.text;
+                    font-size: Theme.body-size;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
             }
         }
     }
 
-    ScrollView {
+    SectionTitle { text: "STORAGE"; }
+
+    Card {
         VerticalLayout {
-            spacing: Theme.md;
+            padding: Theme.md;
+            spacing: Theme.xs;
 
-            SectionTitle { text: "GROUPS"; }
+            VerticalLayout {
+                spacing: 0px;
+                vertical-stretch: 0;
 
-            if root.groups.length == 0 : Card {
-                VerticalLayout {
-                    padding: Theme.md;
-                    Text {
-                        // The sentence the CLI prints for the same state.
-                        text: "no groups. create one with: ac group create --name <name>";
-                        color: Theme.dim;
-                        font-size: Theme.body-size;
-                        wrap: word-wrap;
-                    }
+                // What is left on the volume, whatever the configured ceiling says.
+                RoomLine {
+                    text: root.storage-free;
+                    room: root.storage-free-room;
+                    height: root.storage-free == "" ? 0px : 18px;
+                    visible: root.storage-free != "";
+                }
+
+                RoomLine {
+                    text: root.storage-used;
+                    room: root.storage-used-room;
                 }
             }
 
-            for group in root.groups : GroupCard { group: group; }
+            // The track is the limit that actually applies; the filled part is what is held.
+            Rectangle {
+                height: 10px;
+                border-radius: 5px;
+                background: Theme.raised;
+                clip: true;
 
-            SectionTitle { text: "PEERS"; }
-
-            if root.peers.length == 0 : Card {
-                VerticalLayout {
-                    padding: Theme.md;
-                    Text {
-                        text: "nobody yet. fellow members of your groups appear here too.";
-                        color: Theme.dim;
-                        font-size: Theme.body-size;
-                        wrap: word-wrap;
-                    }
+                for slice in root.storage-slices : Rectangle {
+                    x: parent.width * slice.offset;
+                    width: parent.width * slice.fraction;
+                    height: parent.height;
+                    background: Theme.accent;
+                    opacity: slice.shade;
                 }
             }
 
-            if root.peers.length > 0 : Card {
-                VerticalLayout {
-                    padding: Theme.md;
-                    spacing: Theme.sm;
-                    for peer in root.peers : HorizontalLayout {
-                        spacing: Theme.sm;
-                        ToneDot {
-                            tone: peer.tone;
-                            y: (parent.height - self.height) / 2;
-                        }
-                        Text {
-                            text: peer.name;
-                            color: Theme.text;
-                            font-size: Theme.body-size;
-                            width: 140px;
-                            overflow: elide;
-                        }
-                        Text {
-                            text: peer.state;
-                            color: Theme.dim;
-                            font-size: Theme.body-size;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                        }
-                    }
-                }
+            if root.storage-slices.length == 0 : Text {
+                text: "nothing held yet";
+                color: Theme.dim;
+                font-size: Theme.body-size;
+                height: 20px;
+                vertical-alignment: center;
             }
 
-            // Absorbs the slack, so cards keep their natural height instead of growing.
-            Rectangle { vertical-stretch: 1; }
+            for slice in root.storage-slices : HorizontalLayout {
+                spacing: Theme.sm;
+                height: 20px;
+                VerticalLayout {
+                    alignment: center;
+                    Dot { tint: Theme.accent; opacity: slice.shade; }
+                }
+                Text {
+                    text: slice.label;
+                    color: Theme.text;
+                    font-size: Theme.body-size;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: slice.size;
+                    color: Theme.dim;
+                    font-size: Theme.body-size;
+                    vertical-alignment: center;
+                }
+            }
         }
     }
+
+    SectionTitle { text: "BANDWIDTH"; }
+
+    Card {
+        VerticalLayout {
+            padding: Theme.md;
+            spacing: Theme.xs;
+
+            for row in root.traffic : HorizontalLayout {
+                spacing: Theme.sm;
+                height: 20px;
+
+                VerticalLayout {
+                    alignment: center;
+                    Dot { tint: row.live ? Theme.accent : Theme.faint; }
+                }
+                Text {
+                    text: row.label;
+                    color: Theme.faint;
+                    font-size: Theme.small-size;
+                    vertical-alignment: center;
+                    width: 68px;
+                }
+                Text {
+                    text: row.total;
+                    color: Theme.text;
+                    font-size: Theme.body-size;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Text {
+                    text: row.rate;
+                    color: row.live ? Theme.text : Theme.dim;
+                    font-size: Theme.body-size;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: row.limit;
+                    color: Theme.faint;
+                    font-size: Theme.small-size;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // Absorbs the slack, so the cards keep their natural height instead of growing.
+    Rectangle { vertical-stretch: 1; }
 }

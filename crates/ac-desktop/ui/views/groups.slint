@@ -1,5 +1,5 @@
 import { ScrollView, Button, LineEdit } from "std-widgets.slint";
-import { Theme, Card, Dot } from "../theme.slint";
+import { Theme, Card, Dot, DangerButton } from "../theme.slint";
 
 // One row of `ac group list`. The words are Rust's; this file only decides where they sit.
 export struct GroupItem {
@@ -17,11 +17,8 @@ export struct MemberItem {
     peer: string,
     note: string,
     departed: bool,
-}
-
-export struct LogItem {
-    seq: string,
-    text: string,
+    // This node. Removing yourself is what Leave is for, so no button is offered here.
+    is_me: bool,
 }
 
 // A destructive action explains itself before it happens, in the same words the CLI uses
@@ -148,7 +145,7 @@ component GroupItemRow inherits Rectangle {
                 font-family: Theme.mono;
             }
             Text {
-                text: group.state + " · " + group.members;
+                text: group.state == "" ? group.members : group.state + " · " + group.members;
                 color: Theme.dim;
                 font-size: Theme.small-size;
                 overflow: elide;
@@ -164,10 +161,11 @@ export component GroupsView inherits Rectangle {
     in property <string> detail-name;
     in property <string> detail-id;
     in property <string> detail-state;
+    // 0 invited, 1 member, 2 gone. The numbers are `groups::INVITED` and friends.
+    in property <int> detail-membership;
     in property <string> detail-entries;
     in property <bool> detail-admin;
     in property <[MemberItem]> members;
-    in property <[LogItem]> log;
     in property <bool> busy;
 
     callback select(string);
@@ -291,22 +289,35 @@ export component GroupsView inherits Rectangle {
 
                         HorizontalLayout {
                             spacing: Theme.sm;
-                            Button {
+
+                            if root.detail-membership == 0 : Button {
                                 text: "Accept";
                                 enabled: !root.busy;
                                 clicked => { root.accept(root.selected); }
                             }
-                            Button {
+                            if root.detail-membership == 0 : Button {
                                 text: "Leave";
                                 enabled: !root.busy;
                                 clicked => { root.asking = 1; }
                             }
-                            Button {
-                                text: "Forget";
+
+                            Rectangle { horizontal-stretch: 1; }
+
+                            if root.detail-membership == 1 && !root.detail-admin : DangerButton {
+                                label: "Leave";
+                                enabled: !root.busy;
+                                clicked => { root.asking = 1; }
+                            }
+                            if root.detail-membership == 1 && root.detail-admin : DangerButton {
+                                label: "Leave";
                                 enabled: !root.busy;
                                 clicked => { root.asking = 2; }
                             }
-                            Rectangle { horizontal-stretch: 1; }
+                            if root.detail-membership == 2 : DangerButton {
+                                label: "Leave";
+                                enabled: !root.busy;
+                                clicked => { root.asking = 2; }
+                            }
                         }
                     }
                 }
@@ -351,6 +362,7 @@ export component GroupsView inherits Rectangle {
 
                         for member in root.members : HorizontalLayout {
                             spacing: Theme.sm;
+                            height: 32px;
 
                             Dot {
                                 tint: member.departed ? Theme.faint : Theme.ok;
@@ -362,6 +374,8 @@ export component GroupsView inherits Rectangle {
                                 font-size: Theme.body-size;
                                 width: 120px;
                                 overflow: elide;
+                                // with the id and the note beside it.
+                                vertical-alignment: center;
                             }
                             Text {
                                 text: member.peer;
@@ -378,7 +392,7 @@ export component GroupsView inherits Rectangle {
                                 font-size: Theme.small-size;
                                 vertical-alignment: center;
                             }
-                            if root.detail-admin && !member.departed : Button {
+                            if root.detail-admin && !member.departed && !member.is_me : Button {
                                 text: "Remove";
                                 enabled: !root.busy;
                                 clicked => {
@@ -386,38 +400,6 @@ export component GroupsView inherits Rectangle {
                                     root.asking-peer-name = member.username;
                                     root.asking = 3;
                                 }
-                            }
-                        }
-                    }
-                }
-
-                if root.log.length > 0 : Text {
-                    text: "LOG";
-                    color: Theme.dim;
-                    font-size: Theme.small-size;
-                    font-weight: 700;
-                }
-
-                if root.log.length > 0 : Card {
-                    VerticalLayout {
-                        padding: Theme.md;
-                        spacing: Theme.xs;
-                        for line in root.log : HorizontalLayout {
-                            spacing: Theme.sm;
-                            Text {
-                                text: line.seq;
-                                color: Theme.faint;
-                                font-size: Theme.small-size;
-                                font-family: Theme.mono;
-                                width: 32px;
-                                horizontal-alignment: right;
-                            }
-                            Text {
-                                text: line.text;
-                                color: Theme.dim;
-                                font-size: Theme.small-size;
-                                wrap: word-wrap;
-                                horizontal-stretch: 1;
                             }
                         }
                     }
@@ -440,12 +422,11 @@ export component GroupsView inherits Rectangle {
     }
 
     if root.asking == 2 : Confirm {
-        title: "Forget " + root.detail-name + "?";
-        // What `ac group forget` says, for the case that is not the admin's.
-        body: "Nothing is told to anyone. The others still list you, and will keep offering "
-            + "it, use Leave instead if you meant to tell them. Files already on disk are "
-            + "left there, no longer indexed.";
-        verb: "Forget";
+        title: "Leave " + root.detail-name + "?";
+        body: "This tells nobody. The group is dropped from this node, and anyone still "
+            + "listing it will go on doing so. Files already on disk are left there, no "
+            + "longer indexed.";
+        verb: "Leave";
         confirmed => { root.asking = 0; root.forget(root.selected); }
         dismissed => { root.asking = 0; }
     }

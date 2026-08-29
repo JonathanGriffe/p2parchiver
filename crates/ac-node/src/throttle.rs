@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -7,6 +8,8 @@ use tokio::time::Instant;
 #[derive(Debug)]
 pub struct Throttle {
     bucket: Option<Mutex<Bucket>>,
+    /// Every byte that passed through, limit or no limit.
+    moved: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -20,7 +23,10 @@ struct Bucket {
 impl Throttle {
     /// No limit. Every call returns without waiting.
     pub fn none() -> Self {
-        Self { bucket: None }
+        Self {
+            bucket: None,
+            moved: AtomicU64::new(0),
+        }
     }
 
     /// `bytes_per_second` bytes a second, with a burst of `burst` bytes.
@@ -33,6 +39,7 @@ impl Throttle {
                 burst: (burst as f64).max(rate),
                 last: Instant::now(),
             })),
+            moved: AtomicU64::new(0),
         }
     }
 
@@ -49,8 +56,17 @@ impl Throttle {
         self.bucket.is_some()
     }
 
+    /// Bytes that have passed through since this node started.
+    pub fn moved(&self) -> u64 {
+        self.moved.load(Ordering::Relaxed)
+    }
+
     /// Wait until `n` bytes may move, then account for them.
     pub async fn consume(&self, n: usize) {
+        // Counted above the early return, so an unthrottled node still has a total. Nothing
+        // reads this often enough for the ordering to matter.
+        self.moved.fetch_add(n as u64, Ordering::Relaxed);
+
         let Some(bucket) = &self.bucket else {
             return;
         };
@@ -103,6 +119,25 @@ mod tests {
             start.elapsed() < Duration::from_millis(50),
             "unlimited should be free"
         );
+    }
+
+    /// The total is what the Status page shows, so it has to keep counting on the nodes that
+    /// set no limit — which is most of them.
+    #[tokio::test]
+    async fn bytes_are_counted_even_with_no_limit_to_apply() {
+        let t = Throttle::none();
+        t.consume(1000).await;
+        t.consume(24).await;
+
+        assert_eq!(t.moved(), 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_limited_throttle_counts_the_same_bytes_it_delays() {
+        let t = Throttle::new(1024, 1024);
+        t.consume(4096).await;
+
+        assert_eq!(t.moved(), 4096);
     }
 
     #[tokio::test(start_paused = true)]

@@ -9,13 +9,12 @@ use std::str::FromStr;
 
 use ac_net::config::Paths;
 use ac_node::ops;
-use ac_node::ops::format::state_name;
-use ac_node::ops::group::LogLine;
+use ac_node::ops::format::{State, state_name};
 use anyhow::{Context, Result};
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::selection::Selection;
-use crate::ui::{GroupItem, LogItem, MainWindow, MemberItem};
+use crate::ui::{GroupItem, MainWindow, MemberItem};
 use crate::work::{self, Nudge};
 
 /// Everything the page shows, read in one pass off the event loop.
@@ -29,10 +28,23 @@ pub struct Detail {
     pub name: String,
     pub id: String,
     pub state: String,
+    /// Which actions apply, as [`INVITED`], [`MEMBER`] or [`GONE`].
+    pub membership: i32,
     pub entries: String,
     pub admin: bool,
     pub members: Vec<MemberItem>,
-    pub log: Vec<LogItem>,
+}
+
+const INVITED: i32 = 0;
+const MEMBER: i32 = 1;
+const GONE: i32 = 2;
+
+fn membership(state: State) -> i32 {
+    match state {
+        State::Pending => INVITED,
+        State::Active => MEMBER,
+        State::Left => GONE,
+    }
 }
 
 pub fn read(paths: &Paths, selected: &str) -> Page {
@@ -43,7 +55,11 @@ pub fn read(paths: &Paths, selected: &str) -> Page {
                 name: group.name.clone().into(),
                 id: group.id.to_string().into(),
                 short: group.id.short().into(),
-                state: state_name(group.state).into(),
+                state: match group.state {
+                    State::Active => String::new(),
+                    other => state_name(other).to_owned(),
+                }
+                .into(),
                 members: format!("{} member(s)", group.members).into(),
                 admin: group.is_admin,
                 removed: group.removed_by_admin,
@@ -58,7 +74,7 @@ pub fn read(paths: &Paths, selected: &str) -> Page {
     // A selected group that has just been forgotten is not an error worth showing: the list
     // beside it has already stopped mentioning it.
     let detail = (!selected.is_empty())
-        .then(|| ops::group::show(paths, selected, true).ok())
+        .then(|| ops::group::show(paths, selected, false).ok())
         .flatten()
         .map(present);
 
@@ -87,22 +103,8 @@ fn present(detail: ops::group::GroupDetail) -> Detail {
                 peer: member.peer.to_string().into(),
                 note: notes.join(", ").into(),
                 departed: member.departed,
+                is_me: member.is_me,
             }
-        })
-        .collect();
-
-    let log = detail
-        .log
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-        .map(|(seq, line)| LogItem {
-            seq: seq.to_string().into(),
-            text: match line {
-                LogLine::Said(said) => said.clone(),
-                LogLine::Unreadable(why) => format!("<unreadable: {why}>"),
-            }
-            .into(),
         })
         .collect();
 
@@ -110,10 +112,10 @@ fn present(detail: ops::group::GroupDetail) -> Detail {
         name: detail.row.name.clone(),
         id: detail.row.id.to_string(),
         state: state_name(detail.row.state).to_owned(),
+        membership: membership(detail.row.state),
         entries: detail.row.head_seq.to_string(),
         admin: detail.is_admin,
         members,
-        log,
     }
 }
 
@@ -122,17 +124,16 @@ pub fn apply(window: &MainWindow, page: Page) {
 
     let Some(detail) = page.detail else {
         window.set_group_members(ModelRc::from(Rc::new(VecModel::from(Vec::new()))));
-        window.set_group_log(ModelRc::from(Rc::new(VecModel::from(Vec::new()))));
         return;
     };
 
     window.set_group_name(detail.name.into());
     window.set_group_id(detail.id.into());
     window.set_group_state(detail.state.into());
+    window.set_group_membership(detail.membership);
     window.set_group_entries(detail.entries.into());
     window.set_group_admin(detail.admin);
     window.set_group_members(ModelRc::from(Rc::new(VecModel::from(detail.members))));
-    window.set_group_log(ModelRc::from(Rc::new(VecModel::from(detail.log))));
 }
 
 /// Connect the page's buttons. Each one runs its `ops` call off the event loop, then says what
@@ -180,7 +181,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         let selection = selection.clone();
         let inner = run(&weak, paths, nudge, |paths, id: &str, _| {
             let forgotten = ops::group::forget(paths, id)?;
-            let mut said = format!("forgot {} locally", forgotten.name);
+            let mut said = format!("left {} on this node only, nobody was told", forgotten.name);
             if forgotten.held > 0 {
                 said += &format!(
                     ", {} file(s) left on disk and no longer indexed",
@@ -313,6 +314,70 @@ pub mod tests {
         assert_eq!(page.items[0].short, created.id.short());
         assert!(page.items[0].admin, "whoever creates a group is its admin");
         assert!(!page.items[0].removed);
+        assert_eq!(
+            page.items[0].state, "",
+            "being a member is what a listed group already means"
+        );
+    }
+
+    #[test]
+    fn every_membership_state_maps_to_its_own_set_of_buttons() {
+        assert_eq!(membership(State::Pending), INVITED);
+        assert_eq!(membership(State::Active), MEMBER);
+        assert_eq!(membership(State::Left), GONE);
+    }
+
+    #[test]
+    fn a_group_this_node_created_needs_no_accepting() {
+        let (_tmp, paths) = home("jonathan");
+        let created = ops::group::create(&paths, "holiday").unwrap();
+
+        let detail = read(&paths, &created.id.to_string()).detail.unwrap();
+
+        // Creating one makes you a member outright, so offering Accept would be nonsense.
+        assert_eq!(detail.membership, MEMBER);
+        assert_eq!(detail.state, "member", "and the word beside it agrees");
+    }
+
+    #[test]
+    fn a_groups_own_admin_is_not_offered_a_leave_that_would_be_refused() {
+        let (_tmp, paths) = home("jonathan");
+        let created = ops::group::create(&paths, "holiday").unwrap();
+        let id = created.id.to_string();
+
+        let detail = read(&paths, &id).detail.unwrap();
+        assert_eq!(detail.membership, MEMBER);
+        assert!(detail.admin, "this is the case the branch turns on");
+
+        // What the Leave button would have called, had it been offered.
+        let Err(refused) = ops::group::leave(&paths, &id) else {
+            panic!("leaving must be refused for a group's only admin");
+        };
+        assert!(
+            format!("{refused:#}").contains("forget"),
+            "and it points at the action that does apply: {refused:#}"
+        );
+    }
+
+    #[test]
+    fn this_node_is_marked_in_the_member_list_and_nobody_else_is() {
+        let (_tmp, paths) = home("jonathan");
+        let created = ops::group::create(&paths, "holiday").unwrap();
+        ops::group::add(
+            &paths,
+            &created.id.to_string(),
+            &somebody_else(),
+            Some("ana"),
+        )
+        .unwrap();
+
+        let detail = read(&paths, &created.id.to_string()).detail.unwrap();
+        let me = detail.members.iter().find(|m| m.is_me).unwrap();
+        let ana = detail.members.iter().find(|m| m.username == "ana").unwrap();
+
+        assert_eq!(me.username, "jonathan");
+        assert!(!ana.is_me, "and only this node carries the mark");
+        assert_eq!(detail.members.iter().filter(|m| m.is_me).count(), 1);
     }
 
     #[test]
@@ -370,8 +435,6 @@ pub mod tests {
         let created = ops::group::create(&paths, "holiday").unwrap();
         ops::group::forget(&paths, &created.id.to_string()).unwrap();
 
-        // Still "selected", because forgetting is what the selection was pointing at. The
-        // page must cope rather than showing a stale pane.
         let page = read(&paths, &created.id.to_string());
 
         assert!(page.items.is_empty());

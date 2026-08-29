@@ -27,6 +27,22 @@ pub fn identity(paths: &Paths) -> Result<Identity> {
     Ok(identity)
 }
 
+/// What enrolling settled, as recorded on disk: this node's username, the server that vouched
+/// for it, and how long that lasts. `None` until this node has enrolled with anyone.
+pub fn enrolment(paths: &Paths) -> Result<Option<attest::Statement>> {
+    let path = paths.attestation_file();
+    let Some(attestation) =
+        attest::load(&path).with_context(|| format!("reading {}", path.display()))?
+    else {
+        return Ok(None);
+    };
+
+    attestation
+        .statement()
+        .map(Some)
+        .context("reading the stored attestation")
+}
+
 /// What a daemon needs before it can start: who this node is, and how it is configured.
 pub fn startup(paths: &Paths) -> Result<(Identity, Config)> {
     let identity = identity(paths)?;

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use ksni::blocking::TrayMethods;
-use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
+use ksni::menu::{MenuItem, StandardItem};
 use slint::Weak;
 
 use super::{Live, icon};
@@ -22,8 +22,6 @@ impl Tray {
 struct Item {
     window: Weak<MainWindow>,
     nudge: Nudge,
-    /// Mirrors the recorded entry, re-read after every change rather than assumed.
-    autostart: bool,
     live: Live,
 }
 
@@ -73,13 +71,6 @@ impl ksni::Tray for Item {
                 ..Default::default()
             }
             .into(),
-            CheckmarkItem {
-                label: "Start at login".into(),
-                checked: self.autostart,
-                activate: Box::new(|item: &mut Self| item.toggle_autostart()),
-                ..Default::default()
-            }
-            .into(),
             MenuItem::Separator,
             StandardItem {
                 label: "Quit".into(),
@@ -91,20 +82,11 @@ impl ksni::Tray for Item {
     }
 }
 
-impl Item {
-    fn toggle_autostart(&mut self) {
-        super::set_autostart(!self.autostart);
-        self.autostart = crate::autostart::state().is_ok_and(|s| s.is_on());
-    }
-}
-
 pub fn spawn(window: Weak<MainWindow>, nudge: Nudge) -> Result<Tray> {
-    let autostart = crate::autostart::state().is_ok_and(|s| s.is_on());
     let live = Live::new(true);
     let handle = Item {
         window,
         nudge,
-        autostart,
         live: live.clone(),
     }
     .spawn()

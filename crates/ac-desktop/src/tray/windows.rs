@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use slint::Weak;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use super::{Live, icon};
@@ -28,21 +28,13 @@ pub fn spawn(window: Weak<MainWindow>, nudge: Nudge) -> Result<Tray> {
 
     let menu = Menu::new();
     let open = MenuItem::new("Open", true, None);
-    let startup = CheckMenuItem::new(
-        "Start at login",
-        true,
-        crate::autostart::state().is_ok_and(|s| s.is_on()),
-        None,
-    );
     let quit = MenuItem::new("Quit", true, None);
     menu.append(&open).context("building the tray menu")?;
-    menu.append(&startup).context("building the tray menu")?;
     menu.append(&PredefinedMenuItem::separator())
         .context("building the tray menu")?;
     menu.append(&quit).context("building the tray menu")?;
 
-    let (open_id, startup_id, quit_id) =
-        (open.id().clone(), startup.id().clone(), quit.id().clone());
+    let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
 
     let icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -56,9 +48,6 @@ pub fn spawn(window: Weak<MainWindow>, nudge: Nudge) -> Result<Tray> {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == open_id {
                 super::show(&window, &nudge);
-            } else if event.id == startup_id {
-                super::set_autostart(startup.is_checked());
-                startup.set_checked(crate::autostart::state().is_ok_and(|s| s.is_on()));
             } else if event.id == quit_id {
                 super::quit();
             }

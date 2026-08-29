@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use ac_net::config::{Config, Paths};
 use ac_node::ops;
+use ac_node::ops::format::human_size;
 use anyhow::{Context, Result, anyhow};
 use slint::ComponentHandle;
 
@@ -27,20 +28,8 @@ pub fn load(window: &MainWindow, paths: &Paths) {
             .unwrap_or_default()
             .into(),
     );
-    window.set_storage_max(
-        config
-            .storage_max
-            .map(|n| n.to_string())
-            .unwrap_or_default()
-            .into(),
-    );
-    window.set_bandwidth_max(
-        config
-            .bandwidth_max
-            .map(|n| n.to_string())
-            .unwrap_or_default()
-            .into(),
-    );
+    window.set_storage_max(size_field(config.storage_max).into());
+    window.set_bandwidth_max(size_field(config.bandwidth_max).into());
     window.set_server(
         config
             .server
@@ -212,8 +201,20 @@ fn save(paths: &Paths, fields: Fields) -> Result<String> {
     config.external = parse_addrs(&fields.external).context("the announced addresses")?;
     config.mdns = fields.mdns;
     config.storage_root = blank_to_none(&fields.root).map(PathBuf::from);
-    config.storage_max = parse_bytes(&fields.max).context("the storage ceiling")?;
-    config.bandwidth_max = parse_bytes(&fields.bandwidth).context("the bandwidth limit")?;
+    config.storage_max = parse_size(&fields.max).context("the storage ceiling")?;
+    config.bandwidth_max = parse_size(&fields.bandwidth).context("the bandwidth limit")?;
+
+    if let Some(rate) = config.bandwidth_max
+        && rate < ac_net::config::MIN_BANDWIDTH
+    {
+        anyhow::bail!(
+            "a bandwidth limit of {} a second is below the {} a second this node will \
+             honour. A limit that slow stalls a transfer long enough to look like a dead \
+             connection. Raise it, or say \"{UNLIMITED}\" for no limit.",
+            human_size(rate),
+            human_size(ac_net::config::MIN_BANDWIDTH),
+        );
+    }
 
     config
         .save(&path)
@@ -247,15 +248,56 @@ fn blank_to_none(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
-/// Empty means no limit, which is not the same as zero.
-fn parse_bytes(text: &str) -> Result<Option<u64>> {
-    match blank_to_none(text) {
-        None => Ok(None),
-        Some(value) => value
-            .parse()
-            .map(Some)
-            .with_context(|| format!("{value:?} is not a number of bytes")),
+const KB: u64 = 1_000;
+const MB: u64 = 1_000 * KB;
+const GB: u64 = 1_000 * MB;
+const TB: u64 = 1_000 * GB;
+
+/// The word these fields use for no limit, and accept back.
+const UNLIMITED: &str = "unlimited";
+
+/// A size as the field shows it
+fn size_field(bytes: Option<u64>) -> String {
+    let Some(bytes) = bytes else {
+        return UNLIMITED.to_owned();
+    };
+
+    for (unit, scale) in [("TB", TB), ("GB", GB), ("MB", MB), ("KB", KB)] {
+        if bytes >= scale && bytes % scale == 0 {
+            return format!("{} {unit}", bytes / scale);
+        }
     }
+    bytes.to_string()
+}
+
+fn parse_size(text: &str) -> Result<Option<u64>> {
+    let text = text.trim().to_lowercase();
+    if text.is_empty() || text == UNLIMITED || text == "none" {
+        return Ok(None);
+    }
+
+    let count = text.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c.is_whitespace());
+    let scale = match text[count.len()..].trim() {
+        "" | "b" => 1,
+        "k" | "kb" => KB,
+        "m" | "mb" => MB,
+        "g" | "gb" => GB,
+        "t" | "tb" => TB,
+        "kib" => 1024,
+        "mib" => 1024 * 1024,
+        "gib" => 1024 * 1024 * 1024,
+        "tib" => 1024_u64.pow(4),
+        unit => anyhow::bail!("{unit:?} is not a unit. Use B, KB, MB, GB or TB"),
+    };
+
+    let count: f64 = count
+        .parse()
+        .with_context(|| format!("{count:?} is not a number"))?;
+    anyhow::ensure!(count >= 0.0, "a limit cannot be negative");
+
+    // Zero is how the config file asks for no limit, so the field agrees with it.
+    let bytes = (count * scale as f64) as u64;
+    Ok((bytes > 0).then_some(bytes))
 }
 
 fn restart(node: &Shared, paths: &Paths) -> Result<()> {
@@ -311,17 +353,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_empty_limit_means_no_limit_rather_than_zero() {
-        assert_eq!(parse_bytes("").unwrap(), None);
-        assert_eq!(parse_bytes("   ").unwrap(), None);
-        assert_eq!(parse_bytes("0").unwrap(), Some(0), "zero is a real answer");
-        assert_eq!(parse_bytes("1048576").unwrap(), Some(1048576));
+    fn every_way_of_saying_no_limit_means_the_same_thing() {
+        for said in ["", "   ", "unlimited", "UNLIMITED", "none", "0", "0 GB"] {
+            assert_eq!(parse_size(said).unwrap(), None, "for {said:?}");
+        }
     }
 
     #[test]
-    fn a_limit_that_is_not_a_number_says_which_one() {
-        let e = parse_bytes("10 GB").unwrap_err();
-        assert!(format!("{e:#}").contains("\"10 GB\""), "got {e:#}");
+    fn a_size_is_read_the_way_a_person_writes_one() {
+        assert_eq!(parse_size("500 GB").unwrap(), Some(500 * GB));
+        assert_eq!(parse_size("10 MB").unwrap(), Some(10 * MB));
+        assert_eq!(
+            parse_size("10mb").unwrap(),
+            Some(10 * MB),
+            "spacing is optional"
+        );
+        assert_eq!(parse_size("2T").unwrap(), Some(2 * TB));
+        assert_eq!(parse_size("1.5 GB").unwrap(), Some(GB + GB / 2));
+        assert_eq!(parse_size("1000000").unwrap(), Some(MB), "bare bytes");
+    }
+
+    #[test]
+    fn the_binary_spellings_keep_their_own_meaning() {
+        assert_eq!(parse_size("1 GiB").unwrap(), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size("1 GB").unwrap(), Some(1_000_000_000));
+        assert_ne!(parse_size("1 GiB").unwrap(), parse_size("1 GB").unwrap());
+    }
+
+    #[test]
+    fn what_the_field_shows_parses_back_to_the_same_bytes() {
+        for bytes in [
+            500 * GB,
+            10 * MB,
+            ac_net::config::DEFAULT_STORAGE_MAX,
+            ac_net::config::DEFAULT_BANDWIDTH_MAX,
+            123_456_789,
+            1,
+        ] {
+            let shown = size_field(Some(bytes));
+            assert_eq!(
+                parse_size(&shown).unwrap(),
+                Some(bytes),
+                "{bytes} showed as {shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_defaults_are_shown_as_the_round_numbers_they_are() {
+        assert_eq!(
+            size_field(Some(ac_net::config::DEFAULT_STORAGE_MAX)),
+            "500 GB"
+        );
+        assert_eq!(
+            size_field(Some(ac_net::config::DEFAULT_BANDWIDTH_MAX)),
+            "10 MB"
+        );
+        assert_eq!(size_field(None), "unlimited");
+    }
+
+    #[test]
+    fn a_size_that_is_not_one_says_what_was_wrong_with_it() {
+        let e = parse_size("ten gigs").unwrap_err();
+        assert!(format!("{e:#}").contains("ten gigs"), "got {e:#}");
+
+        let e = parse_size("10 furlongs").unwrap_err();
+        assert!(format!("{e:#}").contains("furlongs"), "got {e:#}");
     }
 
     #[test]
@@ -341,8 +438,6 @@ mod tests {
 
     #[test]
     fn a_bad_address_is_refused_by_name_rather_than_dropped() {
-        // Silently discarding one line of six would leave a node listening somewhere the
-        // settings page claims it is not.
         let e = parse_addrs("/ip4/0.0.0.0/udp/0/quic-v1\nnot-an-address").unwrap_err();
         assert!(format!("{e:#}").contains("not-an-address"), "got {e:#}");
     }

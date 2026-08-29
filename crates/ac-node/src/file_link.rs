@@ -113,6 +113,11 @@ impl FileLink {
         })
     }
 
+    /// Bytes of content served since this node started.
+    pub fn moved_up(&self) -> u64 {
+        self.up.moved()
+    }
+
     #[cfg(test)]
     pub(crate) fn sync(&mut self) -> &mut FileSync {
         &mut self.sync

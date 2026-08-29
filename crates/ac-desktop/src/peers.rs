@@ -12,42 +12,56 @@ use crate::ui::{MainWindow, PeerItem};
 use crate::view;
 use crate::work::{self, Nudge};
 
-pub fn read(paths: &Paths, report: Option<&StatusReport>) -> Vec<PeerItem> {
+/// The Peers page, in the two groups it is drawn in: people this node was told about, and
+/// people it only ever met through a group.
+#[derive(Default)]
+pub struct Page {
+    pub contacts: Vec<PeerItem>,
+    pub discovered: Vec<PeerItem>,
+}
+
+pub fn read(paths: &Paths, report: Option<&StatusReport>) -> Page {
     let known = match ops::peer::list(paths) {
         Ok(known) => known,
         Err(e) => {
             tracing::warn!(error = %e, "could not list peers");
-            return Vec::new();
+            return Page::default();
         }
     };
 
-    known
-        .iter()
-        .map(|entry| {
-            let live = report
-                .and_then(|report| report.peers.iter().find(|p| p.peer == entry.peer))
-                .map(|p| view::describe_peer(p, report.map_or(0, |r| r.now)));
+    let mut page = Page::default();
+    for entry in &known {
+        let live = report
+            .and_then(|report| report.peers.iter().find(|p| p.peer == entry.peer))
+            .map(|p| view::describe_peer(p, report.map_or(0, |r| r.now)));
 
-            let (tone, state) = live.unwrap_or_else(|| (view::QUIET, "no contact yet".to_owned()));
+        let (tone, state) = live.unwrap_or_else(|| (view::QUIET, "no contact yet".to_owned()));
+        let contact = matches!(entry.source, Source::Contact);
 
-            PeerItem {
-                name: entry.name.clone().into(),
-                peer: entry.peer.to_string().into(),
-                via: match entry.source {
-                    Source::Contact => "contact",
-                    Source::Group => "group",
-                }
-                .into(),
-                state: state.into(),
-                tone,
-                removable: matches!(entry.source, Source::Contact),
+        let item = PeerItem {
+            // A name this node chose stands as it is; one it only overheard in a group is
+            // marked, so the two are not read as equally trustworthy at a glance.
+            name: match contact {
+                true => entry.name.clone(),
+                false => format!("~ {}", entry.name),
             }
-        })
-        .collect()
+            .into(),
+            peer: entry.peer.to_string().into(),
+            state: state.into(),
+            tone,
+        };
+
+        match contact {
+            true => page.contacts.push(item),
+            false => page.discovered.push(item),
+        }
+    }
+    page
 }
 
-pub fn apply(window: &MainWindow, items: Vec<PeerItem>) {
-    window.set_peer_items(ModelRc::from(Rc::new(VecModel::from(items))));
+pub fn apply(window: &MainWindow, page: Page) {
+    window.set_peer_contacts(ModelRc::from(Rc::new(VecModel::from(page.contacts))));
+    window.set_peer_discovered(ModelRc::from(Rc::new(VecModel::from(page.discovered))));
 }
 
 pub fn wire(window: &MainWindow, paths: &Paths, nudge: &Nudge) {
@@ -98,31 +112,51 @@ mod tests {
     use crate::groups::tests::{home, somebody_else};
 
     #[test]
-    fn a_contact_is_listed_as_one_and_can_be_removed() {
+    fn a_contact_is_listed_under_contacts_by_the_name_this_node_gave_them() {
         let (_tmp, paths) = home("jonathan");
         let them = somebody_else();
         ops::peer::add(&paths, &them, "ana").unwrap();
 
-        let items = read(&paths, None);
+        let page = read(&paths, None);
 
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].name, "ana");
-        assert_eq!(items[0].via, "contact");
-        assert!(items[0].removable, "a contact is this node's to drop");
+        assert_eq!(page.contacts.len(), 1);
+        assert_eq!(page.contacts[0].name, "ana", "no mark on a name we chose");
+        assert!(page.discovered.is_empty());
     }
 
     #[test]
-    fn a_fellow_member_is_listed_through_the_group_and_cannot_be_removed() {
+    fn a_fellow_member_is_listed_as_discovered_and_marked_as_overheard() {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
         let them = somebody_else();
         ops::group::add(&paths, &created.id.to_string(), &them, Some("ana")).unwrap();
 
-        let items = read(&paths, None);
-        let ana = items.iter().find(|p| p.name == "ana").unwrap();
+        let page = read(&paths, None);
 
-        assert_eq!(ana.via, "group");
-        assert!(!ana.removable);
+        assert!(page.contacts.is_empty(), "never told about them directly");
+        let ana = page
+            .discovered
+            .iter()
+            .find(|p| p.name.ends_with("ana"))
+            .unwrap();
+        assert_eq!(ana.name, "~ ana");
+    }
+
+    /// Adding someone as a contact is what promotes them out of the discovered list, so the
+    /// same person must not appear in both.
+    #[test]
+    fn a_fellow_member_this_node_also_named_is_listed_once_as_a_contact() {
+        let (_tmp, paths) = home("jonathan");
+        let created = ops::group::create(&paths, "holiday").unwrap();
+        let them = somebody_else();
+        ops::group::add(&paths, &created.id.to_string(), &them, Some("ana")).unwrap();
+        ops::peer::add(&paths, &them, "ana").unwrap();
+
+        let page = read(&paths, None);
+
+        assert_eq!(page.contacts.len(), 1);
+        assert_eq!(page.contacts[0].name, "ana");
+        assert!(page.discovered.is_empty(), "not in both lists");
     }
 
     #[test]
@@ -130,9 +164,9 @@ mod tests {
         let (_tmp, paths) = home("jonathan");
         ops::peer::add(&paths, &somebody_else(), "ana").unwrap();
 
-        let items = read(&paths, None);
+        let page = read(&paths, None);
 
-        assert_eq!(items[0].state, "no contact yet");
-        assert_eq!(items[0].tone, view::QUIET);
+        assert_eq!(page.contacts[0].state, "no contact yet");
+        assert_eq!(page.contacts[0].tone, view::QUIET);
     }
 }

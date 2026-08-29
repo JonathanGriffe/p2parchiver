@@ -16,12 +16,6 @@ pub enum State {
     Stale { was: PathBuf },
 }
 
-impl State {
-    pub fn is_on(&self) -> bool {
-        matches!(self, State::On)
-    }
-}
-
 /// Whether this binary starts with the session.
 pub fn state() -> Result<State> {
     let exe = std::env::current_exe().context("finding this binary")?;

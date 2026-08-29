@@ -159,6 +159,9 @@ export component FilesView inherits VerticalLayout {
                         font-size: Theme.body-size;
                         overflow: elide;
                         horizontal-stretch: 1;
+                        // Text sits at the top of the space it is given, and every column
+                        // beside this one is centred, so without this the path rides high.
+                        vertical-alignment: center;
                     }
                     Text {
                         text: file.size;
@@ -201,7 +204,9 @@ export component FilesView inherits VerticalLayout {
                         enabled: !root.busy;
                         clicked => { root.remove(file.path); }
                     }
-                    if file.removed : Rectangle { width: 72px; }
+                    // Stands in for the button, height included: a row without one would
+                    // otherwise be shorter than every row that has one.
+                    if file.removed : Rectangle { width: 72px; height: 32px; }
                 }
             }
 
