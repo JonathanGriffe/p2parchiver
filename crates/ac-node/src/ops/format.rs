@@ -47,7 +47,7 @@ pub fn state_name(state: State) -> &'static str {
 pub fn describe(op: &Op) -> String {
     match op {
         Op::Create { name, admin, .. } => format!("created {name:?} by {admin}"),
-        Op::Add { peer, username } => format!("added {username} ({peer})"),
+        Op::Add { peer } => format!("added {peer}"),
         Op::Remove { peer } => format!("removed {peer}"),
     }
 }

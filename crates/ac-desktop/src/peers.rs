@@ -20,17 +20,23 @@ pub struct Page {
     pub discovered: Vec<PeerItem>,
 }
 
-pub fn read(paths: &Paths, report: Option<&StatusReport>) -> Page {
-    let known = match ops::peer::list(paths) {
-        Ok(known) => known,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not list peers");
-            return Page::default();
-        }
-    };
+/// How a name is shown, wherever a person appears.
+///
+/// A name this node chose stands as it is. A name the person chose for themselves is marked,
+/// because nothing verifies it: it is what they say they are called, not who they are.
+pub fn display_name(name: Option<&str>, source: Source, peer: &ac_net::PeerId) -> String {
+    match (name, source) {
+        (Some(name), Source::Contact) => name.to_owned(),
+        (Some(name), Source::Group) => format!("~ {name}"),
+        // Nobody has told us anything, so there is nothing to mark up. A short id is not a
+        // claim, and dressing it as one would say they call themselves "12D3KooW".
+        (None, _) => peer.to_base58()[..8].to_owned(),
+    }
+}
 
+pub fn read(known: &[ops::Known], report: Option<&StatusReport>) -> Page {
     let mut page = Page::default();
-    for entry in &known {
+    for entry in known {
         let live = report
             .and_then(|report| report.peers.iter().find(|p| p.peer == entry.peer))
             .map(|p| view::describe_peer(p, report.map_or(0, |r| r.now)));
@@ -39,13 +45,7 @@ pub fn read(paths: &Paths, report: Option<&StatusReport>) -> Page {
         let contact = matches!(entry.source, Source::Contact);
 
         let item = PeerItem {
-            // A name this node chose stands as it is; one it only overheard in a group is
-            // marked, so the two are not read as equally trustworthy at a glance.
-            name: match contact {
-                true => entry.name.clone(),
-                false => format!("~ {}", entry.name),
-            }
-            .into(),
+            name: display_name(entry.name.as_deref(), entry.source, &entry.peer).into(),
             peer: entry.peer.to_string().into(),
             state: state.into(),
             tone,
@@ -111,13 +111,18 @@ mod tests {
     use super::*;
     use crate::groups::tests::{home, somebody_else};
 
+    /// The page as the poller builds it.
+    fn page(paths: &Paths) -> Page {
+        read(&ops::peer::list(paths).unwrap_or_default(), None)
+    }
+
     #[test]
     fn a_contact_is_listed_under_contacts_by_the_name_this_node_gave_them() {
         let (_tmp, paths) = home("jonathan");
         let them = somebody_else();
         ops::peer::add(&paths, &them, "ana").unwrap();
 
-        let page = read(&paths, None);
+        let page = page(&paths);
 
         assert_eq!(page.contacts.len(), 1);
         assert_eq!(page.contacts[0].name, "ana", "no mark on a name we chose");
@@ -129,17 +134,15 @@ mod tests {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
         let them = somebody_else();
-        ops::group::add(&paths, &created.id.to_string(), &them, Some("ana")).unwrap();
+        ops::group::add(&paths, &created.id.to_string(), &them).unwrap();
 
-        let page = read(&paths, None);
+        let page = page(&paths);
 
         assert!(page.contacts.is_empty(), "never told about them directly");
-        let ana = page
-            .discovered
-            .iter()
-            .find(|p| p.name.ends_with("ana"))
-            .unwrap();
-        assert_eq!(ana.name, "~ ana");
+        // They have published no standing, so there is no name to mark up: the short id is
+        // the only thing this node actually knows about them.
+        assert_eq!(page.discovered.len(), 1);
+        assert_eq!(page.discovered[0].name, them.to_base58()[..8].to_owned());
     }
 
     /// Adding someone as a contact is what promotes them out of the discovered list, so the
@@ -149,10 +152,10 @@ mod tests {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
         let them = somebody_else();
-        ops::group::add(&paths, &created.id.to_string(), &them, Some("ana")).unwrap();
+        ops::group::add(&paths, &created.id.to_string(), &them).unwrap();
         ops::peer::add(&paths, &them, "ana").unwrap();
 
-        let page = read(&paths, None);
+        let page = page(&paths);
 
         assert_eq!(page.contacts.len(), 1);
         assert_eq!(page.contacts[0].name, "ana");
@@ -164,7 +167,7 @@ mod tests {
         let (_tmp, paths) = home("jonathan");
         ops::peer::add(&paths, &somebody_else(), "ana").unwrap();
 
-        let page = read(&paths, None);
+        let page = page(&paths);
 
         assert_eq!(page.contacts[0].state, "no contact yet");
         assert_eq!(page.contacts[0].tone, view::QUIET);

@@ -11,7 +11,6 @@ use ac_net::identity::Identity;
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::{now, open, open_files, resolve};
-use crate::contacts::Contacts;
 
 /// One group, as a list wants it.
 pub struct GroupSummary {
@@ -27,11 +26,16 @@ pub struct GroupSummary {
 /// One member, and what is worth saying about them beyond their name.
 pub struct MemberView {
     pub peer: PeerId,
-    pub username: String,
+    /// What they call themselves, once their standing has reached this node. `None` until it
+    /// does — the chain names nobody, so there is nothing else to fall back on.
+    pub username: Option<String>,
     pub is_admin: bool,
     pub is_me: bool,
     /// Has said they are out, but the admin has not written the removal yet.
     pub departed: bool,
+    /// Whether they have answered the invitation at all. False while this node holds the
+    /// entry that names them but has heard nothing back from them.
+    pub answered: bool,
 }
 
 /// One log entry, or the reason it could not be read. A corrupt entry is shown rather than
@@ -55,7 +59,6 @@ pub struct Created {
 }
 
 pub struct Added {
-    pub username: String,
     pub peer: PeerId,
 }
 
@@ -107,6 +110,7 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<GroupDetail> {
 
     let members = groups.members(id).context("reading members")?;
     let departed = groups.departed(id).context("reading departures")?;
+    let positions = groups.positions(id).context("reading positions")?;
 
     let members = members
         .iter()
@@ -116,6 +120,12 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<GroupDetail> {
             is_admin: member.is_admin,
             is_me: member.peer == me,
             departed: departed.contains(&member.peer),
+            // Anything other than silence counts as an answer, including "not yet": a member
+            // who has published `Unanswered` has at least received the invitation.
+            answered: matches!(
+                positions.get(&member.peer),
+                Some(Position::In) | Some(Position::Out)
+            ),
         })
         .collect();
 
@@ -142,17 +152,22 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<GroupDetail> {
     })
 }
 
-pub fn create(paths: &Paths, name: &str) -> Result<Created> {
-    let (identity, mut groups) = open(paths)?;
-
+/// What this node calls itself, as the server that enrolled it recorded. Every standing this
+/// node signs carries it, so joining a group at all depends on having one.
+pub fn my_username(paths: &Paths) -> Result<String> {
     let attestation = attest::load(&paths.attestation_file())
         .context("reading this node's attestation")?
         .ok_or_else(|| anyhow!("this node has not enrolled with a server; run `ac join` first"))?;
-    let username = attestation
+    Ok(attestation
         .statement()
         .map_err(|e| anyhow!("{e}"))
         .context("reading the stored attestation")?
-        .username;
+        .username)
+}
+
+pub fn create(paths: &Paths, name: &str) -> Result<Created> {
+    let (identity, mut groups) = open(paths)?;
+    let username = my_username(paths)?;
 
     let id = groups
         .create(identity.keypair(), name, &username, now())
@@ -165,34 +180,10 @@ pub fn create(paths: &Paths, name: &str) -> Result<Created> {
     })
 }
 
-pub fn add(paths: &Paths, needle: &str, peer: &PeerId, username: Option<&str>) -> Result<Added> {
+pub fn add(paths: &Paths, needle: &str, peer: &PeerId) -> Result<Added> {
     let (identity, mut groups) = open(paths)?;
     let (id, row) = resolve(&groups, needle)?;
     require_admin(&row, &identity, "add members")?;
-
-    let (raw, source) = match username {
-        Some(name) => (name.to_owned(), "username"),
-        None => (
-            Contacts::open(&paths.db_file())
-                .ok()
-                .and_then(|c| c.get(peer).ok().flatten())
-                .map(|c| c.label)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no name for {peer}; pass --username, or add them first with \
-                         `ac peer add {peer} --label <name>`"
-                    )
-                })?,
-            "contact label",
-        ),
-    };
-
-    let username = attest::normalise_username(&raw).map_err(|e| {
-        anyhow!(
-            "unusable {source} {raw:?}: {e}\n\
-             pass --username <name> with a name that fits"
-        )
-    })?;
 
     groups
         .author(
@@ -200,16 +191,12 @@ pub fn add(paths: &Paths, needle: &str, peer: &PeerId, username: Option<&str>) -
             id,
             Op::Add {
                 peer: peer.to_base58(),
-                username: username.clone(),
             },
             now(),
         )
         .with_context(|| format!("adding {peer} to {needle}"))?;
 
-    Ok(Added {
-        username,
-        peer: *peer,
-    })
+    Ok(Added { peer: *peer })
 }
 
 pub fn remove(paths: &Paths, needle: &str, peer: &PeerId) -> Result<()> {
@@ -249,7 +236,13 @@ pub fn accept(paths: &Paths, needle: &str) -> Result<Accepted> {
     }
 
     groups
-        .author_standing(identity.keypair(), id, Position::In, now())
+        .author_standing(
+            identity.keypair(),
+            id,
+            Position::In,
+            &my_username(paths)?,
+            now(),
+        )
         .with_context(|| format!("accepting {needle}"))?;
 
     Ok(Accepted::Joined(row.name))
@@ -271,7 +264,13 @@ pub fn leave(paths: &Paths, needle: &str) -> Result<Departed> {
     }
 
     groups
-        .author_standing(identity.keypair(), id, Position::Out, now())
+        .author_standing(
+            identity.keypair(),
+            id,
+            Position::Out,
+            &my_username(paths)?,
+            now(),
+        )
         .with_context(|| format!("leaving {needle}"))?;
 
     Ok(Departed::Left(row.name))

@@ -51,7 +51,13 @@ pub struct Snapshot {
 
 pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
     let looking_at = selection.get();
-    let page = groups::read(paths, &looking_at.group);
+    // Read once and shared: both the Groups page and the Peers page name the same people, and
+    // they have to agree about what each is called.
+    let known = ops::peer::list(paths).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "could not list peers");
+        Vec::new()
+    });
+    let page = groups::read(paths, &known, &looking_at.group);
     let files = files::read(paths, &looking_at);
 
     let report = match ops::peer::status(paths) {
@@ -61,7 +67,7 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
             None
         }
     };
-    let directory = peers::read(paths, report.as_ref());
+    let directory = peers::read(&known, report.as_ref());
 
     let (running, node_state) = match &report {
         Some(report) => describe_liveness(report),

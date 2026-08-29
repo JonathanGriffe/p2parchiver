@@ -328,21 +328,18 @@ export component GroupsView inherits Rectangle {
                         padding: Theme.md;
                         spacing: Theme.sm;
 
+                        // A peer id and nothing else. What a member is called is theirs to
+                        // publish, so there is no name here for an admin to invent.
                         peer := LineEdit {
                             placeholder-text: "peer id to add";
                             horizontal-stretch: 1;
-                        }
-                        who := LineEdit {
-                            placeholder-text: "name (optional)";
-                            width: 140px;
                         }
                         Button {
                             text: "Add";
                             enabled: peer.text != "" && !root.busy;
                             clicked => {
-                                root.add-member(root.selected, peer.text, who.text);
+                                root.add-member(root.selected, peer.text, "");
                                 peer.text = "";
-                                who.text = "";
                             }
                         }
                     }

@@ -79,6 +79,9 @@ pub struct GroupSync {
     store: Groups,
     me: PeerId,
     key: Keypair,
+    /// What this node calls itself, written into every standing it authors. Supplied by the
+    /// caller because it comes from the attestation, which this crate knows nothing about.
+    username: String,
     inflight: HashMap<GroupId, InFlight>,
     deferred: VecDeque<(PeerId, GroupId)>,
     budget: TickBudget,
@@ -86,12 +89,13 @@ pub struct GroupSync {
 }
 
 impl GroupSync {
-    pub fn new(store: Groups, key: Keypair) -> Self {
+    pub fn new(store: Groups, key: Keypair, username: String) -> Self {
         let me = key.public().to_peer_id();
         Self {
             store,
             me,
             key,
+            username,
             inflight: HashMap::new(),
             deferred: VecDeque::new(),
             budget: TickBudget::new(ANSWERS_PER_TICK),
@@ -320,9 +324,9 @@ impl GroupSync {
         if !pending || !named || spoken {
             return;
         }
-        if let Err(e) = self
-            .store
-            .author_standing(&self.key, group, Position::Unanswered, at)
+        if let Err(e) =
+            self.store
+                .author_standing(&self.key, group, Position::Unanswered, &self.username, at)
         {
             tracing::warn!(%group, error = %e, "could not record an unanswered invitation");
         }

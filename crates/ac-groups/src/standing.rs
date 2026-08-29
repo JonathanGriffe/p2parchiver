@@ -1,4 +1,5 @@
 use ac_net::PeerId;
+use ac_net::attest::normalise_username;
 use ac_net::identity::{Keypair, public_key_of};
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +39,10 @@ pub struct StandingBody {
     pub peer: String,
     pub seq: u64,
     pub position: Position,
+    /// What this member calls itself. Their own claim, signed with their own key — the chain
+    /// carries no name, so this is the only place a member is named, and nobody but them can
+    /// write it. Unverified beyond its shape: it says who they say they are, not who they are.
+    pub username: String,
     pub at: i64,
 }
 
@@ -59,13 +64,16 @@ impl Standing {
         group: GroupId,
         seq: u64,
         position: Position,
+        username: &str,
         at: i64,
     ) -> Result<Self, StandingError> {
+        let username = normalise_username(username).map_err(|_| StandingError::BadUsername)?;
         let body = StandingBody {
             group,
             peer: key.public().to_peer_id().to_base58(),
             seq,
             position,
+            username,
             at,
         };
         let mut bytes = Vec::new();
@@ -111,6 +119,9 @@ impl Standing {
         if !key.verify(&self.body, &self.signature) {
             return Err(StandingError::BadSignature);
         }
+        // Checked here rather than where it is displayed: this is the one gate every standing
+        // passes through, so a name that reaches the rest of the app has already been shaped.
+        normalise_username(&body.username).map_err(|_| StandingError::BadUsername)?;
         Ok(body)
     }
 
@@ -144,6 +155,7 @@ struct Held {
     standing: Standing,
     seq: u64,
     position: Position,
+    username: String,
 }
 
 /// The latest position each member has claimed for itself.
@@ -158,6 +170,7 @@ impl StandingSet {
         standing: Standing,
         seq: u64,
         position: Position,
+        username: String,
     ) -> bool {
         if let Some(held) = self.0.get(&peer)
             && !wins((seq, &standing.body), (held.seq, &held.standing.body))
@@ -170,6 +183,7 @@ impl StandingSet {
                 standing,
                 seq,
                 position,
+                username,
             },
         );
         true
@@ -177,6 +191,11 @@ impl StandingSet {
 
     pub fn latest(&self, peer: &PeerId) -> Option<(u64, Position)> {
         self.0.get(peer).map(|h| (h.seq, h.position))
+    }
+
+    /// What this member last called itself, if it has said anything at all.
+    pub fn username(&self, peer: &PeerId) -> Option<&str> {
+        self.0.get(peer).map(|h| h.username.as_str())
     }
 
     /// Whether this peer's own latest word is that it has left.
@@ -211,6 +230,8 @@ pub enum StandingError {
     BadSignature,
     #[error("the standing is for group {found}, not this one")]
     WrongGroup { found: GroupId },
+    #[error("the standing carries an unusable username")]
+    BadUsername,
 }
 
 #[cfg(test)]
@@ -242,7 +263,7 @@ mod tests {
     #[test]
     fn a_standing_verifies_and_reports_what_was_asserted() {
         let bob = key();
-        let s = Standing::author(&bob, group(), 1, Position::Out, AT).unwrap();
+        let s = Standing::author(&bob, group(), 1, Position::Out, "someone", AT).unwrap();
 
         let body = s.verify(group()).unwrap();
         assert_eq!(body.peer, bob.public().to_peer_id().to_base58());
@@ -260,6 +281,7 @@ mod tests {
                 peer: bob.public().to_peer_id().to_base58(),
                 seq: 1,
                 position: Position::Out,
+                username: "bob".to_owned(),
                 at: AT,
             },
         );
@@ -270,7 +292,7 @@ mod tests {
     #[test]
     fn a_standing_for_another_group_is_refused() {
         let bob = key();
-        let s = Standing::author(&bob, group(), 1, Position::Out, AT).unwrap();
+        let s = Standing::author(&bob, group(), 1, Position::Out, "someone", AT).unwrap();
         let elsewhere = GroupId::of_genesis(b"a different group");
 
         assert!(matches!(
@@ -282,7 +304,7 @@ mod tests {
     #[test]
     fn a_standing_survives_cbor_and_still_verifies() {
         let bob = key();
-        let s = Standing::author(&bob, group(), 1, Position::Out, AT).unwrap();
+        let s = Standing::author(&bob, group(), 1, Position::Out, "someone", AT).unwrap();
 
         let mut buf = Vec::new();
         ciborium::into_writer(&s, &mut buf).unwrap();
@@ -294,8 +316,8 @@ mod tests {
     #[test]
     fn a_higher_seq_supersedes() {
         let bob = key();
-        let first = Standing::author(&bob, group(), 1, Position::Out, AT).unwrap();
-        let second = Standing::author(&bob, group(), 2, Position::In, AT).unwrap();
+        let first = Standing::author(&bob, group(), 1, Position::Out, "someone", AT).unwrap();
+        let second = Standing::author(&bob, group(), 2, Position::In, "someone", AT).unwrap();
 
         let (Ok(first_body), Ok(second_body)) = (first.body(), second.body()) else {
             panic!("failed to parse body");
@@ -317,8 +339,8 @@ mod tests {
         // converge without coordinating, so the rule is deterministic rather than
         // arrival-ordered.
         let bob = key();
-        let a = Standing::author(&bob, group(), 1, Position::In, AT).unwrap();
-        let b = Standing::author(&bob, group(), 1, Position::Out, AT + 1).unwrap();
+        let a = Standing::author(&bob, group(), 1, Position::In, "someone", AT).unwrap();
+        let b = Standing::author(&bob, group(), 1, Position::Out, "someone", AT + 1).unwrap();
         assert_ne!(a.body, b.body);
 
         let (Ok(a_body), Ok(b_body)) = (a.body(), b.body()) else {
@@ -354,13 +376,13 @@ mod tests {
     fn a_set_refuses_a_statement_it_has_already_bettered() {
         let bob = key();
         let bob_peer = bob.public().to_peer_id();
-        let old = Standing::author(&bob, group(), 1, Position::In, AT).unwrap();
-        let new = Standing::author(&bob, group(), 2, Position::Out, AT).unwrap();
+        let old = Standing::author(&bob, group(), 1, Position::In, "someone", AT).unwrap();
+        let new = Standing::author(&bob, group(), 2, Position::Out, "someone", AT).unwrap();
 
         let mut set = StandingSet::default();
-        assert!(set.insert(bob_peer, new, 2, Position::Out));
+        assert!(set.insert(bob_peer, new, 2, Position::Out, "someone".to_owned()));
         assert!(
-            !set.insert(bob_peer, old, 1, Position::In),
+            !set.insert(bob_peer, old, 1, Position::In, "someone".to_owned()),
             "a rollback must not take"
         );
         assert_eq!(set.latest(&bob_peer), Some((2, Position::Out)));

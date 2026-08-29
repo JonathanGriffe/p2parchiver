@@ -887,7 +887,6 @@ mod tests {
                 id,
                 Op::Add {
                     peer: member_peer.to_base58(),
-                    username: "bob".into(),
                 },
                 AT,
             )
@@ -898,7 +897,7 @@ mod tests {
         let store = member.link.sync().groups_mut();
         store.adopt(&entries, &[], AT).unwrap();
         store
-            .author_standing(&member_key, id, Position::In, AT)
+            .author_standing(&member_key, id, Position::In, "someone", AT)
             .unwrap();
         id
     }

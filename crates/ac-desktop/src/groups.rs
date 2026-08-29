@@ -13,6 +13,7 @@ use ac_node::ops::format::{State, state_name};
 use anyhow::{Context, Result};
 use slint::{ComponentHandle, ModelRc, VecModel};
 
+use crate::peers;
 use crate::selection::Selection;
 use crate::ui::{GroupItem, MainWindow, MemberItem};
 use crate::work::{self, Nudge};
@@ -39,6 +40,24 @@ const INVITED: i32 = 0;
 const MEMBER: i32 = 1;
 const GONE: i32 = 2;
 
+/// What to call a member, by the same rule the Peers page uses: a name this node chose stands
+/// plain, a name they chose for themselves is marked, and someone who has said nothing yet is
+/// shown by the only thing known about them.
+fn name_for(member: &ops::group::MemberView, known: &[ops::Known]) -> String {
+    // Our own name is not somebody else's claim about us, so it is never marked. The directory
+    // leaves this node out entirely, which is why it has to be handled before the lookup.
+    if member.is_me {
+        return member
+            .username
+            .clone()
+            .unwrap_or_else(|| member.peer.to_base58()[..8].to_owned());
+    }
+    if let Some(entry) = known.iter().find(|k| k.peer == member.peer) {
+        return peers::display_name(entry.name.as_deref(), entry.source, &entry.peer);
+    }
+    peers::display_name(member.username.as_deref(), ops::Source::Group, &member.peer)
+}
+
 fn membership(state: State) -> i32 {
     match state {
         State::Pending => INVITED,
@@ -47,7 +66,7 @@ fn membership(state: State) -> i32 {
     }
 }
 
-pub fn read(paths: &Paths, selected: &str) -> Page {
+pub fn read(paths: &Paths, known: &[ops::Known], selected: &str) -> Page {
     let items = match ops::group::list(paths) {
         Ok(summaries) => summaries
             .iter()
@@ -76,12 +95,12 @@ pub fn read(paths: &Paths, selected: &str) -> Page {
     let detail = (!selected.is_empty())
         .then(|| ops::group::show(paths, selected, false).ok())
         .flatten()
-        .map(present);
+        .map(|detail| present(detail, known));
 
     Page { items, detail }
 }
 
-fn present(detail: ops::group::GroupDetail) -> Detail {
+fn present(detail: ops::group::GroupDetail, known: &[ops::Known]) -> Detail {
     let members = detail
         .members
         .iter()
@@ -96,10 +115,14 @@ fn present(detail: ops::group::GroupDetail) -> Detail {
             }
             if member.departed {
                 notes.push("has left, awaiting removal");
+            } else if !member.answered && !member.is_me {
+                // Named in the chain, silent so far. Either they have not been reached yet or
+                // they have the invitation and have not decided.
+                notes.push("invited, no answer yet");
             }
 
             MemberItem {
-                username: member.username.clone().into(),
+                username: name_for(member, known).into(),
                 peer: member.peer.to_string().into(),
                 note: notes.join(", ").into(),
                 departed: member.departed,
@@ -197,15 +220,14 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         }
     });
 
-    window.on_add_member(run3(&weak, paths, nudge, |paths, id, peer, username| {
+    window.on_add_member(run3(&weak, paths, nudge, |paths, id, peer, _| {
         let peer =
             ac_net::PeerId::from_str(peer).with_context(|| format!("{peer} is not a peer id"))?;
-        let username = (!username.is_empty()).then_some(username);
-        let added = ops::group::add(paths, id, &peer, username)?;
+        let added = ops::group::add(paths, id, &peer)?;
         Ok(format!(
             "added {}. They are told the next time both nodes are online; being added is an \
-             invitation, and they choose whether to accept.",
-            added.username
+             invitation, and they choose whether to accept. Their name is theirs to publish.",
+            added.peer
         ))
     }));
 
@@ -294,6 +316,12 @@ pub mod tests {
         (tmp, paths)
     }
 
+    /// The page as the poller builds it, directory and all.
+    pub fn page(paths: &Paths, selected: &str) -> Page {
+        let known = ops::peer::list(paths).unwrap_or_default();
+        read(paths, &known, selected)
+    }
+
     /// A peer id belonging to somebody else.
     pub fn somebody_else() -> ac_net::PeerId {
         let elsewhere = tempfile::tempdir().unwrap();
@@ -307,7 +335,7 @@ pub mod tests {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
 
-        let page = read(&paths, &created.id.to_string());
+        let page = page(&paths, &created.id.to_string());
 
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].name, "holiday");
@@ -332,7 +360,7 @@ pub mod tests {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
 
-        let detail = read(&paths, &created.id.to_string()).detail.unwrap();
+        let detail = page(&paths, &created.id.to_string()).detail.unwrap();
 
         // Creating one makes you a member outright, so offering Accept would be nonsense.
         assert_eq!(detail.membership, MEMBER);
@@ -345,7 +373,7 @@ pub mod tests {
         let created = ops::group::create(&paths, "holiday").unwrap();
         let id = created.id.to_string();
 
-        let detail = read(&paths, &id).detail.unwrap();
+        let detail = page(&paths, &id).detail.unwrap();
         assert_eq!(detail.membership, MEMBER);
         assert!(detail.admin, "this is the case the branch turns on");
 
@@ -363,21 +391,48 @@ pub mod tests {
     fn this_node_is_marked_in_the_member_list_and_nobody_else_is() {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
-        ops::group::add(
-            &paths,
-            &created.id.to_string(),
-            &somebody_else(),
-            Some("ana"),
-        )
-        .unwrap();
+        ops::group::add(&paths, &created.id.to_string(), &somebody_else()).unwrap();
 
-        let detail = read(&paths, &created.id.to_string()).detail.unwrap();
+        let detail = page(&paths, &created.id.to_string()).detail.unwrap();
         let me = detail.members.iter().find(|m| m.is_me).unwrap();
-        let ana = detail.members.iter().find(|m| m.username == "ana").unwrap();
 
+        // Creating the group published this node's own standing, so it is named. Nobody else
+        // has spoken yet, so nobody else is.
         assert_eq!(me.username, "jonathan");
-        assert!(!ana.is_me, "and only this node carries the mark");
         assert_eq!(detail.members.iter().filter(|m| m.is_me).count(), 1);
+    }
+
+    /// The chain says who is in a group; only the member says what they are called. Until the
+    /// person who was added publishes a standing, this node has never been told a name for
+    /// them and must not invent one.
+    #[test]
+    fn a_member_who_has_not_spoken_yet_is_shown_by_id_and_marked_as_unanswered() {
+        let (_tmp, paths) = home("jonathan");
+        let created = ops::group::create(&paths, "holiday").unwrap();
+        let them = somebody_else();
+        ops::group::add(&paths, &created.id.to_string(), &them).unwrap();
+
+        let detail = page(&paths, &created.id.to_string()).detail.unwrap();
+        let them = detail.members.iter().find(|m| !m.is_me).unwrap();
+
+        assert_eq!(them.username, them.peer.to_string()[..8].to_string());
+        assert_eq!(them.note, "invited, no answer yet");
+    }
+
+    /// A name this node chose for itself outranks silence, so someone added to a group who is
+    /// also a contact is shown by the contact label, unmarked.
+    #[test]
+    fn a_member_this_node_has_a_name_for_is_shown_by_that_name() {
+        let (_tmp, paths) = home("jonathan");
+        let created = ops::group::create(&paths, "holiday").unwrap();
+        let them = somebody_else();
+        ops::group::add(&paths, &created.id.to_string(), &them).unwrap();
+        ops::peer::add(&paths, &them, "ana").unwrap();
+
+        let detail = page(&paths, &created.id.to_string()).detail.unwrap();
+        let ana = detail.members.iter().find(|m| !m.is_me).unwrap();
+
+        assert_eq!(ana.username, "ana", "a name we chose carries no mark");
     }
 
     #[test]
@@ -386,7 +441,7 @@ pub mod tests {
         let first = ops::group::create(&paths, "first").unwrap();
         ops::group::create(&paths, "second").unwrap();
 
-        let page = read(&paths, &first.id.to_string());
+        let page = page(&paths, &first.id.to_string());
 
         assert_eq!(page.items.len(), 2, "both are listed");
         let detail = page.detail.expect("a selected group has a detail pane");
@@ -400,7 +455,7 @@ pub mod tests {
         let (_tmp, paths) = home("jonathan");
         ops::group::create(&paths, "holiday").unwrap();
 
-        let page = read(&paths, "");
+        let page = page(&paths, "");
 
         assert_eq!(page.items.len(), 1);
         assert!(page.detail.is_none());
@@ -411,9 +466,9 @@ pub mod tests {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
         let them = somebody_else();
-        ops::group::add(&paths, &created.id.to_string(), &them, Some("ana")).unwrap();
+        ops::group::add(&paths, &created.id.to_string(), &them).unwrap();
 
-        let page = read(&paths, &created.id.to_string());
+        let page = page(&paths, &created.id.to_string());
         let detail = page.detail.unwrap();
 
         assert_eq!(detail.members.len(), 2, "the admin and the one just added");
@@ -424,9 +479,9 @@ pub mod tests {
             .expect("this node is a member of a group it created");
         assert_eq!(me.note, "admin, this node");
 
-        let ana = detail.members.iter().find(|m| m.username == "ana").unwrap();
-        assert_eq!(ana.note, "", "a plain member carries no notes");
-        assert!(!ana.departed);
+        let them = detail.members.iter().find(|m| !m.is_me).unwrap();
+        assert_eq!(them.note, "invited, no answer yet", "they have not replied");
+        assert!(!them.departed);
     }
 
     #[test]
@@ -435,7 +490,7 @@ pub mod tests {
         let created = ops::group::create(&paths, "holiday").unwrap();
         ops::group::forget(&paths, &created.id.to_string()).unwrap();
 
-        let page = read(&paths, &created.id.to_string());
+        let page = page(&paths, &created.id.to_string());
 
         assert!(page.items.is_empty());
         assert!(page.detail.is_none());

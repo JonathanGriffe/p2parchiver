@@ -73,10 +73,12 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<()> {
 
     println!();
     println!("members");
+    // A member who has not published a standing yet has told us no name at all.
+    let named = |m: &ops::group::MemberView| m.username.clone().unwrap_or_else(|| "?".to_owned());
     let widest = detail
         .members
         .iter()
-        .map(|m| m.username.len())
+        .map(|m| named(m).len())
         .max()
         .unwrap_or(0);
     for member in &detail.members {
@@ -95,7 +97,7 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<()> {
         } else {
             format!("  ({})", notes.join(", "))
         };
-        println!("  {:<widest$}  {}{note}", member.username, member.peer);
+        println!("  {:<widest$}  {}{note}", named(member), member.peer);
     }
 
     if let Some(log) = detail.log {
@@ -111,10 +113,10 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn add(paths: &Paths, needle: &str, peer: &PeerId, username: Option<&str>) -> Result<()> {
-    let added = ops::group::add(paths, needle, peer, username)?;
+pub fn add(paths: &Paths, needle: &str, peer: &PeerId) -> Result<()> {
+    let added = ops::group::add(paths, needle, peer)?;
 
-    println!("added {} ({})", added.username, added.peer);
+    println!("added {}", added.peer);
     println!();
     println!("They will be told the next time this node and theirs are both online and");
     println!("connected. Being added is an invitation: they choose whether to accept.");

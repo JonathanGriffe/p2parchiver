@@ -134,7 +134,7 @@ impl Groups {
              CREATE TABLE IF NOT EXISTS group_members (
                  group_id  TEXT NOT NULL,
                  peer      TEXT NOT NULL,
-                 username  TEXT NOT NULL,
+                 username  TEXT,
                  is_admin  INTEGER NOT NULL,
                  PRIMARY KEY (group_id, peer)
              );
@@ -229,7 +229,7 @@ impl Groups {
         let rows = stmt.query_map(params![group.to_string()], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(1)?,
                 r.get::<_, i64>(2)?,
             ))
         })?;
@@ -238,7 +238,8 @@ impl Groups {
         for row in rows {
             let (peer, username, is_admin) = row?;
             if let Ok(peer) = peer.parse() {
-                members.insert(peer, username, is_admin != 0);
+                members.insert(peer, is_admin != 0);
+                members.set_username(&peer, username);
             }
         }
         Ok(members)
@@ -360,6 +361,29 @@ impl Groups {
         Ok(out)
     }
 
+    /// What each member last said about itself. A member missing from this has said nothing
+    /// yet: this node holds the chain that names them but has never heard from them.
+    pub fn positions(
+        &self,
+        group: GroupId,
+    ) -> Result<std::collections::HashMap<PeerId, Position>, StoreError> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT peer, position FROM group_standings WHERE group_id = ?1")?;
+        let rows = stmt.query_map(params![group.to_string()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (peer, position) = row?;
+            if let Ok(peer) = peer.parse() {
+                out.insert(peer, position_of(&position));
+            }
+        }
+        Ok(out)
+    }
+
     /// The highest standing seq we hold for ourselves, so the next one climbs past it.
     pub fn my_standing_seq(&self, group: GroupId) -> Result<Option<u64>, StoreError> {
         Ok(self
@@ -386,11 +410,32 @@ impl Groups {
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(|_| StoreError::Entropy)?;
 
-        let chain = Chain::create(key, name, username, nonce, at)?;
+        let chain = Chain::create(key, name, nonce, at)?;
         let id = chain.id();
         if self.get(id)?.is_some() {
             return Err(StoreError::Duplicate { group: id });
         }
+
+        // An admin is never invited to their own group, so nothing else would ever prompt them
+        // to author a standing — and without one they would be the only member of it with no
+        // name. Written here, in the same transaction, so a group is never briefly nameless.
+        let standing = Standing::author(
+            key,
+            id,
+            Standing::next_seq(None),
+            Position::In,
+            username,
+            at,
+        )?;
+        let body = standing.verify(id)?;
+        let mut standings = StandingSet::default();
+        standings.insert(
+            chain.admin(),
+            standing.clone(),
+            body.seq,
+            body.position,
+            body.username,
+        );
 
         let tx = self
             .db
@@ -410,7 +455,8 @@ impl Groups {
         )?;
         write_entries(&tx, id, 0, chain.entries())?;
         set_head(&tx, id, 0, chain.len(), chain.head())?;
-        rebuild_caches(&tx, id, &chain, &StandingSet::default())?;
+        write_standing(&tx, id, &chain.admin(), &standing, body.seq, body.position)?;
+        rebuild_caches(&tx, id, &chain, &standings)?;
         tx.commit()?;
         Ok(id)
     }
@@ -476,7 +522,13 @@ impl Groups {
             if !ever_mentioned(&chain, &peer) {
                 continue;
             }
-            if !set.insert(peer, standing.clone(), body.seq, body.position) {
+            if !set.insert(
+                peer,
+                standing.clone(),
+                body.seq,
+                body.position,
+                body.username.clone(),
+            ) {
                 continue;
             }
             tx.execute(
@@ -557,30 +609,18 @@ impl Groups {
         key: &Keypair,
         group: GroupId,
         position: Position,
+        username: &str,
         at: i64,
     ) -> Result<Standing, StoreError> {
         let seq = Standing::next_seq(self.my_standing_seq(group)?);
-        let standing = Standing::author(key, group, seq, position, at)?;
+        let standing = Standing::author(key, group, seq, position, username, at)?;
         let body = standing.verify(group)?;
 
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT INTO group_standings (group_id, peer, seq, position, body, signature)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(group_id, peer) DO UPDATE SET
-                 seq = excluded.seq, position = excluded.position,
-                 body = excluded.body, signature = excluded.signature",
-            params![
-                group.to_string(),
-                self.me.to_base58(),
-                body.seq as i64,
-                position_str(position),
-                standing.body,
-                standing.signature,
-            ],
-        )?;
+        let me = self.me;
+        write_standing(&tx, group, &me, &standing, body.seq, body.position)?;
         let state = match position {
             Position::Unanswered => State::Pending,
             Position::In => State::Active,
@@ -761,6 +801,33 @@ fn set_head(
     )?)
 }
 
+/// One member's own signed word about itself, written where a transaction is already open.
+fn write_standing(
+    tx: &rusqlite::Transaction<'_>,
+    group: GroupId,
+    peer: &PeerId,
+    standing: &Standing,
+    seq: u64,
+    position: Position,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO group_standings (group_id, peer, seq, position, body, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(group_id, peer) DO UPDATE SET
+             seq = excluded.seq, position = excluded.position,
+             body = excluded.body, signature = excluded.signature",
+        params![
+            group.to_string(),
+            peer.to_base58(),
+            seq as i64,
+            position_str(position),
+            standing.body,
+            standing.signature,
+        ],
+    )?;
+    Ok(())
+}
+
 fn load_standings(
     tx: &rusqlite::Transaction<'_>,
     group: GroupId,
@@ -781,12 +848,19 @@ fn load_standings(
     let mut set = StandingSet::default();
     for row in rows {
         let (peer, seq, position, body, signature) = row?;
+        let standing = Standing { body, signature };
+        // The name lives inside the signed body, so it is read back from there rather than
+        // cached in a column of its own: one copy, and it is the one the signature covers.
+        let Ok(decoded) = standing.body() else {
+            continue;
+        };
         if let Ok(peer) = peer.parse() {
             set.insert(
                 peer,
-                Standing { body, signature },
+                standing,
                 seq as u64,
                 position_of(&position),
+                decoded.username,
             );
         }
     }
@@ -800,7 +874,8 @@ fn rebuild_caches(
     chain: &Chain,
     standings: &StandingSet,
 ) -> Result<(), StoreError> {
-    let members = chain.fold();
+    let mut members = chain.fold();
+    members.name_from(standings);
 
     tx.execute(
         "DELETE FROM group_members WHERE group_id = ?1",
@@ -990,7 +1065,7 @@ mod tests {
         assert_eq!(theirs.news(id).unwrap(), 0, "receiving it says nothing");
 
         theirs
-            .author_standing(&member, id, Position::In, AT)
+            .author_standing(&member, id, Position::In, "someone", AT)
             .unwrap();
         assert_eq!(
             theirs.news(id).unwrap(),
@@ -999,14 +1074,13 @@ mod tests {
         );
     }
 
-    fn add(store: &mut Groups, admin: &Keypair, id: GroupId, peer: PeerId, name: &str) {
+    fn add(store: &mut Groups, admin: &Keypair, id: GroupId, peer: PeerId, _name: &str) {
         store
             .author(
                 admin,
                 id,
                 Op::Add {
                     peer: peer.to_base58(),
-                    username: name.into(),
                 },
                 AT,
             )
@@ -1053,14 +1127,13 @@ mod tests {
         // Build a longer chain elsewhere and offer only its tail.
         let mut source = store.chain(id).unwrap();
         let mut tail = Vec::new();
-        for name in ["bob", "carol"] {
+        for _ in 0..2 {
             tail.push(
                 source
                     .author(
                         &admin,
                         Op::Add {
                             peer: peer_of(&key()).to_base58(),
-                            username: name.into(),
                         },
                         AT,
                     )
@@ -1087,7 +1160,6 @@ mod tests {
                 &admin,
                 Op::Add {
                     peer: peer_of(&key()).to_base58(),
-                    username: "mallory".into(),
                 },
                 AT,
             )
@@ -1243,7 +1315,8 @@ mod tests {
             "and we still answer a member asking for the log, which is not data"
         );
 
-        mine.author_standing(&me, id, Position::In, AT).unwrap();
+        mine.author_standing(&me, id, Position::In, "someone", AT)
+            .unwrap();
         assert_eq!(mine.get(id).unwrap().unwrap().state, State::Active);
         assert_eq!(mine.shared_with(&peer_of(&admin)).unwrap().len(), 1);
     }
@@ -1282,8 +1355,10 @@ mod tests {
             AT,
         )
         .unwrap();
-        mine.author_standing(&me, id, Position::In, AT).unwrap();
-        mine.author_standing(&me, id, Position::Out, AT).unwrap();
+        mine.author_standing(&me, id, Position::In, "someone", AT)
+            .unwrap();
+        mine.author_standing(&me, id, Position::Out, "someone", AT)
+            .unwrap();
         assert_eq!(mine.get(id).unwrap().unwrap().state, State::Left);
 
         // The admin removes and re-adds us; we ingest both.
@@ -1325,12 +1400,12 @@ mod tests {
         let bob = key();
         add(&mut store, &admin, id, peer_of(&bob), "bob");
 
-        let leaving = Standing::author(&bob, id, 1, Position::Out, AT).unwrap();
+        let leaving = Standing::author(&bob, id, 1, Position::Out, "someone", AT).unwrap();
         store.put(id, 1, &[], &[leaving], AT).unwrap();
         assert_eq!(
             store.standings(id).unwrap().len(),
-            1,
-            "still a member, so their word still travels"
+            2,
+            "the admin's own, plus bob's: still a member, so their word still travels"
         );
         assert_eq!(store.departed(id).unwrap(), vec![peer_of(&bob)]);
 
@@ -1345,9 +1420,16 @@ mod tests {
             )
             .unwrap();
 
-        assert!(
-            store.standings(id).unwrap().is_empty(),
-            "ratified, so the entry is the record and the standing is dropped"
+        let held = store.standings(id).unwrap();
+        assert_eq!(
+            held.len(),
+            1,
+            "ratified, so the entry is the record and bob's standing is dropped"
+        );
+        assert_eq!(
+            held[0].subject().unwrap(),
+            peer_of(&admin),
+            "only the admin's own remains"
         );
         assert!(store.departed(id).unwrap().is_empty());
     }
@@ -1360,7 +1442,7 @@ mod tests {
         let bob = key();
         add(&mut store, &admin, id, peer_of(&bob), "bob");
 
-        let standing = Standing::author(&bob, id, 1, Position::Out, AT).unwrap();
+        let standing = Standing::author(&bob, id, 1, Position::Out, "someone", AT).unwrap();
         let first = store
             .put(id, 2, &[], std::slice::from_ref(&standing), AT)
             .unwrap();
@@ -1392,26 +1474,30 @@ mod tests {
         // Otherwise an enrolled peer could grow our database with statements about strangers.
         let (mut store, _admin, id) = admin_store();
         let stranger = key();
-        let junk = Standing::author(&stranger, id, 1, Position::Out, AT).unwrap();
+        let junk = Standing::author(&stranger, id, 1, Position::Out, "someone", AT).unwrap();
 
         store.put(id, 1, &[], &[junk], AT).unwrap();
-        assert!(store.standings(id).unwrap().is_empty());
+        // The admin's own standing is there from creation; the stranger's is not.
+        let held = store.standings(id).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].subject().unwrap(), peer_of(&_admin));
     }
 
     #[test]
     fn a_standing_arriving_before_its_add_is_accepted_afterwards() {
         let (mut store, admin, id) = admin_store();
         let bob = key();
-        let early = Standing::author(&bob, id, 1, Position::Out, AT).unwrap();
+        let early = Standing::author(&bob, id, 1, Position::Out, "someone", AT).unwrap();
 
         store
             .put(id, 1, &[], std::slice::from_ref(&early), AT)
             .unwrap();
-        assert!(store.standings(id).unwrap().is_empty(), "not a member yet");
+        // Only the admin's own, which creation wrote: bob is not a member yet.
+        assert_eq!(store.standings(id).unwrap().len(), 1);
 
         add(&mut store, &admin, id, peer_of(&bob), "bob");
         let applied = store.put(id, 2, &[], &[early], AT).unwrap();
-        assert_eq!(store.standings(id).unwrap().len(), 1);
+        assert_eq!(store.standings(id).unwrap().len(), 2);
         assert_eq!(applied.departed, vec![peer_of(&bob)]);
     }
 
@@ -1435,7 +1521,17 @@ mod tests {
 
         // Every field, not just the peer ids: a cache that defaulted the rest would be a
         // quiet trap for whoever reads `is_admin` back.
-        assert_eq!(store.members(id).unwrap(), store.chain(id).unwrap().fold());
+        // The chain says who; the standings say what they are called, so a bare fold is
+        // compared against a bare fold.
+        let mut set = StandingSet::default();
+        for held in store.standings(id).unwrap() {
+            let body = held.verify(id).unwrap();
+            let peer = body.peer.parse().unwrap();
+            set.insert(peer, held, body.seq, body.position, body.username);
+        }
+        let mut folded = store.chain(id).unwrap().fold();
+        folded.name_from(&set);
+        assert_eq!(store.members(id).unwrap(), folded);
         assert_eq!(store.members(id).unwrap().len(), 5); // admin + 5 added - 1 removed
 
         let admin_peer = peer_of(&admin);
@@ -1456,7 +1552,7 @@ mod tests {
         add(&mut store, &admin, id, peer_of(&bob), "bob");
         let before = store.get(id).unwrap().unwrap().standings_digest;
 
-        let standing = Standing::author(&bob, id, 1, Position::Out, AT).unwrap();
+        let standing = Standing::author(&bob, id, 1, Position::Out, "someone", AT).unwrap();
         store.put(id, 2, &[], &[standing], AT).unwrap();
 
         assert_ne!(store.get(id).unwrap().unwrap().standings_digest, before);
@@ -1512,14 +1608,17 @@ mod tests {
     #[test]
     fn our_own_standing_seq_climbs_and_never_repeats() {
         let (mut store, admin, id) = admin_store();
-        assert_eq!(store.my_standing_seq(id).unwrap(), None);
+        // Creating the group already spoke once: the admin names themselves there.
+        assert_eq!(store.my_standing_seq(id).unwrap(), Some(1));
 
         store
-            .author_standing(&admin, id, Position::Out, AT)
+            .author_standing(&admin, id, Position::Out, "someone", AT)
             .unwrap();
-        assert_eq!(store.my_standing_seq(id).unwrap(), Some(1));
-        store.author_standing(&admin, id, Position::In, AT).unwrap();
         assert_eq!(store.my_standing_seq(id).unwrap(), Some(2));
+        store
+            .author_standing(&admin, id, Position::In, "someone", AT)
+            .unwrap();
+        assert_eq!(store.my_standing_seq(id).unwrap(), Some(3));
     }
 
     #[test]

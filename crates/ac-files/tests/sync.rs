@@ -153,7 +153,7 @@ fn share_group(nodes: &mut [&mut Node]) -> GroupId {
         .create(&admin_key, "holiday", "admin", AT)
         .unwrap();
 
-    for (i, peer) in members.iter().enumerate() {
+    for peer in members.iter() {
         nodes[0]
             .sync
             .groups_mut()
@@ -162,7 +162,6 @@ fn share_group(nodes: &mut [&mut Node]) -> GroupId {
                 id,
                 Op::Add {
                     peer: peer.to_base58(),
-                    username: format!("member{i}"),
                 },
                 AT,
             )
@@ -183,7 +182,7 @@ fn share_group(nodes: &mut [&mut Node]) -> GroupId {
         node.sync.groups_mut().adopt(&entries, &[], AT).unwrap();
         node.sync
             .groups_mut()
-            .author_standing(&key, id, Position::In, AT)
+            .author_standing(&key, id, Position::In, "someone", AT)
             .unwrap();
     }
     id

@@ -61,7 +61,7 @@ impl Node {
             .create(&key, "holiday", "alice", AT)
             .unwrap();
 
-        for (i, peer) in members.iter().enumerate() {
+        for peer in members.iter() {
             self.peers
                 .groups_mut()
                 .author(
@@ -69,7 +69,6 @@ impl Node {
                     id,
                     Op::Add {
                         peer: peer.to_base58(),
-                        username: format!("member{i}"),
                     },
                     AT,
                 )
@@ -141,7 +140,6 @@ impl Node {
                 group,
                 Op::Add {
                     peer: peer.to_base58(),
-                    username: "newcomer".into(),
                 },
                 AT,
             )
@@ -149,7 +147,7 @@ impl Node {
     }
 
     fn accept_invite(&mut self, group: GroupId, key: &Keypair) {
-        let standing = Standing::author(key, group, 1, Position::In, AT).unwrap();
+        let standing = Standing::author(key, group, 1, Position::In, "someone", AT).unwrap();
         let entries: Vec<_> = self
             .peers
             .groups_mut()
@@ -517,7 +515,6 @@ fn adding_a_member_provokes_a_round_although_no_file_changed() {
             id,
             Op::Add {
                 peer: newcomer.to_base58(),
-                username: "new".into(),
             },
             AT,
         )

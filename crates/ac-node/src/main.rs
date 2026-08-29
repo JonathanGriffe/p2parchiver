@@ -84,8 +84,6 @@ enum GroupCommand {
     Add {
         group: String,
         peer: PeerId,
-        #[arg(long)]
-        username: Option<String>,
     },
     Remove {
         group: String,
@@ -162,11 +160,7 @@ fn main() -> Result<()> {
         Command::Group(GroupCommand::Create { name }) => cmd::group::create(&paths, &name),
         Command::Group(GroupCommand::List) => cmd::group::list(&paths),
         Command::Group(GroupCommand::Show { group, log }) => cmd::group::show(&paths, &group, log),
-        Command::Group(GroupCommand::Add {
-            group,
-            peer,
-            username,
-        }) => cmd::group::add(&paths, &group, &peer, username.as_deref()),
+        Command::Group(GroupCommand::Add { group, peer }) => cmd::group::add(&paths, &group, &peer),
         Command::Group(GroupCommand::Remove { group, peer }) => {
             cmd::group::remove(&paths, &group, &peer)
         }

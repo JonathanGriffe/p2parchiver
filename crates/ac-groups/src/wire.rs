@@ -71,19 +71,18 @@ mod tests {
 
     fn sample() -> (Chain, Standing) {
         let admin = Keypair::generate_ed25519();
-        let mut chain = Chain::create(&admin, "family", "alice", [1u8; 16], AT).unwrap();
+        let mut chain = Chain::create(&admin, "family", [1u8; 16], AT).unwrap();
         let bob = Keypair::generate_ed25519();
         chain
             .author(
                 &admin,
                 Op::Add {
                     peer: bob.public().to_peer_id().to_base58(),
-                    username: "bob".into(),
                 },
                 AT,
             )
             .unwrap();
-        let standing = Standing::author(&bob, chain.id(), 1, Position::Out, AT).unwrap();
+        let standing = Standing::author(&bob, chain.id(), 1, Position::Out, "someone", AT).unwrap();
         (chain, standing)
     }
 
@@ -111,22 +110,15 @@ mod tests {
     #[test]
     fn a_chain_transfers_at_a_size_that_leaves_room_for_real_history() {
         let admin = Keypair::generate_ed25519();
-        let mut chain = Chain::create(&admin, "family", "alice", [1u8; 16], AT).unwrap();
+        let mut chain = Chain::create(&admin, "family", [1u8; 16], AT).unwrap();
 
-        for i in 0..50 {
+        for _ in 0..50 {
             let p = Keypair::generate_ed25519()
                 .public()
                 .to_peer_id()
                 .to_base58();
             chain
-                .author(
-                    &admin,
-                    Op::Add {
-                        peer: p.clone(),
-                        username: format!("user{i}"),
-                    },
-                    AT,
-                )
+                .author(&admin, Op::Add { peer: p.clone() }, AT)
                 .unwrap();
             chain.author(&admin, Op::Remove { peer: p }, AT).unwrap();
         }

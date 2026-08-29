@@ -120,7 +120,7 @@ pub fn status(paths: &Paths) -> Result<StatusReport> {
     let names: HashMap<PeerId, String> =
         directory::everyone(&contacts(paths)?, &groups, identity.peer_id())?
             .into_iter()
-            .map(|entry| (entry.peer, entry.name))
+            .filter_map(|entry| Some((entry.peer, entry.name?)))
             .collect();
     let name = |peer: &PeerId| {
         names
