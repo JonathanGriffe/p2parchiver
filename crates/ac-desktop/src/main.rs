@@ -112,6 +112,11 @@ fn main() -> Result<()> {
     settings::wire(&window, &paths, &node, &nudge);
     settings::load(&window, &paths);
 
+    // Asked once, on the way in. A node that has not enrolled can prove nothing about itself
+    // and every connection it makes is refused, so this is worth saying before anything else
+    // is tried rather than leaving it to be discovered.
+    window.set_show_enrol(!window.get_enrolled());
+
     if showing {
         window.show().context("showing the window")?;
     }

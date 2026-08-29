@@ -109,8 +109,9 @@ fn describe_liveness(report: &StatusReport) -> (bool, String) {
 
 fn describe_groups(count: usize, report: Option<&StatusReport>) -> String {
     if count == 0 {
-        // The sentence the CLI prints for the same state.
-        return "none yet. create one with: ac group create --name <name>".to_owned();
+        // The Groups page is one click away and says how; a summary line only has to say
+        // what is true.
+        return "no groups".to_owned();
     }
 
     let groups = match count {

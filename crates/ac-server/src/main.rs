@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use libp2p::PeerId;
+use libp2p::{Multiaddr, PeerId};
 
 use ac_net::config::Paths;
 
@@ -65,6 +65,10 @@ enum InviteCommand {
         /// Hours until the code expires.
         #[arg(long, default_value_t = 24)]
         ttl_hours: i64,
+        /// The enrolment address to put in the token, if `external` in config.toml does not
+        /// already say where this server is reached.
+        #[arg(long)]
+        address: Option<Multiaddr>,
     },
     /// Show every invite and whether it has been used.
     List,
@@ -95,9 +99,11 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init => cmd::init::run(&paths),
         Command::Run => cmd::run::run(&paths),
-        Command::Invite(InviteCommand::New { label, ttl_hours }) => {
-            cmd::invite::new(&paths, &label, ttl_hours)
-        }
+        Command::Invite(InviteCommand::New {
+            label,
+            ttl_hours,
+            address,
+        }) => cmd::invite::new(&paths, &label, ttl_hours, address.as_ref()),
         Command::Invite(InviteCommand::List) => cmd::invite::list(&paths),
         Command::Client(ClientCommand::List) => cmd::client::list(&paths),
         Command::Client(ClientCommand::Revoke { peer }) => cmd::client::revoke(&paths, &peer),

@@ -28,9 +28,10 @@ struct Cli {
 enum Command {
     Id,
 
+    /// Enrol with a server, using the token its operator gave you.
     Join {
-        server: Multiaddr,
-        code: String,
+        /// The invite token, as `ac-server invite new` printed it.
+        token: String,
         #[arg(long)]
         username: String,
     },
@@ -146,11 +147,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Id => cmd::id::run(&paths),
-        Command::Join {
-            server,
-            code,
-            username,
-        } => cmd::join::run(&paths, &server, &code, &username),
+        Command::Join { token, username } => cmd::join::run(&paths, &token, &username),
         Command::Run { dial } => cmd::run::run(&paths, &dial),
         Command::Probe { peer } => cmd::probe::run(&paths, peer),
         Command::Peer(PeerCommand::Add { peer, label }) => cmd::peer::add(&paths, &peer, &label),

@@ -105,26 +105,6 @@ export component PeersView inherits VerticalLayout {
         }
     }
 
-    if root.contacts.length == 0 && root.discovered.length == 0 : Card {
-        VerticalLayout {
-            padding: Theme.md;
-            spacing: Theme.xs;
-            // The two sentences the CLI prints for the same state.
-            Text {
-                text: "nobody yet. add someone with: ac peer add <peer-id> --label <name>";
-                color: Theme.dim;
-                font-size: Theme.body-size;
-                wrap: word-wrap;
-            }
-            Text {
-                text: "fellow members of your groups appear here too.";
-                color: Theme.dim;
-                font-size: Theme.body-size;
-                wrap: word-wrap;
-            }
-        }
-    }
-
     if root.contacts.length > 0 || root.discovered.length > 0 : ScrollView {
         VerticalLayout {
             spacing: Theme.sm;

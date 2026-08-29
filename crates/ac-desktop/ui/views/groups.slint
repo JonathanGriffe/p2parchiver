@@ -207,19 +207,6 @@ export component GroupsView inherits Rectangle {
                 }
             }
 
-            if root.groups.length == 0 : Card {
-                VerticalLayout {
-                    padding: Theme.md;
-                    Text {
-                        // The sentence the CLI prints for the same state.
-                        text: "no groups. create one with: ac group create --name <name>";
-                        color: Theme.dim;
-                        font-size: Theme.body-size;
-                        wrap: word-wrap;
-                    }
-                }
-            }
-
             ScrollView {
                 VerticalLayout {
                     spacing: 2px;

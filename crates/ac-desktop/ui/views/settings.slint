@@ -49,7 +49,7 @@ export component SettingsView inherits ScrollView {
     callback set-autostart(bool);
     callback open-logs();
     callback restart();
-    callback join(string, string, string);
+    callback join(string, string);
 
     VerticalLayout {
         spacing: Theme.md;
@@ -165,18 +165,17 @@ export component SettingsView inherits ScrollView {
 
                 Row {
                     label: root.enrolled ? "Enrol again" : "Enrol";
-                    hint: "The address must end with /p2p/<peer-id>. Enrolling restarts the node.";
+                    hint: "The token carries the server's address and peer id. Enrolling restarts the node.";
                     VerticalLayout {
                         spacing: Theme.sm;
-                        address := LineEdit { placeholder-text: "/ip4/…/udp/…/quic-v1/p2p/…"; }
+                        token := LineEdit { placeholder-text: "invite token"; }
                         HorizontalLayout {
                             spacing: Theme.sm;
-                            code := LineEdit { placeholder-text: "invite code"; horizontal-stretch: 1; }
-                            who := LineEdit { placeholder-text: "username"; width: 160px; }
+                            who := LineEdit { placeholder-text: "username"; horizontal-stretch: 1; }
                             Button {
                                 text: "Enrol";
-                                enabled: address.text != "" && code.text != "" && who.text != "" && !root.busy;
-                                clicked => { root.join(address.text, code.text, who.text); }
+                                enabled: token.text != "" && who.text != "" && !root.busy;
+                                clicked => { root.join(token.text, who.text); }
                             }
                         }
                     }

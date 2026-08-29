@@ -9,6 +9,7 @@ license.workspace = true
 libp2p.workspace = true
 serde.workspace = true
 ciborium.workspace = true
+bs58.workspace = true
 toml.workspace = true
 directories.workspace = true
 tracing.workspace = true

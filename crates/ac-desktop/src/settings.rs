@@ -150,22 +150,17 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
         let paths = paths.clone();
         let node = node.clone();
         let nudge = nudge.clone();
-        move |address, code, username| {
+        move |token, username| {
             let (paths, node, nudge) = (paths.clone(), node.clone(), nudge.clone());
-            let (address, code, username) =
-                (address.to_string(), code.to_string(), username.to_string());
+            let (token, username) = (token.to_string(), username.to_string());
             work::begin(&weak);
 
             let reload = paths.clone();
             work::action(
                 &weak,
                 move || {
-                    let server = address
-                        .parse()
-                        .with_context(|| format!("{address} is not an address"))?;
-
                     stop(&node)?;
-                    let enrolled = ops::join::run(&paths, &server, &code, &username);
+                    let enrolled = ops::join::from_token(&paths, &token, &username);
                     start(&node, &paths)?;
 
                     let enrolled = enrolled?;
@@ -176,6 +171,11 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
                 },
                 move |window, outcome| {
                     load(window, &reload);
+                    // Only once it actually worked: a failed attempt leaves the dialog up
+                    // with the message underneath saying why.
+                    if window.get_enrolled() {
+                        window.set_show_enrol(false);
+                    }
                     work::finish(window, outcome, &nudge);
                 },
             );

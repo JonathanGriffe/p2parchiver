@@ -57,6 +57,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Invite codes: OS randomness, and a hash so a leaked database backup does
 # not hand over live invites.
 getrandom = "0.4"
+# Invite tokens: the alphabet peer ids already use, plus the checksum that catches a token
+# which lost a character between the operator and whoever they sent it to.
+bs58 = { version = "0.5", features = ["check"] }
 sha2 = "0.10"
 hex = "0.4"
 

@@ -1,12 +1,11 @@
 use anyhow::Result;
-use libp2p::Multiaddr;
 
 use ac_net::config::Paths;
 
 use crate::ops;
 
-pub fn run(paths: &Paths, server: &Multiaddr, code: &str, username: &str) -> Result<()> {
-    let enrolled = ops::join::run(paths, server, code, username)?;
+pub fn run(paths: &Paths, token: &str, username: &str) -> Result<()> {
+    let enrolled = ops::join::from_token(paths, token, username)?;
 
     println!("enrolled as {}", enrolled.username);
     println!("peer     {}", enrolled.peer);
@@ -17,8 +16,8 @@ pub fn run(paths: &Paths, server: &Multiaddr, code: &str, username: &str) -> Res
         enrolled.attested_for
     );
     println!();
-    println!("Compare that server peer id against what `ac-server init` printed. It is");
-    println!("pinned now: a different server at the same address will fail to connect.");
+    println!("That server is pinned now: a different one at the same address will fail to");
+    println!("connect. The token you used is what said which server to expect.");
 
     Ok(())
 }

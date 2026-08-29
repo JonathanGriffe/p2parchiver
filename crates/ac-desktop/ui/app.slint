@@ -5,6 +5,7 @@ import { PeersView, PeerItem } from "views/peers.slint";
 import { FilesView, FileItem } from "views/files.slint";
 import { SettingsView } from "views/settings.slint";
 import { AboutView } from "views/about.slint";
+import { EnrolDialog } from "views/enrol.slint";
 
 // Re-exported so slint-build generates the Rust structs the models are built from.
 export { GroupItem, MemberItem, PeerItem, FileItem, StorageSlice, TrafficRow }
@@ -105,6 +106,9 @@ export component MainWindow inherits Window {
     in-out property <string> bandwidth-max;
     in-out property <string> server;
     in-out property <bool> enrolled;
+    // Raised once at startup for a node that has never enrolled, and lowered for good the
+    // moment it has or the moment it is waved away.
+    in-out property <bool> show-enrol;
     in-out property <bool> autostart;
     in-out property <string> autostart-warning;
 
@@ -136,7 +140,7 @@ export component MainWindow inherits Window {
     callback set-autostart(bool);
     callback open-logs();
     callback restart();
-    callback join(string, string, string);
+    callback join(string, string);
 
     property <int> tab: 0;
 
@@ -280,7 +284,7 @@ export component MainWindow inherits Window {
                 set-autostart(on) => { root.set-autostart(on); }
                 open-logs() => { root.open-logs(); }
                 restart() => { root.restart(); }
-                join(a, c, u) => { root.join(a, c, u); }
+                join(t, u) => { root.join(t, u); }
             }
 
             if root.tab == 5 : AboutView {
@@ -308,5 +312,11 @@ export component MainWindow inherits Window {
                 }
             }
         }
+    }
+
+    if root.show-enrol : EnrolDialog {
+        busy: root.busy;
+        enrol(t, u) => { root.join(t, u); }
+        dismissed => { root.show-enrol = false; }
     }
 }

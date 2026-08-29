@@ -10,6 +10,7 @@ use ac_net::attest::{self, Attestation, normalise_username};
 use ac_net::authz::AcceptAnyPeer;
 use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
+use ac_net::invite::Invite;
 use ac_net::proto::{EnrollRequest, EnrollResponse};
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
 
@@ -23,6 +24,15 @@ pub struct Enrolled {
     pub service: Multiaddr,
     /// Hours this node is attested for. Renewed automatically while the node is running.
     pub attested_for: i64,
+}
+
+/// Enrol using the one token an operator hands out.
+///
+/// The token is the whole point: the address and the server's peer id travel with the code,
+/// so pinning the right server costs whoever is joining nothing but a paste.
+pub fn from_token(paths: &Paths, token: &str, username: &str) -> Result<Enrolled> {
+    let invite = Invite::decode(token).map_err(|e| anyhow!("{e}"))?;
+    run(paths, &invite.server, &invite.code, username)
 }
 
 pub fn run(paths: &Paths, server: &Multiaddr, code: &str, username: &str) -> Result<Enrolled> {

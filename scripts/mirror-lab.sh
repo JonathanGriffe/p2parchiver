@@ -85,11 +85,14 @@ TOML
 enrol() {
     local who=$1
     mkdir -p "$LAB/$who"
-    local code
-    # By field, not by shape: the server peer id on the last line also looks like a token,
-    # and picking it produced "this does not look like an invite code" from three lines away.
-    code=$(AC_SERVER_HOME="$LAB/srv" "$ACS" invite new --label "$who" | awk '/^invite/ {print $2}')
-    ac "$who" join "$ENROL" "$code" --username "$who" >/dev/null
+    local token
+    # By field, not by shape: the server peer id and the token both look like one blob of
+    # base58, and picking by shape produced an error from three lines away.
+    #
+    # No --address: the server builds one from its own `external` host and `listen_enroll`
+    # port, which is the path a real operator's server takes.
+    token=$(AC_SERVER_HOME="$LAB/srv" "$ACS" invite new --label "$who" | awk '/^token/ {print $2}')
+    ac "$who" join "$token" --username "$who" >/dev/null
 
     sed -i 's/^mdns = .*/mdns = false/' "$LAB/$who/config.toml"
     echo "  $who $(ac "$who" id)"
@@ -161,8 +164,8 @@ main() {
     say "one group, two members"
     ac alice group create --name holiday >/dev/null
     GROUP=$(group_id alice)
-    ac alice group add "$GROUP" "$BOB" --username bob >/dev/null
-    ac alice group add "$GROUP" "$CAROL" --username carol >/dev/null
+    ac alice group add "$GROUP" "$BOB" >/dev/null
+    ac alice group add "$GROUP" "$CAROL" >/dev/null
 
     mkdir -p "$LAB/content"
     head -c 300000 /dev/urandom > "$LAB/content/photo.jpg"
@@ -212,7 +215,7 @@ main() {
     say "4. a new member is reached in seconds, not hours"
     run_node dave
     sleep 2
-    ac alice group add "$GROUP" "$DAVE" --username dave >/dev/null
+    ac alice group add "$GROUP" "$DAVE" >/dev/null
     if wait_for 120 "dave to hear about the group" in_group dave; then
         ok "dave learned the group promptly after being added"
     else
@@ -286,7 +289,7 @@ main() {
     run_node alice
     run_desktop_node erin
     sleep 2
-    ac alice group add "$GROUP" "$ERIN" --username erin >/dev/null
+    ac alice group add "$GROUP" "$ERIN" >/dev/null
 
     if wait_for "$SETTLE" "erin to hear about the group" in_group erin; then
         ok "the desktop app's node learned the group, with no --dial and no window"
