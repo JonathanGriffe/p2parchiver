@@ -1,4 +1,4 @@
-import { Theme, Card, Dot } from "../theme.slint";
+import { Theme, Card, Dot, IdText, CopyButton } from "../theme.slint";
 
 // One group's share of the storage bar. Rust lays these out, including where each starts:
 // Slint cannot accumulate a running total across a `for`.
@@ -62,6 +62,8 @@ export component StatusView inherits VerticalLayout {
     in property <int> storage-used-room;
     in property <[TrafficRow]> traffic;
 
+    callback copy-peer-id();
+
     spacing: Theme.md;
 
     SectionTitle { text: "THIS NODE"; }
@@ -85,13 +87,11 @@ export component StatusView inherits VerticalLayout {
                     overflow: elide;
                     horizontal-stretch: 1;
                 }
-                Text {
-                    text: root.peer-id;
-                    color: Theme.faint;
-                    font-size: Theme.small-size;
-                    font-family: Theme.mono;
-                    vertical-alignment: center;
-                    overflow: elide;
+                IdText { id: root.peer-id; }
+                CopyButton {
+                    value: root.peer-id;
+                    y: (parent.height - self.height) / 2;
+                    copied => { root.copy-peer-id(); }
                 }
             }
 

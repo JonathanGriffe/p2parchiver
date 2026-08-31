@@ -32,21 +32,19 @@ component SectionTitle inherits Text {
 export component SettingsView inherits ScrollView {
     // Loaded once and after each save, never on the poll: refreshing these every two seconds
     // would overwrite whatever is half-typed.
-    in property <string> listen;
-    in property <string> external;
     in property <bool> mdns;
     in property <string> storage-root;
     in property <string> storage-max;
     in property <string> bandwidth-max;
     in property <string> server;
 
-    in property <bool> autostart;
-    in property <string> autostart-warning;
     in property <bool> busy;
     in property <bool> enrolled;
 
-    callback save(string, string, bool, string, string, string);
-    callback set-autostart(bool);
+    callback save(bool, string, string, string);
+    // Hands back what the field should read, which is what it already read if nothing was
+    // chosen.
+    callback pick-storage-root(string) -> string;
     callback open-logs();
     callback restart();
     callback join(string, string);
@@ -60,18 +58,6 @@ export component SettingsView inherits ScrollView {
             VerticalLayout {
                 padding: Theme.md;
                 spacing: Theme.md;
-
-                Row {
-                    label: "Listen on";
-                    hint: "One multiaddr per line. Port 0 asks the system for a free one.";
-                    listen := LineEdit { text: root.listen; }
-                }
-
-                Row {
-                    label: "Announce as";
-                    hint: "Addresses to advertise beyond the ones discovered. Usually empty.";
-                    external := LineEdit { text: root.external; }
-                }
 
                 mdns := CheckBox {
                     text: "Find peers on the local network (mDNS)";
@@ -90,12 +76,25 @@ export component SettingsView inherits ScrollView {
                 Row {
                     label: "Keep files in";
                     hint: "Empty means the default inside this node's home.";
-                    root-dir := LineEdit { text: root.storage-root; }
+                    HorizontalLayout {
+                        spacing: Theme.sm;
+                        root-dir := LineEdit {
+                            text: root.storage-root;
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "Browse…";
+                            enabled: !root.busy;
+                            clicked => {
+                                root-dir.text = root.pick-storage-root(root-dir.text);
+                            }
+                        }
+                    }
                 }
 
                 Row {
-                    label: "Stop mirroring past";
-                    hint: "Like 500 GB. Say \"unlimited\" for no ceiling beyond the free-space floor the node keeps anyway.";
+                    label: "Storage Limit";
+                    hint: "Like 500 GB. Say \"unlimited\" for no ceiling beyond the disk space.";
                     max := LineEdit { text: root.storage-max; }
                 }
 
@@ -114,10 +113,7 @@ export component SettingsView inherits ScrollView {
                 primary: true;
                 enabled: !root.busy;
                 clicked => {
-                    root.save(
-                        listen.text, external.text, mdns.checked,
-                        root-dir.text, max.text, bandwidth.text,
-                    );
+                    root.save(mdns.checked, root-dir.text, max.text, bandwidth.text);
                 }
             }
             Button {
@@ -163,9 +159,10 @@ export component SettingsView inherits ScrollView {
                     wrap: word-wrap;
                 }
 
-                Row {
-                    label: root.enrolled ? "Enrol again" : "Enrol";
-                    hint: "The token carries the server's address and peer id. Enrolling restarts the node.";
+                // Only a node that has not enrolled is offered the form: enrolling again is
+                // the dialog's job, on the way in.
+                if !root.enrolled : Row {
+                    label: "Enrol";
                     VerticalLayout {
                         spacing: Theme.sm;
                         token := LineEdit { placeholder-text: "invite token"; }
@@ -189,20 +186,6 @@ export component SettingsView inherits ScrollView {
             VerticalLayout {
                 padding: Theme.md;
                 spacing: Theme.sm;
-
-                CheckBox {
-                    text: "Start when I log in";
-                    checked: root.autostart;
-                    enabled: !root.busy;
-                    toggled => { root.set-autostart(self.checked); }
-                }
-
-                if root.autostart-warning != "" : Text {
-                    text: root.autostart-warning;
-                    color: Theme.warn;
-                    font-size: Theme.small-size;
-                    wrap: word-wrap;
-                }
 
                 HorizontalLayout {
                     alignment: start;

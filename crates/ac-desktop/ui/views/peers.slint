@@ -1,5 +1,5 @@
 import { ScrollView, Button, LineEdit } from "std-widgets.slint";
-import { Theme, Card, ToneDot } from "../theme.slint";
+import { Theme, Card, ToneDot, IdText } from "../theme.slint";
 
 // One row of `ac peer list`, with what `ac peer status` knows about the same peer folded in.
 // Which section a row is in says how this node knows them, so no row carries that itself.
@@ -19,12 +19,12 @@ component SectionTitle inherits Text {
 }
 
 // One person, drawn the same way however this node came to know them.
-component PeerCard inherits Card {
+export component PeerCard inherits Card {
     in property <PeerItem> peer;
     in property <bool> busy;
-    // Only a contact is this node's to drop, so whether there is a button is the list's call.
-    in property <bool> removable;
-    callback remove(string);
+    // The button on the right, if the list wants one. Its label is the list's call.
+    in property <string> action;
+    callback acted(string);
 
     HorizontalLayout {
         padding: Theme.md;
@@ -47,13 +47,7 @@ component PeerCard inherits Card {
                 overflow: elide;
             }
 
-            Text {
-                text: root.peer.peer;
-                color: Theme.faint;
-                font-size: Theme.small-size;
-                font-family: Theme.mono;
-                overflow: elide;
-            }
+            IdText { id: root.peer.peer; }
 
             Text {
                 text: root.peer.state;
@@ -62,10 +56,10 @@ component PeerCard inherits Card {
             }
         }
 
-        if root.removable : Button {
-            text: "Remove";
+        if root.action != "" : Button {
+            text: root.action;
             enabled: !root.busy;
-            clicked => { root.remove(root.peer.peer); }
+            clicked => { root.acted(root.peer.peer); }
         }
     }
 }
@@ -114,8 +108,8 @@ export component PeersView inherits VerticalLayout {
             for peer in root.contacts : PeerCard {
                 peer: peer;
                 busy: root.busy;
-                removable: true;
-                remove(id) => { root.remove(id); }
+                action: "Remove";
+                acted(id) => { root.remove(id); }
             }
 
             if root.contacts.length > 0 && root.discovered.length > 0 : Rectangle {
@@ -128,7 +122,6 @@ export component PeersView inherits VerticalLayout {
             for peer in root.discovered : PeerCard {
                 peer: peer;
                 busy: root.busy;
-                removable: false;
             }
 
             Rectangle { vertical-stretch: 1; }

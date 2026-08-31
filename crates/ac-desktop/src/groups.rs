@@ -9,13 +9,13 @@ use std::str::FromStr;
 
 use ac_net::config::Paths;
 use ac_node::ops;
-use ac_node::ops::format::{State, state_name};
+use ac_node::ops::format::{State, human_size, state_name};
 use anyhow::{Context, Result};
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::peers;
 use crate::selection::Selection;
-use crate::ui::{GroupItem, MainWindow, MemberItem};
+use crate::ui::{GroupItem, MainWindow, MemberItem, PeerItem};
 use crate::work::{self, Nudge};
 
 /// Everything the page shows, read in one pass off the event loop.
@@ -31,9 +31,13 @@ pub struct Detail {
     pub state: String,
     /// Which actions apply, as [`INVITED`], [`MEMBER`] or [`GONE`].
     pub membership: i32,
-    pub entries: String,
+    /// How much the group holds, and where those bytes live on this node.
+    pub content: String,
+    pub dir: String,
     pub admin: bool,
     pub members: Vec<MemberItem>,
+    /// Who the Add dialog offers, in the Peers page's two lists less this group's members.
+    pub candidates: peers::Page,
 }
 
 const INVITED: i32 = 0;
@@ -66,10 +70,39 @@ fn membership(state: State) -> i32 {
     }
 }
 
-pub fn read(paths: &Paths, known: &[ops::Known], selected: &str) -> Page {
+/// What this node is to a group, in the words the page shows.
+fn standing(state: State) -> &'static str {
+    match state {
+        State::Pending => "invited",
+        State::Active => "member",
+        State::Left => "left",
+    }
+}
+
+/// What the group holds. Every file in it, not only the ones this node has fetched: the
+/// question is what the group is, and the Status page answers what is on this disk.
+fn describe_content(files: usize, bytes: u64) -> String {
+    match files {
+        0 => "no files".to_owned(),
+        1 => format!("1 file, {}", human_size(bytes)),
+        n => format!("{n} files, {}", human_size(bytes)),
+    }
+}
+
+/// Whether the page has any business showing a group.
+///
+/// Leaving is this node's own decision and takes effect here at once, whatever the admin has
+/// or has not written yet. Listing it until they ratify would be showing someone a group they
+/// have already walked out of.
+fn listed(state: State) -> bool {
+    !matches!(state, State::Left)
+}
+
+pub fn read(paths: &Paths, known: &[ops::Known], directory: &peers::Page, selected: &str) -> Page {
     let items = match ops::group::list(paths) {
         Ok(summaries) => summaries
             .iter()
+            .filter(|group| listed(group.state))
             .map(|group| GroupItem {
                 name: group.name.clone().into(),
                 id: group.id.to_string().into(),
@@ -95,12 +128,36 @@ pub fn read(paths: &Paths, known: &[ops::Known], selected: &str) -> Page {
     let detail = (!selected.is_empty())
         .then(|| ops::group::show(paths, selected, false).ok())
         .flatten()
-        .map(|detail| present(detail, known));
+        // Left from another window or the CLI while this one was looking at it.
+        .filter(|detail| listed(detail.row.state))
+        .map(|detail| present(detail, known, directory, content(paths, selected)));
 
     Page { items, detail }
 }
 
-fn present(detail: ops::group::GroupDetail, known: &[ops::Known]) -> Detail {
+/// What the group holds and where, read off the file index rather than the chain.
+fn content(paths: &Paths, selected: &str) -> (String, String) {
+    match ops::file::list(paths, selected, None, false) {
+        Ok(listing) => (
+            describe_content(
+                listing.rows.len(),
+                listing.rows.iter().map(|r| r.size).sum(),
+            ),
+            listing.dir.display().to_string(),
+        ),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not list a group's files");
+            (describe_content(0, 0), String::new())
+        }
+    }
+}
+
+fn present(
+    detail: ops::group::GroupDetail,
+    known: &[ops::Known],
+    directory: &peers::Page,
+    (content, dir): (String, String),
+) -> Detail {
     let members = detail
         .members
         .iter()
@@ -134,11 +191,27 @@ fn present(detail: ops::group::GroupDetail, known: &[ops::Known]) -> Detail {
     Detail {
         name: detail.row.name.clone(),
         id: detail.row.id.to_string(),
-        state: state_name(detail.row.state).to_owned(),
+        state: standing(detail.row.state).to_owned(),
         membership: membership(detail.row.state),
-        entries: detail.row.head_seq.to_string(),
+        content,
+        dir,
         admin: detail.is_admin,
+        candidates: candidates(directory, &detail.members),
         members,
+    }
+}
+
+/// Everyone this node knows of who is not in the group already. Offering a member again
+/// would only earn them the refusal the CLI gives.
+fn candidates(directory: &peers::Page, members: &[ops::group::MemberView]) -> peers::Page {
+    let mine = |item: &PeerItem| members.iter().any(|m| item.peer == m.peer.to_string());
+    let without_members = |list: &[PeerItem]| -> Vec<PeerItem> {
+        list.iter().filter(|item| !mine(item)).cloned().collect()
+    };
+
+    peers::Page {
+        contacts: without_members(&directory.contacts),
+        discovered: without_members(&directory.discovered),
     }
 }
 
@@ -147,6 +220,8 @@ pub fn apply(window: &MainWindow, page: Page) {
 
     let Some(detail) = page.detail else {
         window.set_group_members(ModelRc::from(Rc::new(VecModel::from(Vec::new()))));
+        window.set_group_add_contacts(ModelRc::from(Rc::new(VecModel::from(Vec::new()))));
+        window.set_group_add_discovered(ModelRc::from(Rc::new(VecModel::from(Vec::new()))));
         return;
     };
 
@@ -154,9 +229,16 @@ pub fn apply(window: &MainWindow, page: Page) {
     window.set_group_id(detail.id.into());
     window.set_group_state(detail.state.into());
     window.set_group_membership(detail.membership);
-    window.set_group_entries(detail.entries.into());
+    window.set_group_content(detail.content.into());
+    window.set_group_dir(detail.dir.into());
     window.set_group_admin(detail.admin);
     window.set_group_members(ModelRc::from(Rc::new(VecModel::from(detail.members))));
+    window.set_group_add_contacts(ModelRc::from(Rc::new(VecModel::from(
+        detail.candidates.contacts,
+    ))));
+    window.set_group_add_discovered(ModelRc::from(Rc::new(VecModel::from(
+        detail.candidates.discovered,
+    ))));
 }
 
 /// Connect the page's buttons. Each one runs its `ops` call off the event loop, then says what
@@ -191,14 +273,22 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         })
     }));
 
-    window.on_leave_group(run(&weak, paths, nudge, |paths, id: &str, _| {
-        Ok(match ops::group::leave(paths, id)? {
-            ops::group::Departed::Already(name) => format!("already left {name}"),
-            ops::group::Departed::Left(name) => {
-                format!("left {name}. The others are told when they next connect.")
-            }
-        })
-    }));
+    window.on_leave_group({
+        let selection = selection.clone();
+        let inner = run(&weak, paths, nudge, |paths, id: &str, _| {
+            Ok(match ops::group::leave(paths, id)? {
+                ops::group::Departed::Already(name) => format!("already left {name}"),
+                ops::group::Departed::Left(name) => {
+                    format!("left {name}. The others are told when they next connect.")
+                }
+            })
+        });
+        move |id| {
+            // The list is about to stop offering it, so nothing should still be pointing at it.
+            selection.set_group("");
+            inner(id);
+        }
+    });
 
     window.on_forget_group({
         let selection = selection.clone();
@@ -217,6 +307,18 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             // The group is about to stop existing, so nothing should still be pointing at it.
             selection.set_group("");
             inner(id);
+        }
+    });
+
+    window.on_open_group_folder({
+        let weak = weak.clone();
+        let nudge = nudge.clone();
+        move |dir| {
+            let dir = std::path::PathBuf::from(dir.as_str());
+            let outcome = crate::shell::open(&dir).map(|()| format!("opened {}", dir.display()));
+            if let Some(window) = weak.upgrade() {
+                work::finish(&window, outcome, &nudge);
+            }
         }
     });
 
@@ -319,7 +421,8 @@ pub mod tests {
     /// The page as the poller builds it, directory and all.
     pub fn page(paths: &Paths, selected: &str) -> Page {
         let known = ops::peer::list(paths).unwrap_or_default();
-        read(paths, &known, selected)
+        let directory = peers::read(&known, None);
+        read(paths, &known, &directory, selected)
     }
 
     /// A peer id belonging to somebody else.
@@ -345,6 +448,223 @@ pub mod tests {
         assert_eq!(
             page.items[0].state, "",
             "being a member is what a listed group already means"
+        );
+    }
+
+    /// The dialog is a list of people to add, so it must not list someone already in the
+    /// group: the only thing pressing that could earn is the refusal the CLI gives.
+    #[test]
+    fn the_add_dialog_offers_everyone_who_is_not_in_the_group_yet() {
+        let (_tmp, paths) = home("jonathan");
+        let created = ops::group::create(&paths, "holiday").unwrap();
+        let id = created.id.to_string();
+
+        let (ana, bob) = (somebody_else(), somebody_else());
+        ops::peer::add(&paths, &ana, "ana").unwrap();
+        ops::peer::add(&paths, &bob, "bob").unwrap();
+        ops::group::add(&paths, &id, &bob).unwrap();
+
+        let detail = page(&paths, &id).detail.unwrap();
+        let offered: Vec<&str> = detail
+            .candidates
+            .contacts
+            .iter()
+            .map(|peer| peer.name.as_str())
+            .collect();
+
+        assert_eq!(offered, ["ana"], "bob is in the group already");
+        assert_eq!(detail.candidates.contacts[0].peer, ana.to_string());
+        assert!(detail.candidates.discovered.is_empty());
+        assert!(
+            detail.members.iter().any(|m| m.peer == bob.to_string()),
+            "bob is offered nowhere because he is a member, not because he is unknown"
+        );
+    }
+
+    /// Every peer id opens with the same handful of characters, so a box too narrow for one
+    /// has to drop the front and keep the tail.
+    #[test]
+    fn a_peer_id_too_wide_for_its_box_loses_its_beginning() {
+        use std::rc::Rc;
+
+        use i_slint_backend_testing::ElementHandle;
+
+        const PEER: &str = "12D3KooWDmPLKCjUV7snQBQVod5bNQnDmZ5X4MYNnPx8NM95zxke";
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window.set_tab(1);
+        window.set_selected_group("holiday-id".into());
+        window.set_group_membership(MEMBER);
+        window.set_group_members(ModelRc::from(Rc::new(VecModel::from(vec![MemberItem {
+            username: "ana".into(),
+            peer: PEER.into(),
+            note: "".into(),
+            departed: false,
+            is_me: false,
+        }]))));
+
+        // Cut or not, the id keeps the whole of itself for anything reading the window.
+        let shown = || {
+            let handle = ElementHandle::find_by_accessible_label(&window, PEER)
+                .next()
+                .unwrap();
+            (handle.absolute_position().x, handle.size().width)
+        };
+        // The box it was given, which the columns either side of it keep put.
+        let box_of = || {
+            let handle = ElementHandle::find_by_element_id(&window, "IdText::root")
+                .next()
+                .unwrap();
+            (handle.absolute_position().x, handle.size().width)
+        };
+
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(1600., 800.));
+        let (roomy, room) = box_of();
+        let (text, whole) = shown();
+        assert!(room > whole, "room enough for all of it");
+        assert_eq!(text, roomy, "so it is not moved");
+
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(900., 800.));
+        let (left, narrow) = box_of();
+        let (moved, width) = shown();
+        assert_eq!(left, roomy, "the columns beside it have not moved");
+        assert!(narrow < width, "the box is now narrower than the id");
+        assert!(
+            moved < left,
+            "the front is what hangs outside the box: {moved} is not left of {left}"
+        );
+        assert_eq!(
+            moved + width,
+            left + narrow,
+            "and the last character sits at the right edge"
+        );
+    }
+
+    /// Adding is the admin's, and every row offers to add the person on it: what travels is
+    /// the peer id, never the name beside it.
+    #[test]
+    fn only_an_admin_is_offered_the_dialog_and_its_rows_add_who_they_name() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use i_slint_backend_testing::ElementHandle;
+
+        fn candidate(name: &str, id: &str) -> PeerItem {
+            PeerItem {
+                name: name.into(),
+                peer: id.into(),
+                state: "no contact yet".into(),
+                tone: crate::view::QUIET,
+            }
+        }
+        fn model(items: Vec<PeerItem>) -> ModelRc<PeerItem> {
+            ModelRc::from(Rc::new(VecModel::from(items)))
+        }
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+
+        window.set_tab(1);
+        window.set_selected_group("holiday-id".into());
+        window.set_group_name("holiday".into());
+        window.set_group_membership(MEMBER);
+        window.set_group_add_contacts(model(vec![candidate("ana", "12D3-ana")]));
+        window.set_group_add_discovered(model(vec![candidate("~ bo", "12D3-bo")]));
+
+        window.set_group_admin(false);
+        assert_eq!(showing("Add member"), 0, "not this node's group to add to");
+
+        window.set_group_admin(true);
+        assert_eq!(showing("Add member"), 1);
+        assert_eq!(showing("Add to holiday"), 0, "not until it is asked for");
+
+        ElementHandle::find_by_accessible_label(&window, "Add member")
+            .next()
+            .unwrap()
+            .invoke_accessible_default_action();
+
+        assert_eq!(showing("Add to holiday"), 1);
+        assert_eq!(showing("ana"), 1, "a contact");
+        assert_eq!(showing("~ bo"), 1, "and someone met through a group");
+
+        let row = ElementHandle::find_by_accessible_label(&window, "ana")
+            .next()
+            .unwrap()
+            .size();
+        assert!(
+            row.width > 0. && row.height > 0.,
+            "the rows are laid out rather than collapsed: {row:?}"
+        );
+
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        window.on_add_member({
+            let asked = asked.clone();
+            move |group, peer, name| {
+                asked
+                    .borrow_mut()
+                    .push((group.to_string(), peer.to_string(), name.to_string()))
+            }
+        });
+
+        // In tree order: the field's own button, then a row for each person.
+        let buttons: Vec<_> = ElementHandle::find_by_accessible_label(&window, "Add").collect();
+        assert_eq!(buttons.len(), 3, "one to add a pasted id, one per person");
+        buttons[1].invoke_accessible_default_action();
+
+        assert_eq!(
+            *asked.borrow(),
+            [(
+                "holiday-id".to_owned(),
+                "12D3-ana".to_owned(),
+                String::new()
+            )],
+            "the id of the row pressed, under no name of the admin's invention"
+        );
+        assert_eq!(showing("Add to holiday"), 0, "and the dialog is done with");
+    }
+
+    /// Leaving takes effect on this node at once. Holding the group on the page until the
+    /// admin ratifies would offer a way back into something already walked out of.
+    #[test]
+    fn a_group_this_node_has_left_is_not_listed_before_the_admin_ratifies() {
+        assert!(listed(State::Pending), "an invitation is still to answer");
+        assert!(listed(State::Active));
+        assert!(!listed(State::Left));
+    }
+
+    /// The line under a group's name says what this node is to it and what is in it. The log
+    /// length it used to carry answered neither question.
+    #[test]
+    fn the_group_line_says_what_this_node_is_and_what_the_group_holds() {
+        assert_eq!(standing(State::Active), "member");
+        assert_eq!(standing(State::Pending), "invited");
+
+        assert_eq!(describe_content(0, 0), "no files");
+        assert_eq!(describe_content(1, 2_000), "1 file, 2.0 KB");
+        assert_eq!(describe_content(12, 3_400_000_000), "12 files, 3.4 GB");
+    }
+
+    /// Everything on that line comes from the file index, and the folder button opens the
+    /// same group's bytes.
+    #[test]
+    fn a_group_reports_its_files_and_where_they_are_kept() {
+        let (_tmp, paths) = home("jonathan");
+        let created = ops::group::create(&paths, "holiday").unwrap();
+        let id = created.id.to_string();
+
+        let detail = page(&paths, &id).detail.unwrap();
+        assert_eq!(detail.state, "member", "whoever creates a group is in it");
+        assert_eq!(detail.content, "no files");
+        assert!(
+            detail.dir.ends_with("/holiday") || detail.dir.ends_with("\\holiday"),
+            "the folder is this group's: {}",
+            detail.dir
         );
     }
 

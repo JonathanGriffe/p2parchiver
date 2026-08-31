@@ -1,0 +1,115 @@
+import { ScrollView, Button, LineEdit } from "std-widgets.slint";
+import { Theme, Card } from "../theme.slint";
+import { PeerItem, PeerCard } from "peers.slint";
+
+// Matches the Peers page, which is where these two lists come from.
+component SectionTitle inherits Text {
+    color: Theme.dim;
+    font-size: Theme.small-size;
+    font-weight: 700;
+}
+
+// Who an admin can add to a group: anyone this node already knows of, and anyone whose peer
+// id they were handed. The lists are the Peers page's, less whoever is in the group already.
+export component AddMemberDialog inherits Rectangle {
+    in property <string> group-name;
+    in property <[PeerItem]> contacts;
+    in property <[PeerItem]> discovered;
+    in property <bool> busy;
+
+    callback add(string);
+    callback dismissed();
+
+    background: #000000.with-alpha(0.45);
+
+    TouchArea {
+        clicked => { root.dismissed(); }
+    }
+
+    Card {
+        width: min(560px, parent.width - 2 * Theme.lg);
+        // Only as tall as it needs to be when there is nobody to list.
+        height: root.contacts.length > 0 || root.discovered.length > 0
+            ? min(600px, parent.height - 2 * Theme.lg)
+            : self.preferred-height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+
+        TouchArea {}
+
+        VerticalLayout {
+            padding: Theme.lg;
+            spacing: Theme.md;
+
+            Text {
+                text: "Add to " + root.group-name;
+                color: Theme.text;
+                font-size: Theme.heading-size;
+                font-weight: 700;
+                overflow: elide;
+            }
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+
+                id := LineEdit {
+                    placeholder-text: "peer id";
+                    horizontal-stretch: 1;
+                    accepted => {
+                        if (self.text != "" && !root.busy) { root.add(self.text); }
+                    }
+                }
+                Button {
+                    text: "Add";
+                    primary: true;
+                    enabled: id.text != "" && !root.busy;
+                    clicked => { root.add(id.text); }
+                }
+            }
+
+            if root.contacts.length > 0 || root.discovered.length > 0 : ScrollView {
+                vertical-stretch: 1;
+
+                VerticalLayout {
+                    spacing: Theme.sm;
+
+                    if root.contacts.length > 0 : SectionTitle { text: "CONTACTS"; }
+
+                    for peer in root.contacts : PeerCard {
+                        peer: peer;
+                        busy: root.busy;
+                        action: "Add";
+                        // Raised rather than surface: these sit on a card of their own.
+                        background: Theme.raised;
+                        acted(id) => { root.add(id); }
+                    }
+
+                    if root.contacts.length > 0 && root.discovered.length > 0 : Rectangle {
+                        height: 1px;
+                        background: Theme.line;
+                    }
+
+                    if root.discovered.length > 0 : SectionTitle { text: "DISCOVERED FROM GROUPS"; }
+
+                    for peer in root.discovered : PeerCard {
+                        peer: peer;
+                        busy: root.busy;
+                        action: "Add";
+                        background: Theme.raised;
+                        acted(id) => { root.add(id); }
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                Button {
+                    text: "Close";
+                    clicked => { root.dismissed(); }
+                }
+            }
+        }
+    }
+}

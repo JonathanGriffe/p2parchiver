@@ -10,7 +10,7 @@ use slint::ComponentHandle;
 use crate::node::Node;
 use crate::ui::MainWindow;
 use crate::work::{self, Nudge};
-use crate::{autostart, log, view};
+use crate::{log, shell, view};
 
 pub type Shared = Arc<Mutex<Node>>;
 
@@ -23,8 +23,6 @@ pub const ENROL_DONE: i32 = 2;
 pub fn load(window: &MainWindow, paths: &Paths) {
     let config = Config::load(&paths.config_file()).unwrap_or_default();
 
-    window.set_listen(join_addrs(&config.listen).into());
-    window.set_external(join_addrs(&config.external).into());
     window.set_mdns(config.mdns);
     window.set_config_storage_root(
         config
@@ -45,28 +43,6 @@ pub fn load(window: &MainWindow, paths: &Paths) {
             .into(),
     );
     window.set_enrolled(config.server.is_some());
-
-    load_autostart(window);
-}
-
-/// The tick, and the warning that goes with a recorded path that is no longer this binary.
-fn load_autostart(window: &MainWindow) {
-    let (on, warning) = match autostart::state() {
-        Ok(autostart::State::On) => (true, String::new()),
-        Ok(autostart::State::Off) => (false, String::new()),
-        Ok(autostart::State::Stale { was }) => (
-            false,
-            format!(
-                "The recorded entry points at {}, which is not this program. Turn this on \
-                 again to correct it.",
-                was.display()
-            ),
-        ),
-        Err(e) => (false, format!("could not read the autostart entry: {e:#}")),
-    };
-
-    window.set_autostart(on);
-    window.set_autostart_warning(warning.into());
 }
 
 pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
@@ -76,11 +52,9 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
         let weak = weak.clone();
         let paths = paths.clone();
         let nudge = nudge.clone();
-        move |listen, external, mdns, root, max, bandwidth| {
+        move |mdns, root, max, bandwidth| {
             let (paths, nudge) = (paths.clone(), nudge.clone());
             let fields = Fields {
-                listen: listen.to_string(),
-                external: external.to_string(),
                 mdns,
                 root: root.to_string(),
                 max: max.to_string(),
@@ -100,29 +74,24 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
         }
     });
 
-    window.on_set_autostart({
-        let weak = weak.clone();
-        let nudge = nudge.clone();
-        move |wanted| {
-            let result = if wanted {
-                autostart::enable()
-            } else {
-                autostart::disable()
+    window.on_pick_storage_root({
+        let paths = paths.clone();
+        move |current| {
+            let start = match current.is_empty() {
+                // Where the files are now, which is the only folder worth opening on.
+                true => Config::load(&paths.config_file())
+                    .unwrap_or_default()
+                    .storage_root(&paths),
+                false => PathBuf::from(current.as_str()),
             };
-            if let Some(window) = weak.upgrade() {
-                // The tick follows what is recorded, not what was asked for.
-                load_autostart(&window);
-                let said = match (&result, wanted) {
-                    (Ok(()), true) => "this app will start when you log in".to_owned(),
-                    (Ok(()), false) => "this app will not start when you log in".to_owned(),
-                    (Err(e), _) => format!("{e:#}"),
-                };
-                work::finish(
-                    &window,
-                    result.map(|()| said).map_err(|e| anyhow!("{e:#}")),
-                    &nudge,
-                );
-            }
+
+            rfd::FileDialog::new()
+                .set_title("Keep files in")
+                .set_directory(start)
+                .pick_folder()
+                .map(|dir| dir.display().to_string().into())
+                // Dismissed, so the field keeps whatever it already read.
+                .unwrap_or(current)
         }
     });
 
@@ -132,7 +101,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
         let nudge = nudge.clone();
         move || {
             let dir = log::dir(&paths);
-            let outcome = open(&dir).map(|()| format!("opened {}", dir.display()));
+            let outcome = shell::open(&dir).map(|()| format!("opened {}", dir.display()));
             if let Some(window) = weak.upgrade() {
                 work::finish(&window, outcome, &nudge);
             }
@@ -224,8 +193,6 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
 }
 
 struct Fields {
-    listen: String,
-    external: String,
     mdns: bool,
     root: String,
     max: String,
@@ -237,8 +204,6 @@ fn save(paths: &Paths, fields: Fields) -> Result<String> {
     let mut config =
         Config::load(&path).with_context(|| format!("loading config from {}", path.display()))?;
 
-    config.listen = parse_addrs(&fields.listen).context("the listen addresses")?;
-    config.external = parse_addrs(&fields.external).context("the announced addresses")?;
     config.mdns = fields.mdns;
     config.storage_root = blank_to_none(&fields.root).map(PathBuf::from);
     config.storage_max = parse_size(&fields.max).context("the storage ceiling")?;
@@ -261,26 +226,6 @@ fn save(paths: &Paths, fields: Fields) -> Result<String> {
         .with_context(|| format!("saving config to {}", path.display()))?;
 
     Ok("saved. Restart the node for this to take effect.".to_owned())
-}
-
-/// Multiaddrs, one per line. Anything unparseable is refused by name rather than dropped.
-fn parse_addrs(text: &str) -> Result<Vec<ac_net::Multiaddr>> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            line.parse()
-                .with_context(|| format!("{line:?} is not an address"))
-        })
-        .collect()
-}
-
-fn join_addrs(addrs: &[ac_net::Multiaddr]) -> String {
-    addrs
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn blank_to_none(text: &str) -> Option<String> {
@@ -357,34 +302,6 @@ fn start(node: &Shared, paths: &Paths) -> Result<()> {
         .lock()
         .map_err(|_| anyhow!("the node is in an unknown state after an earlier panic"))?;
     *node = Node::start(paths.clone()).context("starting the node again")?;
-    Ok(())
-}
-
-/// Hand a directory to whatever the desktop opens directories with.
-fn open(dir: &std::path::Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(dir);
-        command
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("explorer");
-        command.arg(dir);
-        command
-    };
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    let mut command = {
-        let _ = dir;
-        anyhow::bail!("opening a folder is not supported on this platform");
-    };
-
-    command
-        .spawn()
-        .with_context(|| format!("opening {}", dir.display()))?;
     Ok(())
 }
 
@@ -577,31 +494,5 @@ mod tests {
 
         let e = parse_size("10 furlongs").unwrap_err();
         assert!(format!("{e:#}").contains("furlongs"), "got {e:#}");
-    }
-
-    #[test]
-    fn addresses_survive_the_round_trip() {
-        let text = "/ip4/0.0.0.0/udp/0/quic-v1\n/ip6/::/udp/0/quic-v1";
-        let parsed = parse_addrs(text).unwrap();
-
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(join_addrs(&parsed), text);
-    }
-
-    #[test]
-    fn blank_lines_between_addresses_are_not_addresses() {
-        let parsed = parse_addrs("\n/ip4/0.0.0.0/udp/0/quic-v1\n\n  \n").unwrap();
-        assert_eq!(parsed.len(), 1);
-    }
-
-    #[test]
-    fn a_bad_address_is_refused_by_name_rather_than_dropped() {
-        let e = parse_addrs("/ip4/0.0.0.0/udp/0/quic-v1\nnot-an-address").unwrap_err();
-        assert!(format!("{e:#}").contains("not-an-address"), "got {e:#}");
-    }
-
-    #[test]
-    fn no_addresses_at_all_is_an_empty_list_not_an_error() {
-        assert!(parse_addrs("").unwrap().is_empty());
     }
 }

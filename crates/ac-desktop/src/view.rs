@@ -5,7 +5,7 @@ use ac_node::ops;
 use ac_node::ops::file::Storage;
 use ac_node::ops::format::human_size;
 use ac_node::ops::peer::{Liveness, PeerProgress, StatusReport};
-use slint::{ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::files;
 use crate::groups;
@@ -57,7 +57,6 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
         tracing::warn!(error = %e, "could not list peers");
         Vec::new()
     });
-    let page = groups::read(paths, &known, &looking_at.group);
     let files = files::read(paths, &looking_at);
 
     let report = match ops::peer::status(paths) {
@@ -67,7 +66,9 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
             None
         }
     };
+    // Before the groups page, which offers the same people as candidates to add to one.
     let directory = peers::read(&known, report.as_ref());
+    let page = groups::read(paths, &known, &directory, &looking_at.group);
 
     let (running, node_state) = match &report {
         Some(report) => describe_liveness(report),
@@ -147,6 +148,19 @@ pub fn apply(window: &MainWindow, snapshot: Snapshot) {
     groups::apply(window, page);
     peers::apply(window, directory);
     files::apply(window, files);
+}
+
+/// The Status page's one button. Copying happens in the markup, through the same clipboard
+/// the platform gives any text field; this only says that it did.
+pub fn wire(window: &MainWindow, nudge: &crate::work::Nudge) {
+    let weak = window.as_weak();
+    let nudge = nudge.clone();
+
+    window.on_copy_peer_id(move || {
+        if let Some(window) = weak.upgrade() {
+            crate::work::finish(&window, Ok("copied the peer id".to_owned()), &nudge);
+        }
+    });
 }
 
 /// The facts that only change when this node enrols: read at startup, and again the moment
@@ -347,6 +361,38 @@ fn name_of(id: &str, page: &groups::Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The button copies in the markup, so what a test can hold to is that pressing it is
+    /// wired to the node's own id and says so. Whether the platform took the text is the
+    /// platform's business, and the testing backend has no clipboard to check.
+    #[test]
+    fn the_peer_id_is_offered_with_a_button_that_copies_it() {
+        use i_slint_backend_testing::ElementHandle;
+
+        const PEER: &str = "12D3KooWDmPLKCjUV7snQBQVod5bNQnDmZ5X4MYNnPx8NM95zxke";
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        let (nudge, _ticks) = crate::work::nudge();
+        wire(&window, &nudge);
+
+        window.set_tab(0);
+        window.set_peer_id(PEER.into());
+
+        // The id it carries is this node's, not whatever was last drawn beside it.
+        let copier = ElementHandle::find_by_element_id(&window, "CopyButton::carrier")
+            .next()
+            .unwrap();
+        assert_eq!(copier.accessible_value().unwrap(), PEER);
+
+        let button = ElementHandle::find_by_accessible_label(&window, "Copy")
+            .next()
+            .unwrap();
+        button.invoke_accessible_default_action();
+
+        assert_eq!(window.get_message(), "copied the peer id");
+        assert!(!window.get_message_bad());
+    }
 
     fn storage(held: u64, max: Option<u64>, free: Option<u64>) -> Storage {
         Storage {

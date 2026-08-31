@@ -23,7 +23,7 @@ export component AboutView inherits ScrollView {
                     font-weight: 700;
                 }
                 Field { label: "version"; value: root.version; }
-                Field { label: "peer id"; value: root.peer-id; monospace: true; }
+                Field { label: "peer id"; value: root.peer-id; monospace: true; elide-start: true; }
                 Field { label: "home"; value: root.home; monospace: true; }
                 Field { label: "files"; value: root.storage-root; monospace: true; }
                 Field { label: "logs"; value: root.log-dir; monospace: true; }

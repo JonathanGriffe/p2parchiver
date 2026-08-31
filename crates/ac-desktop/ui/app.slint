@@ -6,6 +6,7 @@ import { FilesView, FileItem } from "views/files.slint";
 import { SettingsView } from "views/settings.slint";
 import { AboutView } from "views/about.slint";
 import { EnrolDialog } from "views/enrol.slint";
+import { AddMemberDialog } from "views/add-member.slint";
 
 // Re-exported so slint-build generates the Rust structs the models are built from.
 export { GroupItem, MemberItem, PeerItem, FileItem, StorageSlice, TrafficRow }
@@ -82,9 +83,13 @@ export component MainWindow inherits Window {
     in property <string> group-state;
     // 0 invited, 1 member, 2 gone. `groups::INVITED` and friends.
     in property <int> group-membership;
-    in property <string> group-entries;
+    in property <string> group-content;
+    in property <string> group-dir;
     in property <bool> group-admin;
     in property <[MemberItem]> group-members;
+    // Who the group's Add dialog offers, which is the Peers page's lists less its members.
+    in property <[PeerItem]> group-add-contacts;
+    in property <[PeerItem]> group-add-discovered;
 
     in property <[PeerItem]> peer-contacts;
     in property <[PeerItem]> peer-discovered;
@@ -98,8 +103,6 @@ export component MainWindow inherits Window {
     in property <string> file-progress;
 
     // The Settings page. Loaded once and after each save, never on the poll.
-    in-out property <string> listen;
-    in-out property <string> external;
     in-out property <bool> mdns;
     in-out property <string> config-storage-root;
     in-out property <string> storage-max;
@@ -113,8 +116,6 @@ export component MainWindow inherits Window {
     in-out property <int> enrol-phase;
     in-out property <string> enrol-error;
     in-out property <string> enrol-summary;
-    in-out property <bool> autostart;
-    in-out property <string> autostart-warning;
 
     // What the last action did, and whether it went wrong. Set by Rust, cleared when the
     // next one starts.
@@ -124,7 +125,7 @@ export component MainWindow inherits Window {
 
     // Which group the Groups page is showing. Rust owns it too, since the poller needs to
     // know what to read; this copy is what the list highlights.
-    property <string> selected-group;
+    in-out property <string> selected-group;
 
     callback select-group(string);
     callback create-group(string);
@@ -133,6 +134,7 @@ export component MainWindow inherits Window {
     callback accept-group(string);
     callback leave-group(string);
     callback forget-group(string);
+    callback open-group-folder(string);
     callback add-peer(string, string);
     callback remove-peer(string);
     callback pick-group(int);
@@ -140,13 +142,15 @@ export component MainWindow inherits Window {
     callback browse(bool);
     callback remove-file(string);
     callback verify();
-    callback save(string, string, bool, string, string, string);
-    callback set-autostart(bool);
+    callback save(bool, string, string, string);
+    callback pick-storage-root(string) -> string;
     callback open-logs();
     callback restart();
     callback join(string, string);
+    callback copy-peer-id();
 
-    property <int> tab: 0;
+    // Which page is up. In-out so a test can open the one it is about.
+    in-out property <int> tab: 0;
 
     HorizontalLayout {
         padding: Theme.md;
@@ -219,6 +223,8 @@ export component MainWindow inherits Window {
                 storage-used-room: root.storage-used-room;
                 traffic: root.traffic;
                 vertical-stretch: 1;
+
+                copy-peer-id() => { root.copy-peer-id(); }
             }
 
             if root.tab == 1 : GroupsView {
@@ -228,9 +234,12 @@ export component MainWindow inherits Window {
                 detail-id: root.group-id;
                 detail-state: root.group-state;
                 detail-membership: root.group-membership;
-                detail-entries: root.group-entries;
+                detail-content: root.group-content;
+                detail-dir: root.group-dir;
                 detail-admin: root.group-admin;
                 members: root.group-members;
+                add-contacts: root.group-add-contacts;
+                add-discovered: root.group-add-discovered;
                 busy: root.busy;
                 vertical-stretch: 1;
 
@@ -239,8 +248,9 @@ export component MainWindow inherits Window {
                 add-member(id, peer, who) => { root.add-member(id, peer, who); }
                 remove-member(id, peer) => { root.remove-member(id, peer); }
                 accept(id) => { root.accept-group(id); }
-                leave(id) => { root.leave-group(id); }
+                leave(id) => { root.selected-group = ""; root.leave-group(id); }
                 forget(id) => { root.selected-group = ""; root.forget-group(id); }
+                open-folder(dir) => { root.open-group-folder(dir); }
             }
 
             if root.tab == 2 : PeersView {
@@ -271,21 +281,17 @@ export component MainWindow inherits Window {
             }
 
             if root.tab == 4 : SettingsView {
-                listen: root.listen;
-                external: root.external;
                 mdns: root.mdns;
                 storage-root: root.config-storage-root;
                 storage-max: root.storage-max;
                 bandwidth-max: root.bandwidth-max;
                 server: root.server;
                 enrolled: root.enrolled;
-                autostart: root.autostart;
-                autostart-warning: root.autostart-warning;
                 busy: root.busy;
                 vertical-stretch: 1;
 
-                save(l, e, m, r, s, b) => { root.save(l, e, m, r, s, b); }
-                set-autostart(on) => { root.set-autostart(on); }
+                save(m, r, s, b) => { root.save(m, r, s, b); }
+                pick-storage-root(current) => { return root.pick-storage-root(current); }
                 open-logs() => { root.open-logs(); }
                 restart() => { root.restart(); }
                 join(t, u) => { root.join(t, u); }

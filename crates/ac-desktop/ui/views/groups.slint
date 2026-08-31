@@ -1,5 +1,7 @@
 import { ScrollView, Button, LineEdit } from "std-widgets.slint";
-import { Theme, Card, Dot, DangerButton } from "../theme.slint";
+import { Theme, Card, Dot, DangerButton, IdText } from "../theme.slint";
+import { PeerItem } from "peers.slint";
+import { AddMemberDialog } from "add-member.slint";
 
 // One row of `ac group list`. The words are Rust's; this file only decides where they sit.
 export struct GroupItem {
@@ -163,9 +165,13 @@ export component GroupsView inherits Rectangle {
     in property <string> detail-state;
     // 0 invited, 1 member, 2 gone. The numbers are `groups::INVITED` and friends.
     in property <int> detail-membership;
-    in property <string> detail-entries;
+    in property <string> detail-content;
+    in property <string> detail-dir;
     in property <bool> detail-admin;
     in property <[MemberItem]> members;
+    // Who the Add dialog offers: the Peers page's two lists, less this group's members.
+    in property <[PeerItem]> add-contacts;
+    in property <[PeerItem]> add-discovered;
     in property <bool> busy;
 
     callback select(string);
@@ -175,11 +181,13 @@ export component GroupsView inherits Rectangle {
     callback accept(string);
     callback leave(string);
     callback forget(string);
+    callback open-folder(string);
 
     // 0 none, 1 leave, 2 forget, 3 remove-member
     property <int> asking: 0;
     property <string> asking-peer;
     property <string> asking-peer-name;
+    property <bool> adding: false;
 
     HorizontalLayout {
         spacing: Theme.md;
@@ -269,7 +277,7 @@ export component GroupsView inherits Rectangle {
                         }
 
                         Text {
-                            text: root.detail-state + " · " + root.detail-entries + " entries";
+                            text: root.detail-state + " · " + root.detail-content;
                             color: Theme.dim;
                             font-size: Theme.small-size;
                         }
@@ -288,6 +296,19 @@ export component GroupsView inherits Rectangle {
                                 clicked => { root.asking = 1; }
                             }
 
+                            // Adding a member is the admin's job, so only an admin is offered it.
+                            if root.detail-admin : Button {
+                                text: "Add member";
+                                enabled: !root.busy;
+                                clicked => { root.adding = true; }
+                            }
+
+                            Button {
+                                text: "Open the folder";
+                                enabled: root.detail-dir != "" && !root.busy;
+                                clicked => { root.open-folder(root.detail-dir); }
+                            }
+
                             Rectangle { horizontal-stretch: 1; }
 
                             if root.detail-membership == 1 && !root.detail-admin : DangerButton {
@@ -304,29 +325,6 @@ export component GroupsView inherits Rectangle {
                                 label: "Leave";
                                 enabled: !root.busy;
                                 clicked => { root.asking = 2; }
-                            }
-                        }
-                    }
-                }
-
-                // Adding a member is the admin's job, so the control only appears for one.
-                if root.detail-admin : Card {
-                    HorizontalLayout {
-                        padding: Theme.md;
-                        spacing: Theme.sm;
-
-                        // A peer id and nothing else. What a member is called is theirs to
-                        // publish, so there is no name here for an admin to invent.
-                        peer := LineEdit {
-                            placeholder-text: "peer id to add";
-                            horizontal-stretch: 1;
-                        }
-                        Button {
-                            text: "Add";
-                            enabled: peer.text != "" && !root.busy;
-                            clicked => {
-                                root.add-member(root.selected, peer.text, "");
-                                peer.text = "";
                             }
                         }
                     }
@@ -361,14 +359,9 @@ export component GroupsView inherits Rectangle {
                                 // with the id and the note beside it.
                                 vertical-alignment: center;
                             }
-                            Text {
-                                text: member.peer;
-                                color: Theme.faint;
-                                font-size: Theme.small-size;
-                                font-family: Theme.mono;
-                                overflow: elide;
+                            IdText {
+                                id: member.peer;
                                 horizontal-stretch: 1;
-                                vertical-alignment: center;
                             }
                             Text {
                                 text: member.note;
@@ -392,6 +385,17 @@ export component GroupsView inherits Rectangle {
                 Rectangle { vertical-stretch: 1; }
             }
         }
+    }
+
+    if root.adding : AddMemberDialog {
+        group-name: root.detail-name;
+        contacts: root.add-contacts;
+        discovered: root.add-discovered;
+        busy: root.busy;
+        // Closed on the way out, so what was added is said in the line underneath rather
+        // than behind a dialog nobody asked to keep.
+        add(peer) => { root.adding = false; root.add-member(root.selected, peer, ""); }
+        dismissed => { root.adding = false; }
     }
 
     if root.asking == 1 : Confirm {

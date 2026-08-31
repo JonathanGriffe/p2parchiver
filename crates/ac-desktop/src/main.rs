@@ -1,6 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-mod autostart;
 mod files;
 mod groups;
 mod log;
@@ -8,6 +7,7 @@ mod node;
 mod peers;
 mod selection;
 mod settings;
+mod shell;
 mod tray;
 mod view;
 mod work;
@@ -58,11 +58,6 @@ fn main() -> Result<()> {
 
     let _lock = NodeLock::take(&paths)?;
 
-    // Cheaper than explaining why autostart quietly stopped working after a rebuild.
-    if let Err(e) = autostart::repair() {
-        tracing::warn!(error = %e, "could not check the autostart entry");
-    }
-
     // No window, so nothing needs the main thread and the daemon can have it.
     if cli.headless {
         tracing::info!("running headless");
@@ -105,6 +100,7 @@ fn main() -> Result<()> {
         &nudge,
         ticks,
     );
+    view::wire(&window, &nudge);
     groups::wire(&window, &paths, &selection, &nudge);
     peers::wire(&window, &paths, &nudge);
     files::wire(&window, &paths, &selection, &nudge);
