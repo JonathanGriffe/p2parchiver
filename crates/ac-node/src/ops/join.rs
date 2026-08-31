@@ -35,7 +35,7 @@ pub fn from_token(paths: &Paths, token: &str, username: &str) -> Result<Enrolled
     run(paths, &invite.server, &invite.code, username)
 }
 
-pub fn run(paths: &Paths, server: &Multiaddr, code: &str, username: &str) -> Result<Enrolled> {
+pub fn run(paths: &Paths, server: &Multiaddr, code: &[u8], username: &str) -> Result<Enrolled> {
     let server_peer = peer_id_of(server).ok_or_else(|| {
         anyhow!(
             "the server address must end with /p2p/<peer-id> so the right server can be \
@@ -98,7 +98,7 @@ async fn enroll(
     config: &Config,
     server: &Multiaddr,
     server_peer: PeerId,
-    code: &str,
+    code: &[u8],
     username: &str,
 ) -> Result<(String, Vec<Multiaddr>, Attestation)> {
     let mut swarm = build(
@@ -124,7 +124,7 @@ async fn enroll(
                         enroll.send_request(
                             &server_peer,
                             EnrollRequest {
-                                code: code.to_owned(),
+                                code: code.to_vec(),
                                 username: username.to_owned(),
                             },
                         );

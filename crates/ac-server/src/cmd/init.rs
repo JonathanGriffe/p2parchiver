@@ -24,7 +24,7 @@ listen = [
     "/ip6/::/tcp/{SERVICE_PORT}",
 ]
 
-# The enrolment listener: `/ac/enroll/2.0.0` and nothing else, open to anyone.
+# The enrolment listener: `/ac/enroll/3.0.0` and nothing else, open to anyone.
 #
 # Separate because one listener cannot both admit strangers (so they can enrol) and
 # require enrolment (so the services are protected). This address goes into an invite.

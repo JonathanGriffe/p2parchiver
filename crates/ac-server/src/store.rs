@@ -490,9 +490,7 @@ mod tests {
 
         assert_eq!(stored.code_hash, code.hash());
         assert!(
-            !stored
-                .code_hash
-                .contains(&code.to_string().replace('-', "")),
+            !stored.code_hash.contains(&hex::encode(code.as_bytes())),
             "a leaked backup must not contain live invite codes"
         );
     }

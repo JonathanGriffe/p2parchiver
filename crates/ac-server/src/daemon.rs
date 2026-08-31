@@ -31,7 +31,7 @@ const NO_APP: NoApp = libp2p::swarm::dummy::Behaviour;
 /// The service listener's swarm: relay, rendezvous, AutoNAT, attestation renewal, presence.
 type ServiceSwarm = Swarm<AcBehaviour<Enrolled, NoApp>>;
 
-/// The enrolment listener's swarm: `/ac/enroll/2.0.0` and nothing else.
+/// The enrolment listener's swarm: `/ac/enroll/3.0.0` and nothing else.
 type EnrollSwarm = Swarm<AcBehaviour<Store, NoApp>>;
 
 /// Run the server: two listeners, one policy each.
@@ -478,7 +478,7 @@ fn on_presence(
 fn decide(
     store: &Store,
     identity: &Identity,
-    raw_code: &str,
+    raw_code: &[u8],
     raw_username: &str,
     peer: &PeerId,
     service_addrs: &[libp2p::Multiaddr],
@@ -628,6 +628,8 @@ mod tests {
         meter.report();
         assert!(meter.opened.is_empty());
     }
+    use ac_net::invite::CODE_BYTES;
+
     use super::*;
 
     #[test]
@@ -754,7 +756,7 @@ mod tests {
                 decide(
                     &store,
                     &test_identity(),
-                    &code.to_string(),
+                    code.as_bytes(),
                     "alice",
                     &member.peer_id(),
                     &[]
@@ -887,7 +889,7 @@ mod tests {
             store.create_invite(&code, name, now() + HOUR).unwrap();
             assert!(
                 matches!(
-                    decide(&store, &server_identity, &code.to_string(), name, &who, &[]),
+                    decide(&store, &server_identity, code.as_bytes(), name, &who, &[]),
                     EnrollResponse::Enrolled { .. }
                 ),
                 "{name} must start out enrolled"
@@ -1012,7 +1014,7 @@ mod tests {
             username,
             service,
             attestation,
-        } = decide(&store, &identity, &code.to_string(), "Alice", &p, &[])
+        } = decide(&store, &identity, code.as_bytes(), "Alice", &p, &[])
         else {
             panic!("expected an enrolment");
         };
@@ -1035,7 +1037,7 @@ mod tests {
         let p = peer();
 
         let EnrollResponse::Enrolled { attestation, .. } =
-            decide(&store, &identity, &code.to_string(), "alice", &p, &[])
+            decide(&store, &identity, code.as_bytes(), "alice", &p, &[])
         else {
             panic!("expected an enrolment");
         };
@@ -1057,17 +1059,10 @@ mod tests {
         store.create_invite(&first, "a", now() + HOUR).unwrap();
         store.create_invite(&second, "b", now() + HOUR).unwrap();
 
-        decide(&store, &identity, &first.to_string(), "alice", &peer(), &[]);
+        decide(&store, &identity, first.as_bytes(), "alice", &peer(), &[]);
 
         assert_eq!(
-            decide(
-                &store,
-                &identity,
-                &second.to_string(),
-                "alice",
-                &peer(),
-                &[]
-            ),
+            decide(&store, &identity, second.as_bytes(), "alice", &peer(), &[]),
             EnrollResponse::Refused(Refusal::UsernameTaken)
         );
     }
@@ -1079,7 +1074,7 @@ mod tests {
 
         for bad in ["ab", "alice smith", "-alice", &"a".repeat(64)] {
             assert_eq!(
-                decide(&store, &identity, &code.to_string(), bad, &peer(), &[]),
+                decide(&store, &identity, code.as_bytes(), bad, &peer(), &[]),
                 EnrollResponse::Refused(Refusal::InvalidUsername),
                 "{bad:?}"
             );
@@ -1087,7 +1082,7 @@ mod tests {
 
         assert!(
             matches!(
-                decide(&store, &identity, &code.to_string(), "alice", &peer(), &[]),
+                decide(&store, &identity, code.as_bytes(), "alice", &peer(), &[]),
                 EnrollResponse::Enrolled { .. }
             ),
             "a bad username must not consume the invite"
@@ -1100,17 +1095,17 @@ mod tests {
         // other means "check what you typed".
         let (store, code) = store_with_invite();
         let identity = test_identity();
-        decide(&store, &identity, &code.to_string(), "alice", &peer(), &[]);
+        decide(&store, &identity, code.as_bytes(), "alice", &peer(), &[]);
 
         assert_eq!(
-            decide(&store, &identity, &code.to_string(), "bob", &peer(), &[]),
+            decide(&store, &identity, code.as_bytes(), "bob", &peer(), &[]),
             EnrollResponse::Refused(Refusal::AlreadyRedeemed)
         );
         assert_eq!(
             decide(
                 &store,
                 &identity,
-                &InviteCode::generate().unwrap().to_string(),
+                InviteCode::generate().unwrap().as_bytes(),
                 "carol",
                 &peer(),
                 &[],
@@ -1129,7 +1124,7 @@ mod tests {
             decide(
                 &store,
                 &test_identity(),
-                &code.to_string(),
+                code.as_bytes(),
                 "alice",
                 &peer(),
                 &[]
@@ -1138,30 +1133,23 @@ mod tests {
         );
     }
 
+    /// A code is a fixed number of bytes, so anything else is refused on its shape before
+    /// the database is asked about it.
     #[test]
     fn something_that_is_not_a_code_is_refused_as_malformed() {
         let store = Store::in_memory().unwrap();
         let identity = test_identity();
-        for junk in ["", "hello", "AAAA-BBBB", "!!!!-!!!!-!!!!-!!!!"] {
+        let code = InviteCode::generate().unwrap();
+        let short = &code.as_bytes()[..CODE_BYTES - 1];
+        let long = [code.as_bytes().as_slice(), b"x"].concat();
+
+        for junk in [b"".as_slice(), b"hello", short, &long] {
             assert_eq!(
                 decide(&store, &identity, junk, "alice", &peer(), &[]),
                 EnrollResponse::Refused(Refusal::Malformed),
                 "{junk:?}"
             );
         }
-    }
-
-    #[test]
-    fn a_mistyped_but_recoverable_code_still_works() {
-        // Crockford normalisation happens before the lookup, so lowercase and missing
-        // dashes reach the database as the same code.
-        let (store, code) = store_with_invite();
-        let mangled = code.to_string().to_lowercase().replace('-', "");
-
-        assert!(matches!(
-            decide(&store, &test_identity(), &mangled, "alice", &peer(), &[]),
-            EnrollResponse::Enrolled { .. }
-        ));
     }
 
     #[test]
@@ -1173,7 +1161,7 @@ mod tests {
         decide(
             &store,
             &test_identity(),
-            &code.to_string(),
+            code.as_bytes(),
             "alice",
             &asker,
             &[],
@@ -1190,7 +1178,7 @@ mod tests {
         let (store, code) = store_with_invite();
         let identity = test_identity();
         let p = peer();
-        decide(&store, &identity, &code.to_string(), "alice", &p, &[]);
+        decide(&store, &identity, code.as_bytes(), "alice", &p, &[]);
 
         let username = store.username_of(&p).unwrap().expect("a username on file");
         let renewed =

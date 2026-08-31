@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::attest::Attestation;
 
-pub const ENROLL_PROTOCOL: &str = "/ac/enroll/2.0.0";
+pub const ENROLL_PROTOCOL: &str = "/ac/enroll/3.0.0";
 pub const ATTEST_PROTOCOL: &str = "/ac/attest/1.0.0";
 pub const PRESENCE_PROTOCOL: &str = "/ac/presence/1.0.0";
 pub const PEER_ATTEST_PROTOCOL: &str = "/ac/peer-attest/1.0.0";
@@ -10,7 +10,7 @@ pub const RENDEZVOUS_NAMESPACE: &str = "ac";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollRequest {
-    pub code: String,
+    pub code: Vec<u8>,
     pub username: String,
 }
 

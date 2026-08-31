@@ -10,56 +10,45 @@ use crate::invite::InviteCode;
 use crate::store::now;
 
 pub fn new(paths: &Paths, label: &str, ttl_hours: i64, address: Option<&Multiaddr>) -> Result<()> {
-    let store = super::open_store(paths)?;
+    let identity = Identity::load(&paths.identity_file())
+        .context("loading the server identity; run `ac-server init` first")?;
 
+    let config = Config::load(&paths.config_file()).unwrap_or_default();
+    let server = address
+        .cloned()
+        .or_else(|| enrol_address(&config))
+        .map(|addr| addr.with(Protocol::P2p(identity.peer_id())))
+        .context(
+            "this server has no public enrolment address to put in a token. Set `external` \
+             in config.toml, or pass --address <multiaddr>",
+        )?;
+
+    let store = super::open_store(paths)?;
     let code = InviteCode::generate().context("reading system randomness")?;
+    let token = Invite::new(server, *code.as_bytes())
+        .and_then(|invite| invite.encode())
+        .context("building the invite token")?;
+
     let expires_at = now() + ttl_hours * 3600;
     store
         .create_invite(&code, label, expires_at)
         .with_context(|| format!("recording an invite for {label}"))?;
 
-    let identity = Identity::load(&paths.identity_file())
-        .context("loading the server identity; run `ac-server init` first")?;
-
-    println!("invite  {code}");
+    println!("token   {token}");
     println!("label   {label}");
     println!("expires in {ttl_hours}h");
     println!("server  {}", identity.peer_id());
-
-    let config = Config::load(&paths.config_file()).unwrap_or_default();
-    match address
-        .cloned()
-        .or_else(|| enrol_address(&config))
-        .map(|addr| addr.with(Protocol::P2p(identity.peer_id())))
-    {
-        Some(server) => {
-            let token = Invite::new(server, code.to_string())
-                .and_then(|invite| invite.encode())
-                .context("building the invite token")?;
-            println!("token   {token}");
-            println!();
-            println!("Send the token. It carries this server's address and peer id along with");
-            println!("the code, so whoever holds it enrols against this server and no other.");
-        }
-        None => {
-            println!();
-            println!("No token: this server has no public enrolment address to put in one.");
-            println!("Set `external` in config.toml, or pass --address <multiaddr>, and mint");
-            println!("the invite again.");
-        }
-    }
     println!();
-    println!("This code is shown once and is not recoverable. It is a bearer secret:");
-    println!("whoever holds it can enrol. Send it over a channel you trust.");
+    println!("Send the token. It carries this server's address and peer id along with the");
+    println!("secret, so whoever holds it enrols against this server and no other.");
+    println!();
+    println!("It is shown once and is not recoverable. It is a bearer secret: whoever holds");
+    println!("it can enrol. Send it over a channel you trust.");
 
     Ok(())
 }
 
 /// Where the world reaches this server's enrolment listener.
-///
-/// The operator has already said where they are reachable, in `external`, and which port
-/// takes enrolments, in `listen_enroll`. Neither alone is the answer: `external` carries the
-/// service port, and `listen_enroll` is usually a wildcard bind. Together they are.
 fn enrol_address(config: &Config) -> Option<Multiaddr> {
     let host = config
         .external
@@ -144,9 +133,6 @@ mod tests {
         }
     }
 
-    /// The host comes from `external`, which is where the operator said the world reaches
-    /// them, and the port from `listen_enroll`, which is the only one that takes enrolments.
-    /// Neither on its own is the address a newcomer needs.
     #[test]
     fn the_enrolment_address_is_the_public_host_on_the_enrolment_port() {
         let config = config(

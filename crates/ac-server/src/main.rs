@@ -16,7 +16,7 @@ use ac_net::config::Paths;
 /// The service listener's port: relay, rendezvous, AutoNAT, enrolled peers only.
 pub const SERVICE_PORT: u16 = 4001;
 
-/// The enrolment listener's port: `/ac/enroll/2.0.0` only, open to anyone.
+/// The enrolment listener's port: `/ac/enroll/3.0.0` only, open to anyone.
 pub const ENROLL_PORT: u16 = 4002;
 
 /// Kept distinct from the client's directory so both can run on one host.
@@ -46,7 +46,7 @@ enum Command {
     /// Run the server.
     Run,
 
-    /// Mint and inspect invite codes.
+    /// Mint and inspect invite tokens.
     #[command(subcommand)]
     Invite(InviteCommand),
 
@@ -57,12 +57,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum InviteCommand {
-    /// Mint a single-use invite code. Shown once and not recoverable.
+    /// Mint a single-use invite token. Shown once and not recoverable.
     New {
         /// What this invite is for, e.g. the device it will be used on.
         #[arg(long)]
         label: String,
-        /// Hours until the code expires.
+        /// Hours until the invite expires.
         #[arg(long, default_value_t = 24)]
         ttl_hours: i64,
         /// The enrolment address to put in the token, if `external` in config.toml does not
@@ -112,7 +112,7 @@ fn main() -> Result<()> {
 }
 
 /// Logs go to stderr so stdout stays parseable for commands that print a peer id or an
-/// invite code.
+/// invite token.
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
 
