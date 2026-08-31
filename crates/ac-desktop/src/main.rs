@@ -20,8 +20,7 @@ mod ui {
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ac_net::config::{Config, Paths};
-use ac_node::ops;
+use ac_net::config::Paths;
 use ac_node::ops::lock::NodeLock;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -74,7 +73,7 @@ fn main() -> Result<()> {
     let node: settings::Shared = Arc::new(Mutex::new(node::Node::start(paths.clone())?));
 
     let window = MainWindow::new().context("creating the window")?;
-    describe_node(&window, &paths)?;
+    view::describe_node(&window, &paths)?;
 
     let (nudge, ticks) = work::nudge();
     let _tray = tray::spawn(window.as_weak(), nudge.clone());
@@ -129,46 +128,4 @@ fn main() -> Result<()> {
         // and the process is on its way out.
         Err(_) => Ok(()),
     }
-}
-
-/// The facts that do not change while the app is open.
-fn describe_node(window: &MainWindow, paths: &Paths) -> Result<()> {
-    let identity = ops::identity(paths)?;
-    let config = Config::load(&paths.config_file()).unwrap_or_default();
-
-    // Only enrolling changes these, and enrolling restarts the node.
-    let enrolled = ops::enrolment(paths).unwrap_or_default();
-    window.set_username(enrolled.map(|e| e.username).unwrap_or_default().into());
-    window.set_server_host(
-        config
-            .server
-            .as_ref()
-            .map(server_host)
-            .unwrap_or_else(|| "not enrolled".to_owned())
-            .into(),
-    );
-
-    window.set_version(env!("CARGO_PKG_VERSION").into());
-    window.set_peer_id(identity.peer_id().to_string().into());
-    window.set_home(paths.root.display().to_string().into());
-    window.set_storage_root(config.storage_root(paths).display().to_string().into());
-    window.set_log_dir(log::dir(paths).display().to_string().into());
-    Ok(())
-}
-
-fn server_host(server: &ac_net::Multiaddr) -> String {
-    use ac_net::Protocol;
-
-    server
-        .iter()
-        .find_map(|part| match part {
-            Protocol::Ip4(ip) => Some(ip.to_string()),
-            Protocol::Ip6(ip) => Some(ip.to_string()),
-            Protocol::Dns(name)
-            | Protocol::Dns4(name)
-            | Protocol::Dns6(name)
-            | Protocol::Dnsaddr(name) => Some(name.to_string()),
-            _ => None,
-        })
-        .unwrap_or_else(|| server.to_string())
 }

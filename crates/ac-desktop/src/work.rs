@@ -118,6 +118,14 @@ where
     });
 }
 
+/// Let the buttons go without saying anything, for an action that reports its own outcome
+/// somewhere the shared line would only duplicate.
+pub fn quiet(window: &MainWindow, nudge: &Nudge) {
+    window.set_busy(false);
+    window.set_message("".into());
+    nudge.now();
+}
+
 /// Say what an action did, let the buttons go, and get the change on screen at once.
 pub fn finish(window: &MainWindow, outcome: anyhow::Result<String>, nudge: &Nudge) {
     window.set_busy(false);

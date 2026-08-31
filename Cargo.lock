@@ -28,6 +28,7 @@ dependencies = [
  "clap",
  "directories",
  "fontique",
+ "i-slint-backend-testing",
  "ksni",
  "png 0.18.1",
  "rfd",

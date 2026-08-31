@@ -107,8 +107,12 @@ export component MainWindow inherits Window {
     in-out property <string> server;
     in-out property <bool> enrolled;
     // Raised once at startup for a node that has never enrolled, and lowered for good the
-    // moment it has or the moment it is waved away.
+    // moment the dialog is closed, whether it enrolled or was waved away.
     in-out property <bool> show-enrol;
+    // What that dialog is showing: the form, the wait, or what it settled as.
+    in-out property <int> enrol-phase;
+    in-out property <string> enrol-error;
+    in-out property <string> enrol-summary;
     in-out property <bool> autostart;
     in-out property <string> autostart-warning;
 
@@ -316,6 +320,9 @@ export component MainWindow inherits Window {
 
     if root.show-enrol : EnrolDialog {
         busy: root.busy;
+        phase: root.enrol-phase;
+        error: root.enrol-error;
+        summary: root.enrol-summary;
         enrol(t, u) => { root.join(t, u); }
         dismissed => { root.show-enrol = false; }
     }

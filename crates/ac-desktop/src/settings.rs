@@ -10,9 +10,15 @@ use slint::ComponentHandle;
 use crate::node::Node;
 use crate::ui::MainWindow;
 use crate::work::{self, Nudge};
-use crate::{autostart, log};
+use crate::{autostart, log, view};
 
 pub type Shared = Arc<Mutex<Node>>;
+
+/// What the enrolment dialog is showing. Mirrored in `views/enrol.slint`, which is why
+/// these are the ints the property takes rather than an enum.
+pub const ENROL_FORM: i32 = 0;
+pub const ENROL_WORKING: i32 = 1;
+pub const ENROL_DONE: i32 = 2;
 
 pub fn load(window: &MainWindow, paths: &Paths) {
     let config = Config::load(&paths.config_file()).unwrap_or_default();
@@ -154,6 +160,10 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
             let (paths, node, nudge) = (paths.clone(), node.clone(), nudge.clone());
             let (token, username) = (token.to_string(), username.to_string());
             work::begin(&weak);
+            if let Some(window) = weak.upgrade() {
+                window.set_enrol_phase(ENROL_WORKING);
+                window.set_enrol_error("".into());
+            }
 
             let reload = paths.clone();
             work::action(
@@ -161,22 +171,52 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
                 move || {
                     stop(&node)?;
                     let enrolled = ops::join::from_token(&paths, &token, &username);
+                    // Started again whichever way it went: a node left stopped by a
+                    // refusal would look like the app itself had given up.
                     start(&node, &paths)?;
-
-                    let enrolled = enrolled?;
-                    Ok(format!(
-                        "enrolled as {} with {}, attested for {}h. That server is pinned now.",
-                        enrolled.username, enrolled.server, enrolled.attested_for
-                    ))
+                    enrolled
                 },
                 move |window, outcome| {
                     load(window, &reload);
-                    // Only once it actually worked: a failed attempt leaves the dialog up
-                    // with the message underneath saying why.
-                    if window.get_enrolled() {
-                        window.set_show_enrol(false);
+                    // The window reads these once at startup, and enrolling is the one
+                    // thing that changes them: without this the name and the server stay
+                    // blank until the app is opened again.
+                    if let Err(e) = view::describe_node(window, &reload) {
+                        tracing::warn!(error = %e, "could not re-read this node's details");
                     }
-                    work::finish(window, outcome, &nudge);
+
+                    match &outcome {
+                        Ok(enrolled) => {
+                            // The dialog has the name in front of someone who just typed
+                            // it; the rest is on the Status page behind it.
+                            window.set_enrol_summary(
+                                format!("Enrolled as {}.", enrolled.username).into(),
+                            );
+                            window.set_enrol_phase(ENROL_DONE);
+                        }
+                        Err(e) => {
+                            // `{:#}` so the server's reason comes through, not just the
+                            // outermost context.
+                            window.set_enrol_error(format!("{e:#}").into());
+                            window.set_enrol_phase(ENROL_FORM);
+                        }
+                    }
+
+                    if window.get_show_enrol() {
+                        // The dialog is saying it; the shared line would only repeat it,
+                        // out of sight behind the dialog.
+                        work::quiet(window, &nudge);
+                    } else {
+                        // Nobody is looking at a dialog, so the one line has to carry it.
+                        let said = outcome.map(|enrolled| {
+                            format!(
+                                "Enrolled as {} with {}, attested for {}h. That server is \
+                                 pinned now.",
+                                enrolled.username, enrolled.server, enrolled.attested_for
+                            )
+                        });
+                        work::finish(window, said, &nudge);
+                    }
                 },
             );
         }
@@ -350,7 +390,125 @@ fn open(dir: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use i_slint_backend_testing::ElementHandle;
+
     use super::*;
+
+    /// The dialog stays up for the whole of enrolling, so what it shows is the only thing
+    /// saying whether anything is happening. Drawn into memory, so this needs no display.
+    #[test]
+    fn the_enrol_dialog_shows_one_thing_at_a_time() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window.set_show_enrol(true);
+
+        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+        let enrolling = "Enrolling. The node stops and starts again, which takes a moment.";
+
+        window.set_enrol_phase(ENROL_FORM);
+        assert_eq!(showing("Enrol"), 1, "the form offers to enrol");
+        assert_eq!(showing("Not now"), 1);
+        assert_eq!(showing(enrolling), 0);
+        assert_eq!(showing("Close"), 0);
+
+        // A refusal comes back into the form, with the reason above it.
+        window.set_enrol_error("that invite token is damaged".into());
+        assert_eq!(showing("that invite token is damaged"), 1);
+        assert_eq!(showing("Enrol"), 1, "and it can be tried again");
+
+        window.set_enrol_phase(ENROL_WORKING);
+        assert_eq!(showing(enrolling), 1);
+        assert_eq!(showing("Enrol"), 0, "nothing to press while it runs");
+        assert_eq!(showing("Not now"), 0);
+        assert_eq!(
+            showing("that invite token is damaged"),
+            0,
+            "the last failure is not still on screen while the next attempt runs"
+        );
+
+        window.set_enrol_phase(ENROL_DONE);
+        window.set_enrol_summary("Enrolled as alice.".into());
+        assert_eq!(showing("Successfully enrolled"), 1, "the title says so too");
+        assert_eq!(showing("Enrol this node"), 0);
+        assert_eq!(showing("Enrolled as alice."), 1);
+        assert_eq!(showing("Close"), 1);
+        assert_eq!(showing("Enrol"), 0, "there is nothing left to enrol");
+
+        ElementHandle::find_by_accessible_label(&window, "Close")
+            .next()
+            .unwrap()
+            .invoke_accessible_default_action();
+        assert!(!window.get_show_enrol(), "Close puts the dialog away");
+    }
+
+    /// Enrolling is the one thing that changes the name and the server a node shows, and it
+    /// happens with the window already open. Read only at startup, the Status page went on
+    /// saying "not enrolled" until the app was opened again.
+    #[test]
+    fn the_window_picks_up_an_enrolment_without_being_restarted() {
+        use ac_net::attest::{self, Attestation};
+        use ac_net::identity::Keypair;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted_at(home.path());
+        view::describe_node(&window, &paths).unwrap();
+        assert_eq!(window.get_username(), "");
+        assert_eq!(window.get_server_host(), "not enrolled");
+
+        // What enrolling leaves on disk: the server in the config, and the attestation it
+        // was issued.
+        let me = ops::identity(&paths).unwrap();
+        let attestation = Attestation::issue(
+            &Keypair::generate_ed25519(),
+            &me.peer_id(),
+            "alice",
+            attest::now(),
+            attest::LIFETIME,
+        )
+        .unwrap();
+        attest::save(&paths.attestation_file(), &attestation).unwrap();
+
+        let mut config = Config::load(&paths.config_file()).unwrap();
+        config.server = Some("/dns4/ac.example.net/udp/4001/quic-v1".parse().unwrap());
+        config.save(&paths.config_file()).unwrap();
+
+        view::describe_node(&window, &paths).unwrap();
+        assert_eq!(window.get_username(), "alice");
+        assert_eq!(window.get_server_host(), "ac.example.net");
+    }
+
+    /// A refusal over the username should not cost someone the token they pasted, so the
+    /// fields have to survive the trip out to the phase that has no fields at all.
+    #[test]
+    fn what_was_typed_survives_a_failed_attempt() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window.set_show_enrol(true);
+        window.set_enrol_phase(ENROL_FORM);
+
+        let field = |id: &str| {
+            ElementHandle::find_by_element_id(&window, id)
+                .next()
+                .unwrap()
+        };
+        field("EnrolDialog::token").set_accessible_value("ac1thetoken");
+        field("EnrolDialog::who").set_accessible_value("alice");
+
+        window.set_enrol_phase(ENROL_WORKING);
+        window.set_enrol_phase(ENROL_FORM);
+
+        assert_eq!(
+            field("EnrolDialog::token").accessible_value().unwrap(),
+            "ac1thetoken"
+        );
+        assert_eq!(
+            field("EnrolDialog::who").accessible_value().unwrap(),
+            "alice"
+        );
+    }
 
     #[test]
     fn every_way_of_saying_no_limit_means_the_same_thing() {
