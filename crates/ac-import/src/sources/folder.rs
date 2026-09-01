@@ -2,24 +2,34 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::config::{Field, Fields};
+use crate::registry::{Registered, RegisteredSource};
 use crate::source::{Cursor, Item, Page, Result, Source, SourceError, SourceType};
 
-pub const NAME: &str = "folder";
-pub const TYPE: SourceType = SourceType::OneShot;
-
-/// Items per page
 const PAGE: usize = 500;
 
 /// Read buffer, the size `ac-files` copies with.
 const CHUNK: usize = 64 * 1024;
 
-pub fn open(config: &str) -> Result<Box<dyn Source>> {
-    Ok(Box::new(Folder::parse(config)?))
+/// This source's row in the registry
+pub(super) const ENTRY: Registered = Registered::of::<Folder>();
+
+impl RegisteredSource for Folder {
+    const NAME: &'static str = "folder";
+    const TYPE: SourceType = SourceType::OneShot;
+
+    /// Nothing to share: what one folder import is told has no bearing on the next.
+    const SETTINGS: &'static [Field] = &[];
+
+    const CONFIG: &'static [Field] = &[Field::paths("path", "Folders or files")];
+
+    fn open(config: &Fields, _settings: &Fields) -> Result<Box<dyn Source>> {
+        Ok(Box::new(Folder::parse(config)?))
+    }
 }
 
 struct Folder {
     roots: Vec<Root>,
-    /// How many items a page holds
     page: usize,
 }
 
@@ -30,12 +40,9 @@ struct Root {
 }
 
 impl Folder {
-    fn parse(config: &str) -> Result<Self> {
-        let picked: Vec<&str> = config
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
+    fn parse(config: &Fields) -> Result<Self> {
+        config.check(Self::NAME, Self::CONFIG)?;
+        let picked: Vec<&str> = config.all("path").filter(|path| !path.is_empty()).collect();
 
         if picked.is_empty() {
             return Err(refused("no paths were given"));
@@ -109,12 +116,12 @@ impl Folder {
             folder: String::new(),
             name: name.to_owned(),
             size: Some(meta.len()),
+            // A local file is not hashed to list it: that would read the whole tree twice.
+            checksum: None,
         });
         page.items.len() < self.page
     }
 
-    /// Everything under `dir`, in reference order, starting after `after`. `false` when the
-    /// page filled and the walk has to stop where it is.
     fn visit(&self, dir: &Path, folder: &str, after: Option<&str>, page: &mut Page) -> bool {
         let read = match fs::read_dir(dir) {
             Ok(read) => read,
@@ -137,8 +144,6 @@ impl Folder {
                     continue;
                 }
             };
-            // Lossy so that a name we cannot import still has a reference to be ordered by,
-            // and so its skip is reported once rather than on every page.
             let name = path
                 .file_name()
                 .unwrap_or_default()
@@ -156,9 +161,6 @@ impl Folder {
             };
 
             entries.push(Entry {
-                // A directory sorts where its contents do, so `a.txt` and `a/x` come out in
-                // the order the cursor will compare them in. Without the slash they do not:
-                // `a/x` is greater than `a.txt`, and resuming would step over the file.
                 key: match kind {
                     Kind::Dir => format!("{reference}/"),
                     _ => reference.clone(),
@@ -174,9 +176,6 @@ impl Folder {
         for entry in entries {
             match entry.kind {
                 Kind::Dir => {
-                    // Against the key, never the reference: `a` compares below `a.txt` while
-                    // everything in it — `a/x` — sorts above it, so a directory is judged by
-                    // where its contents are, which is what the trailing slash says.
                     let past = |cursor: &str| {
                         entry.key.as_str() <= cursor && !cursor.starts_with(&entry.key)
                     };
@@ -196,13 +195,12 @@ impl Folder {
                         folder: folder.to_owned(),
                         name: entry.name,
                         size: Some(size),
+                        checksum: None,
                     });
                     if page.items.len() >= self.page {
                         return false;
                     }
                 }
-                // Only ever said once: an entry the last page already walked past is not
-                // mentioned again.
                 Kind::Skip(why) => {
                     if after.is_some_and(|cursor| entry.reference.as_str() <= cursor) {
                         continue;
@@ -256,17 +254,16 @@ impl Folder {
 
 impl Source for Folder {
     fn source_type(&self) -> SourceType {
-        TYPE
+        Self::TYPE
     }
 
     fn scan(&self, from: Option<&Cursor>) -> Result<Page> {
-        // The cursor names the pick it stopped in as well as where in it, so the picks need no
-        // order between them: each is resumed on its own terms.
         let (start, within) = match from {
             None => (0, None),
             Some(cursor) => {
-                let unreadable =
-                    || SourceError::Failed(format!("{NAME} cannot resume from {cursor:?}"));
+                let unreadable = || {
+                    SourceError::Failed(format!("{} cannot resume from {cursor:?}", Folder::NAME))
+                };
                 let (index, reference) = cursor.split_once(':').ok_or_else(unreadable)?;
                 let index: usize = index.parse().map_err(|_| unreadable())?;
                 (index, Some(reference.to_owned()))
@@ -359,10 +356,7 @@ fn name_of(path: &Path) -> Result<&str> {
 }
 
 fn refused(reason: impl Into<String>) -> SourceError {
-    SourceError::Config {
-        implementation: NAME,
-        reason: reason.into(),
-    }
+    SourceError::config(Folder::NAME, reason)
 }
 
 #[cfg(test)]
@@ -380,12 +374,12 @@ mod tests {
         }
     }
 
-    fn config(paths: &[&Path]) -> String {
-        paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
+    fn config(paths: &[&Path]) -> Fields {
+        let mut fields = Fields::new();
+        for path in paths {
+            fields.push("path", &path.display().to_string());
+        }
+        fields
     }
 
     /// Every page of a full scan, drained the way `ops::import` will drain it.
@@ -569,18 +563,29 @@ mod tests {
 
     #[test]
     fn a_config_that_names_nothing_reachable_is_refused_at_open() {
-        for config in ["", "   \n\n"] {
+        for empty in [Fields::new(), config(&[Path::new("")])] {
             assert!(matches!(
-                Folder::parse(config),
+                Folder::parse(&empty),
                 Err(SourceError::Config { .. })
             ));
         }
         // A daemon reads this row from some other working directory, so a relative path is
         // refused where it can still be explained rather than silently importing nothing.
         assert!(matches!(
-            Folder::parse("pictures/2024"),
+            Folder::parse(&config(&[Path::new("pictures/2024")])),
             Err(SourceError::Config { .. })
         ));
+    }
+
+    #[test]
+    fn a_config_answering_a_field_the_folder_never_declared_is_refused() {
+        let mut fields = config(&[Path::new("/home/a/pictures")]);
+        fields.push("recursive", "true");
+
+        let Err(err) = Folder::parse(&fields) else {
+            panic!("a field the folder never declared cannot be answered");
+        };
+        assert!(err.to_string().contains("recursive"), "{err}");
     }
 
     #[test]
@@ -620,6 +625,7 @@ mod tests {
                 folder: String::new(),
                 name: "x".to_owned(),
                 size: None,
+                checksum: None,
             };
             let err = source.fetch(&item, &mut Vec::new()).unwrap_err();
             assert!(
@@ -632,7 +638,7 @@ mod tests {
     #[test]
     fn a_folder_is_never_polled() {
         let dir = tempfile::tempdir().unwrap();
-        let source = open(&config(&[dir.path()])).unwrap();
+        let source = Folder::open(&config(&[dir.path()]), &Fields::new()).unwrap();
         assert_eq!(source.source_type(), SourceType::OneShot);
         assert!(!source.source_type().polled());
     }

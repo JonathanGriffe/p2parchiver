@@ -42,20 +42,13 @@ fn main() {
         let _ = write!(out, "\n#[path = {file:?}]\nmod {name};\n");
     }
 
-    let _ = writeln!(out, "\nstatic KNOWN: &[(&str, SourceType)] = &[");
+    // Each source declares its own entry, so what a source has to provide is the
+    // `RegisteredSource` trait rather than the shape of a struct literal written out here.
+    let _ = writeln!(out, "\nstatic KNOWN: &[Registered] = &[");
     for name in &names {
-        let _ = writeln!(out, "    ({name}::NAME, {name}::TYPE),");
+        let _ = writeln!(out, "    {name}::ENTRY,");
     }
     let _ = writeln!(out, "];");
-
-    let _ = writeln!(
-        out,
-        "\nfn opener(name: &str) -> Option<Opener> {{\n    match name {{"
-    );
-    for name in &names {
-        let _ = writeln!(out, "        {name}::NAME => Some({name}::open),");
-    }
-    let _ = writeln!(out, "        _ => None,\n    }}\n}}");
 
     let generated = match std::env::var("OUT_DIR") {
         Ok(dir) => Path::new(&dir).join("registry.rs"),

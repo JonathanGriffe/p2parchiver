@@ -1,7 +1,6 @@
 use std::fmt;
 use std::io::{self, Write};
 
-/// What every fallible thing in this crate answers with.
 pub type Result<T> = std::result::Result<T, SourceError>;
 
 /// How a source is driven
@@ -21,7 +20,6 @@ impl SourceType {
         }
     }
 
-    /// Whether the scheduler ever scans this source of its own accord
     pub fn polled(&self) -> bool {
         !matches!(self, Self::OneShot)
     }
@@ -40,9 +38,40 @@ pub struct Item {
     pub folder: String,
     pub name: String,
     pub size: Option<u64>,
+    /// What the source says these bytes will come to, if it says anything at all.
+    pub checksum: Option<Checksum>,
 }
 
-/// Where a scan got to
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checksum {
+    pub algo: Digest,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Digest {
+    Md5,
+    Sha1,
+    Sha256,
+}
+
+impl Checksum {
+    /// Case-insensitively: hex is published in either case.
+    pub fn matches(&self, computed: &str) -> bool {
+        self.value.eq_ignore_ascii_case(computed)
+    }
+}
+
+impl Digest {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Md5 => "md5",
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+        }
+    }
+}
+
 pub type Cursor = String;
 
 /// One page of a scan.
@@ -94,6 +123,13 @@ pub enum SourceError {
 }
 
 impl SourceError {
+    pub fn config(implementation: &'static str, reason: impl Into<String>) -> Self {
+        Self::Config {
+            implementation,
+            reason: reason.into(),
+        }
+    }
+
     pub fn io(what: impl Into<String>, source: io::Error) -> Self {
         Self::Io {
             what: what.into(),
@@ -111,6 +147,16 @@ mod tests {
         assert!(!SourceType::OneShot.polled());
         assert!(SourceType::Remote.polled());
         assert!(SourceType::Intermittent.polled());
+    }
+
+    #[test]
+    fn a_published_digest_is_compared_in_either_case() {
+        let checksum = Checksum {
+            algo: Digest::Md5,
+            value: "D41D8CD98F00B204E9800998ECF8427E".to_owned(),
+        };
+        assert!(checksum.matches("d41d8cd98f00b204e9800998ecf8427e"));
+        assert!(!checksum.matches("d41d8cd98f00b204e9800998ecf8427f"));
     }
 
     #[test]
