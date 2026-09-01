@@ -79,6 +79,7 @@ dependencies = [
 name = "ac-import"
 version = "0.0.0"
 dependencies = [
+ "rusqlite",
  "tempfile",
  "thiserror 2.0.19",
 ]
