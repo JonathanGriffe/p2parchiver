@@ -54,6 +54,54 @@ enum Command {
 
     #[command(subcommand)]
     File(FileCommand),
+
+    #[command(subcommand)]
+    Import(ImportCommand),
+}
+
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// What this build can import from, and what each source needs to be told.
+    Available { source: Option<String> },
+
+    #[command(subcommand)]
+    Source(ImportSourceCommand),
+
+    /// One implementation's settings, shared by every source built from it.
+    #[command(subcommand)]
+    Settings(SettingsCommand),
+
+    /// Scan one source now, whatever its cadence says.
+    Scan { source: String },
+}
+
+#[derive(Subcommand)]
+enum ImportSourceCommand {
+    Add {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        name: String,
+        /// Answer one of the source's fields. Repeatable: `--set path=~/Pictures`.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+    },
+    List,
+    Remove {
+        source: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SettingsCommand {
+    Show {
+        source: String,
+    },
+    Set {
+        source: String,
+        key: String,
+        value: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -190,6 +238,25 @@ fn main() -> Result<()> {
             cmd::file::remove(&paths, &group, &path)
         }
         Command::File(FileCommand::Verify { group }) => cmd::file::verify(&paths, &group),
+        Command::Import(ImportCommand::Available { source }) => {
+            cmd::import::available(source.as_deref())
+        }
+        Command::Import(ImportCommand::Source(ImportSourceCommand::Add { source, name, set })) => {
+            cmd::import::source_add(&paths, &source, &name, &set)
+        }
+        Command::Import(ImportCommand::Source(ImportSourceCommand::List)) => {
+            cmd::import::source_list(&paths)
+        }
+        Command::Import(ImportCommand::Source(ImportSourceCommand::Remove { source })) => {
+            cmd::import::source_remove(&paths, &source)
+        }
+        Command::Import(ImportCommand::Settings(SettingsCommand::Show { source })) => {
+            cmd::import::settings_show(&paths, &source)
+        }
+        Command::Import(ImportCommand::Settings(SettingsCommand::Set { source, key, value })) => {
+            cmd::import::settings_set(&paths, &source, &key, &value)
+        }
+        Command::Import(ImportCommand::Scan { source }) => cmd::import::scan(&paths, &source),
     }
 }
 

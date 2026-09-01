@@ -3,6 +3,7 @@
 pub mod file;
 pub mod group;
 pub mod id;
+pub mod import;
 pub mod join;
 pub mod peer;
 pub mod probe;

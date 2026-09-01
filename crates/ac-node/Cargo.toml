@@ -13,6 +13,7 @@ path = "src/main.rs"
 ac-net.workspace = true
 ac-groups.workspace = true
 ac-files.workspace = true
+ac-import.workspace = true
 ac-peers.workspace = true
 fs4 = "1"
 libp2p-stream = "0.4.0-alpha"

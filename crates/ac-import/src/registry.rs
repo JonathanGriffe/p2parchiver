@@ -15,6 +15,7 @@ pub trait RegisteredSource {
     fn open(config: &Fields, settings: &Fields) -> Result<Box<dyn Source>>;
 }
 
+#[derive(Debug)]
 pub struct Registered {
     pub name: &'static str,
     pub kind: SourceType,
