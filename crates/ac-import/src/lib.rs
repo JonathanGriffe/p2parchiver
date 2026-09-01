@@ -9,5 +9,7 @@ pub mod verdict;
 pub use config::{Field, FieldKind, Fields};
 pub use ledger::{Imported, Ledger, LedgerError, Owed, SourceRow, State, Tally};
 pub use registry::Registered;
-pub use source::{Checksum, Cursor, Digest, Held, Item, Page, Source, SourceError, SourceType};
+pub use source::{
+    Checksum, Cursor, Digest, Held, Item, Page, Source, SourceError, SourceType, Verify,
+};
 pub use verdict::{Verdict, decide};

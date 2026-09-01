@@ -6,7 +6,7 @@ use rusqlite::{
 };
 
 use crate::config::Fields;
-use crate::source::{Item, SourceError, SourceType};
+use crate::source::{Checksum, Digest, Item, SourceError, SourceType};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -69,6 +69,20 @@ pub struct Owed {
     pub folder: String,
     pub name: String,
     pub size: Option<u64>,
+    pub checksum: Option<Checksum>,
+}
+
+impl Owed {
+    /// What the source offered, as it was written down. What a fetch is handed back.
+    pub fn item(&self) -> Item {
+        Item {
+            reference: self.source_ref.clone(),
+            folder: self.folder.clone(),
+            name: self.name.clone(),
+            size: self.size,
+            checksum: self.checksum.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +144,11 @@ impl Ledger {
                  folder     TEXT NOT NULL,
                  name       TEXT NOT NULL,
                  size       INTEGER,
+                 -- What the source said the bytes would come to, kept from the scan that
+                 -- heard it: the fetch that has to check it happens much later.
+                 algo       TEXT,
+                 checksum   TEXT,
+                 -- What they came to. Set once the file is in, which is what settles the row.
                  hash       TEXT,
                  tried_at   INTEGER NOT NULL DEFAULT 0,
                  fails      INTEGER NOT NULL DEFAULT 0,
@@ -224,7 +243,9 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn scan_failed(&self, dir: &str, why: &str) -> Result<(), LedgerError> {
+    /// What is wrong with this source, for the list to show. Cleared by a scan that finishes,
+    /// so it is always the last thing that went wrong rather than the first.
+    pub fn failed(&self, dir: &str, why: &str) -> Result<(), LedgerError> {
         self.db.execute(
             "UPDATE sources SET last_error = ?2 WHERE dir = ?1",
             params![dir, why],
@@ -336,16 +357,19 @@ impl Ledger {
 
     pub fn owe(&self, source_dir: &str, item: &Item) -> Result<(), LedgerError> {
         self.db.execute(
-            "INSERT INTO import_refs (source_dir, source_ref, folder, name, size)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO import_refs (source_dir, source_ref, folder, name, size, algo, checksum)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (source_dir, source_ref) DO UPDATE
-                 SET folder = excluded.folder, name = excluded.name, size = excluded.size",
+                 SET folder = excluded.folder, name = excluded.name, size = excluded.size,
+                     algo = excluded.algo, checksum = excluded.checksum",
             params![
                 source_dir,
                 item.reference,
                 item.folder,
                 item.name,
                 item.size.map(|size| size as i64),
+                item.checksum.as_ref().map(|sum| sum.algo.as_str()),
+                item.checksum.as_ref().map(|sum| sum.value.as_str()),
             ],
         )?;
         Ok(())
@@ -379,7 +403,8 @@ impl Ledger {
 
         let taken = {
             let mut stmt = tx.prepare(
-                "SELECT source_dir, source_ref, folder, name, size FROM import_refs
+                "SELECT source_dir, source_ref, folder, name, size, algo, checksum
+                   FROM import_refs
                   WHERE hash IS NULL AND fails < ?1 AND tried_at < ?2
                   ORDER BY tried_at LIMIT ?3",
             )?;
@@ -396,6 +421,7 @@ impl Ledger {
                         folder: row.get(2)?,
                         name: row.get(3)?,
                         size: row.get::<_, Option<i64>>(4)?.map(|size| size.max(0) as u64),
+                        checksum: checksum(row.get(5)?, row.get(6)?),
                     })
                 },
             )?;
@@ -426,6 +452,16 @@ impl Ledger {
         Ok(())
     }
 
+    /// Drop a reference the source has answered for by saying it is gone. The next scan
+    /// writes it down again if it ever comes back.
+    pub fn forget(&self, source_dir: &str, source_ref: &str) -> Result<bool, LedgerError> {
+        let gone = self.db.execute(
+            "DELETE FROM import_refs WHERE source_dir = ?1 AND source_ref = ?2 AND hash IS NULL",
+            params![source_dir, source_ref],
+        )?;
+        Ok(gone > 0)
+    }
+
     pub fn owed(&self, source_dir: &str) -> Result<u64, LedgerError> {
         let count: i64 = self.db.query_row(
             "SELECT COUNT(*) FROM import_refs WHERE source_dir = ?1 AND hash IS NULL",
@@ -448,6 +484,29 @@ impl Ledger {
             None => Ok(None),
             Some(raw) => State::parse(&raw).map(Some).ok_or(LedgerError::CorruptRow),
         }
+    }
+
+    /// Whether some other reference is already waiting under this name, in this folder, from
+    /// this source. Only `unsorted` counts: a sorted file has been moved into its group and a
+    /// dropped one is gone, so neither is still holding the name.
+    pub fn name_taken(
+        &self,
+        source_dir: &str,
+        folder: &str,
+        name: &str,
+        except: &str,
+    ) -> Result<bool, LedgerError> {
+        let found: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT 1 FROM imported
+                  WHERE source_dir = ?1 AND folder = ?2 AND name = ?3 AND source_ref <> ?4
+                    AND state = 'unsorted' LIMIT 1",
+                params![source_dir, folder, name, except],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     pub fn keep(&self, row: &Imported) -> Result<(), LedgerError> {
@@ -598,6 +657,16 @@ impl Ledger {
     }
 }
 
+/// The promise as it was stored. An algorithm this build no longer has is no promise at all:
+/// there is nothing to check the bytes against, and refusing them would be worse.
+fn checksum(algo: Option<String>, value: Option<String>) -> Option<Checksum> {
+    let (algo, value) = (algo?, value?);
+    Some(Checksum {
+        algo: Digest::parse(&algo)?,
+        value,
+    })
+}
+
 fn read_imported(row: &rusqlite::Row<'_>) -> rusqlite::Result<Imported> {
     Ok(Imported {
         hash: row.get(0)?,
@@ -703,9 +772,7 @@ mod tests {
         let ledger = ledger();
         ledger.add_source(&source("pictures", "Pictures")).unwrap();
 
-        ledger
-            .scan_failed("pictures", "the disk went away")
-            .unwrap();
+        ledger.failed("pictures", "the disk went away").unwrap();
         assert!(
             ledger
                 .source("pictures")
@@ -917,6 +984,80 @@ mod tests {
     }
 
     #[test]
+    fn a_promise_about_the_bytes_survives_until_something_fetches_them() {
+        let mut ledger = ledger();
+        let mut promised = item("a.jpg");
+        promised.checksum = Some(Checksum {
+            algo: Digest::Md5,
+            value: "5d41402abc4b2a76b9719d911017c592".to_owned(),
+        });
+        ledger.owe("pictures", &promised).unwrap();
+        ledger.owe("pictures", &item("b.jpg")).unwrap();
+
+        let taken = ledger.claim(AT, 8).unwrap();
+        let checked = |reference: &str| {
+            taken
+                .iter()
+                .find(|owed| owed.source_ref == reference)
+                .unwrap()
+                .clone()
+        };
+
+        // What comes back out is what `fetch` is handed, promise and all.
+        assert_eq!(checked("a.jpg").item(), promised);
+        assert_eq!(checked("b.jpg").checksum, None, "most sources promise none");
+    }
+
+    #[test]
+    fn a_reference_the_source_says_is_gone_stops_being_owed_at_once() {
+        let ledger = ledger();
+        ledger.owe("pictures", &item("gone.jpg")).unwrap();
+        ledger.owe("pictures", &item("here.jpg")).unwrap();
+        ledger.settled("pictures", "here.jpg", "aa").unwrap();
+
+        assert!(ledger.forget("pictures", "gone.jpg").unwrap());
+        assert_eq!(ledger.owed("pictures").unwrap(), 0);
+
+        // Nothing else is disturbed: an unknown reference, and one already settled, both stay
+        // as they were — the settled row is the history of a file that did arrive.
+        assert!(!ledger.forget("pictures", "never.jpg").unwrap());
+        assert!(!ledger.forget("pictures", "here.jpg").unwrap());
+        assert_eq!(
+            ledger.known_refs("pictures", &["here.jpg"]).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_name_is_taken_by_the_reference_that_is_still_waiting_under_it() {
+        let ledger = ledger();
+        let mut row = imported("aa", "pictures", AT);
+        row.folder = "DCIM".to_owned();
+        row.name = "IMG_1.jpg".to_owned();
+        row.source_ref = "DCIM/IMG_1.jpg".to_owned();
+        ledger.keep(&row).unwrap();
+
+        let taken = |reference: &str| {
+            ledger
+                .name_taken("pictures", "DCIM", "IMG_1.jpg", reference)
+                .unwrap()
+        };
+        assert!(taken("other-id"), "someone else is waiting under that name");
+        assert!(
+            !taken("DCIM/IMG_1.jpg"),
+            "but it does not take it from itself"
+        );
+        assert!(
+            !ledger.name_taken("pictures", "", "IMG_1.jpg", "x").unwrap(),
+            "the same name in another folder is a different name"
+        );
+
+        // Sorted into a group, the file left `.unsorted`, so the name is free again.
+        assert!(ledger.sorted("aa", "g").unwrap());
+        assert!(!taken("other-id"));
+    }
+
+    #[test]
     fn settling_takes_a_reference_off_the_queue_for_good() {
         let mut ledger = ledger();
         ledger.owe("pictures", &item("a.jpg")).unwrap();
@@ -1095,9 +1236,7 @@ mod tests {
         ledger.add_source(&row).unwrap();
 
         // The scan is cut short, so `scanned` is never called and the stamp does not move.
-        ledger
-            .scan_failed("pictures", "the process went away")
-            .unwrap();
+        ledger.failed("pictures", "the process went away").unwrap();
 
         let back = ledger.source("pictures").unwrap().unwrap();
         assert!(due(

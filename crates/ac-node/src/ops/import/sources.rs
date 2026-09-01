@@ -1,34 +1,26 @@
-use ac_files::Files;
+//! Configuring a source, and what one has been told.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
 use ac_files::dirname::sanitize;
 use ac_import::config::{Field, FieldKind, Fields};
 use ac_import::ledger::{Ledger, SourceRow, Tally};
 use ac_import::registry::{self, Registered};
-use ac_import::source::{Held, Source, SourceError, SourceType};
+use ac_import::source::{Source, SourceType};
 use ac_net::config::Paths;
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::now;
+use super::ledger;
+use crate::ops::now;
 
-/// Suffixes tried before giving up on finding a free directory. Far past anything real; it is
-/// here so a bug cannot spin.
+/// Suffixes tried before giving up on finding a free directory.
 const MAX_DIRS: u32 = 1000;
 
-pub fn ledger(paths: &Paths) -> Result<Ledger> {
-    let db = paths.db_file();
-    Ledger::open(&db).with_context(|| format!("opening the import ledger at {}", db.display()))
-}
-
-/// The `Held` port: whether a group already holds these bytes. The inbox has no business
-/// asking `ac-files` that itself, so this is the node answering for it.
-pub struct HeldHere<'a>(pub &'a Files);
-
-impl Held for HeldHere<'_> {
-    fn held(&self, hash: &str) -> Result<bool, SourceError> {
-        self.0
-            .held_anywhere(hash)
-            .map_err(|e| SourceError::Failed(format!("reading the file index: {e}")))
-    }
-}
+/// The one source every build has, and the field it takes. Named here because the registry
+/// keeps its implementations to itself; a test holds this to the declaration.
+const FOLDER: &str = "folder";
+const FOLDER_PATH: &str = "path";
 
 /// What this build can import from, and what each one has to be told.
 pub fn available() -> &'static [Registered] {
@@ -47,11 +39,10 @@ pub fn implementation(source: &str) -> Result<&'static Registered> {
 
 /// One configured source, with everything the Sources section shows about it.
 pub struct Configured {
+    /// What it was told is here too, minus anything its implementation declared `Secret`:
+    /// see [`without_secrets`].
     pub row: SourceRow,
-    /// `None` when the row names an implementation this build does not have. Reported rather
-    /// than hidden: the files it brought in are still here.
     pub kind: Option<SourceType>,
-    /// References it still owes. Goes up when a scan finds things, down as the pump works.
     pub owed: u64,
     pub tally: Tally,
 }
@@ -69,18 +60,38 @@ pub fn sources(paths: &Paths) -> Result<Vec<Configured>> {
             .find(|(dir, _)| *dir == row.dir)
             .map(|(_, tally)| *tally)
             .unwrap_or_default();
+        let entry = registry::find(&row.source);
         out.push(Configured {
-            kind: registry::find(&row.source).map(|entry| entry.kind),
+            kind: entry.map(|entry| entry.kind),
             owed: ledger.owed(&row.dir)?,
             tally,
-            row,
+            row: without_secrets(row, entry.map(|entry| entry.config)),
         });
     }
     Ok(out)
 }
 
-/// Create a source. Everything that could make it fail on its first scan is checked here,
-/// where it can still be explained, and nothing is written until it all passes.
+/// A source row with its credentials taken out
+fn without_secrets(mut row: SourceRow, declared: Option<&[Field]>) -> SourceRow {
+    let Some(declared) = declared else {
+        row.config = Fields::new();
+        return row;
+    };
+
+    let mut kept = Fields::new();
+    for (key, value) in row.config.iter() {
+        let secret = declared
+            .iter()
+            .any(|field| field.key == key && field.kind == FieldKind::Secret);
+        if !secret {
+            kept.push(key, value);
+        }
+    }
+    row.config = kept;
+    row
+}
+
+/// Create a source
 pub fn add_source(paths: &Paths, source: &str, name: &str, config: Fields) -> Result<SourceRow> {
     let entry = implementation(source)?;
     let name = name.trim();
@@ -99,8 +110,6 @@ pub fn add_source(paths: &Paths, source: &str, name: &str, config: Fields) -> Re
     config.check(entry.name, entry.config)?;
     let settings = ledger.settings(entry.name)?;
     check_settings(entry.name, entry.settings, &settings)?;
-    // Opened before the row is written, so a config the implementation refuses never becomes a
-    // source that can only fail later.
     entry
         .open(&config, &settings)
         .with_context(|| format!("checking how {name} is configured"))?;
@@ -139,13 +148,12 @@ fn source_matching(ledger: &Ledger, needle: &str) -> Result<Option<SourceRow>> {
 }
 
 /// The same, for the callers that have nothing to do without one.
-fn find_source(ledger: &Ledger, needle: &str) -> Result<SourceRow> {
+pub(super) fn find_source(ledger: &Ledger, needle: &str) -> Result<SourceRow> {
     source_matching(ledger, needle)?
         .ok_or_else(|| anyhow!("no source called {needle:?}; `ac import source list` shows them"))
 }
 
-/// Delete a source and its queue. Its files stay under `.unsorted`, still unsorted, still
-/// listed and still sortable: they were never the source's property.
+/// Delete a source and its queue
 pub fn remove_source(paths: &Paths, needle: &str) -> Result<bool> {
     let mut ledger = ledger(paths)?;
     let Some(row) = source_matching(&ledger, needle)? else {
@@ -203,99 +211,67 @@ pub fn set_setting(paths: &Paths, source: &str, key: &str, value: &str) -> Resul
         .with_context(|| format!("setting {source} {key}"))
 }
 
-/// What a scan found, and what it changed. It moves no bytes, so this is the whole of it.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Scanned {
-    pub name: String,
-    /// Items the source offered, over every page.
-    pub found: u64,
-    /// References written down for the first time.
-    pub owed: u64,
-    /// Exhausted references the source still offers, put back on the queue.
-    pub again: u64,
-    /// Exhausted references it no longer offers: the file has gone from the source.
-    pub retired: u64,
-    pub skipped: Vec<String>,
-    /// False when the source could not be reached. Not a failure, and not recorded as one.
-    pub reachable: bool,
-    /// A scan that reached the end. Only a complete one may retire rows or stamp `scanned_at`.
-    pub complete: bool,
+/// A one-shot import: the source its files are filed under, and whether it is new.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picked {
+    pub row: SourceRow,
+    /// False when these same folders were already a source, which is scanned again instead.
+    pub added: bool,
 }
 
-/// Scan one source now, ignoring both its cadence and its backoff.
-pub fn scan(paths: &Paths, needle: &str) -> Result<Scanned> {
-    let ledger = ledger(paths)?;
-    let row = find_source(&ledger, needle)?;
-
-    let source = open_source(&ledger, &row)?;
-    scan_with(&ledger, &row, source.as_ref())
-}
-
-/// The scan itself, over an already-opened source, so the daemon and a test can drive it
-/// without going back through the registry.
-pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Result<Scanned> {
-    let mut out = Scanned {
-        name: row.name.clone(),
-        reachable: true,
-        ..Scanned::default()
+/// Import from folders someone picked, without their having to know what the `folder`
+/// implementation calls its fields.
+pub fn from_folder(paths: &Paths, name: Option<&str>, picked: &[PathBuf]) -> Result<Picked> {
+    let [first, ..] = picked else {
+        bail!("pick a folder to import from");
     };
 
-    if !source.reachable() {
-        // A phone that is simply elsewhere. Nothing is recorded, or the tab would show a
-        // permanent failure for a source that is working perfectly.
-        out.reachable = false;
-        return Ok(out);
+    let mut config = Fields::new();
+    for path in picked {
+        if !path.exists() {
+            bail!("{} is not there", path.display());
+        }
+        // What was typed is rarely absolute, and the implementation takes nothing else.
+        let full = std::path::absolute(path)
+            .with_context(|| format!("working out where {} is", path.display()))?;
+        config.push(FOLDER_PATH, &full.display().to_string());
     }
 
-    let mut cursor = None;
-    loop {
-        let page = match source.scan(cursor.as_ref()) {
-            Ok(page) => page,
-            Err(e) => {
-                let why = e.to_string();
-                ledger.scan_failed(&row.dir, &why)?;
-                return Err(anyhow!(why)).with_context(|| format!("scanning {}", row.name));
-            }
-        };
-
-        let refs: Vec<&str> = page
-            .items
-            .iter()
-            .map(|item| item.reference.as_str())
-            .collect();
-        // One query for the whole page. On a source that has not changed, this is the only
-        // thing a complete scan runs.
-        let known = ledger.known_refs(&row.dir, &refs)?;
-
-        let mut stale = Vec::new();
-        for item in &page.items {
-            out.found += 1;
-            match known.iter().find(|(seen, _)| *seen == item.reference) {
-                // Already known and still worth trying: nothing to do, which is the case a
-                // complete scan is cheap because of.
-                Some((_, fails)) if *fails < ac_import::ledger::MAX_FETCH_ATTEMPTS => {}
-                Some(_) => stale.push(item.reference.as_str()),
-                None => {
-                    ledger.owe(&row.dir, item)?;
-                    out.owed += 1;
-                }
-            }
-        }
-        out.again += ledger.offer_again(&row.dir, &stale)? as u64;
-        out.skipped.extend(page.skipped);
-
-        match page.next {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
+    if let Some(row) = configured_for(&ledger(paths)?, &config)? {
+        return Ok(Picked { row, added: false });
     }
 
-    // Only now: an interrupted scan has not seen the whole source, so it may no more delete a
-    // row than it may stamp `scanned_at`. Both hang off having reached the end.
-    out.complete = true;
-    out.retired = ledger.retire_gone(&row.dir)? as u64;
-    ledger.scanned(&row.dir, now())?;
-    Ok(out)
+    let named = match name {
+        Some(name) => name.to_owned(),
+        None if picked.len() == 1 => folder_name(first)?,
+        None => bail!("give the import a name with --name: it is what its files are filed under"),
+    };
+    Ok(Picked {
+        row: add_source(paths, FOLDER, &named, config)?,
+        added: true,
+    })
+}
+
+fn configured_for(ledger: &Ledger, config: &Fields) -> Result<Option<SourceRow>> {
+    let want: BTreeSet<&str> = config.all(FOLDER_PATH).collect();
+
+    Ok(ledger.sources()?.into_iter().find(|row| {
+        row.source == FOLDER && row.config.all(FOLDER_PATH).collect::<BTreeSet<_>>() == want
+    }))
+}
+
+/// What a picked folder is called, as a name for the source.
+fn folder_name(picked: &Path) -> Result<String> {
+    picked
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow!(
+                "{} has no name to import under; give one with --name",
+                picked.display()
+            )
+        })
 }
 
 /// Open one configured source: its own config, and its implementation's shared settings.
@@ -305,8 +281,6 @@ pub fn open_source(ledger: &Ledger, row: &SourceRow) -> Result<Box<dyn Source>> 
         .with_context(|| format!("opening {}", row.name))
 }
 
-/// A missing setting is a different mistake from a missing config field — it is fixed once,
-/// for every source of that implementation — so it says where to fix it.
 fn check_settings(implementation: &'static str, declared: &[Field], have: &Fields) -> Result<()> {
     have.check(implementation, declared).map_err(|e| {
         anyhow!("{e}\nset it first: ac import settings set {implementation} <key> <value>")
@@ -315,9 +289,6 @@ fn check_settings(implementation: &'static str, declared: &[Field], have: &Field
 
 /// The directory a source's files land in, allocated once from its name and then frozen, so
 /// renaming it later never moves a file.
-///
-/// A name stays taken while unsorted files still live under it, which is what makes removing a
-/// source safe: re-adding one called "Pictures" gets `pictures-2` and the old files stay put.
 fn allocate_dir(ledger: &Ledger, name: &str) -> Result<String> {
     let base = slug(name)
         .ok_or_else(|| anyhow!("{name:?} has no characters a directory can be named after"))?;
@@ -332,12 +303,6 @@ fn allocate_dir(ledger: &Ledger, name: &str) -> Result<String> {
     bail!("could not find an unused directory for {name:?}")
 }
 
-/// A directory name from a source's name: lowercase, with one dash for every run of anything
-/// else, so `Pictures 2024` becomes `pictures-2024` — a name that is also a command-line
-/// argument, since it is what `ac import scan` takes.
-///
-/// `sanitize` still has the last word, which is what keeps a source directory out of
-/// `.unsorted`'s own staging area and stops one being named `..`.
 fn slug(name: &str) -> Option<String> {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
@@ -353,78 +318,12 @@ fn slug(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::import::fetch::drain;
+    use crate::ops::import::fixtures::*;
+    use crate::ops::import::scan::scan;
+
     use ac_import::ledger::State;
-    use ac_import::source::{Cursor, Item, Page};
-    use std::io::Write;
-    use std::path::Path;
-
-    fn home() -> tempfile::TempDir {
-        tempfile::tempdir().unwrap()
-    }
-
-    fn paths(home: &tempfile::TempDir) -> Paths {
-        Paths::rooted_at(home.path())
-    }
-
-    fn picked(path: &Path) -> Fields {
-        let mut config = Fields::new();
-        config.push("path", &path.display().to_string());
-        config
-    }
-
-    /// A tree of empty files, so a scan has something to find.
-    fn tree(root: &Path, files: &[&str]) {
-        for file in files {
-            let path = root.join(file);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, file.as_bytes()).unwrap();
-        }
-    }
-
-    /// A source that offers whatever it is handed. Stands in for the Remote and Intermittent
-    /// implementations that are not in this build.
-    struct Fake {
-        kind: SourceType,
-        items: Vec<Item>,
-        reachable: bool,
-    }
-
-    impl Source for Fake {
-        fn source_type(&self) -> SourceType {
-            self.kind
-        }
-        fn reachable(&self) -> bool {
-            self.reachable
-        }
-        fn scan(&self, from: Option<&Cursor>) -> Result<Page, SourceError> {
-            assert!(from.is_none(), "this fake offers one page");
-            Ok(Page {
-                items: self.items.clone(),
-                next: None,
-                skipped: Vec::new(),
-            })
-        }
-        fn fetch(&self, _item: &Item, _into: &mut dyn Write) -> Result<(), SourceError> {
-            unreachable!("step 4 moves no bytes")
-        }
-    }
-
-    fn fake(kind: SourceType, refs: &[&str]) -> Fake {
-        Fake {
-            kind,
-            reachable: true,
-            items: refs
-                .iter()
-                .map(|reference| Item {
-                    reference: (*reference).to_owned(),
-                    folder: String::new(),
-                    name: (*reference).to_owned(),
-                    size: Some(1),
-                    checksum: None,
-                })
-                .collect(),
-        }
-    }
+    use ac_import::source::SourceType;
 
     #[test]
     fn the_build_offers_the_folder_source_and_says_what_it_wants() {
@@ -436,44 +335,6 @@ mod tests {
 
         let err = implementation("drive").unwrap_err().to_string();
         assert!(err.contains("folder"), "it should say what there is: {err}");
-    }
-
-    #[test]
-    fn a_scan_writes_down_what_it_owes_and_moves_no_bytes() {
-        let home = home();
-        let paths = paths(&home);
-        let album = home.path().join("album");
-        tree(&album, &["a.jpg", "DCIM/b.jpg", "DCIM/c.jpg"]);
-
-        let row = add_source(&paths, "folder", "Pictures 2024", picked(&album)).unwrap();
-        assert_eq!(row.dir, "pictures-2024");
-
-        let scanned = scan(&paths, &row.dir).unwrap();
-        assert_eq!(scanned.found, 3);
-        assert_eq!(scanned.owed, 3);
-        assert!(scanned.complete);
-
-        let ledger = ledger(&paths).unwrap();
-        assert_eq!(ledger.owed(&row.dir).unwrap(), 3);
-        assert_eq!(ledger.waiting().unwrap(), 0, "a scan imports nothing");
-        assert_eq!(ledger.unsorted_bytes().unwrap(), 0);
-        assert!(ledger.source(&row.dir).unwrap().unwrap().scanned_at > 0);
-    }
-
-    #[test]
-    fn scanning_a_source_that_has_not_changed_owes_nothing_new() {
-        let home = home();
-        let paths = paths(&home);
-        let album = home.path().join("album");
-        tree(&album, &["a.jpg", "b.jpg"]);
-
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
-        scan(&paths, &row.dir).unwrap();
-
-        let again = scan(&paths, &row.dir).unwrap();
-        assert_eq!(again.found, 2);
-        assert_eq!(again.owed, 0, "everything is already written down");
-        assert_eq!(ledger(&paths).unwrap().owed(&row.dir).unwrap(), 2);
     }
 
     #[test]
@@ -489,8 +350,6 @@ mod tests {
         let err = add_source(&paths, "folder", "Pictures", picked(home.path())).unwrap_err();
         assert!(err.to_string().contains("already a source"), "{err}");
 
-        // Once it is removed the name is free again — but the directory is not, while its
-        // unsorted files are still there.
         ledger
             .keep(&ac_import::ledger::Imported {
                 hash: "aa".to_owned(),
@@ -554,8 +413,6 @@ mod tests {
 
     #[test]
     fn a_source_cannot_be_added_before_its_implementation_is_configured() {
-        // `folder` shares nothing, so the rule is checked against the declaration it would be
-        // checked against — the one a Drive implementation will bring with it.
         const NEEDED: &[Field] = &[Field::secret("client_id", "Client id")];
 
         let err = check_settings("drive", NEEDED, &Fields::new()).unwrap_err();
@@ -644,53 +501,125 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_source_is_skipped_without_being_called_a_failure() {
+    fn the_same_folders_picked_again_are_the_same_import() {
         let home = home();
         let paths = paths(&home);
-        let ledger = ledger(&paths).unwrap();
+        let album = home.path().join("album");
+        tree(&album, &["a.jpg", "b.jpg"]);
 
-        let row = add_source(&paths, "folder", "Phone", picked(home.path())).unwrap();
-        let mut phone = fake(SourceType::Intermittent, &["a.jpg"]);
-        phone.reachable = false;
+        // The three steps the CLI and the GUI both drive: find or create, scan, pump.
+        let first = from_folder(&paths, None, std::slice::from_ref(&album)).unwrap();
+        assert!(first.added);
+        assert_eq!(scan(&paths, &first.row.dir).unwrap().owed, 2);
+        assert_eq!(drain(&paths, None).unwrap().kept, 2);
 
-        let scanned = scan_with(&ledger, &row, &phone).unwrap();
-        assert!(!scanned.reachable);
-        assert!(!scanned.complete);
-        assert_eq!(scanned.found, 0);
+        // The same pick again: the same source, rescanned, owing nothing new.
+        let again = from_folder(&paths, None, std::slice::from_ref(&album)).unwrap();
+        assert!(!again.added, "it was not added a second time");
+        assert_eq!(again.row.dir, first.row.dir);
+        assert_eq!(sources(&paths).unwrap().len(), 1);
 
-        let back = ledger.source(&row.dir).unwrap().unwrap();
-        assert_eq!(back.last_error, None, "elsewhere is not broken");
-        assert_eq!(back.scanned_at, 0, "and it is still overdue");
+        assert_eq!(scan(&paths, &again.row.dir).unwrap().owed, 0);
+        assert_eq!(drain(&paths, None).unwrap().kept, 0, "nothing to bring in");
+        assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 2);
+
+        // And what is genuinely new there is picked up by that rescan.
+        tree(&album, &["c.jpg"]);
+        let third = from_folder(&paths, None, std::slice::from_ref(&album)).unwrap();
+        assert!(!third.added);
+        assert_eq!(scan(&paths, &third.row.dir).unwrap().owed, 1);
+        assert_eq!(drain(&paths, None).unwrap().kept, 1);
     }
 
     #[test]
-    fn a_scan_puts_back_what_it_still_offers_and_retires_what_it_does_not() {
+    fn picking_the_same_folders_in_another_order_is_still_the_same_import() {
         let home = home();
         let paths = paths(&home);
-        let mut ledger = ledger(&paths).unwrap();
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let (one, two) = (home.path().join("one"), home.path().join("two"));
+        tree(&one, &["a.jpg"]);
+        tree(&two, &["b.jpg"]);
 
-        let both = fake(SourceType::Remote, &["kept.jpg", "gone.jpg"]);
-        assert_eq!(scan_with(&ledger, &row, &both).unwrap().owed, 2);
+        let first = from_folder(&paths, Some("Both"), &[one.clone(), two.clone()]).unwrap();
+        let again = from_folder(&paths, Some("Both"), &[two, one]).unwrap();
 
-        // Both run out of attempts, as an unreadable file would.
-        let mut at = now();
-        for _ in 0..ac_import::ledger::MAX_FETCH_ATTEMPTS {
-            ledger.claim(at, 8).unwrap();
-            at += ac_import::ledger::FETCH_RETRY_DELAY + 1;
-        }
-        assert!(ledger.claim(at, 8).unwrap().is_empty());
+        assert!(!again.added);
+        assert_eq!(again.row.dir, first.row.dir);
+        assert_eq!(sources(&paths).unwrap().len(), 1);
+    }
 
-        // The next scan offers only one of them.
-        let one = fake(SourceType::Remote, &["kept.jpg"]);
-        let scanned = scan_with(&ledger, &row, &one).unwrap();
-        assert_eq!(scanned.again, 1, "still offered, so back on the queue");
+    #[test]
+    fn a_picked_folder_is_imported_under_its_own_name() {
+        let home = home();
+        let paths = paths(&home);
+        let album = home.path().join("Pictures 2024");
+        tree(&album, &["a.jpg"]);
+
+        let picked = from_folder(&paths, None, std::slice::from_ref(&album)).unwrap();
+        assert!(picked.added);
+        assert_eq!(picked.row.name, "Pictures 2024");
+        assert_eq!(picked.row.source, "folder");
+        assert_eq!(picked.row.dir, "pictures-2024");
         assert_eq!(
-            scanned.retired, 1,
-            "no longer offered, so the file has gone"
+            picked.row.config.get("path").map(Path::new),
+            Some(album.as_path()),
+            "the implementation takes nothing but an absolute path"
         );
-        assert_eq!(ledger.owed(&row.dir).unwrap(), 1);
-        assert_eq!(ledger.claim(at, 8).unwrap().len(), 1);
+
+        // Several picks have no one name to take, so one has to be given.
+        let two = [album.clone(), home.path().join("other")];
+        std::fs::create_dir_all(&two[1]).unwrap();
+        let err = from_folder(&paths, None, &two).unwrap_err();
+        assert!(err.to_string().contains("--name"), "{err}");
+        assert_eq!(
+            from_folder(&paths, Some("Everything"), &two)
+                .unwrap()
+                .row
+                .dir,
+            "everything"
+        );
+
+        // A folder that is not there is refused before anything is written down.
+        let err = from_folder(&paths, None, &[home.path().join("nope")]).unwrap_err();
+        assert!(err.to_string().contains("is not there"), "{err}");
+        assert!(from_folder(&paths, None, &[]).is_err());
+        assert_eq!(sources(&paths).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn what_a_source_was_told_is_listed_without_its_credentials() {
+        // What a Drive account or a phone declares: somewhere to look, and the credential
+        // that reaches it. No source in this build has one, which is the whole reason this
+        // is tested against a declaration rather than through the registry.
+        let declared = [
+            Field::paths("path", "Folders"),
+            Field::secret("token", "Refresh token"),
+        ];
+
+        let mut config = Fields::new();
+        config.push("path", "/one");
+        config.push("token", "shhh");
+        config.push("path", "/two");
+        let row = SourceRow {
+            dir: "phone".to_owned(),
+            name: "Phone".to_owned(),
+            source: "phone".to_owned(),
+            config,
+            added_at: now(),
+            scanned_at: 0,
+            last_error: None,
+        };
+
+        let shown = without_secrets(row.clone(), Some(&declared));
+        assert_eq!(shown.config.get("token"), None, "the credential stays here");
+        assert_eq!(
+            shown.config.all("path").collect::<Vec<_>>(),
+            ["/one", "/two"],
+            "and a repeated answer keeps every one of its values"
+        );
+
+        // Nothing says which key of an implementation this build has never seen is the
+        // credential, so none of it is handed out.
+        assert!(without_secrets(row, None).config.is_empty());
     }
 
     #[test]

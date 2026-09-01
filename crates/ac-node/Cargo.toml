@@ -21,6 +21,7 @@ futures = "0.3"
 serde.workspace = true
 ciborium.workspace = true
 hex.workspace = true
+sha2.workspace = true
 libp2p.workspace = true
 tokio.workspace = true
 clap.workspace = true

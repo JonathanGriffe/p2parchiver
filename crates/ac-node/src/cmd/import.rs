@@ -1,8 +1,11 @@
+use std::path::PathBuf;
+
 use ac_import::config::{Field, FieldKind, Fields};
-use ac_net::config::Paths;
+use ac_net::config::{Config, Paths};
+use ac_peers::sync::{Limits, Space};
 use anyhow::{Result, bail};
 
-use crate::ops::format::ago;
+use crate::ops::format::{ago, human_size};
 use crate::ops::{self};
 
 /// The one command that needs no node: what this build can import from is a fact about the
@@ -59,10 +62,119 @@ pub fn source_add(paths: &Paths, source: &str, name: &str, set: &[String]) -> Re
     let row = ops::import::add_source(paths, source, name, pairs(set)?)?;
 
     println!("added {} ({})", row.name, row.source);
-    println!("its files will land in .unsorted/{}", row.dir);
+    println!(
+        "its files will land in {}/{}",
+        ops::import::UNSORTED,
+        row.dir
+    );
     println!();
     println!("scan it now with: ac import scan {}", row.dir);
     Ok(())
+}
+
+/// Add a folder, scan it, and bring it in: the whole of an import, with no daemon running.
+pub fn from(paths: &Paths, picked: &[PathBuf], name: Option<&str>) -> Result<()> {
+    let ops::import::Picked { row, added } = ops::import::from_folder(paths, name, picked)?;
+    match added {
+        true => println!("added {} ({})", row.name, row.source),
+        false => println!("{} was imported before, looking for what is new", row.name),
+    }
+
+    let scanned = ops::import::scan(paths, &row.dir)?;
+    for note in &scanned.skipped {
+        eprintln!("{note}");
+    }
+    println!("{}: {} to bring in", scanned.name, scanned.owed);
+    if scanned.owed == 0 {
+        return Ok(());
+    }
+
+    println!();
+    report(&work(paths, None)?, Some(&row.dir));
+    Ok(())
+}
+
+/// Work through what every source is owed.
+pub fn fetch(paths: &Paths, limit: Option<usize>) -> Result<()> {
+    let fetched = work(paths, limit)?;
+    if fetched.tried == 0 {
+        println!("nothing is owed. `ac import scan <source>` looks for more");
+        return Ok(());
+    }
+    report(&fetched, None);
+    Ok(())
+}
+
+/// Whether there is room to bring anything in, and what to say if there is not.
+///
+/// The same `Limits` the daemon holds imports to and the sync side refuses transfers on, so
+/// "full" means one thing on this node however the bytes were going to arrive. Measured once
+/// rather than per file: this is a foreground command somebody is watching, and stopping at
+/// the top with a reason beats stopping partway with none.
+fn no_room(paths: &Paths) -> Option<String> {
+    let storage = ops::file::storage(paths).ok()?;
+    let limits = Limits {
+        storage_max: Config::load(&paths.config_file())
+            .unwrap_or_default()
+            .storage_max,
+        ..Limits::default()
+    };
+    let space = Space {
+        free: storage.free?,
+        held: storage.held,
+    };
+    limits
+        .room(space)
+        .map(|why| format!("there is no room to import: {why:?}"))
+}
+
+fn work(paths: &Paths, limit: Option<usize>) -> Result<ops::import::Fetched> {
+    use ops::import::Outcome;
+
+    if let Some(why) = no_room(paths) {
+        bail!("{why}");
+    }
+
+    let mut pump = ops::import::pump(paths, limit)?;
+    let mut fetched = ops::import::Fetched::default();
+    while let Some(brought) = pump.next()? {
+        match &brought.outcome {
+            Outcome::Kept { size } => println!("{}  {}", brought.name, human_size(*size)),
+            Outcome::Failed(why) => eprintln!("{}: {why}", brought.name),
+            Outcome::Known | Outcome::Held | Outcome::Gone => {}
+        }
+        fetched.count(&brought);
+    }
+    pump.finish()?;
+    Ok(fetched)
+}
+
+/// The summary under the per-file lines [`work`] has already printed.
+fn report(fetched: &ops::import::Fetched, dir: Option<&str>) {
+    println!(
+        "{} imported ({}), {} already had, {} in a group already",
+        fetched.kept,
+        human_size(fetched.bytes),
+        fetched.known,
+        fetched.held,
+    );
+    if fetched.gone > 0 {
+        println!("{} had left the source", fetched.gone);
+    }
+    if !fetched.failed.is_empty() {
+        println!(
+            "{} did not come in, and will be tried again",
+            fetched.failed.len()
+        );
+    }
+    if fetched.kept > 0 {
+        let unsorted = ops::import::UNSORTED;
+        println!();
+        match dir {
+            Some(dir) => println!("they are waiting in {unsorted}/{dir}"),
+            None => println!("they are waiting in {unsorted}"),
+        }
+    }
 }
 
 pub fn source_list(paths: &Paths) -> Result<()> {
@@ -93,7 +205,7 @@ pub fn source_list(paths: &Paths) -> Result<()> {
             "", entry.tally.waiting, entry.tally.sorted, entry.tally.dropped, entry.owed,
         );
         if let Some(why) = &entry.row.last_error {
-            eprintln!("{:<widest$}  last scan failed: {why}", "");
+            eprintln!("{:<widest$}  last error: {why}", "");
         }
     }
     Ok(())
@@ -155,7 +267,8 @@ pub fn scan(paths: &Paths, source: &str) -> Result<()> {
     );
     if scanned.owed > 0 {
         println!();
-        println!("nothing has been downloaded yet: `ac run` works through what is owed");
+        println!("nothing has been downloaded yet: `ac import fetch` brings them in now,");
+        println!("and `ac run` works through them in the background");
     }
     Ok(())
 }
@@ -176,6 +289,25 @@ fn pairs(set: &[String]) -> Result<Fields> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon holds imports to `Limits` and the sync side refuses transfers on the same
+    /// ones; a fetch typed at a terminal answers to them too. What is asserted here is the
+    /// half a mistake would break silently: an empty node must not refuse. Whether a spent
+    /// budget says no is `Limits::room`'s own question, and `ac-peers` tests it.
+    #[test]
+    fn a_fetch_on_an_empty_node_is_not_refused_for_want_of_room() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted_at(home.path());
+        ops::identity(&paths).unwrap();
+
+        assert_eq!(no_room(&paths), None, "nothing is held, so nothing is full");
+
+        // A ceiling well above nothing does not change that.
+        let mut config = Config::load(&paths.config_file()).unwrap_or_default();
+        config.storage_max = Some(64 * 1024 * 1024 * 1024);
+        config.save(&paths.config_file()).unwrap();
+        assert_eq!(no_room(&paths), None, "and the ceiling is nowhere near");
+    }
 
     #[test]
     fn a_set_flag_is_split_once_so_a_value_may_hold_an_equals_sign() {

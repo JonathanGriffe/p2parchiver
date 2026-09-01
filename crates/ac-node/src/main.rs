@@ -73,6 +73,22 @@ enum ImportCommand {
 
     /// Scan one source now, whatever its cadence says.
     Scan { source: String },
+
+    /// Import folders in one go: add them, scan them, and bring them in.
+    From {
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<PathBuf>,
+        /// What to file them under. Defaults to the name of the folder itself.
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Bring in what the sources are owed, without waiting for the daemon.
+    Fetch {
+        /// Stop after this many files.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -257,6 +273,11 @@ fn main() -> Result<()> {
             cmd::import::settings_set(&paths, &source, &key, &value)
         }
         Command::Import(ImportCommand::Scan { source }) => cmd::import::scan(&paths, &source),
+        Command::Import(ImportCommand::From {
+            paths: picked,
+            name,
+        }) => cmd::import::from(&paths, &picked, name.as_deref()),
+        Command::Import(ImportCommand::Fetch { limit }) => cmd::import::fetch(&paths, limit),
     }
 }
 

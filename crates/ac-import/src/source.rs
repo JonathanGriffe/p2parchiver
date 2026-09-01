@@ -70,6 +70,80 @@ impl Digest {
             Self::Sha256 => "sha256",
         }
     }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "md5" => Some(Self::Md5),
+            "sha1" => Some(Self::Sha1),
+            "sha256" => Some(Self::Sha256),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The bytes on their way to wherever they are being written, counted in the algorithm the
+/// source published — so the promise is checked as they pass, not by reading the file back.
+pub struct Verify<'a> {
+    into: &'a mut dyn Write,
+    hasher: Hasher,
+}
+
+enum Hasher {
+    Md5(md5::Md5),
+    Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
+}
+
+impl<'a> Verify<'a> {
+    pub fn new(algo: Digest, into: &'a mut dyn Write) -> Self {
+        use sha2::Digest as _;
+
+        Self {
+            into,
+            hasher: match algo {
+                Digest::Md5 => Hasher::Md5(md5::Md5::new()),
+                Digest::Sha1 => Hasher::Sha1(sha1::Sha1::new()),
+                Digest::Sha256 => Hasher::Sha256(sha2::Sha256::new()),
+            },
+        }
+    }
+
+    /// What arrived, in the algorithm it was promised in.
+    pub fn digest(self) -> String {
+        use sha2::Digest as _;
+
+        match self.hasher {
+            Hasher::Md5(hasher) => hex::encode(hasher.finalize()),
+            Hasher::Sha1(hasher) => hex::encode(hasher.finalize()),
+            Hasher::Sha256(hasher) => hex::encode(hasher.finalize()),
+        }
+    }
+}
+
+impl Write for Verify<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        use sha2::Digest as _;
+
+        // Only what was taken is hashed, or a short write would leave the digest describing
+        // bytes that never landed.
+        let wrote = self.into.write(buf)?;
+        match &mut self.hasher {
+            Hasher::Md5(hasher) => hasher.update(&buf[..wrote]),
+            Hasher::Sha1(hasher) => hasher.update(&buf[..wrote]),
+            Hasher::Sha256(hasher) => hasher.update(&buf[..wrote]),
+        }
+        Ok(wrote)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.into.flush()
+    }
 }
 
 pub type Cursor = String;
@@ -157,6 +231,41 @@ mod tests {
         };
         assert!(checksum.matches("d41d8cd98f00b204e9800998ecf8427e"));
         assert!(!checksum.matches("d41d8cd98f00b204e9800998ecf8427f"));
+    }
+
+    #[test]
+    fn what_was_promised_is_checked_in_whichever_algorithm_it_was_promised_in() {
+        // "hello", in the three algorithms a source might already have a digest in.
+        for (algo, expected) in [
+            (Digest::Md5, "5d41402abc4b2a76b9719d911017c592"),
+            (Digest::Sha1, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+            (
+                Digest::Sha256,
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            ),
+        ] {
+            let mut arrived = Vec::new();
+            let mut verify = Verify::new(algo, &mut arrived);
+            verify.write_all(b"hel").unwrap();
+            verify.write_all(b"lo").unwrap();
+
+            assert_eq!(verify.digest(), expected, "{algo}");
+            assert_eq!(arrived, b"hello", "the bytes go through untouched");
+
+            let promised = Checksum {
+                algo,
+                value: expected.to_owned(),
+            };
+            assert!(promised.matches(expected));
+        }
+    }
+
+    #[test]
+    fn an_algorithm_survives_the_round_trip_through_the_ledger() {
+        for algo in [Digest::Md5, Digest::Sha1, Digest::Sha256] {
+            assert_eq!(Digest::parse(algo.as_str()), Some(algo));
+        }
+        assert_eq!(Digest::parse("crc32"), None);
     }
 
     #[test]
