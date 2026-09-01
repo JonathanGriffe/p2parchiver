@@ -353,6 +353,19 @@ impl Files {
             .transpose()
     }
 
+    /// Whether any group has these bytes on this disk
+    pub fn held_anywhere(&self, hash: &str) -> Result<bool, FilesError> {
+        let found: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT 1 FROM files WHERE hash = ?1 AND have = 1 AND removed_at IS NULL LIMIT 1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     pub fn mark_have(
         &mut self,
         group: GroupId,
@@ -583,7 +596,7 @@ fn move_bytes(
     from: &RelPath,
     to: &RelPath,
 ) -> Result<bool, FilesError> {
-    match content.rename(dir, from, to) {
+    match content.adopt(dir, from, dir, to) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(%from, "the index claimed bytes that are not on disk");
@@ -949,6 +962,36 @@ mod tests {
             .remove(g, &RelPath::parse("here.jpg").unwrap(), AT)
             .unwrap();
         assert_eq!(files.held_bytes().unwrap(), 50);
+    }
+
+    #[test]
+    fn held_anywhere_asks_about_bytes_not_about_a_group() {
+        let (mut files, me) = store();
+        let (g, other) = (group_id(1), group_id(2));
+
+        files.record(g, &row(me, "here.jpg", "aa"), true).unwrap();
+        assert!(files.held_anywhere("aa").unwrap());
+        assert!(!files.held_anywhere("zz").unwrap());
+
+        // The point of it: `path_of_hash` answers one group at a time and would say no here.
+        assert!(files.path_of_hash(other, "aa").unwrap().is_none());
+        assert!(files.held_anywhere("aa").unwrap());
+
+        // Catalogued but not fetched is not held, or an import would throw away bytes we have
+        // in order to wait for a peer to send them back.
+        files
+            .record(g, &row(me, "elsewhere.jpg", "bb"), true)
+            .unwrap();
+        files
+            .mark_have(g, &RelPath::parse("elsewhere.jpg").unwrap(), false)
+            .unwrap();
+        assert!(!files.held_anywhere("bb").unwrap());
+
+        // And a removal stops it being held, which is why `imported` has to remember instead.
+        files
+            .remove(g, &RelPath::parse("here.jpg").unwrap(), AT)
+            .unwrap();
+        assert!(!files.held_anywhere("aa").unwrap());
     }
 
     #[test]
