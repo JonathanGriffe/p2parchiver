@@ -81,7 +81,7 @@ pub struct Transfers {
 }
 
 impl Transfers {
-    pub fn new(db: PathBuf, me: PeerId, bandwidth_max: Option<u64>) -> Self {
+    pub fn new(db: PathBuf, me: PeerId, down: Arc<Throttle>) -> Self {
         let (outcomes, inbox) = mpsc::unbounded_channel();
         Self {
             outcomes,
@@ -89,7 +89,7 @@ impl Transfers {
             running: HashMap::new(),
             db,
             me,
-            down: Arc::new(Throttle::from_config(bandwidth_max, THROTTLE_BURST)),
+            down,
         }
     }
 

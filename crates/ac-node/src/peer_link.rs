@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use libp2p::multiaddr::Protocol;
@@ -20,6 +21,7 @@ use crate::daemon::ClientSwarm;
 use crate::file_link::{FileLink, RoundOutcome};
 use crate::group_link::GroupLink;
 use crate::status::{Bandwidth, Published};
+use crate::throttle::Throttle;
 
 /// Candidate direct addresses kept per peer
 const MAX_DIRECT_ADDRS: usize = 8;
@@ -60,6 +62,7 @@ impl PeerLink {
         identity: &Identity,
         server: Option<PeerId>,
         at: i64,
+        down: Arc<Throttle>,
     ) -> Result<Self> {
         let path = paths.db_file();
         let me = identity.peer_id();
@@ -79,7 +82,7 @@ impl PeerLink {
                 storage_max: config.storage_max,
                 ..Limits::default()
             }),
-            transfers: Transfers::new(path.clone(), me, config.bandwidth_max),
+            transfers: Transfers::new(path.clone(), me, down),
             proposals: HashMap::new(),
             presence: HashMap::new(),
             server,
@@ -639,7 +642,14 @@ mod tests {
                 swarm,
                 link: FileLink::open(&paths, &identity).unwrap(),
                 groups: GroupLink::open(&paths, &identity).unwrap(),
-                peers: PeerLink::open(&paths, &identity, None, AT).unwrap(),
+                peers: PeerLink::open(
+                    &paths,
+                    &identity,
+                    None,
+                    AT,
+                    Arc::new(Throttle::from_config(None, blob::THROTTLE_BURST)),
+                )
+                .unwrap(),
                 blobs,
                 roster: Roster::default(),
                 peer: identity.peer_id(),

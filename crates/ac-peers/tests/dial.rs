@@ -14,7 +14,7 @@ use ac_net::identity::Keypair;
 use ac_peers::sync::{
     CLOSE_TIMEOUT, DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_ROUND, DIALS_PER_WINDOW, HEARTBEAT,
     Limits, MAX_TRANSFERS, MIN_BACKOFF, NoRoom, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent,
-    Peers, RETRY_AFTER, RETRY_ATTEMPTS, ROUND_TIMEOUT, SHARE_AFTER_IDLE,
+    Peers, RETRY_AFTER, RETRY_ATTEMPTS, ROUND_TIMEOUT, SHARE_AFTER_IDLE, Space,
 };
 use tempfile::TempDir;
 
@@ -1661,6 +1661,67 @@ fn a_settled_node_goes_quiet() {
 }
 
 // ---- disk limits ----
+
+#[test]
+fn the_limits_answer_for_any_caller_not_just_the_sync_machine() {
+    // `Limits` is what an importer consults too, so that "full" means one thing on this node
+    // rather than two things that happen to agree. These are the same rules the machine runs
+    // on, asked directly.
+    let limits = Limits {
+        min_free: 1_000,
+        storage_max: Some(5_000),
+    };
+
+    let roomy = Space {
+        free: 10_000,
+        held: 1_000,
+    };
+    assert_eq!(limits.room(roomy), None);
+    assert!(limits.fits(roomy, 500));
+
+    // The floor is about the volume, whatever the budget says.
+    assert!(
+        matches!(
+            limits.room(Space { free: 900, held: 0 }),
+            Some(NoRoom::Floor { .. })
+        ),
+        "under the floor is no room"
+    );
+    assert!(
+        !limits.fits(roomy, 9_500),
+        "and a file that would breach it does not fit"
+    );
+
+    // The budget is about what we chose to hold.
+    assert!(matches!(
+        limits.room(Space {
+            free: 10_000,
+            held: 5_000
+        }),
+        Some(NoRoom::Budget { .. })
+    ));
+    assert!(
+        !limits.fits(roomy, 4_001),
+        "one that would exceed it does not fit"
+    );
+    assert!(
+        limits.fits(roomy, 4_000),
+        "and one that lands exactly on it does"
+    );
+
+    // No budget leaves only the floor.
+    let unbounded = Limits {
+        min_free: 1_000,
+        storage_max: None,
+    };
+    assert_eq!(
+        unbounded.room(Space {
+            free: 10_000,
+            held: u64::MAX / 2
+        }),
+        None
+    );
+}
 
 /// A node with a budget, two members, and a disk report to go with it.
 fn cramped(storage_max: Option<u64>, free: u64, held: u64) -> (Node, GroupId) {

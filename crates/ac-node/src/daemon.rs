@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -5,9 +6,11 @@ use libp2p::futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, rendezvous, request_response, upnp};
 
+use crate::blob;
 use crate::file_link::FileLink;
 use crate::group_link::GroupLink;
 use crate::peer_link::PeerLink;
+use crate::throttle::Throttle;
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_groups::wire::{GroupRequest, GroupResponse};
 use ac_net::admission_link::AdmissionLink;
@@ -114,11 +117,20 @@ pub async fn run(
 
     let mut groups = GroupLink::open(paths, identity)?;
     let mut files = FileLink::open(paths, identity)?;
+
+    // Only the download throttle is created here as only download is done in two places
+    // Upload is only done in peer link
+    let down = Arc::new(Throttle::from_config(
+        config.bandwidth_max,
+        blob::THROTTLE_BURST,
+    ));
+
     let mut peers = PeerLink::open(
         paths,
         identity,
         link.as_ref().map(|l| l.server),
         attest::now(),
+        down.clone(),
     )?;
 
     let mut blobs = FileLink::accept_blobs(&mut swarm)?;

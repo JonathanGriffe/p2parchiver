@@ -77,11 +77,41 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// Why there is no room for more content, or `None` if there is.
+    pub fn room(&self, space: Space) -> Option<NoRoom> {
+        if space.free < self.min_free {
+            return Some(NoRoom::Floor {
+                held: space.held,
+                limit: self.min_free,
+            });
+        }
+        match self.storage_max {
+            Some(max) if space.held >= max => Some(NoRoom::Budget {
+                held: space.held,
+                limit: max,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether one more file of this size fits inside both limits.
+    pub fn fits(&self, space: Space, size: u64) -> bool {
+        if space.free.saturating_sub(size) < self.min_free {
+            return false;
+        }
+        match self.storage_max {
+            Some(max) => space.held.saturating_add(size) <= max,
+            None => true,
+        }
+    }
+}
+
 /// What the disk last looked like, as the daemon reported it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Space {
-    free: u64,
-    held: u64,
+pub struct Space {
+    pub free: u64,
+    pub held: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -875,37 +905,15 @@ impl Peers {
         self.ask_holdings(peer, group)
     }
 
-    /// Why there is no room for more content, or `None` if there is.
+    /// Why there is no room for more content, or `None` if there is. Nothing known about the
+    /// disk yet means no reason to refuse.
     pub fn room(&self) -> Option<NoRoom> {
-        let space = self.space?;
-
-        if space.free < self.limits.min_free {
-            return Some(NoRoom::Floor {
-                held: space.held,
-                limit: self.limits.min_free,
-            });
-        }
-        match self.limits.storage_max {
-            Some(max) if space.held >= max => Some(NoRoom::Budget {
-                held: space.held,
-                limit: max,
-            }),
-            _ => None,
-        }
+        self.limits.room(self.space?)
     }
 
     /// Whether one more file of this size fits inside both limits.
     fn room_for(&self, size: u64) -> bool {
-        let Some(space) = self.space else {
-            return true;
-        };
-        if space.free.saturating_sub(size) < self.limits.min_free {
-            return false;
-        }
-        match self.limits.storage_max {
-            Some(max) => space.held.saturating_add(size) <= max,
-            None => true,
-        }
+        self.space.is_none_or(|space| self.limits.fits(space, size))
     }
 
     /// Book the space a fetch is about to use.
