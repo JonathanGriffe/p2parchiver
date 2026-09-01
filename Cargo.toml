@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/ac-files",
+    "crates/ac-import",
     "crates/ac-peers",
     "crates/ac-groups",
     "crates/ac-net",
@@ -24,6 +25,9 @@ ac-groups = { path = "crates/ac-groups" }
 # Content. Depends on `ac-groups` for the group id it files things under, never the reverse:
 # a group is a membership question and stays answerable with nothing stored.
 ac-files = { path = "crates/ac-files" }
+# Where files come from. Depends on nothing here: a source offers items and writes bytes into
+# whatever it is handed, and what is already held is a question the node answers for it.
+ac-import = { path = "crates/ac-import" }
 # The supervisor. Depends on everything below it and nothing depends on it but the binary:
 # deciding who to call needs to see membership and content at once.
 ac-peers = { path = "crates/ac-peers" }
