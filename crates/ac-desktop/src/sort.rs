@@ -48,6 +48,9 @@ pub struct Page {
     pub implementations: Vec<slint::SharedString>,
     /// The Settings tab's Sources section, which is about the app rather than the accounts.
     pub settings: Vec<SettingItem>,
+    /// The file either side of the one on screen, as (hash, path): what the preview worker
+    /// fetches ahead so stepping is instant rather than a spawn per keypress.
+    pub neighbours: Vec<(String, String)>,
 }
 
 pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
@@ -75,8 +78,9 @@ pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
 
     // Opened once for the whole read: the tab asks for the file on screen, and reopening the
     // ledger and the file index for each question is the bulk of what that costs.
-    let inbox = ops::import::Inbox::open(paths).ok();
-    let Some((file, here)) = inbox.as_ref().and_then(|it| current_in(it, looking_at)) else {
+    let opened = ops::import::Inbox::open(paths).ok();
+    let found = opened.as_ref().and_then(|it| current_in(it, looking_at));
+    let (Some(inbox), Some((file, here))) = (opened, found) else {
         page.position = match backlog.total {
             0 => String::new(),
             total => format!("{total} waiting"),
@@ -98,7 +102,34 @@ pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
     page.hash = file.row.hash.clone();
     page.held = file.held;
     page.path = located(paths, &file);
+    page.neighbours = neighbours(&inbox, paths, looking_at, &file);
     page
+}
+
+/// The one behind and the one ahead, which is the whole of what gets prefetched.
+fn neighbours(
+    inbox: &ops::import::Inbox,
+    paths: &Paths,
+    looking_at: &Sorting,
+    file: &Waiting,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+
+    let ahead = inbox.page(Some((file.row.at, &file.row.hash)), 1);
+    let behind = match looking_at.trail.len() {
+        0 | 1 => Vec::new(),
+        len => {
+            let (at, hash) = &looking_at.trail[len - 2];
+            inbox
+                .page(Some((*at, hash.as_str())), 1)
+                .unwrap_or_default()
+        }
+    };
+
+    for file in ahead.unwrap_or_default().iter().chain(behind.iter()) {
+        out.push((file.row.hash.clone(), located(paths, file)));
+    }
+    out
 }
 
 /// The file on screen: the first row after the trail's last cursor.
@@ -223,7 +254,7 @@ pub fn apply(window: &MainWindow, page: Page) {
     window.set_sort_arrived(page.arrived.into());
     window.set_sort_source(page.source.into());
     window.set_sort_folder(page.folder.into());
-    window.set_sort_hash(page.hash.into());
+    window.set_sort_hash(page.hash.as_str().into());
     window.set_sort_held(page.held);
     window.set_sort_position(page.position.into());
     window.set_sort_in_folder(page.in_folder);
@@ -236,13 +267,13 @@ pub fn apply(window: &MainWindow, page: Page) {
     window.set_source_kinds(ModelRc::from(Rc::new(VecModel::from(page.implementations))));
     window.set_source_settings(ModelRc::from(Rc::new(VecModel::from(page.settings))));
 
-    // The preview is whatever slint can decode; everything else gets the tile the view
-    // already draws when this is empty.
-    let preview = (!page.path.is_empty())
-        .then(|| slint::Image::load_from_path(std::path::Path::new(&page.path)).ok())
-        .flatten();
-    window.set_sort_preview(preview.unwrap_or_default());
-    window.set_sort_path(page.path.into());
+    window.set_sort_path(page.path.clone().into());
+
+    let previews = crate::preview::previews();
+    previews.show(window, &page.hash, std::path::Path::new(&page.path));
+    for (hash, path) in &page.neighbours {
+        previews.prefetch(hash, std::path::Path::new(path));
+    }
 }
 
 pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &Nudge) {

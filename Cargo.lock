@@ -30,6 +30,7 @@ dependencies = [
  "directories",
  "fontique",
  "i-slint-backend-testing",
+ "image",
  "ksni",
  "png 0.18.1",
  "rfd",

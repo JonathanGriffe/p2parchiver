@@ -5,6 +5,7 @@ mod groups;
 mod log;
 mod node;
 mod peers;
+mod preview;
 mod selection;
 mod settings;
 mod shell;

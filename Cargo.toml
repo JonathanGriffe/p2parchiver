@@ -80,6 +80,12 @@ slint = { version = "1.17", default-features = false, features = [
 ] }
 slint-build = "1.17"
 
+# Decoding, capping and turning previews the right way up. Already in the tree behind
+# slint's image-default-formats; named here because the preview worker uses it directly.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg", "png", "gif", "bmp", "tiff", "webp",
+] }
+
 tracing = "0.1"
 # A desktop app has no console to log to, and an unattended one needs its log capped.
 tracing-appender = "0.2"
