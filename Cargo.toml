@@ -86,6 +86,8 @@ image = { version = "0.25", default-features = false, features = [
     "jpeg", "png", "gif", "bmp", "tiff", "webp",
 ] }
 
+heif-oxide = "0.1"
+
 tracing = "0.1"
 # A desktop app has no console to log to, and an unattended one needs its log capped.
 tracing-appender = "0.2"

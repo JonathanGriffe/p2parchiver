@@ -35,6 +35,7 @@ pub enum Route {
     /// A first frame, pulled with ffmpeg. iPhones shoot HEVC in `.mov` and Android H.264
     /// in `.mp4`, and one route covers the lot.
     Video,
+    /// Decoded in this process. What an iPhone shoots by default.
     Heic,
     /// Every RAW embeds a full-size JPEG, so nothing here decodes RAW itself.
     Raw,
@@ -57,27 +58,19 @@ pub fn route_for(name: &str) -> Option<Route> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tools {
     pub ffmpeg: bool,
-    /// Whichever of the two is here, since macOS ships one and Linux the other.
-    pub heif: Option<&'static str>,
 }
 
 pub fn detect() -> Tools {
     Tools {
         ffmpeg: on_path("ffmpeg"),
-        heif: ["heif-convert", "sips"]
-            .into_iter()
-            .find(|tool| on_path(tool)),
     }
 }
 
 impl Tools {
     pub fn can(&self, route: Route) -> bool {
         match route {
-            // Neither needs anything installed: one is decoded in this binary, and the
-            // other is a JPEG this binary goes and finds.
-            Route::BuiltIn | Route::Raw => true,
+            Route::BuiltIn | Route::Heic | Route::Raw => true,
             Route::Video => self.ffmpeg,
-            Route::Heic => self.heif.is_some(),
         }
     }
 }
@@ -293,9 +286,8 @@ fn produce(tools: Tools, src: &Path, dest: &Path) -> Result<()> {
 
     match route {
         Route::BuiltIn => shrink(src, dest),
-        // The three that need a tool all produce an ordinary picture first, and then take
-        // the same path a jpeg does — so capping and orientation are written once.
-        _ => {
+        Route::Heic => heic(src, dest),
+        Route::Video | Route::Raw => {
             let extracted = dest.with_extension("extracted");
             let outcome = extract(tools, route, src, &extracted).and_then(|()| {
                 shrink(&extracted, dest).with_context(|| format!("reading what {route:?} made"))
@@ -306,8 +298,19 @@ fn produce(tools: Tools, src: &Path, dest: &Path) -> Result<()> {
     }
 }
 
+/// Decode a HEIC in this process, which is what an iPhone shoots by default
+fn heic(src: &Path, dest: &Path) -> Result<()> {
+    let decoded = heif_oxide::decode_file(src)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("decoding {}", src.display()))?;
+
+    let picture = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.to_rgba8())
+        .with_context(|| format!("{} decoded to fewer pixels than it declared", src.display()))?;
+    store(image::DynamicImage::ImageRgba8(picture), dest)
+}
+
 /// Get *a* picture out of a file the `image` crate cannot open on its own.
-fn extract(tools: Tools, route: Route, src: &Path, dest: &Path) -> Result<()> {
+fn extract(_tools: Tools, route: Route, src: &Path, dest: &Path) -> Result<()> {
     let mut command = match route {
         Route::Video => {
             let mut command = std::process::Command::new("ffmpeg");
@@ -321,22 +324,7 @@ fn extract(tools: Tools, route: Route, src: &Path, dest: &Path) -> Result<()> {
                 .arg(dest);
             command
         }
-        Route::Heic => match tools.heif {
-            Some("sips") => {
-                let mut command = std::process::Command::new("sips");
-                command
-                    .args(["-s", "format", "jpeg"])
-                    .arg(src)
-                    .arg("--out")
-                    .arg(dest);
-                command
-            }
-            _ => {
-                let mut command = std::process::Command::new("heif-convert");
-                command.arg(src).arg(dest);
-                command
-            }
-        },
+        Route::Heic => bail!("heic is decoded in this process, not by a tool"),
         // Handled here rather than by a tool: see `embedded`.
         Route::Raw => return embedded(src, dest),
         Route::BuiltIn => bail!("the built-in route needs no tool"),
@@ -497,8 +485,10 @@ fn shrink(src: &Path, dest: &Path) -> Result<()> {
     let mut picture = image::DynamicImage::from_decoder(decoder)
         .with_context(|| format!("decoding {}", src.display()))?;
     picture.apply_orientation(orientation);
+    store(picture, dest)
+}
 
-    // Bounded by construction, including for the formats slint could have loaded itself.
+fn store(mut picture: image::DynamicImage, dest: &Path) -> Result<()> {
     if picture.width() > PREVIEW_MAX || picture.height() > PREVIEW_MAX {
         picture = picture.thumbnail(PREVIEW_MAX, PREVIEW_MAX);
     }
@@ -544,20 +534,16 @@ mod tests {
 
     #[test]
     fn a_route_whose_tool_is_missing_is_one_this_machine_cannot_take() {
+        // Three of the four are answered inside this binary, so a machine with nothing
+        // installed still previews a photo, an iPhone photo and a RAW.
         let bare = Tools::default();
         assert!(bare.can(Route::BuiltIn), "decoding needs nothing installed");
-        assert!(
-            bare.can(Route::Raw),
-            "and neither does finding an embedded jpeg"
-        );
-        assert!(!bare.can(Route::Video));
-        assert!(!bare.can(Route::Heic));
+        assert!(bare.can(Route::Heic), "nor does an iPhone photo");
+        assert!(bare.can(Route::Raw), "nor finding the jpeg a RAW embeds");
 
-        let equipped = Tools {
-            ffmpeg: true,
-            heif: Some("heif-convert"),
-        };
-        assert!(equipped.can(Route::Video) && equipped.can(Route::Heic));
+        // Video is the one left, and the only thing `Tools` still answers for.
+        assert!(!bare.can(Route::Video));
+        assert!(Tools { ffmpeg: true }.can(Route::Video));
     }
 
     #[test]
@@ -681,6 +667,26 @@ mod tests {
         // the tile is a designed state.
         assert!(!previews.wanted(Path::new("/somewhere/IMG_1.mov")));
         assert!(previews.wanted(Path::new("/somewhere/IMG_1.jpg")));
+    }
+
+    /// No HEIC to hand and no way to make one — encoding needs an HEVC encoder, which is
+    /// the very thing this removed. What can be shown is that the route reaches the
+    /// decoder and that a refusal comes back as a tile rather than a panic.
+    #[test]
+    fn something_that_is_not_a_heic_is_refused_by_the_decoder() {
+        let tmp = tmp();
+        let src = tmp.path().join("IMG_0001.HEIC");
+        std::fs::write(&src, b"ftypheic but nothing behind it").unwrap();
+
+        assert!(
+            Tools::default().can(Route::Heic),
+            "the route is always available now, so nothing gates this"
+        );
+        let error = produce(Tools::default(), &src, &tmp.path().join("out.png")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("decoding"),
+            "the decoder was reached and said no: {error:#}"
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ ac-net.workspace = true
 # For the field declarations the Sort tab's Add form is generated from.
 ac-import.workspace = true
 image.workspace = true
+heif-oxide.workspace = true
 slint.workspace = true
 clap.workspace = true
 tokio.workspace = true
