@@ -59,7 +59,6 @@ pub struct Tools {
     pub ffmpeg: bool,
     /// Whichever of the two is here, since macOS ships one and Linux the other.
     pub heif: Option<&'static str>,
-    pub exiftool: bool,
 }
 
 pub fn detect() -> Tools {
@@ -68,17 +67,17 @@ pub fn detect() -> Tools {
         heif: ["heif-convert", "sips"]
             .into_iter()
             .find(|tool| on_path(tool)),
-        exiftool: on_path("exiftool"),
     }
 }
 
 impl Tools {
     pub fn can(&self, route: Route) -> bool {
         match route {
-            Route::BuiltIn => true,
+            // Neither needs anything installed: one is decoded in this binary, and the
+            // other is a JPEG this binary goes and finds.
+            Route::BuiltIn | Route::Raw => true,
             Route::Video => self.ffmpeg,
             Route::Heic => self.heif.is_some(),
-            Route::Raw => self.exiftool,
         }
     }
 }
@@ -338,18 +337,8 @@ fn extract(tools: Tools, route: Route, src: &Path, dest: &Path) -> Result<()> {
                 command
             }
         },
-        Route::Raw => {
-            // Every RAW carries a full-size JPEG, which is both faster and better than
-            // anything a decoder would make of the sensor data.
-            let out = std::fs::File::create(dest)
-                .with_context(|| format!("writing {}", dest.display()))?;
-            let mut command = std::process::Command::new("exiftool");
-            command
-                .args(["-b", "-PreviewImage"])
-                .arg(src)
-                .stdout(std::process::Stdio::from(out));
-            command
-        }
+        // Handled here rather than by a tool: see `embedded`.
+        Route::Raw => return embedded(src, dest),
         Route::BuiltIn => bail!("the built-in route needs no tool"),
     };
 
@@ -358,6 +347,113 @@ fn extract(tools: Tools, route: Route, src: &Path, dest: &Path) -> Result<()> {
         0 => bail!("{route:?} produced nothing"),
         _ => Ok(()),
     }
+}
+
+/// A RAW bigger than this is not read
+const MAX_RAW: u64 = 256 * 1024 * 1024;
+
+/// Below this, a JPEG inside a RAW is the little thumbnail rather than the preview.
+const MIN_PREVIEW: u32 = 160;
+
+/// The biggest usable JPEG inside a RAW, written out as it was found.
+fn embedded(src: &Path, dest: &Path) -> Result<()> {
+    let size = std::fs::metadata(src)
+        .with_context(|| format!("reading {}", src.display()))?
+        .len();
+    if size > MAX_RAW {
+        bail!("{} is too big to look inside", src.display());
+    }
+
+    let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
+    let mut found = jpegs(&bytes);
+    found.sort_by_key(|range| std::cmp::Reverse(range.len()));
+
+    for range in found {
+        let candidate = &bytes[range];
+        let Ok(reader) = image::ImageReader::new(std::io::Cursor::new(candidate))
+            .with_guessed_format()
+            .map(|reader| reader.into_dimensions())
+        else {
+            continue;
+        };
+        let Ok((width, height)) = reader else {
+            continue;
+        };
+        if width < MIN_PREVIEW && height < MIN_PREVIEW {
+            continue;
+        }
+
+        return std::fs::write(dest, candidate)
+            .with_context(|| format!("writing {}", dest.display()));
+    }
+    bail!(
+        "produced nothing: no preview is embedded in {}",
+        src.display()
+    )
+}
+
+/// Every complete JPEG in `bytes`, as byte ranges.
+fn jpegs(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+
+    while at + 3 < bytes.len() {
+        if bytes[at] == 0xFF && bytes[at + 1] == 0xD8 && bytes[at + 2] == 0xFF {
+            if let Some(end) = ends_at(bytes, at) {
+                out.push(at..end);
+                at = end;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    out
+}
+
+/// Where the JPEG starting at `from` ends, or `None` if it never does.
+fn ends_at(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut at = from + 2;
+
+    loop {
+        // Segments are allowed to be padded with fill bytes before their marker.
+        while *bytes.get(at)? == 0xFF && *bytes.get(at + 1)? == 0xFF {
+            at += 1;
+        }
+        if *bytes.get(at)? != 0xFF {
+            return None;
+        }
+        let marker = *bytes.get(at + 1)?;
+        at += 2;
+
+        match marker {
+            // The end.
+            0xD9 => return Some(at),
+            // Standalone: no length, nothing to skip.
+            0x01 | 0xD0..=0xD7 => {}
+            // The image data itself, which is not a segment: it runs until the next marker
+            // that is not a stuffed 0xFF00 or a restart.
+            0xDA => {
+                at += length(bytes, at)?;
+                loop {
+                    while *bytes.get(at)? != 0xFF {
+                        at += 1;
+                    }
+                    match *bytes.get(at + 1)? {
+                        0x00 | 0xFF => at += 2,
+                        0xD0..=0xD7 => at += 2,
+                        _ => break,
+                    }
+                }
+            }
+            _ => at += length(bytes, at)?,
+        }
+    }
+}
+
+/// A segment's length, which counts its own two bytes.
+fn length(bytes: &[u8], at: usize) -> Option<usize> {
+    let len = u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]) as usize;
+    (len >= 2).then_some(len)
 }
 
 /// Run a tool, and kill it if it will not finish. A hung ffmpeg would otherwise take every
@@ -395,9 +491,6 @@ fn shrink(src: &Path, dest: &Path) -> Result<()> {
     let mut decoder = reader
         .into_decoder()
         .with_context(|| format!("decoding {}", src.display()))?;
-    // Phones routinely store a portrait photo rotated with a tag saying so, and the `image`
-    // crate does not apply it — without this, portrait shots come out sideways, which in a
-    // photo sorter is the first thing anyone notices.
     let orientation = image::ImageDecoder::orientation(&mut decoder)
         .unwrap_or(image::metadata::Orientation::NoTransforms);
 
@@ -453,14 +546,16 @@ mod tests {
     fn a_route_whose_tool_is_missing_is_one_this_machine_cannot_take() {
         let bare = Tools::default();
         assert!(bare.can(Route::BuiltIn), "decoding needs nothing installed");
+        assert!(
+            bare.can(Route::Raw),
+            "and neither does finding an embedded jpeg"
+        );
         assert!(!bare.can(Route::Video));
         assert!(!bare.can(Route::Heic));
-        assert!(!bare.can(Route::Raw));
 
         let equipped = Tools {
             ffmpeg: true,
             heif: Some("heif-convert"),
-            exiftool: true,
         };
         assert!(equipped.can(Route::Video) && equipped.can(Route::Heic));
     }
@@ -629,31 +724,98 @@ mod tests {
         );
     }
 
-    /// The one route with a tool on this machine, driven for real. A RAW with nothing
-    /// embedded is the case that matters: exiftool succeeds and writes no bytes, and what
-    /// must come of that is a tile rather than a broken cache entry.
-    #[test]
-    fn a_tool_that_produces_nothing_leaves_no_preview_behind() {
-        let tools = detect();
-        if !tools.exiftool {
-            return;
+    /// A stand-in for a RAW: a container with a little thumbnail and a big preview inside
+    /// it, which is the shape every one of them has.
+    fn raw_with(at: &Path, embedded: &[(u32, u32)]) {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend(b"II\x2a\x00\x08\x00\x00\x00");
+        out.extend([0xFF, 0xD8, 0xFF, 0x11, 0x22, 0x33]);
+        out.extend([0u8; 64]);
+
+        for (width, height) in embedded {
+            let mut jpeg: Vec<u8> = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(*width, *height, |x, y| {
+                image::Rgb([(x % 256) as u8, (y % 256) as u8, 200])
+            }))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+
+            out.extend(&jpeg);
+            out.extend([0u8; 32]);
         }
+        std::fs::write(at, out).unwrap();
+    }
+
+    #[test]
+    fn a_raw_gives_up_the_biggest_jpeg_it_carries() {
+        let tmp = tmp();
+        let src = tmp.path().join("DSC_0001.NEF");
+        let dest = tmp.path().join("preview.png");
+        // The thumbnail every RAW has, and the preview worth showing.
+        raw_with(&src, &[(160, 120), (1024, 768)]);
+
+        produce(Tools::default(), &src, &dest).unwrap();
+
+        assert_eq!(
+            image::image_dimensions(&dest).unwrap(),
+            (1024, 768),
+            "the preview, not the thumbnail beside it"
+        );
+    }
+
+    #[test]
+    fn bytes_that_merely_look_like_a_jpeg_are_walked_past() {
+        let noise = [0xFFu8, 0xD8, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55];
+        assert!(jpegs(&noise).is_empty());
 
         let tmp = tmp();
-        let src = tmp.path().join("shot.dng");
-        picture(&src.with_extension("tiff"), 64, 48);
-        std::fs::rename(src.with_extension("tiff"), &src).unwrap();
+        let src = tmp.path().join("sensor.cr2");
+        std::fs::write(&src, [noise.as_slice(), &[7u8; 512]].concat()).unwrap();
 
-        let dest = tmp.path().join("preview.png");
-        let error = produce(tools, &src, &dest).unwrap_err();
-
+        let error = produce(Tools::default(), &src, &tmp.path().join("out.png")).unwrap_err();
         assert!(
-            format!("{error:#}").contains("produced nothing"),
-            "an empty extraction is caught rather than decoded: {error:#}"
+            format!("{error:#}").contains("no preview is embedded"),
+            "and what comes of that is a tile: {error:#}"
         );
+    }
+
+    #[test]
+    fn a_jpeg_is_found_whole_rather_than_to_the_first_end_marker() {
+        let tmp = tmp();
+        let src = tmp.path().join("one.arw");
+        raw_with(&src, &[(320, 240)]);
+
+        let bytes = std::fs::read(&src).unwrap();
+        let found = jpegs(&bytes);
+
+        assert_eq!(found.len(), 1, "one jpeg, found once: {found:?}");
+        // What was found is exactly a jpeg, start to end, and decodes on its own.
+        let carved = &bytes[found[0].clone()];
+        assert_eq!(&carved[..2], &[0xFF, 0xD8]);
+        assert_eq!(&carved[carved.len() - 2..], &[0xFF, 0xD9]);
+        assert_eq!(
+            image::load_from_memory(carved).unwrap().width(),
+            320,
+            "carved cleanly out of the middle of the file"
+        );
+    }
+
+    #[test]
+    fn a_raw_too_big_to_hold_in_memory_is_refused_before_it_is_read() {
+        let tmp = tmp();
+        let src = tmp.path().join("huge.dng");
+        std::fs::File::create(&src)
+            .unwrap()
+            .set_len(MAX_RAW + 1)
+            .unwrap();
+
+        let error = embedded(&src, &tmp.path().join("out.jpg")).unwrap_err();
         assert!(
-            !dest.is_file(),
-            "and nothing half-made is left where a preview goes"
+            format!("{error:#}").contains("too big to look inside"),
+            "refused on its size rather than after allocating it: {error:#}"
         );
     }
 }
@@ -663,8 +825,6 @@ mod through_the_window {
     use super::*;
     use crate::ui::MainWindow;
 
-    /// The whole pipeline, ending where it matters: a real photo becoming the image the
-    /// Sort tab draws. Everything above this tests a piece; this tests that they join up.
     #[test]
     fn a_photo_becomes_the_image_the_tab_shows() {
         let tmp = tempfile::tempdir().unwrap();
