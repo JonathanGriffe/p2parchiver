@@ -1,7 +1,8 @@
 //! Asking a source what it has, and writing down what it owes.
 
 use ac_import::ledger::{Ledger, SourceRow};
-use ac_import::source::Source;
+use ac_import::registry;
+use ac_import::source::{Source, SourceType};
 use ac_net::config::Paths;
 use anyhow::{Context, Result, anyhow};
 
@@ -26,6 +27,19 @@ pub struct Scanned {
     pub reachable: bool,
     /// A scan that reached the end. Only a complete one may retire rows or stamp `scanned_at`.
     pub complete: bool,
+}
+
+/// Every source that is polled at all, stalest first: what the daemon picks its next scan
+/// from. A one-shot source is never here, which is what "one-shot" means.
+pub fn pollable(ledger: &Ledger) -> Result<Vec<(SourceRow, SourceType)>> {
+    Ok(ledger
+        .stalest()?
+        .into_iter()
+        .filter_map(|row| {
+            let kind = registry::find(&row.source)?.kind;
+            kind.polled().then_some((row, kind))
+        })
+        .collect())
 }
 
 /// Scan one source now, ignoring both its cadence and its backoff.

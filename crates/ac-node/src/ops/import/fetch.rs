@@ -1,6 +1,7 @@
 //! Bringing the bytes in: the pump, and what one fetch does.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use ac_files::{Content, Files, RelPath};
 use ac_import::ledger::{Imported, Ledger, Owed, SourceRow, State};
@@ -102,7 +103,34 @@ pub fn pump(paths: &Paths, limit: Option<usize>) -> Result<Pump> {
         queue: VecDeque::new(),
         open: None,
         put_back: Vec::new(),
+        pace: None,
     })
+}
+
+/// A download budget an import answers to, so the daemon can hold imports and peer
+/// transfers to one allowance. Called with what is about to be written, and blocks.
+pub trait Pace: Send + Sync {
+    fn take(&self, bytes: usize);
+}
+
+/// The bytes on their way to the sink, held to whatever budget the caller set.
+struct Paced<'a> {
+    pace: Option<&'a dyn Pace>,
+    into: &'a mut dyn std::io::Write,
+}
+
+impl std::io::Write for Paced<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Paid for before it moves, as a peer transfer pays before its own write.
+        if let Some(pace) = self.pace {
+            pace.take(buf.len());
+        }
+        self.into.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.into.flush()
+    }
 }
 
 /// A run of the pump: the handles it needs, and the claim it is working through.
@@ -118,9 +146,17 @@ pub struct Pump {
     open: Option<(SourceRow, Box<dyn Source>)>,
     /// Attempts spent on nothing, given back when the run ends.
     put_back: Vec<(String, String)>,
+    /// The download budget, when there is one to answer to.
+    pace: Option<Arc<dyn Pace>>,
 }
 
 impl Pump {
+    /// Hold this run to a download budget.
+    pub fn paced(mut self, pace: Arc<dyn Pace>) -> Self {
+        self.pace = Some(pace);
+        self
+    }
+
     /// The next file, or `None` once nothing more is owed. Claims another batch when the
     /// one in hand runs out.
     #[allow(clippy::should_implement_trait)]
@@ -165,6 +201,7 @@ impl Pump {
                 continue;
             };
             return Ok(Some(fetch_one(
+                self.pace.as_deref(),
                 &self.ledger,
                 &HeldHere(&self.files),
                 &self.content,
@@ -227,6 +264,7 @@ impl Pump {
 }
 
 fn fetch_one(
+    pace: Option<&dyn Pace>,
     ledger: &Ledger,
     held: &dyn Held,
     content: &Content,
@@ -253,16 +291,24 @@ fn fetch_one(
         .as_ref()
         .map(|sum| sum.algo)
         .filter(|algo| *algo != Digest::Sha256);
-    let arrived = match second {
-        None => source.fetch(&item, &mut sink).map(|()| None),
-        Some(algo) => {
-            let mut verify = Verify::new(algo, &mut sink);
-            source.fetch(&item, &mut verify).map(|()| Some(verify))
+    let arrived = {
+        let mut paced = Paced {
+            pace,
+            into: &mut sink,
+        };
+        match second {
+            None => source.fetch(&item, &mut paced).map(|()| None),
+            Some(algo) => {
+                let mut verify = Verify::new(algo, &mut paced);
+                source
+                    .fetch(&item, &mut verify)
+                    .map(|()| Some(verify.digest()))
+            }
         }
     };
 
     let computed = match arrived {
-        Ok(verify) => verify.map(Verify::digest),
+        Ok(digest) => digest,
         Err(e) => {
             // Whatever arrived before the failure is thrown away rather than resumed: the
             // next attempt starts the fetch again, and a stale partial would outlive it.
@@ -389,7 +435,8 @@ mod tests {
         let taken = ledger.claim(now(), BATCH).unwrap();
         let mut out = Fetched::default();
         for owed in &taken {
-            let brought = fetch_one(ledger, &HeldHere(files), content, row, source, owed).unwrap();
+            let brought =
+                fetch_one(None, ledger, &HeldHere(files), content, row, source, owed).unwrap();
             out.count(&brought);
         }
         out

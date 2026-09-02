@@ -9,6 +9,7 @@ use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, rendezvous, reques
 use crate::blob;
 use crate::file_link::FileLink;
 use crate::group_link::GroupLink;
+use crate::import_link::ImportLink;
 use crate::peer_link::PeerLink;
 use crate::throttle::Throttle;
 use ac_files::wire::{ManifestRequest, ManifestResponse};
@@ -133,6 +134,8 @@ pub async fn run(
         down.clone(),
     )?;
 
+    let mut imports = ImportLink::open(paths, down.clone())?;
+
     let mut blobs = FileLink::accept_blobs(&mut swarm)?;
     let mut connectivity = Connectivity::default();
 
@@ -154,7 +157,15 @@ pub async fn run(
 
                 groups.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
                 files.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
-                peers.housekeeping(&mut swarm, &mut files, &mut groups, &roster, attest::now());
+
+                // Measured once and given to both, which is what makes them one budget.
+                let space = peers.space(&files, imports.unsorted_bytes());
+                peers.housekeeping(&mut swarm, &mut files, &mut groups, &roster, attest::now(), space);
+                imports.housekeeping(attest::now(), space);
+            }
+
+            Some(done) = imports.finished() => {
+                imports.on_done(done);
             }
 
             event = swarm.select_next_some() => {

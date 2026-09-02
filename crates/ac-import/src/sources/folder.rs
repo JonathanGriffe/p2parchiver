@@ -382,7 +382,7 @@ fn refused(reason: impl Into<String>) -> SourceError {
 mod tests {
     use super::*;
 
-    /// Build a tree from `<relative path>` entries, each written with its own path as content.
+    /// Each file is written with its own path as its content.
     fn tree(root: &Path, files: &[&str]) {
         for file in files {
             let path = root.join(file);

@@ -18,8 +18,8 @@ pub mod sources;
 #[cfg(test)]
 pub(crate) mod fixtures;
 
-pub use fetch::{Brought, Fetched, Outcome, Pump, drain, pump};
-pub use scan::{Scanned, scan, scan_with};
+pub use fetch::{Brought, Fetched, Outcome, Pace, Pump, drain, pump};
+pub use scan::{Scanned, pollable, scan, scan_with};
 pub use sources::{
     Configured, Picked, Setting, add_source, available, from_folder, implementation, open_source,
     remove_source, set_setting, settings, sources,

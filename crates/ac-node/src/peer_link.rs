@@ -13,7 +13,7 @@ use ac_net::roster::Roster;
 use ac_files::content::Content;
 use ac_files::store::Files;
 use ac_groups::store::Groups;
-use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers};
+use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers, Space};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
 use crate::blob::{self, Transfers};
@@ -251,11 +251,15 @@ impl PeerLink {
         groups: &mut GroupLink,
         roster: &Roster,
         at: i64,
+        space: Option<Space>,
     ) {
         self.collect(swarm, files, groups, roster);
 
-        if let Some((free, held)) = self.disk(files) {
-            self.peers.on(PeerEvent::Space { free, held });
+        if let Some(space) = space {
+            self.peers.on(PeerEvent::Space {
+                free: space.free,
+                held: space.held,
+            });
         }
 
         let actions = self.peers.on(PeerEvent::Tick { at });
@@ -298,7 +302,7 @@ impl PeerLink {
     }
 
     /// Free bytes on the storage volume, and bytes of content this node holds.
-    fn disk(&self, files: &FileLink) -> Option<(u64, u64)> {
+    pub fn space(&self, files: &FileLink, unsorted: u64) -> Option<Space> {
         let probe = if self.root.exists() {
             self.root.clone()
         } else {
@@ -312,7 +316,10 @@ impl PeerLink {
                 return None;
             }
         };
-        Some((free, files.held_bytes()?))
+        Some(Space {
+            free,
+            held: files.held_bytes()?.saturating_add(unsorted),
+        })
     }
 
     /// A peer asking whether we are finished with it, and our answers to the same question.
@@ -740,12 +747,14 @@ mod tests {
                 .housekeeping(&mut self.swarm, &self.roster, Instant::now(), self.at);
             self.link
                 .housekeeping(&mut self.swarm, &self.roster, Instant::now(), self.at);
+            let space = self.peers.space(&self.link, 0);
             self.peers.housekeeping(
                 &mut self.swarm,
                 &mut self.link,
                 &mut self.groups,
                 &self.roster,
                 self.at,
+                space,
             );
         }
 

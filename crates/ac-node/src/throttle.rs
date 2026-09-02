@@ -51,7 +51,7 @@ impl Throttle {
         }
     }
 
-    #[cfg(test)]
+    /// Whether there is a cap
     pub fn is_limited(&self) -> bool {
         self.bucket.is_some()
     }
