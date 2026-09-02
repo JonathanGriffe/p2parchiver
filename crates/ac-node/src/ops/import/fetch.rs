@@ -11,7 +11,7 @@ use ac_net::config::Paths;
 use anyhow::{Context, Result};
 
 use super::sources::open_source;
-use super::{HeldHere, UNSORTED, ledger};
+use super::{HeldHere, UNSORTED, ledger, unsorted_path};
 use crate::ops::now;
 
 /// How many owed references one claim takes at a time. The pump holds a batch in memory
@@ -389,12 +389,7 @@ fn fetch_one(
 
 /// Where one owed file lands
 fn destination(ledger: &Ledger, owed: &Owed) -> Result<RelPath> {
-    let raw = match owed.folder.trim_matches('/') {
-        "" => format!("{}/{}", owed.source_dir, owed.name),
-        folder => format!("{}/{folder}/{}", owed.source_dir, owed.name),
-    };
-    let dest = RelPath::parse(&raw)
-        .or_else(|_| RelPath::under(&owed.source_dir, &owed.name))
+    let dest = unsorted_path(&owed.source_dir, &owed.folder, &owed.name)
         .with_context(|| format!("{} cannot be given a name on disk", owed.source_ref))?;
 
     if ledger.name_taken(
@@ -440,12 +435,6 @@ mod tests {
             out.count(&brought);
         }
         out
-    }
-
-    /// The file index and the storage root, opened as the pump opens them.
-    fn store(paths: &Paths) -> (Files, Content) {
-        let identity = crate::ops::identity(paths).unwrap();
-        crate::ops::open_files(paths, &identity).unwrap()
     }
 
     /// Everything under `.unsorted`, as paths relative to it.

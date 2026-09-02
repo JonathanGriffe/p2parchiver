@@ -89,6 +89,29 @@ enum ImportCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+
+    /// What is waiting to be sorted.
+    List {
+        /// Every page of it, rather than the first.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// File one into a group.
+    Sort {
+        hash: String,
+        group: String,
+        /// Everything that came from the same source folder.
+        #[arg(long)]
+        folder: bool,
+    },
+
+    /// Throw one away, permanently.
+    Drop {
+        hash: String,
+        #[arg(long)]
+        folder: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -278,6 +301,15 @@ fn main() -> Result<()> {
             name,
         }) => cmd::import::from(&paths, &picked, name.as_deref()),
         Command::Import(ImportCommand::Fetch { limit }) => cmd::import::fetch(&paths, limit),
+        Command::Import(ImportCommand::List { all }) => cmd::import::list(&paths, all),
+        Command::Import(ImportCommand::Sort {
+            hash,
+            group,
+            folder,
+        }) => cmd::import::sort(&paths, &hash, &group, folder),
+        Command::Import(ImportCommand::Drop { hash, folder }) => {
+            cmd::import::drop(&paths, &hash, folder)
+        }
     }
 }
 

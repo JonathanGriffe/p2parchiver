@@ -63,8 +63,6 @@ impl Throttle {
 
     /// Wait until `n` bytes may move, then account for them.
     pub async fn consume(&self, n: usize) {
-        // Counted above the early return, so an unthrottled node still has a total. Nothing
-        // reads this often enough for the ordering to matter.
         self.moved.fetch_add(n as u64, Ordering::Relaxed);
 
         let Some(bucket) = &self.bucket else {

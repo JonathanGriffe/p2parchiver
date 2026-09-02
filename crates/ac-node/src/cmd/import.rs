@@ -177,6 +177,100 @@ fn report(fetched: &ops::import::Fetched, dir: Option<&str>) {
     }
 }
 
+/// How many files one page of the listing shows.
+const PAGE: usize = 50;
+
+/// What is waiting to be sorted, oldest first.
+pub fn list(paths: &Paths, all: bool) -> Result<()> {
+    let backlog = ops::import::backlog(paths, None)?;
+    if backlog.total == 0 {
+        println!("nothing is waiting. `ac import from <path>` brings files in");
+        return Ok(());
+    }
+
+    let inbox = ops::import::Inbox::open(paths)?;
+    let mut after: Option<(i64, String)> = None;
+    let mut shown = 0u64;
+    loop {
+        let page = inbox.page(after.as_ref().map(|(at, h)| (*at, h.as_str())), PAGE)?;
+        let Some(last) = page.last() else { break };
+        after = Some((last.row.at, last.row.hash.clone()));
+
+        for file in &page {
+            let where_from = match file.row.folder.as_str() {
+                "" => file.row.source_name.clone(),
+                folder => format!("{}/{folder}", file.row.source_name),
+            };
+            println!(
+                "{}  {:>9}  {where_from}{}",
+                &file.row.hash[..12],
+                human_size(file.row.size),
+                match file.held {
+                    true => "  (a group already has these bytes)",
+                    false => "",
+                }
+            );
+            println!("{:14}{}", "", file.row.name);
+        }
+        shown += page.len() as u64;
+
+        if !all || page.len() < PAGE {
+            break;
+        }
+    }
+
+    println!();
+    match shown < backlog.total {
+        true => println!(
+            "{shown} of {} waiting. `ac import list --all` shows the rest",
+            backlog.total
+        ),
+        false => println!("{} waiting", backlog.total),
+    }
+    println!("sort one with: ac import sort <hash> <group>");
+    Ok(())
+}
+
+/// File one into a group, or everything that came from the same source folder.
+pub fn sort(paths: &Paths, hash: &str, group: &str, folder: bool) -> Result<()> {
+    let row = ops::import::find(paths, hash)?;
+    let filed = match folder {
+        false => ops::import::sort(paths, &row.hash, group)?,
+        true => ops::import::sort_folder(paths, &row.source_dir, &row.folder, group)?,
+    };
+    report_filed(&filed, "filed", Some(group))
+}
+
+pub fn drop(paths: &Paths, hash: &str, folder: bool) -> Result<()> {
+    let row = ops::import::find(paths, hash)?;
+    let filed = match folder {
+        false => ops::import::drop(paths, &row.hash)?,
+        true => ops::import::drop_folder(paths, &row.source_dir, &row.folder)?,
+    };
+    report_filed(&filed, "deleted", None)
+}
+
+fn report_filed(filed: &ops::import::Filed, did: &str, group: Option<&str>) -> Result<()> {
+    for note in &filed.failed {
+        eprintln!("{note}");
+    }
+
+    match group {
+        Some(group) => println!("{} {did} into {group}", filed.done),
+        None => println!("{} {did}", filed.done),
+    }
+    if filed.missing > 0 {
+        println!(
+            "{} had already gone from disk, and are settled from what is held now",
+            filed.missing
+        );
+    }
+    if filed.done == 0 && filed.missing == 0 {
+        bail!("nothing was {did}");
+    }
+    Ok(())
+}
+
 pub fn source_list(paths: &Paths) -> Result<()> {
     let configured = ops::import::sources(paths)?;
     if configured.is_empty() {

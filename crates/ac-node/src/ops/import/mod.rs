@@ -5,12 +5,13 @@
 //! itself, where unsorted bytes wait, and the one question the host can answer that the
 //! importer cannot.
 
-use ac_files::Files;
+use ac_files::{Files, PathError, RelPath};
 use ac_import::ledger::Ledger;
 use ac_import::source::{Held, Result as SourceResult};
 use ac_net::config::Paths;
 use anyhow::{Context, Result};
 
+pub mod backlog;
 pub mod fetch;
 pub mod scan;
 pub mod sources;
@@ -18,6 +19,9 @@ pub mod sources;
 #[cfg(test)]
 pub(crate) mod fixtures;
 
+pub use backlog::{
+    Backlog, Filed, Inbox, Waiting, backlog, drop, drop_folder, find, sort, sort_folder,
+};
 pub use fetch::{Brought, Fetched, Outcome, Pace, Pump, drain, pump};
 pub use scan::{Scanned, pollable, scan, scan_with};
 pub use sources::{
@@ -28,6 +32,19 @@ pub use sources::{
 /// Where imported files wait to be sorted. The leading dot is what keeps it out of the way of
 /// a group: `sanitize` strips one, so no group directory can ever be called this.
 pub const UNSORTED: &str = ".unsorted";
+
+/// Where a file from `source_dir`'s `folder` sits under [`UNSORTED`].
+pub(super) fn unsorted_path(
+    source_dir: &str,
+    folder: &str,
+    name: &str,
+) -> Result<RelPath, PathError> {
+    let raw = match folder.trim_matches('/') {
+        "" => format!("{source_dir}/{name}"),
+        folder => format!("{source_dir}/{folder}/{name}"),
+    };
+    RelPath::parse(&raw).or_else(|_| RelPath::under(source_dir, name))
+}
 
 pub fn ledger(paths: &Paths) -> Result<Ledger> {
     let db = paths.db_file();

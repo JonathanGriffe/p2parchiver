@@ -1,9 +1,10 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
 use ac_groups::id::GroupId;
 use ac_net::PeerId;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 
 use crate::content::Content;
 use crate::dirname::sanitize;
@@ -21,6 +22,16 @@ use row::{row_to_file, wins_hash, wins_path};
 
 /// How long to wait for another process's write lock before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many hashes one `IN (...)` may name, under SQLite's variable limit.
+const BIND_LIMIT: usize = 500;
+
+/// What counts as held
+macro_rules! held {
+    () => {
+        "have = 1 AND removed_at IS NULL"
+    };
+}
 
 pub struct Files {
     db: Connection,
@@ -358,12 +369,34 @@ impl Files {
         let found: Option<i64> = self
             .db
             .query_row(
-                "SELECT 1 FROM files WHERE hash = ?1 AND have = 1 AND removed_at IS NULL LIMIT 1",
+                concat!(
+                    "SELECT 1 FROM files WHERE hash = ?1 AND ",
+                    held!(),
+                    " LIMIT 1"
+                ),
                 params![hash],
                 |row| row.get(0),
             )
             .optional()?;
         Ok(found.is_some())
+    }
+
+    /// Which of `hashes` some group has on this disk
+    pub fn held_any_of(&self, hashes: &[&str]) -> Result<HashSet<String>, FilesError> {
+        let mut out = HashSet::new();
+        // SQLite caps how many variables one statement may bind, so ask in batches.
+        for batch in hashes.chunks(BIND_LIMIT) {
+            let places = vec!["?"; batch.len()].join(",");
+            let mut stmt = self.db.prepare(&format!(
+                "SELECT DISTINCT hash FROM files WHERE hash IN ({places}) AND {}",
+                held!()
+            ))?;
+            let rows = stmt.query_map(params_from_iter(batch), |row| row.get(0))?;
+            for hash in rows {
+                out.insert(hash?);
+            }
+        }
+        Ok(out)
     }
 
     pub fn mark_have(
@@ -992,6 +1025,46 @@ mod tests {
             .remove(g, &RelPath::parse("here.jpg").unwrap(), AT)
             .unwrap();
         assert!(!files.held_anywhere("aa").unwrap());
+    }
+
+    /// Asking about a page at once has to answer exactly what asking row by row would.
+    #[test]
+    fn held_any_of_agrees_with_asking_one_at_a_time() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+
+        files.record(g, &row(me, "here.jpg", "aa"), true).unwrap();
+        files.record(g, &row(me, "also.jpg", "bb"), true).unwrap();
+        // Catalogued but not fetched, so not held.
+        files.record(g, &row(me, "wanted.jpg", "cc"), true).unwrap();
+        files
+            .mark_have(g, &RelPath::parse("wanted.jpg").unwrap(), false)
+            .unwrap();
+
+        let asked = ["aa", "bb", "cc", "zz"];
+        let batch = files.held_any_of(&asked).unwrap();
+        for hash in asked {
+            assert_eq!(batch.contains(hash), files.held_anywhere(hash).unwrap());
+        }
+
+        assert!(files.held_any_of(&[]).unwrap().is_empty());
+    }
+
+    /// More hashes than one statement may bind, so the batching has to hold.
+    #[test]
+    fn held_any_of_asks_about_more_than_one_batch() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+
+        let hashes: Vec<String> = (0..BIND_LIMIT + 20).map(|i| format!("h{i:05}")).collect();
+        for (i, hash) in hashes.iter().enumerate() {
+            files
+                .record(g, &row(me, &format!("f{i}.jpg"), hash), true)
+                .unwrap();
+        }
+
+        let asked: Vec<&str> = hashes.iter().map(|h| h.as_str()).collect();
+        assert_eq!(files.held_any_of(&asked).unwrap().len(), hashes.len());
     }
 
     #[test]
