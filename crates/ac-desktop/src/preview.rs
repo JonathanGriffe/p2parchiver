@@ -10,24 +10,15 @@ use slint::{ComponentHandle, Weak};
 
 use crate::ui::MainWindow;
 
-/// One behind, the one on screen, one ahead. Both the prefetch distance and the cache cap,
-/// deliberately one number: a cache smaller than the window would evict exactly what the
-/// worker just fetched.
 pub const PREVIEW_WINDOW: usize = 3;
 
-/// The longest side a cached preview may have. A 100-megapixel photo decoded to RGBA is
-/// 400MB of memory for something shown at about a thousand pixels.
 const PREVIEW_MAX: u32 = 1400;
 
-/// What a route's tool gets before it is killed. A tool that hangs must not wedge the
-/// worker, which would take every later preview with it.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How often a running tool is looked in on.
 const POLL: Duration = Duration::from_millis(50);
 
-/// How a file becomes a picture. Chosen by extension, which is all that is known before
-/// anything is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     /// What the `image` crate reads itself.
@@ -53,16 +44,49 @@ pub fn route_for(name: &str) -> Option<Route> {
     })
 }
 
-/// Which routes this machine can actually take, settled once at startup. A missing tool
-/// degrades the tab rather than breaking it, which is a designed state and not an error.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+const BUNDLED: &str = "ac-ffmpeg";
+
+const OVERRIDE: &str = "AC_FFMPEG";
+
+/// Which routes this machine can actually take, settled once at startup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tools {
-    pub ffmpeg: bool,
+    pub ffmpeg: Option<PathBuf>,
 }
 
 pub fn detect() -> Tools {
-    Tools {
-        ffmpeg: on_path("ffmpeg"),
+    Tools { ffmpeg: ffmpeg() }
+}
+
+/// The copy this app shipped with, or one named outright.
+fn ffmpeg() -> Option<PathBuf> {
+    beside_us(BUNDLED).or_else(|| named(std::env::var_os(OVERRIDE)))
+}
+
+/// Split out from the variable it reads so a test can hand it one: in edition 2024 the
+/// environment is not something a test may set.
+fn named(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let named = PathBuf::from(value?);
+    named.is_file().then_some(named)
+}
+
+/// A binary installed alongside this one
+fn beside_us(name: &str) -> Option<PathBuf> {
+    let here = std::env::current_exe().ok()?;
+    beside_us_in(here.parent()?, name)
+}
+
+/// Split out so a test can point at a directory it made: the real one is wherever this
+/// process was launched from, which no test can move.
+fn beside_us_in(dir: &Path, name: &str) -> Option<PathBuf> {
+    let candidate = dir.join(exe_name(name));
+    candidate.is_file().then_some(candidate)
+}
+
+fn exe_name(name: &str) -> String {
+    match cfg!(windows) {
+        true => format!("{name}.exe"),
+        false => name.to_owned(),
     }
 }
 
@@ -70,14 +94,9 @@ impl Tools {
     pub fn can(&self, route: Route) -> bool {
         match route {
             Route::BuiltIn | Route::Heic | Route::Raw => true,
-            Route::Video => self.ffmpeg,
+            Route::Video => self.ffmpeg.is_some(),
         }
     }
-}
-
-fn on_path(tool: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()))
 }
 
 /// The previews on disk, newest last. Keyed by content hash, so an entry is unambiguous and
@@ -104,8 +123,6 @@ impl Cache {
         self.path(hash).is_file()
     }
 
-    /// Say this one was just wanted, and drop whatever falls out of the window. Bounding it
-    /// by the window is what saves it needing a size budget of its own.
     pub fn touch(&self, hash: &str) {
         let mut recent = match self.recent.lock() {
             Ok(recent) => recent,
@@ -134,8 +151,7 @@ pub struct Previews {
     cache: Arc<Cache>,
     tools: Tools,
     want: Sender<Job>,
-    /// Previews actually produced. Read only by the test that proves the window is not
-    /// re-fetched as it is stepped through, which is the whole reason it is counted.
+    /// Previews actually produced
     #[allow(dead_code)]
     made: Arc<AtomicUsize>,
 }
@@ -148,8 +164,6 @@ pub fn previews() -> &'static Previews {
 }
 
 fn cache_dir() -> PathBuf {
-    // Derived data, so it goes where the OS puts derived data — never under the storage
-    // root, which was just taught to count `.unsorted` against the content budget.
     directories::ProjectDirs::from("", "", "archiverclient")
         .map(|dirs| dirs.cache_dir().join("previews"))
         .unwrap_or_else(std::env::temp_dir)
@@ -163,11 +177,12 @@ impl Previews {
 
         std::thread::spawn({
             let (cache, made) = (Arc::clone(&cache), Arc::clone(&made));
+            let mine = tools.clone();
             move || {
                 // Off the event loop by construction: an ffmpeg run is far too slow to do
                 // anywhere a frame is waiting on it.
                 while let Ok(job) = jobs.recv() {
-                    work(&cache, tools, &made, job);
+                    work(&cache, &mine, &made, job);
                 }
             }
         });
@@ -231,7 +246,7 @@ impl Previews {
     }
 }
 
-fn work(cache: &Cache, tools: Tools, made: &AtomicUsize, job: Job) {
+fn work(cache: &Cache, tools: &Tools, made: &AtomicUsize, job: Job) {
     // Asked for twice while it sat in the queue, or fetched as a neighbour and then
     // stepped onto. Either way it is here, and running the tool again buys nothing.
     if !cache.has(&job.hash) {
@@ -274,7 +289,7 @@ fn load(path: &Path) -> slint::Image {
 }
 
 /// Turn one file into a capped, right-way-up preview.
-fn produce(tools: Tools, src: &Path, dest: &Path) -> Result<()> {
+fn produce(tools: &Tools, src: &Path, dest: &Path) -> Result<()> {
     let name = src
         .file_name()
         .and_then(|name| name.to_str())
@@ -310,10 +325,13 @@ fn heic(src: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Get *a* picture out of a file the `image` crate cannot open on its own.
-fn extract(_tools: Tools, route: Route, src: &Path, dest: &Path) -> Result<()> {
+fn extract(tools: &Tools, route: Route, src: &Path, dest: &Path) -> Result<()> {
     let mut command = match route {
         Route::Video => {
-            let mut command = std::process::Command::new("ffmpeg");
+            let Some(ffmpeg) = &tools.ffmpeg else {
+                bail!("no ffmpeg to take the video route with");
+            };
+            let mut command = std::process::Command::new(ffmpeg);
             command
                 .arg("-y")
                 .arg("-i")
@@ -509,6 +527,19 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// The ffmpeg a test may use: whatever an installed copy would find, or the one the
+    /// vendoring script fetched, which sits beside this crate rather than beside the test
+    /// binary. `None` only when neither exists, and then the video tests say nothing.
+    fn ffmpeg_for_test() -> Option<PathBuf> {
+        if let Some(found) = ffmpeg() {
+            return Some(found);
+        }
+        let vendored = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor")
+            .join(exe_name(&format!("{BUNDLED}-{}", env!("TEST_TARGET"))));
+        vendored.is_file().then_some(vendored)
+    }
+
     /// A picture of a known size, written where the tests can point at it.
     fn picture(at: &Path, width: u32, height: u32) {
         let buffer = image::RgbImage::from_fn(width, height, |x, y| {
@@ -543,7 +574,41 @@ mod tests {
 
         // Video is the one left, and the only thing `Tools` still answers for.
         assert!(!bare.can(Route::Video));
-        assert!(Tools { ffmpeg: true }.can(Route::Video));
+        let shipped = Tools {
+            ffmpeg: Some(PathBuf::from("/opt/archiverclient/ac-ffmpeg")),
+        };
+        assert!(shipped.can(Route::Video));
+    }
+
+    #[test]
+    fn the_shipped_ffmpeg_is_preferred_over_whatever_the_machine_has() {
+        let tmp = tmp();
+        let installed = tmp.path().join("bin");
+        std::fs::create_dir_all(&installed).unwrap();
+
+        // Nothing shipped yet, so nothing beside us to find.
+        assert_eq!(beside_us_in(&installed, BUNDLED), None);
+
+        // The name is deliberately not `ffmpeg`: these land beside the system's own, and
+        // taking that name would collide with it.
+        let shipped = installed.join(exe_name(BUNDLED));
+        std::fs::write(&shipped, b"#!/bin/sh\n").unwrap();
+        assert_eq!(beside_us_in(&installed, BUNDLED), Some(shipped));
+        assert_ne!(exe_name(BUNDLED), "ffmpeg", "it must not take that name");
+    }
+
+    /// The only way to reach an ffmpeg this app did not ship: named outright, never found
+    /// by searching. A build from source has no bundled copy, and this is what it uses.
+    #[test]
+    fn an_ffmpeg_this_app_did_not_ship_has_to_be_named_outright() {
+        let tmp = tmp();
+        let tool = tmp.path().join(exe_name("my-own-ffmpeg"));
+        std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+
+        assert_eq!(named(Some(tool.clone().into())), Some(tool));
+        // A name that is not there is no answer, rather than a path that will fail later.
+        assert_eq!(named(Some(tmp.path().join("gone").into())), None);
+        assert_eq!(named(None), None);
     }
 
     #[test]
@@ -669,9 +734,6 @@ mod tests {
         assert!(previews.wanted(Path::new("/somewhere/IMG_1.jpg")));
     }
 
-    /// No HEIC to hand and no way to make one — encoding needs an HEVC encoder, which is
-    /// the very thing this removed. What can be shown is that the route reaches the
-    /// decoder and that a refusal comes back as a tile rather than a panic.
     #[test]
     fn something_that_is_not_a_heic_is_refused_by_the_decoder() {
         let tmp = tmp();
@@ -682,11 +744,78 @@ mod tests {
             Tools::default().can(Route::Heic),
             "the route is always available now, so nothing gates this"
         );
-        let error = produce(Tools::default(), &src, &tmp.path().join("out.png")).unwrap_err();
+        let error = produce(&Tools::default(), &src, &tmp.path().join("out.png")).unwrap_err();
         assert!(
             format!("{error:#}").contains("decoding"),
             "the decoder was reached and said no: {error:#}"
         );
+    }
+
+    /// The video route, driven end to end against a real clip.
+    #[test]
+    fn a_video_previews_from_its_first_frame() {
+        let Some(ffmpeg) = ffmpeg_for_test() else {
+            return;
+        };
+        let tools = Tools {
+            ffmpeg: Some(ffmpeg.clone()),
+        };
+
+        let tmp = tmp();
+        let clip = tmp.path().join("holiday.mp4");
+        let made = std::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=640x480:rate=10:duration=1",
+            ])
+            .args(["-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-y"])
+            .arg(&clip)
+            .status();
+        if !made.is_ok_and(|status| status.success()) {
+            return;
+        }
+
+        let dest = tmp.path().join("preview.png");
+        produce(&tools, &clip, &dest).unwrap();
+
+        let shown = image::image_dimensions(&dest).unwrap();
+        assert_eq!(shown, (640, 480), "the first frame, at its own size");
+    }
+
+    #[test]
+    fn an_avif_still_previews_like_any_other_picture() {
+        let Some(ffmpeg) = ffmpeg_for_test() else {
+            return;
+        };
+        let tools = Tools {
+            ffmpeg: Some(ffmpeg.clone()),
+        };
+
+        let tmp = tmp();
+        let picture = tmp.path().join("web.avif");
+        let made = std::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:duration=1:rate=1",
+            ])
+            .args(["-frames:v", "1", "-c:v", "libaom-av1", "-y"])
+            .arg(&picture)
+            .status();
+        if !made.is_ok_and(|status| status.success()) {
+            return;
+        }
+
+        assert_eq!(route_for("web.avif"), Some(Route::Video));
+        let dest = tmp.path().join("preview.png");
+        produce(&tools, &picture, &dest).unwrap();
+
+        assert_eq!(image::image_dimensions(&dest).unwrap(), (320, 240));
     }
 
     #[test]
@@ -695,7 +824,7 @@ mod tests {
         let src = tmp.path().join("clip.mov");
         std::fs::write(&src, b"not really a video").unwrap();
 
-        let error = produce(Tools::default(), &src, &tmp.path().join("out.png")).unwrap_err();
+        let error = produce(&Tools::default(), &src, &tmp.path().join("out.png")).unwrap_err();
         assert!(
             error.to_string().contains("no tool"),
             "it says which route it cannot take: {error}"
@@ -763,7 +892,7 @@ mod tests {
         // The thumbnail every RAW has, and the preview worth showing.
         raw_with(&src, &[(160, 120), (1024, 768)]);
 
-        produce(Tools::default(), &src, &dest).unwrap();
+        produce(&Tools::default(), &src, &dest).unwrap();
 
         assert_eq!(
             image::image_dimensions(&dest).unwrap(),
@@ -781,7 +910,7 @@ mod tests {
         let src = tmp.path().join("sensor.cr2");
         std::fs::write(&src, [noise.as_slice(), &[7u8; 512]].concat()).unwrap();
 
-        let error = produce(Tools::default(), &src, &tmp.path().join("out.png")).unwrap_err();
+        let error = produce(&Tools::default(), &src, &tmp.path().join("out.png")).unwrap_err();
         assert!(
             format!("{error:#}").contains("no preview is embedded"),
             "and what comes of that is a tile: {error:#}"

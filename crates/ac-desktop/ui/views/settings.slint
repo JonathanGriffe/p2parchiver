@@ -198,7 +198,7 @@ export component SettingsView inherits ScrollView {
                         value := LineEdit {
                             text: setting.secret ? "" : setting.value;
                             placeholder-text: setting.secret
-                                ? (setting.set ? "set — type to replace" : "not set")
+                                ? (setting.set ? "set" : "not set")
                                 : "";
                             input-type: setting.secret ? InputType.password : InputType.text;
                             enabled: !root.busy;

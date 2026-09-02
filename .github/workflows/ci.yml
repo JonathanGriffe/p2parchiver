@@ -134,6 +134,13 @@ jobs:
       - name: Build
         run: cargo build --release -p ac-desktop -p ac-node
 
+      # The app previews video by spawning ffmpeg, and a stock Windows has none while most
+      # Linux desktops do not either. A packaged build carries its own, pinned by hash in
+      # the script so two runs of one commit package the same bytes.
+      - name: Vendor ffmpeg
+        shell: bash
+        run: scripts/vendor-ffmpeg.sh ${{ matrix.target }}
+
       - name: Package
         working-directory: crates/ac-desktop
         run: cargo packager --release --formats ${{ matrix.formats }}

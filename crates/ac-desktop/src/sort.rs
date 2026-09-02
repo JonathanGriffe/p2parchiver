@@ -195,9 +195,6 @@ fn sources(paths: &Paths) -> Vec<SourceItem> {
         .collect()
 }
 
-/// Every implementation's shared settings, and what they are set to. What the Settings tab's
-/// Sources section is built from — one row per declared field, across every implementation,
-/// so a source that shares nothing simply contributes none and the section stays away.
 pub fn shared_settings(paths: &Paths) -> Vec<SettingItem> {
     let mut out = Vec::new();
     for entry in ops::import::available() {

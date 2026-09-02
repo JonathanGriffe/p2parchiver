@@ -8,4 +8,11 @@ fn main() {
         eprintln!("could not compile ui/app.slint: {e}");
         std::process::exit(1);
     }
+
+    // The video tests look for the vendored ffmpeg, which is named after the target it was
+    // fetched for. Nothing but those tests reads this.
+    println!(
+        "cargo:rustc-env=TEST_TARGET={}",
+        std::env::var("TARGET").unwrap_or_default()
+    );
 }

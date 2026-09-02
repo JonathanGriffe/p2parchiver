@@ -26,8 +26,6 @@ pub struct GroupSummary {
 /// One member, and what is worth saying about them beyond their name.
 pub struct MemberView {
     pub peer: PeerId,
-    /// What they call themselves, once their standing has reached this node. `None` until it
-    /// does — the chain names nobody, so there is nothing else to fall back on.
     pub username: Option<String>,
     pub is_admin: bool,
     pub is_me: bool,

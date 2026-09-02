@@ -7,3 +7,7 @@
 # It holds an Ed25519 private key.
 /.ac
 /.ac-server
+
+# The ffmpeg a packaged build ships with. Fetched by scripts/vendor-ffmpeg.sh, pinned there
+# by hash, and far too big to keep in the history.
+/crates/ac-desktop/vendor/

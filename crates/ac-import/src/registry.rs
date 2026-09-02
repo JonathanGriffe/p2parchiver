@@ -103,8 +103,6 @@ mod tests {
 
     #[test]
     fn every_declared_field_can_be_told_apart_from_its_neighbours() {
-        // The key is how an answer finds its field, so a duplicate would make one of them
-        // unreachable — and the two lists are stored separately, so they may share keys.
         for entry in known() {
             for fields in [entry.settings, entry.config] {
                 let mut keys: Vec<&str> = fields.iter().map(|field| field.key).collect();

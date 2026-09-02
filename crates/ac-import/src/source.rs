@@ -87,8 +87,6 @@ impl fmt::Display for Digest {
     }
 }
 
-/// The bytes on their way to wherever they are being written, counted in the algorithm the
-/// source published — so the promise is checked as they pass, not by reading the file back.
 pub struct Verify<'a> {
     into: &'a mut dyn Write,
     hasher: Hasher,

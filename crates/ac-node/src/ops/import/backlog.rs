@@ -375,8 +375,6 @@ mod tests {
         assert_eq!(filed.done, 0);
         assert_eq!(filed.missing, 1);
 
-        // Nothing holds those bytes, so that is what the row now says — and it is still
-        // a row: `imported` only ever moves forward.
         let back = ledger(&paths)
             .unwrap()
             .get(&file.row.hash)

@@ -437,9 +437,6 @@ impl Peers {
                 self.dialing.remove(&peer);
                 self.connected.remove(&peer);
 
-                // A round still owed when the line drops goes back on the dial list. Failing
-                // one takes a peer off it, on the grounds that the retry will see to them —
-                // which stops being true the moment the connection they were on has gone.
                 if self
                     .peers
                     .get(&peer)

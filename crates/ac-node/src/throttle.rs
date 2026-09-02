@@ -119,8 +119,6 @@ mod tests {
         );
     }
 
-    /// The total is what the Status page shows, so it has to keep counting on the nodes that
-    /// set no limit — which is most of them.
     #[tokio::test]
     async fn bytes_are_counted_even_with_no_limit_to_apply() {
         let t = Throttle::none();

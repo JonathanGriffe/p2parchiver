@@ -964,9 +964,6 @@ fn membership_is_offered_before_the_catalogue() {
 
 #[test]
 fn a_settled_membership_round_does_not_write_off_the_catalogue() {
-    // Two exchanges, two halves. A chain round carries who is in the group and not one file
-    // head, so it may discharge the membership and nothing else — the catalogue is still
-    // outstanding and follows on the answer.
     let mut node = Node::new();
     let members = peers(1);
     let id = node.group_with(&members);

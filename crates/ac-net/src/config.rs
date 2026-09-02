@@ -179,9 +179,6 @@ impl Config {
             source,
         })?;
 
-        // Past here a limit is either a number to honour or nothing at all, so the file's way
-        // of asking for no limit is turned into one before anything else looks at it — the
-        // bandwidth floor below included, which a literal zero would otherwise fail.
         config.storage_max = config.storage_max.filter(|n| *n != NO_LIMIT);
         config.bandwidth_max = config.bandwidth_max.filter(|n| *n != NO_LIMIT);
 

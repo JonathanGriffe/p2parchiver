@@ -207,8 +207,7 @@ pub struct Storage {
     pub max: Option<u64>,
     /// `held`, split by group id and largest first. Groups holding nothing are absent.
     pub by_group: Vec<(String, u64)>,
-    /// Imported and not yet sorted. Counted in `held`, because it is content this node is
-    /// holding, but in no group — the one kind you have without having chosen to.
+    /// Imported and not yet sorted
     pub unsorted: u64,
 }
 

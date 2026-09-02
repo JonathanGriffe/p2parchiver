@@ -591,8 +591,6 @@ impl Ledger {
         Ok(collect(rows)?.into_iter().next())
     }
 
-    /// How many files are waiting, in total and in one source folder — the "3 of 40,128" and
-    /// the number a bulk button names.
     pub fn waiting(&self) -> Result<u64, LedgerError> {
         let count: i64 = self.db.query_row(
             "SELECT COUNT(*) FROM imported WHERE state = 'unsorted'",
@@ -1018,8 +1016,6 @@ mod tests {
         assert!(ledger.forget("pictures", "gone.jpg").unwrap());
         assert_eq!(ledger.owed("pictures").unwrap(), 0);
 
-        // Nothing else is disturbed: an unknown reference, and one already settled, both stay
-        // as they were — the settled row is the history of a file that did arrive.
         assert!(!ledger.forget("pictures", "never.jpg").unwrap());
         assert!(!ledger.forget("pictures", "here.jpg").unwrap());
         assert_eq!(
