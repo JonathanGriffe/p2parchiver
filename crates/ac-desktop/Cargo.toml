@@ -44,6 +44,8 @@ libs = ["libxkbcommon.so.0", "libfontconfig.so.1"]
 [dependencies]
 ac-node.workspace = true
 ac-net.workspace = true
+# For the field declarations the Sort tab's Add form is generated from.
+ac-import.workspace = true
 slint.workspace = true
 clap.workspace = true
 tokio.workspace = true

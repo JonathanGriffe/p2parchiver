@@ -3,13 +3,15 @@ import { StatusView, StorageSlice, TrafficRow } from "views/status.slint";
 import { GroupsView, GroupItem, MemberItem } from "views/groups.slint";
 import { PeersView, PeerItem } from "views/peers.slint";
 import { FilesView, FileItem } from "views/files.slint";
+import { SortView, SourceItem, FieldItem } from "views/sort.slint";
 import { SettingsView } from "views/settings.slint";
+import { SettingItem } from "views/sources-settings.slint";
 import { AboutView } from "views/about.slint";
 import { EnrolDialog } from "views/enrol.slint";
 import { AddMemberDialog } from "views/add-member.slint";
 
 // Re-exported so slint-build generates the Rust structs the models are built from.
-export { GroupItem, MemberItem, PeerItem, FileItem, StorageSlice, TrafficRow }
+export { GroupItem, MemberItem, PeerItem, FileItem, StorageSlice, TrafficRow, SourceItem, FieldItem, SettingItem }
 
 component NavItem inherits Rectangle {
     in property <string> label;
@@ -102,6 +104,28 @@ export component MainWindow inherits Window {
     in property <[FileItem]> files;
     in property <string> file-progress;
 
+    // The Sort page.
+    in property <bool> sort-have;
+    in property <string> sort-name;
+    in property <string> sort-size;
+    in property <string> sort-arrived;
+    in property <string> sort-source;
+    in property <string> sort-folder;
+    in property <string> sort-hash;
+    in property <string> sort-path;
+    in property <bool> sort-held;
+    in property <string> sort-position;
+    in property <int> sort-in-folder;
+    in property <image> sort-preview;
+    in property <string> sort-progress;
+    in property <[string]> sort-group-names;
+    in property <int> sort-group-index;
+    in property <string> sort-group-id;
+    in property <[SourceItem]> sources;
+    in property <[string]> source-kinds;
+    in-out property <[FieldItem]> source-fields;
+    in property <[SettingItem]> source-settings;
+
     // The Settings page. Loaded once and after each save, never on the poll.
     in-out property <bool> mdns;
     in-out property <string> config-storage-root;
@@ -148,6 +172,20 @@ export component MainWindow inherits Window {
     callback restart();
     callback join(string, string);
     callback copy-peer-id();
+    callback sort-pick-group(int);
+    callback sort-step(bool);
+    callback sort-file(string, bool);
+    callback sort-delete(string, bool);
+    callback sort-open(string);
+    callback import-pick(bool);
+    callback scan-source(string);
+    callback remove-source(string);
+    callback pick-source-kind(string);
+    callback add-source(string, string);
+    callback field-edited(int, string);
+    callback field-browse(int, bool);
+    callback field-cleared(int);
+    callback save-setting(string, string, string);
 
     // Which page is up. In-out so a test can open the one it is about.
     in-out property <int> tab: 0;
@@ -190,14 +228,19 @@ export component MainWindow inherits Window {
                 chosen => { root.tab = 3; }
             }
             NavItem {
-                label: "Settings";
+                label: "Sort";
                 selected: root.tab == 4;
                 chosen => { root.tab = 4; }
             }
             NavItem {
-                label: "About";
+                label: "Settings";
                 selected: root.tab == 5;
                 chosen => { root.tab = 5; }
+            }
+            NavItem {
+                label: "About";
+                selected: root.tab == 6;
+                chosen => { root.tab = 6; }
             }
 
             Rectangle { vertical-stretch: 1; }
@@ -280,24 +323,64 @@ export component MainWindow inherits Window {
                 verify() => { root.verify(); }
             }
 
-            if root.tab == 4 : SettingsView {
+            if root.tab == 4 : SortView {
+                have: root.sort-have;
+                name: root.sort-name;
+                size: root.sort-size;
+                arrived: root.sort-arrived;
+                source: root.sort-source;
+                folder: root.sort-folder;
+                hash: root.sort-hash;
+                path: root.sort-path;
+                held: root.sort-held;
+                position: root.sort-position;
+                in-folder: root.sort-in-folder;
+                preview: root.sort-preview;
+                progress: root.sort-progress;
+                group-names: root.sort-group-names;
+                group-index: root.sort-group-index;
+                group-id: root.sort-group-id;
+                sources: root.sources;
+                kinds: root.source-kinds;
+                fields: root.source-fields;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                pick-group(at) => { root.sort-pick-group(at); }
+                step(forward) => { root.sort-step(forward); }
+                file(hash, folder) => { root.sort-file(hash, folder); }
+                delete(hash, folder) => { root.sort-delete(hash, folder); }
+                open(path) => { root.sort-open(path); }
+                import(folder) => { root.import-pick(folder); }
+                scan(dir) => { root.scan-source(dir); }
+                remove(dir) => { root.remove-source(dir); }
+                pick-kind(source) => { root.pick-source-kind(source); }
+                add(source, name) => { root.add-source(source, name); }
+                field-edited(at, value) => { root.field-edited(at, value); }
+                field-browse(at, several) => { root.field-browse(at, several); }
+                field-cleared(at) => { root.field-cleared(at); }
+            }
+
+            if root.tab == 5 : SettingsView {
                 mdns: root.mdns;
                 storage-root: root.config-storage-root;
                 storage-max: root.storage-max;
                 bandwidth-max: root.bandwidth-max;
                 server: root.server;
                 enrolled: root.enrolled;
+                source-settings: root.source-settings;
                 busy: root.busy;
                 vertical-stretch: 1;
 
                 save(m, r, s, b) => { root.save(m, r, s, b); }
+                save-setting(source, key, value) => { root.save-setting(source, key, value); }
                 pick-storage-root(current) => { return root.pick-storage-root(current); }
                 open-logs() => { root.open-logs(); }
                 restart() => { root.restart(); }
                 join(t, u) => { root.join(t, u); }
             }
 
-            if root.tab == 5 : AboutView {
+            if root.tab == 6 : AboutView {
                 version: root.version;
                 peer-id: root.peer-id;
                 home: root.home;

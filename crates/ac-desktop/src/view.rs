@@ -11,6 +11,7 @@ use crate::files;
 use crate::groups;
 use crate::peers;
 use crate::selection::Selection;
+use crate::sort;
 use crate::ui::{MainWindow, StorageSlice, TrafficRow};
 
 const IDLE: i32 = 0;
@@ -47,6 +48,7 @@ pub struct Snapshot {
     pub page: groups::Page,
     pub directory: peers::Page,
     pub files: files::Page,
+    pub sort: sort::Page,
 }
 
 pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
@@ -58,6 +60,7 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
         Vec::new()
     });
     let files = files::read(paths, &looking_at);
+    let sort = sort::read(paths, &looking_at.sorting);
 
     let report = match ops::peer::status(paths) {
         Ok(report) => Some(report),
@@ -93,6 +96,7 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
         page,
         directory,
         files,
+        sort,
     }
 }
 
@@ -132,6 +136,7 @@ pub fn apply(window: &MainWindow, snapshot: Snapshot) {
         page,
         directory,
         files,
+        sort,
     } = snapshot;
 
     window.set_running(status.running);
@@ -147,6 +152,7 @@ pub fn apply(window: &MainWindow, snapshot: Snapshot) {
     window.set_traffic(ModelRc::from(Rc::new(VecModel::from(status.traffic))));
     groups::apply(window, page);
     peers::apply(window, directory);
+    sort::apply(window, sort);
     files::apply(window, files);
 }
 
@@ -266,7 +272,7 @@ fn describe_storage(storage: Option<&Storage>, page: &groups::Page) -> StoragePa
         .max(1);
 
     let mut offset = 0.0_f32;
-    let slices = storage
+    let mut slices: Vec<StorageSlice> = storage
         .by_group
         .iter()
         .enumerate()
@@ -283,6 +289,16 @@ fn describe_storage(storage: Option<&Storage>, page: &groups::Page) -> StoragePa
             slice
         })
         .collect();
+
+    if storage.unsorted > 0 {
+        slices.push(StorageSlice {
+            label: "waiting to be sorted".into(),
+            size: human_size(storage.unsorted).into(),
+            offset,
+            fraction: (storage.unsorted as f64 / capacity as f64) as f32,
+            shade: 0.3,
+        });
+    }
 
     StoragePanel {
         free: match storage.free {
@@ -401,6 +417,7 @@ mod tests {
             free,
             max,
             by_group: Vec::new(),
+            unsorted: 0,
         }
     }
 

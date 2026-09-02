@@ -207,6 +207,9 @@ pub struct Storage {
     pub max: Option<u64>,
     /// `held`, split by group id and largest first. Groups holding nothing are absent.
     pub by_group: Vec<(String, u64)>,
+    /// Imported and not yet sorted. Counted in `held`, because it is content this node is
+    /// holding, but in no group — the one kind you have without having chosen to.
+    pub unsorted: u64,
 }
 
 pub fn storage(paths: &Paths) -> Result<Storage> {
@@ -223,10 +226,16 @@ pub fn storage(paths: &Paths) -> Result<Storage> {
         root.parent().map(Path::to_path_buf)
     };
 
+    let unsorted = super::import::ledger(paths)?
+        .unsorted_bytes()
+        .context("measuring what is waiting to be sorted")?;
+
     Ok(Storage {
         held: files
             .held_bytes()
-            .context("measuring what this node holds")?,
+            .context("measuring what this node holds")?
+            .saturating_add(unsorted),
+        unsorted,
         by_group: files
             .held_bytes_by_group()
             .context("measuring what each group holds")?,

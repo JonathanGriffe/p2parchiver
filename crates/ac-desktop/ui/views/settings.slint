@@ -1,5 +1,6 @@
 import { ScrollView, Button, LineEdit, CheckBox } from "std-widgets.slint";
 import { Theme, Card } from "../theme.slint";
+import { SettingItem } from "sources-settings.slint";
 
 component Row inherits VerticalLayout {
     in property <string> label;
@@ -40,8 +41,10 @@ export component SettingsView inherits ScrollView {
 
     in property <bool> busy;
     in property <bool> enrolled;
+    in property <[SettingItem]> source-settings;
 
     callback save(bool, string, string, string);
+    callback save-setting(string, string, string);
     // Hands back what the field should read, which is what it already read if nothing was
     // chosen.
     callback pick-storage-root(string) -> string;
@@ -174,6 +177,37 @@ export component SettingsView inherits ScrollView {
                                 enabled: token.text != "" && who.text != "" && !root.busy;
                                 clicked => { root.join(token.text, who.text); }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.source-settings.length > 0 : SectionTitle { text: "SOURCES"; }
+
+        if root.source-settings.length > 0 : Card {
+            VerticalLayout {
+                padding: Theme.md;
+                spacing: Theme.md;
+
+                for setting in root.source-settings : Row {
+                    label: setting.source + " · " + setting.label;
+
+                    HorizontalLayout {
+                        spacing: Theme.sm;
+                        value := LineEdit {
+                            text: setting.secret ? "" : setting.value;
+                            placeholder-text: setting.secret
+                                ? (setting.set ? "set — type to replace" : "not set")
+                                : "";
+                            input-type: setting.secret ? InputType.password : InputType.text;
+                            enabled: !root.busy;
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "Save";
+                            enabled: !root.busy;
+                            clicked => { root.save-setting(setting.source, setting.key, value.text); }
                         }
                     }
                 }

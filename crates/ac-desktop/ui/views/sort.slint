@@ -1,0 +1,386 @@
+import { ScrollView, Button, LineEdit, TextEdit, CheckBox, ComboBox } from "std-widgets.slint";
+import { Theme, Card } from "../theme.slint";
+
+// One configured source, as the Sources section lists it.
+export struct SourceItem {
+    dir: string,
+    name: string,
+    source: string,
+    kind: string,
+    scanned: string,
+    error: string,
+    tally: string,
+}
+
+// One field an implementation declared, and what the form was filled in with. `kind` is
+// `sort::KIND_TEXT` and friends, so neither this file nor the Settings tab knows any
+// source's fields by name.
+export struct FieldItem {
+    key: string,
+    label: string,
+    kind: int,
+    required: bool,
+    value: string,
+}
+
+// One declared field, laid out by its kind. A path is chosen rather than typed, so its
+// value stays Rust's; the rest are typed, and Rust is only ever told what was typed.
+component Field inherits VerticalLayout {
+    in property <FieldItem> field;
+    in property <bool> busy;
+    callback edited(string);
+    callback browse(bool);
+    callback cleared();
+
+    spacing: Theme.xs;
+
+    if root.field.kind != 4 : Text {
+        text: root.field.label + (root.field.required ? "" : " (optional)");
+        color: Theme.dim;
+        font-size: Theme.small-size;
+    }
+
+    // 1 is Path and 2 is Paths, which differ only in taking more than one.
+    if root.field.kind == 1 || root.field.kind == 2 : HorizontalLayout {
+        spacing: Theme.sm;
+
+        Text {
+            text: root.field.value == "" ? "nothing chosen yet" : root.field.value;
+            color: root.field.value == "" ? Theme.faint : Theme.text;
+            font-size: Theme.small-size;
+            font-family: Theme.mono;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+        Button {
+            text: "Choose…";
+            enabled: !root.busy;
+            clicked => { root.browse(root.field.kind == 2); }
+        }
+        if root.field.value != "" : Button {
+            text: "Clear";
+            enabled: !root.busy;
+            clicked => { root.cleared(); }
+        }
+    }
+
+    // 0 is Text and 3 is Secret, which is written and never read back.
+    if root.field.kind == 0 || root.field.kind == 3 : LineEdit {
+        input-type: root.field.kind == 3 ? InputType.password : InputType.text;
+        enabled: !root.busy;
+        edited => { root.edited(self.text); }
+    }
+
+    if root.field.kind == 4 : CheckBox {
+        text: root.field.label;
+        enabled: !root.busy;
+        toggled => { root.edited(self.checked ? "true" : "false"); }
+    }
+}
+
+export component SortView inherits VerticalLayout {
+    in property <bool> have;
+    in property <string> name;
+    in property <string> size;
+    in property <string> arrived;
+    in property <string> source;
+    in property <string> folder;
+    in property <string> hash;
+    in property <string> path;
+    in property <bool> held;
+    in property <string> position;
+    in property <int> in-folder;
+    in property <image> preview;
+    in property <string> progress;
+
+    in property <[string]> group-names;
+    in property <int> group-index;
+    in property <string> group-id;
+
+    in property <[SourceItem]> sources;
+    in property <[string]> kinds;
+    in property <[FieldItem]> fields;
+    in property <bool> busy;
+
+    callback pick-group(int);
+    callback step(bool);
+    callback file(string, bool);
+    callback delete(string, bool);
+    callback open(string);
+    callback import(bool);
+    callback scan(string);
+    callback remove(string);
+    callback pick-kind(string);
+    callback add(string, string);
+    callback field-edited(int, string);
+    callback field-browse(int, bool);
+    callback field-cleared(int);
+
+    // Which implementation the Add form is about, so the button sends the same one the
+    // fields below were built from.
+    property <string> picked-kind;
+
+    // What the bulk buttons are about, said once so the two buttons cannot disagree.
+    property <string> bulk: root.folder == ""
+        ? "all " + root.in-folder + " from this import"
+        : "all " + root.in-folder + " from " + root.folder;
+
+    spacing: Theme.md;
+
+    ScrollView {
+        vertical-stretch: 1;
+
+        VerticalLayout {
+            spacing: Theme.md;
+
+            if root.have : Card {
+                VerticalLayout {
+                    padding: Theme.md;
+                    spacing: Theme.sm;
+
+                    HorizontalLayout {
+                        spacing: Theme.sm;
+                        Text {
+                            text: root.position;
+                            color: Theme.dim;
+                            font-size: Theme.small-size;
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "Previous";
+                            enabled: !root.busy;
+                            clicked => { root.step(false); }
+                        }
+                        Button {
+                            text: "Next";
+                            enabled: !root.busy;
+                            clicked => { root.step(true); }
+                        }
+                    }
+
+                    // The picture itself where slint can decode it, and a tile with the
+                    // name and a way out where it cannot.
+                    Rectangle {
+                        height: 320px;
+                        background: Theme.raised;
+                        border-radius: Theme.radius;
+
+                        if root.preview.width > 0 : Image {
+                            source: root.preview;
+                            image-fit: contain;
+                            width: parent.width - Theme.md;
+                            height: parent.height - Theme.md;
+                        }
+
+                        if root.preview.width == 0 : VerticalLayout {
+                            alignment: center;
+                            spacing: Theme.sm;
+                            Text {
+                                text: root.name;
+                                color: Theme.dim;
+                                font-size: Theme.body-size;
+                                horizontal-alignment: center;
+                                overflow: elide;
+                            }
+                            HorizontalLayout {
+                                alignment: center;
+                                Button {
+                                    text: "Open";
+                                    enabled: root.path != "";
+                                    clicked => { root.open(root.path); }
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: root.name;
+                        color: Theme.text;
+                        font-size: Theme.body-size;
+                        font-weight: 700;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.size + " · " + root.arrived + " · " + root.source
+                            + (root.folder == "" ? "" : " / " + root.folder);
+                        color: Theme.dim;
+                        font-size: Theme.small-size;
+                        overflow: elide;
+                    }
+                    if root.held : Text {
+                        text: "a group already holds these bytes";
+                        color: Theme.dim;
+                        font-size: Theme.small-size;
+                    }
+
+                    HorizontalLayout {
+                        spacing: Theme.sm;
+
+                        ComboBox {
+                            model: root.group-names;
+                            current-index: root.group-index;
+                            enabled: root.group-names.length > 0 && !root.busy;
+                            width: 200px;
+                            selected(_) => { root.pick-group(self.current-index); }
+                        }
+                        Button {
+                            text: "File it";
+                            primary: true;
+                            enabled: root.group-id != "" && !root.busy;
+                            clicked => { root.file(root.hash, false); }
+                        }
+                        Button {
+                            text: "File " + root.bulk;
+                            enabled: root.group-id != "" && !root.busy;
+                            clicked => { root.file(root.hash, true); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Theme.sm;
+                        Button {
+                            text: "Delete";
+                            enabled: !root.busy;
+                            clicked => { root.delete(root.hash, false); }
+                        }
+                        Button {
+                            text: "Delete " + root.bulk;
+                            enabled: !root.busy;
+                            clicked => { root.delete(root.hash, true); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+            }
+
+            if !root.have : Card {
+                VerticalLayout {
+                    padding: Theme.md;
+                    spacing: Theme.sm;
+                    Text {
+                        text: root.position == "" ? "Nothing is waiting to be sorted." : root.position;
+                        color: Theme.dim;
+                        font-size: Theme.body-size;
+                    }
+                }
+            }
+
+            Card {
+                VerticalLayout {
+                    padding: Theme.md;
+                    spacing: Theme.sm;
+
+                    Text {
+                        text: "Sources";
+                        color: Theme.text;
+                        font-size: Theme.body-size;
+                        font-weight: 700;
+                    }
+
+                    HorizontalLayout {
+                        spacing: Theme.sm;
+                        Button {
+                            text: "Import files…";
+                            enabled: !root.busy;
+                            clicked => { root.import(false); }
+                        }
+                        Button {
+                            text: "Import a folder…";
+                            enabled: !root.busy;
+                            clicked => { root.import(true); }
+                        }
+                        Text {
+                            text: root.progress;
+                            color: Theme.dim;
+                            font-size: Theme.small-size;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    for entry in root.sources : VerticalLayout {
+                        spacing: Theme.xs;
+
+                        HorizontalLayout {
+                            spacing: Theme.sm;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: entry.name + "  ·  " + entry.kind;
+                                    color: Theme.text;
+                                    font-size: Theme.small-size;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: entry.scanned + "  ·  " + entry.tally;
+                                    color: Theme.faint;
+                                    font-size: Theme.small-size;
+                                    overflow: elide;
+                                }
+                                if entry.error != "" : Text {
+                                    text: entry.error;
+                                    color: Theme.danger;
+                                    font-size: Theme.small-size;
+                                    overflow: elide;
+                                }
+                            }
+                            Button {
+                                text: "Scan now";
+                                enabled: !root.busy;
+                                clicked => { root.scan(entry.dir); }
+                            }
+                            Button {
+                                text: "Remove";
+                                enabled: !root.busy;
+                                clicked => { root.remove(entry.dir); }
+                            }
+                        }
+                        Rectangle { height: 1px; background: Theme.line; }
+                    }
+                }
+            }
+
+            // The Add form, built from whatever the picked implementation declares. Nothing
+            // here names a field: dropping a source file into the crate fills this in.
+            Card {
+                VerticalLayout {
+                    padding: Theme.md;
+                    spacing: Theme.sm;
+
+                    HorizontalLayout {
+                        spacing: Theme.sm;
+                        ComboBox {
+                            model: root.kinds;
+                            width: 160px;
+                            enabled: !root.busy;
+                            selected(picked) => {
+                                root.picked-kind = picked;
+                                root.pick-kind(picked);
+                            }
+                        }
+                        added-name := LineEdit {
+                            placeholder-text: "what to call it";
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "Add source";
+                            enabled: root.picked-kind != "" && added-name.text != "" && !root.busy;
+                            clicked => { root.add(root.picked-kind, added-name.text); }
+                        }
+                    }
+
+                    for field[at] in root.fields : Field {
+                        field: field;
+                        busy: root.busy;
+                        edited(value) => { root.field-edited(at, value); }
+                        browse(several) => { root.field-browse(at, several); }
+                        cleared => { root.field-cleared(at); }
+                    }
+                }
+            }
+        }
+    }
+}

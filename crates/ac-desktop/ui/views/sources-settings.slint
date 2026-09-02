@@ -1,0 +1,11 @@
+// One field an implementation declared it shares with every source built from it. Its own
+// file so both the Settings tab and the generated form can name it without importing the
+// other's view.
+export struct SettingItem {
+    source: string,
+    key: string,
+    label: string,
+    value: string,
+    secret: bool,
+    set: bool,
+}

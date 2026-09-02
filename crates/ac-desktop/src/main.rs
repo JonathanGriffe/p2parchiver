@@ -8,6 +8,7 @@ mod peers;
 mod selection;
 mod settings;
 mod shell;
+mod sort;
 mod tray;
 mod view;
 mod work;
@@ -104,6 +105,7 @@ fn main() -> Result<()> {
     groups::wire(&window, &paths, &selection, &nudge);
     peers::wire(&window, &paths, &nudge);
     files::wire(&window, &paths, &selection, &nudge);
+    sort::wire(&window, &paths, &selection, &nudge);
     settings::wire(&window, &paths, &node, &nudge);
     settings::load(&window, &paths);
 

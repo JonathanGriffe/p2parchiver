@@ -75,6 +75,8 @@ hex = "0.4"
 # node ships as one file: the same reason SQLite is bundled above.
 slint = { version = "1.17", default-features = false, features = [
     "compat-1-2", "std", "backend-winit", "renderer-software", "accessibility",
+    # What the Sort tab previews with. Everything slint cannot decode gets a tile instead.
+    "image-default-formats",
 ] }
 slint-build = "1.17"
 
