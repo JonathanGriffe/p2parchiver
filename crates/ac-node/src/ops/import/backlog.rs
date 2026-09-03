@@ -397,97 +397,19 @@ mod tests {
     use crate::ops::import::fixtures::*;
     use crate::ops::import::scan::scan;
 
+    /// The fetch writes at this path and the sort reads back from it, so what matters is
+    /// that one answer serves both — including for a folder that is no kind of path, where
+    /// the file still has to land somewhere the sort will look.
     #[test]
-    fn a_dropped_file_is_gone_from_disk_and_stays_remembered() {
-        let home = home();
-        let (paths, dir) = imported(&home, &["a.jpg"]);
-        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
+    fn where_an_unsorted_file_sits_is_one_answer_however_it_is_asked() {
+        let path = |folder| unsorted_path("phone-a1b2", folder, "IMG_1.jpg").unwrap();
 
-        assert_eq!(drop(&paths, &file.row.hash).unwrap().done, 1);
+        assert_eq!(path("DCIM/2024").as_str(), "phone-a1b2/DCIM/2024/IMG_1.jpg");
+        assert_eq!(path("").as_str(), "phone-a1b2/IMG_1.jpg");
+        assert_eq!(path("/DCIM/").as_str(), "phone-a1b2/DCIM/IMG_1.jpg");
 
-        // Thrown away and finished with are two moments. Until the second, the bytes are
-        // still there, which is the only reason it can be taken back.
-        let (_, content) = store(&paths);
-        assert!(content.exists(UNSORTED, &file.path), "not deleted yet");
-        assert!(forget(&paths, &file.row.hash).unwrap());
-        assert!(!content.exists(UNSORTED, &file.path), "the bytes are gone");
-
-        let ledger = ledger(&paths).unwrap();
-        assert_eq!(
-            ledger.get(&file.row.hash).unwrap().unwrap().state,
-            State::Dropped
-        );
-        assert_eq!(ledger.waiting().unwrap(), 0);
-
-        // The whole point of remembering: offering it again brings back nothing.
-        assert_eq!(
-            scan(&paths, &dir).unwrap().owed,
-            0,
-            "the ref is still settled"
-        );
-        assert_eq!(drain(&paths, None).unwrap().kept, 0);
-        assert!(!content.exists(UNSORTED, &file.path), "and it stayed gone");
-    }
-
-    #[test]
-    fn a_hash_is_found_by_as_much_of_it_as_was_printed() {
-        let home = home();
-        let (paths, _) = imported(&home, &["a.jpg"]);
-        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
-
-        let found = find(&paths, &file.row.hash[..12]).unwrap();
-        assert_eq!(found.hash, file.row.hash);
-        assert_eq!(find(&paths, &file.row.hash).unwrap().hash, file.row.hash);
-        assert!(find(&paths, "zzzzzzzz").is_err());
-    }
-
-    #[test]
-    fn a_page_of_the_backlog_reads_the_same_however_much_is_behind_it() {
-        let home = home();
-        let names: Vec<String> = (0..25).map(|i| format!("IMG_{i:02}.jpg")).collect();
-        let files: Vec<&str> = names.iter().map(String::as_str).collect();
-        let (paths, _) = imported(&home, &files);
-
-        // Paged by the last row seen rather than by OFFSET, so every page costs the same.
-        let mut seen: Vec<String> = Vec::new();
-        let mut after: Option<(i64, String)> = None;
-        loop {
-            let page = super::unsorted(&paths, after.as_ref().map(|(at, h)| (*at, h.as_str())), 10)
-                .unwrap();
-            let Some(last) = page.last() else { break };
-            after = Some((last.row.at, last.row.hash.clone()));
-            seen.extend(page.iter().map(|file| file.row.name.clone()));
-        }
-
-        assert_eq!(seen.len(), 25, "every one of them, once");
-        let mut unique = seen.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(unique.len(), 25, "and no row read twice");
-    }
-
-    #[test]
-    fn a_row_whose_file_has_gone_is_settled_from_what_is_held_now() {
-        let home = home();
-        let (paths, _) = imported(&home, &["a.jpg"]);
-        group(&paths, "Holidays");
-        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
-
-        // A crash between moving a file and recording where it went leaves exactly this.
-        let (_, content) = store(&paths);
-        content.remove(UNSORTED, &file.path).unwrap();
-
-        let filed = sort(&paths, &file.row.hash, "Holidays", "").unwrap();
-        assert_eq!(filed.done, 0);
-        assert_eq!(filed.missing, 1);
-
-        let back = ledger(&paths)
-            .unwrap()
-            .get(&file.row.hash)
-            .unwrap()
-            .unwrap();
-        assert_eq!(back.state, State::Dropped);
-        assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 0);
+        // No kind of path: the source's own directory is still somewhere.
+        assert_eq!(path("../../etc").as_str(), "phone-a1b2/IMG_1.jpg");
     }
 
     #[test]
@@ -533,64 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_source_folder_is_filed_in_one_go() {
-        let home = home();
-        let (paths, _) = imported(&home, &["DCIM/a.jpg", "DCIM/b.jpg", "other/c.jpg"]);
-        group(&paths, "Holidays");
-
-        let waiting = super::unsorted(&paths, None, 10).unwrap();
-        let one = waiting
-            .iter()
-            .find(|file| file.row.folder == "DCIM")
-            .unwrap();
-
-        let backlog = backlog(&paths, Some((&one.row.source_dir, &one.row.folder))).unwrap();
-        assert_eq!(backlog.total, 3);
-        assert_eq!(backlog.in_folder, 2, "what the bulk button would name");
-
-        let filed = sort_folder(&paths, &one.row.source_dir, "DCIM", "Holidays", "").unwrap();
-        assert_eq!(filed.done, 2, "both of that folder's, and nothing else");
-        assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 1);
-        assert_eq!(
-            super::unsorted(&paths, None, 10).unwrap()[0].row.folder,
-            "other"
-        );
-    }
-
-    #[test]
-    fn two_files_of_one_name_do_not_land_on_each_other_in_a_group() {
-        let home = home();
-        let (paths, _) = imported(&home, &["one/x.jpg", "two/x.jpg"]);
-        let group = group(&paths, "Holidays");
-
-        for file in super::unsorted(&paths, None, 10).unwrap() {
-            assert_eq!(
-                sort(&paths, &file.row.hash, "Holidays", "").unwrap().done,
-                1
-            );
-        }
-
-        let (files, _) = store(&paths);
-        let listed = files.list(group, None, false).unwrap();
-        assert_eq!(listed.len(), 2, "both are there: {listed:?}");
-    }
-
-    /// The fetch writes at this path and the sort reads back from it, so what matters is
-    /// that one answer serves both — including for a folder that is no kind of path, where
-    /// the file still has to land somewhere the sort will look.
-    #[test]
-    fn where_an_unsorted_file_sits_is_one_answer_however_it_is_asked() {
-        let path = |folder| unsorted_path("phone-a1b2", folder, "IMG_1.jpg").unwrap();
-
-        assert_eq!(path("DCIM/2024").as_str(), "phone-a1b2/DCIM/2024/IMG_1.jpg");
-        assert_eq!(path("").as_str(), "phone-a1b2/IMG_1.jpg");
-        assert_eq!(path("/DCIM/").as_str(), "phone-a1b2/DCIM/IMG_1.jpg");
-
-        // No kind of path: the source's own directory is still somewhere.
-        assert_eq!(path("../../etc").as_str(), "phone-a1b2/IMG_1.jpg");
-    }
-
-    #[test]
     fn a_file_lands_in_the_folder_it_was_filed_into() {
         let home = home();
         let (paths, _) = imported(&home, &["a.jpg", "b.jpg"]);
@@ -625,6 +489,38 @@ mod tests {
         // And the root is still the root: an empty destination is not a folder called "".
         sort(&paths, &waiting[1].row.hash, "Holidays", "").unwrap();
         assert!(content.exists(&dir, &RelPath::parse("b.jpg").unwrap()));
+    }
+
+    #[test]
+    fn a_dropped_file_is_gone_from_disk_and_stays_remembered() {
+        let home = home();
+        let (paths, dir) = imported(&home, &["a.jpg"]);
+        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
+
+        assert_eq!(drop(&paths, &file.row.hash).unwrap().done, 1);
+
+        // Thrown away and finished with are two moments. Until the second, the bytes are
+        // still there, which is the only reason it can be taken back.
+        let (_, content) = store(&paths);
+        assert!(content.exists(UNSORTED, &file.path), "not deleted yet");
+        assert!(forget(&paths, &file.row.hash).unwrap());
+        assert!(!content.exists(UNSORTED, &file.path), "the bytes are gone");
+
+        let ledger = ledger(&paths).unwrap();
+        assert_eq!(
+            ledger.get(&file.row.hash).unwrap().unwrap().state,
+            State::Dropped
+        );
+        assert_eq!(ledger.waiting().unwrap(), 0);
+
+        // The whole point of remembering: offering it again brings back nothing.
+        assert_eq!(
+            scan(&paths, &dir).unwrap().owed,
+            0,
+            "the ref is still settled"
+        );
+        assert_eq!(drain(&paths, None).unwrap().kept, 0);
+        assert!(!content.exists(UNSORTED, &file.path), "and it stayed gone");
     }
 
     #[test]
@@ -677,5 +573,109 @@ mod tests {
             "taking it back would put a row on a file that is gone: {err}"
         );
         assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_whole_source_folder_is_filed_in_one_go() {
+        let home = home();
+        let (paths, _) = imported(&home, &["DCIM/a.jpg", "DCIM/b.jpg", "other/c.jpg"]);
+        group(&paths, "Holidays");
+
+        let waiting = super::unsorted(&paths, None, 10).unwrap();
+        let one = waiting
+            .iter()
+            .find(|file| file.row.folder == "DCIM")
+            .unwrap();
+
+        let backlog = backlog(&paths, Some((&one.row.source_dir, &one.row.folder))).unwrap();
+        assert_eq!(backlog.total, 3);
+        assert_eq!(backlog.in_folder, 2, "what the bulk button would name");
+
+        let filed = sort_folder(&paths, &one.row.source_dir, "DCIM", "Holidays", "").unwrap();
+        assert_eq!(filed.done, 2, "both of that folder's, and nothing else");
+        assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 1);
+        assert_eq!(
+            super::unsorted(&paths, None, 10).unwrap()[0].row.folder,
+            "other"
+        );
+    }
+
+    #[test]
+    fn two_files_of_one_name_do_not_land_on_each_other_in_a_group() {
+        let home = home();
+        let (paths, _) = imported(&home, &["one/x.jpg", "two/x.jpg"]);
+        let group = group(&paths, "Holidays");
+
+        for file in super::unsorted(&paths, None, 10).unwrap() {
+            assert_eq!(
+                sort(&paths, &file.row.hash, "Holidays", "").unwrap().done,
+                1
+            );
+        }
+
+        let (files, _) = store(&paths);
+        let listed = files.list(group, None, false).unwrap();
+        assert_eq!(listed.len(), 2, "both are there: {listed:?}");
+    }
+
+    #[test]
+    fn a_row_whose_file_has_gone_is_settled_from_what_is_held_now() {
+        let home = home();
+        let (paths, _) = imported(&home, &["a.jpg"]);
+        group(&paths, "Holidays");
+        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
+
+        // A crash between moving a file and recording where it went leaves exactly this.
+        let (_, content) = store(&paths);
+        content.remove(UNSORTED, &file.path).unwrap();
+
+        let filed = sort(&paths, &file.row.hash, "Holidays", "").unwrap();
+        assert_eq!(filed.done, 0);
+        assert_eq!(filed.missing, 1);
+
+        let back = ledger(&paths)
+            .unwrap()
+            .get(&file.row.hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.state, State::Dropped);
+        assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_page_of_the_backlog_reads_the_same_however_much_is_behind_it() {
+        let home = home();
+        let names: Vec<String> = (0..25).map(|i| format!("IMG_{i:02}.jpg")).collect();
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (paths, _) = imported(&home, &files);
+
+        // Paged by the last row seen rather than by OFFSET, so every page costs the same.
+        let mut seen: Vec<String> = Vec::new();
+        let mut after: Option<(i64, String)> = None;
+        loop {
+            let page = super::unsorted(&paths, after.as_ref().map(|(at, h)| (*at, h.as_str())), 10)
+                .unwrap();
+            let Some(last) = page.last() else { break };
+            after = Some((last.row.at, last.row.hash.clone()));
+            seen.extend(page.iter().map(|file| file.row.name.clone()));
+        }
+
+        assert_eq!(seen.len(), 25, "every one of them, once");
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 25, "and no row read twice");
+    }
+
+    #[test]
+    fn a_hash_is_found_by_as_much_of_it_as_was_printed() {
+        let home = home();
+        let (paths, _) = imported(&home, &["a.jpg"]);
+        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
+
+        let found = find(&paths, &file.row.hash[..12]).unwrap();
+        assert_eq!(found.hash, file.row.hash);
+        assert_eq!(find(&paths, &file.row.hash).unwrap().hash, file.row.hash);
+        assert!(find(&paths, "zzzzzzzz").is_err());
     }
 }

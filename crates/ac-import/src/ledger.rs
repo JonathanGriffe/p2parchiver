@@ -207,6 +207,18 @@ impl Ledger {
         Ok(())
     }
 
+    /// Replace what one source was told, leaving everything it has done alone.
+    ///
+    /// What a source is configured with can outlive the configuration: signing in again
+    /// swaps a token without the queue, the tally or the history meaning anything different.
+    pub fn set_source_config(&self, dir: &str, config: &Fields) -> Result<(), LedgerError> {
+        self.db.execute(
+            "UPDATE sources SET config = ?2 WHERE dir = ?1",
+            params![dir, config.encode()],
+        )?;
+        Ok(())
+    }
+
     pub fn sources(&self) -> Result<Vec<SourceRow>, LedgerError> {
         self.read_sources("ORDER BY name", [])
     }

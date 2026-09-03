@@ -71,6 +71,9 @@ enum ImportCommand {
     #[command(subcommand)]
     Settings(SettingsCommand),
 
+    /// Sign in again as one source, in a browser. Adding one already does this.
+    Auth { source: String },
+
     /// Scan one source now, whatever its cadence says.
     Scan { source: String },
 
@@ -298,6 +301,7 @@ fn main() -> Result<()> {
         Command::Import(ImportCommand::Settings(SettingsCommand::Set { source, key, value })) => {
             cmd::import::settings_set(&paths, &source, &key, &value)
         }
+        Command::Import(ImportCommand::Auth { source }) => cmd::import::auth(&paths, &source),
         Command::Import(ImportCommand::Scan { source }) => cmd::import::scan(&paths, &source),
         Command::Import(ImportCommand::From { path, name }) => {
             cmd::import::from(&paths, &path, name.as_deref())

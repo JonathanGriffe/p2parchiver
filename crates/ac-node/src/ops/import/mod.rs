@@ -26,8 +26,8 @@ pub use backlog::{
 pub use fetch::{Brought, Fetched, Outcome, Pace, Pump, drain, pump};
 pub use scan::{Scanned, pollable, scan, scan_with};
 pub use sources::{
-    Configured, Picked, Setting, add_source, available, from_folder, implementation, open_source,
-    remove_source, set_setting, settings, sources, tidy,
+    Configured, Picked, Setting, add_source, authorize, available, from_folder, implementation,
+    open_source, remove_source, set_setting, settings, sources, tidy,
 };
 
 /// Where imported files wait to be sorted. The leading dot is what keeps it out of the way of

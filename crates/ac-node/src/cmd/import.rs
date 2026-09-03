@@ -24,10 +24,15 @@ pub fn available(source: Option<&str>) -> Result<()> {
         "per source, given with --set when you add one",
         entry.config,
     );
+    let asked: Vec<Field> = entry.asked_settings().copied().collect();
     print_fields(
         "shared by every one of them, set with `ac import settings set`",
-        entry.settings,
+        &asked,
     );
+    if entry.signs_in() {
+        println!();
+        println!("Adding one signs in to it, in a browser. Each is its own account.");
+    }
     Ok(())
 }
 
@@ -344,14 +349,22 @@ pub fn settings_show(paths: &Paths, source: &str) -> Result<()> {
         .max()
         .unwrap_or(0);
     for setting in &settings {
-        let shown = match (&setting.value, setting.set) {
-            (Some(value), _) => value.clone(),
-            // A secret is replaced rather than displayed, so a screenshot cannot leak it.
-            (None, true) => "(set)".to_owned(),
-            (None, false) => "(not set)".to_owned(),
+        // Masked here, whatever the window does with it: a terminal is scrolled back
+        // through, piped into a file and pasted into bug reports.
+        let secret = setting.field.kind == FieldKind::Secret;
+        let shown = match (&setting.value, secret) {
+            (Some(value), false) => value.clone(),
+            (Some(_), true) => "(set)".to_owned(),
+            (None, _) => "(not set)".to_owned(),
         };
         println!("{:<widest$}  {shown}", setting.field.key);
     }
+    Ok(())
+}
+
+pub fn auth(paths: &Paths, source: &str) -> Result<()> {
+    let row = ops::import::authorize(paths, source)?;
+    println!("signed in again as {}", row.name);
     Ok(())
 }
 

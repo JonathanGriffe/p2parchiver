@@ -195,36 +195,6 @@ mod tests {
         assert_eq!(back.scanned_at, 0, "and it is still overdue");
     }
 
-    #[test]
-    fn a_scan_puts_back_what_it_still_offers_and_retires_what_it_does_not() {
-        let home = home();
-        let paths = paths(&home);
-        let mut ledger = ledger(&paths).unwrap();
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
-
-        let both = fake(SourceType::Remote, &["kept.jpg", "gone.jpg"]);
-        assert_eq!(scan_with(&ledger, &row, &both).unwrap().owed, 2);
-
-        // Both run out of attempts, as an unreadable file would.
-        let mut at = now();
-        for _ in 0..ac_import::ledger::MAX_FETCH_ATTEMPTS {
-            ledger.claim(at, 8).unwrap();
-            at += ac_import::ledger::FETCH_RETRY_DELAY + 1;
-        }
-        assert!(ledger.claim(at, 8).unwrap().is_empty());
-
-        // The next scan offers only one of them.
-        let one = fake(SourceType::Remote, &["kept.jpg"]);
-        let scanned = scan_with(&ledger, &row, &one).unwrap();
-        assert_eq!(scanned.again, 1, "still offered, so back on the queue");
-        assert_eq!(
-            scanned.retired, 1,
-            "no longer offered, so the file has gone"
-        );
-        assert_eq!(ledger.owed(&row.dir).unwrap(), 1);
-        assert_eq!(ledger.claim(at, 8).unwrap().len(), 1);
-    }
-
     /// Being there is asked once, and the pages are read after that. A phone that leaves the
     /// house in between is still only elsewhere — recorded as a failure it would go red on the
     /// Sources tab, and the daemon would back off for hours rather than looking again in
@@ -266,5 +236,35 @@ mod tests {
             Some("the drive said no"),
             "and the reason is kept for the list to show"
         );
+    }
+
+    #[test]
+    fn a_scan_puts_back_what_it_still_offers_and_retires_what_it_does_not() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+
+        let both = fake(SourceType::Remote, &["kept.jpg", "gone.jpg"]);
+        assert_eq!(scan_with(&ledger, &row, &both).unwrap().owed, 2);
+
+        // Both run out of attempts, as an unreadable file would.
+        let mut at = now();
+        for _ in 0..ac_import::ledger::MAX_FETCH_ATTEMPTS {
+            ledger.claim(at, 8).unwrap();
+            at += ac_import::ledger::FETCH_RETRY_DELAY + 1;
+        }
+        assert!(ledger.claim(at, 8).unwrap().is_empty());
+
+        // The next scan offers only one of them.
+        let one = fake(SourceType::Remote, &["kept.jpg"]);
+        let scanned = scan_with(&ledger, &row, &one).unwrap();
+        assert_eq!(scanned.again, 1, "still offered, so back on the queue");
+        assert_eq!(
+            scanned.retired, 1,
+            "no longer offered, so the file has gone"
+        );
+        assert_eq!(ledger.owed(&row.dir).unwrap(), 1);
+        assert_eq!(ledger.claim(at, 8).unwrap().len(), 1);
     }
 }

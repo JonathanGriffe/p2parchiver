@@ -138,6 +138,9 @@ export component MainWindow inherits Window {
     in-out property <[FieldItem]> source-settings-fields;
     // Which implementation the Add dialog is about, and empty when it is closed.
     in-out property <string> adding-source;
+    // Whether one is being added right now. Its own flag rather than `busy`, because adding
+    // can mean waiting on a browser and the rest of the tab has no reason to stop.
+    in-out property <bool> source-adding;
     in property <[SettingItem]> source-settings;
 
     // The Settings page. Loaded once and after each save, never on the poll.
@@ -207,6 +210,7 @@ export component MainWindow inherits Window {
     callback field-browse(int, bool);
     callback field-cleared(int);
     callback save-setting(string, string, string);
+    callback sign-in-source(string);
 
     // Which page is up. In-out so a test can open the one it is about.
     in-out property <int> tab: 0;
@@ -393,10 +397,12 @@ export component MainWindow inherits Window {
                 sources: root.sources;
                 kinds: root.source-kinds;
                 busy: root.busy;
+                adding: root.source-adding;
                 vertical-stretch: 1;
 
                 scan(dir) => { root.scan-source(dir); }
                 remove(dir) => { root.remove-source(dir); }
+                sign-in(dir) => { root.sign-in-source(dir); }
                 // Loading the picked implementation's fields is what opens the dialog.
                 add-source(source) => {
                     root.adding-source = source;
@@ -442,8 +448,12 @@ export component MainWindow inherits Window {
                         text: root.message;
                         color: root.message-bad ? Theme.danger : Theme.dim;
                         font-size: Theme.small-size;
-                        wrap: word-wrap;
+                        // One line, and held to it. What will not fit belongs in the log,
+                        // not in a bar that pushes the page around as it grows.
+                        wrap: no-wrap;
+                        overflow: elide;
                         horizontal-stretch: 1;
+                        min-width: 0px;
                     }
                 }
             }

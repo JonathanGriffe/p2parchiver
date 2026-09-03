@@ -71,6 +71,10 @@ fn sources(paths: &Paths) -> Vec<SourceItem> {
                 }
                 .into(),
                 error: entry.row.last_error.clone().unwrap_or_default().into(),
+                // An account, rather than something answerable by typing: it can be signed
+                // in to again when its token stops working.
+                signs_in: ops::import::implementation(&entry.row.source)
+                    .is_ok_and(ac_import::Registered::signs_in),
             }
         })
         .collect()
@@ -107,19 +111,18 @@ pub fn shared_settings(paths: &Paths) -> Vec<SettingItem> {
                 key: setting.field.key.into(),
                 label: setting.field.label.into(),
                 value: setting.value.unwrap_or_default().into(),
-                secret: setting.field.kind == ac_import::config::FieldKind::Secret,
-                set: setting.set,
             });
         }
     }
     out
 }
 
-/// The shared settings one implementation declares, as fields the Add dialog can offer.
+/// The shared settings one implementation declares, as fields the Add dialog still has to ask.
 ///
-/// Asked in the same dialog as the source's own config, and only the first time: a value
-/// already stored comes back as answered, so a second account of the same implementation is
-/// not asked for the app's credentials again.
+/// Only the ones with no answer yet. These belong to the implementation rather than to the
+/// source being added, so a second account of the same one is not asked for the application's
+/// credentials again — and where they are all already stored, the dialog asks nothing extra
+/// at all. Changing one afterwards is what the Settings tab is for.
 pub fn settings_fields(paths: &Paths, source: &str) -> Vec<FieldItem> {
     let Ok(entry) = ops::import::implementation(source) else {
         return Vec::new();
@@ -127,20 +130,15 @@ pub fn settings_fields(paths: &Paths, source: &str) -> Vec<FieldItem> {
     let stored = ops::import::settings(paths, source).unwrap_or_default();
 
     entry
-        .settings
-        .iter()
-        .map(|field| {
-            let held = stored.iter().find(|s| s.field.key == field.key);
-            let value = held.and_then(|s| s.value.clone()).unwrap_or_default();
-            FieldItem {
-                key: field.key.into(),
-                label: field.label.into(),
-                kind: kind_of(field.kind),
-                required: field.required,
-                shown: shown(&value).into(),
-                // A secret is never read back, so what it shows is nothing at all.
-                value: value.into(),
-            }
+        .asked_settings()
+        .filter(|field| !stored.iter().any(|s| s.field.key == field.key && s.set))
+        .map(|field| FieldItem {
+            key: field.key.into(),
+            label: field.label.into(),
+            kind: kind_of(field.kind),
+            required: field.required,
+            value: Default::default(),
+            shown: Default::default(),
         })
         .collect()
 }
@@ -151,8 +149,7 @@ pub fn fields(source: &str) -> Vec<FieldItem> {
         return Vec::new();
     };
     entry
-        .config
-        .iter()
+        .asked_config()
         .map(|field| FieldItem {
             key: field.key.into(),
             label: field.label.into(),
@@ -172,6 +169,21 @@ pub fn kind_of(kind: ac_import::config::FieldKind) -> i32 {
         FieldKind::Paths => KIND_PATHS,
         FieldKind::Secret => KIND_SECRET,
         FieldKind::Toggle => KIND_TOGGLE,
+    }
+}
+
+/// How many a scan passed over, for the end of the line that says what it did.
+///
+/// Which ones go to the log. A scan of a whole Drive can skip hundreds, and a bar that grows
+/// a line per file stops being a bar; the count is what tells you whether to go and look.
+fn also_skipped(notes: &[String]) -> String {
+    for note in notes {
+        tracing::info!("{note}");
+    }
+    match notes.len() {
+        0 => String::new(),
+        1 => ", 1 skipped".to_owned(),
+        many => format!(", {many} skipped"),
     }
 }
 
@@ -257,6 +269,22 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         }
     });
 
+    // Off the event loop like any other action, and for longer than most: it is waiting on
+    // somebody to finish in a browser, which can take minutes or never happen at all.
+    window.on_sign_in_source({
+        let weak = weak.clone();
+        let paths = paths.clone();
+        let nudge = nudge.clone();
+        move |source| {
+            let (paths, nudge) = (paths.clone(), nudge.clone());
+            let dir = source.to_string();
+            work::run(&weak, &nudge, move || {
+                let row = ops::import::authorize(&paths, &dir)?;
+                Ok(format!("signed in again as {}", row.name))
+            });
+        }
+    });
+
     window.on_field_edited({
         let weak = weak.clone();
         move |at, value| {
@@ -323,32 +351,56 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
 
             let selection = selection.clone();
 
-            work::run(&weak, &nudge, move || {
-                // The settings go first: `add_source` refuses an implementation whose
-                // shared fields are not filled in, and refusing here would leave what was
-                // typed into the dialog with nowhere to have gone.
-                for (key, value) in shared.iter() {
-                    ops::import::set_setting(&paths, &source, key, value)?;
-                }
-                let row = ops::import::add_source(&paths, &source, &name, config)?;
-
-                // Scanned straight away, because a one-shot source is never due and would
-                // otherwise sit there owing nothing until someone pressed Scan. The daemon
-                // fetches what this finds, and the table counts it down.
-                let scanned = ops::import::scan(&paths, &row.dir)?;
-                selection.rewind();
-
-                let mut said = format!("added {}", row.name);
-                if !scanned.reachable {
-                    said += ", which cannot be reached right now";
-                    return Ok(said);
-                }
-                said += &format!(": {} to bring in", scanned.owed);
-                for note in &scanned.skipped {
-                    said += &format!("\n{note}");
-                }
-                Ok(said)
+            // Not `work::run`: that shuts the whole tab until the action is done, and this
+            // one can be waiting on somebody to finish in a browser. Only the Add button
+            // waits, so a sign-in that stalls leaves the rest of the tab usable.
+            window.set_source_adding(true);
+            window.set_message(match ops::import::implementation(&source) {
+                Ok(entry) if entry.signs_in() => "finish signing in, in your browser".into(),
+                _ => slint::SharedString::from(""),
             });
+            window.set_message_bad(false);
+
+            work::action(
+                &weak,
+                move || {
+                    // The settings go first: `add_source` refuses an implementation whose
+                    // shared fields are not filled in, and refusing here would leave what was
+                    // typed into the dialog with nowhere to have gone.
+                    for (key, value) in shared.iter() {
+                        ops::import::set_setting(&paths, &source, key, value)?;
+                    }
+                    let row = ops::import::add_source(&paths, &source, &name, config)?;
+
+                    selection.rewind();
+
+                    // A polled source is left to the daemon. It has never been scanned, which
+                    // makes it the stalest thing there is and the next one picked up, and a whole
+                    // Drive is not something to hold a window open for.
+                    let one_shot = ops::import::implementation(&source)
+                        .is_ok_and(|entry| !entry.kind.polled());
+                    if !one_shot {
+                        return Ok(format!("added {}, and it is being read now", row.name));
+                    }
+
+                    // A one-shot is never due, so nothing would ever come of it: this one scan is
+                    // the whole of what it will ever offer.
+                    let scanned = ops::import::scan(&paths, &row.dir)?;
+                    let mut said = format!("added {}", row.name);
+                    if !scanned.reachable {
+                        said += ", which cannot be reached right now";
+                        return Ok(said);
+                    }
+                    said += &format!(": {} to bring in", scanned.owed);
+                    said += &also_skipped(&scanned.skipped);
+                    Ok(said)
+                },
+                move |window, outcome| {
+                    window.set_source_adding(false);
+                    // Whatever the outcome, including the sign-in that never came back.
+                    work::finish(window, outcome, &nudge);
+                },
+            );
         }
     });
 }
@@ -785,6 +837,42 @@ mod tests {
         assert_eq!(file, sources, "and so do the ones that act on a file");
     }
 
+    /// Adding a source can mean waiting on a browser, which is somebody else's pace. Only the
+    /// Add button waits on it: shutting the tab meant a sign-in that stalled took Scan, Remove
+    /// and everything else down with it for as long as it stalled.
+    #[test]
+    fn adding_a_source_holds_only_its_own_button() {
+        use crate::ui::MainWindow;
+        use i_slint_backend_testing::ElementHandle;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window.set_tab(5);
+
+        let button = |label: &str| ElementHandle::find_by_accessible_label(&window, label).next();
+        let enabled =
+            |label: &str| button(label).map(|found| found.accessible_enabled().unwrap_or(false));
+
+        assert_eq!(enabled("Add source"), Some(true));
+        assert_eq!(enabled("Scan now"), Some(false), "nothing is selected yet");
+
+        window.set_source_adding(true);
+        assert!(button("Add source").is_none(), "it says what it is doing");
+        assert_eq!(enabled("Adding…"), Some(false));
+
+        // The whole point: the rest of the tab is not gated on it, and neither is anything
+        // on any other page — adding never touches `busy`.
+        assert!(!window.get_busy(), "the tab was never shut");
+        assert_eq!(
+            enabled("Scan now"),
+            Some(false),
+            "still only waiting on a selection"
+        );
+
+        window.set_source_adding(false);
+        assert_eq!(enabled("Add source"), Some(true), "and it comes back");
+    }
+
     /// The Add source menu. It was a `PopupWindow` first, which renders in a layer of its
     /// own that a test cannot look into — so a broken one could not have been caught here.
     /// It is part of the ordinary tree now, and this is what says so.
@@ -870,6 +958,88 @@ mod tests {
         assert_eq!(fields("folder")[0].key, "path");
         assert!(settings_fields(&paths, "folder").is_empty());
         assert!(settings_fields(&paths, "nothing-like-this").is_empty());
+    }
+
+    /// A shared setting belongs to the implementation, not to the source being added, so it
+    /// is asked once and then never again — including the case where that leaves the dialog
+    /// with nothing extra to ask at all.
+    #[test]
+    fn the_dialog_stops_asking_for_a_shared_setting_once_it_has_one() {
+        let (_tmp, paths) = crate::groups::tests::home("jonathan");
+
+        let asked = |paths: &Paths| -> Vec<String> {
+            settings_fields(paths, "drive")
+                .iter()
+                .map(|field| field.key.to_string())
+                .collect()
+        };
+        assert_eq!(asked(&paths), ["client_id", "client_secret"]);
+
+        ops::import::set_setting(&paths, "drive", "client_id", "an-id").unwrap();
+        assert_eq!(
+            asked(&paths),
+            ["client_secret"],
+            "the answered one drops out"
+        );
+
+        ops::import::set_setting(&paths, "drive", "client_secret", "shh").unwrap();
+        assert!(
+            asked(&paths).is_empty(),
+            "a second Drive is asked only which folder it is"
+        );
+
+        // Which Drive is still per source, and is still asked every time.
+        let own = fields("drive");
+        let own: Vec<&str> = own.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(own, ["folder"]);
+    }
+
+    /// The token belongs to one source rather than to the implementation — that is what lets
+    /// two of them be two Google accounts — and it is asked for in neither place.
+    #[test]
+    fn the_token_is_never_a_field_anyone_is_offered() {
+        let (_tmp, paths) = crate::groups::tests::home("jonathan");
+
+        for offered in [settings_fields(&paths, "drive"), fields("drive")] {
+            assert!(
+                !offered.iter().any(|field| field.key == "refresh_token"),
+                "a box nobody can fill in"
+            );
+        }
+
+        // And it is not a shared setting at all, so it has no Settings row either.
+        assert!(
+            !shared_settings(&paths)
+                .iter()
+                .any(|item| item.key == "refresh_token")
+        );
+    }
+
+    /// Changing one is what the Settings tab is for, and a value that cannot be read back
+    /// cannot be checked against the one that was meant to be pasted.
+    #[test]
+    fn the_settings_tab_shows_what_is_stored_secret_or_not() {
+        let (_tmp, paths) = crate::groups::tests::home("jonathan");
+        ops::import::set_setting(&paths, "drive", "client_secret", "shh-1234").unwrap();
+
+        let row = shared_settings(&paths)
+            .into_iter()
+            .find(|item| item.key == "client_secret")
+            .expect("the secret has a row of its own");
+        assert_eq!(row.value, "shh-1234");
+    }
+
+    /// A scan of a whole Drive can skip hundreds of files. The bar says how many; the log
+    /// says which, because one line cannot hold them and a growing bar moves the page.
+    #[test]
+    fn what_a_scan_passed_over_is_counted_rather_than_listed() {
+        assert_eq!(also_skipped(&[]), "");
+        assert_eq!(also_skipped(&["skipping Notes".to_owned()]), ", 1 skipped");
+
+        let many: Vec<String> = (0..200).map(|at| format!("skipping {at}")).collect();
+        let said = also_skipped(&many);
+        assert_eq!(said, ", 200 skipped");
+        assert!(!said.contains('\n'), "it stays one line: {said:?}");
     }
 
     /// The promise the registry makes, kept all the way to the window: a declaration this

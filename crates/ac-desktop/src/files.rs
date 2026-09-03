@@ -235,17 +235,24 @@ fn add(
 
             let _ = progress.upgrade_in_event_loop(|window| window.set_file_progress("".into()));
 
+            // Counted here, named in the log. One line can say how it went; it cannot list
+            // every file it went that way for.
+            for note in planned.skipped.iter().chain(failed.iter()) {
+                tracing::info!("{note}");
+            }
+
             let mut said = format!("added {added} file(s)");
-            for skipped in &planned.skipped {
-                said += &format!("\nskipped {skipped}");
+            if !planned.skipped.is_empty() {
+                said += &format!(", {} skipped", planned.skipped.len());
             }
-            for failure in &failed {
-                said += &format!("\n{failure}");
-            }
-            if failed.is_empty() {
-                Ok(said)
-            } else {
-                Err(anyhow::anyhow!(said))
+            match failed.first() {
+                None => Ok(said),
+                // The first one by name, because one failure is the common case and naming
+                // it saves a trip to the log. The rest are a count.
+                Some(first) => Err(anyhow::anyhow!(match failed.len() {
+                    1 => format!("{said}, but {first}"),
+                    more => format!("{said}, but {more} did not: {first}"),
+                })),
             }
         },
         move |window, outcome| work::finish(window, outcome, &nudge),

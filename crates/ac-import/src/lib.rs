@@ -2,13 +2,14 @@
 
 pub mod config;
 pub mod ledger;
+pub mod oauth;
 pub mod registry;
 pub mod source;
 pub mod verdict;
 
 pub use config::{Field, FieldKind, Fields};
 pub use ledger::{Imported, Ledger, LedgerError, Owed, SourceRow, State, Tally};
-pub use registry::Registered;
+pub use registry::{Authorize, Registered};
 pub use source::{
     Checksum, Cursor, Digest, Held, Item, Page, Source, SourceError, SourceType, Verify,
 };

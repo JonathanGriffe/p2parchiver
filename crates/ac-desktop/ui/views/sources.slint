@@ -17,6 +17,8 @@ export struct SourceItem {
     polled: string,
     // What went wrong, shown under the row rather than in it: an error is a sentence.
     error: string,
+    // Whether it is an account that can be signed in to again.
+    signs-in: bool,
 }
 
 // One field an implementation declared, and what the form was filled in with. `kind` is
@@ -180,9 +182,13 @@ export component SourcesView inherits VerticalLayout {
     in property <[SourceItem]> sources;
     in property <[string]> kinds;
     in property <bool> busy;
+    // One is being added. Only the Add button waits on it: everything else on this tab is
+    // about the sources already here, and an add can sit on a browser for minutes.
+    in property <bool> adding;
 
     callback scan(string);
     callback remove(string);
+    callback sign-in(string);
     // Which implementation to add. Opening the dialog is the caller's business, because it
     // has to load that implementation's fields first.
     callback add-source(string);
@@ -190,6 +196,9 @@ export component SourcesView inherits VerticalLayout {
     // The row picked in the table, by directory. Empty when nothing is picked, which is
     // what the two buttons that act on a row are enabled by.
     property <string> selected;
+    // Whether the selected row is an account. Set beside `selected` rather than looked up
+    // from it: the list is a model, and an expression here has no way to search one.
+    property <bool> selected-signs-in;
 
     // Whether the Add source menu is showing. A property rather than a `PopupWindow`, so it
     // is positioned against the button, hovers like anything else, and is part of the tree
@@ -248,6 +257,9 @@ export component SourcesView inherits VerticalLayout {
                             // Clicking the row already picked lets go of it, so an action is
                             // never aimed at something the reader has stopped looking at.
                             clicked => {
+                                root.selected-signs-in = root.selected == entry.dir
+                                    ? false
+                                    : entry.signs-in;
                                 root.menu-open = false;
                                 root.selected = root.selected == entry.dir ? "" : entry.dir;
                             }
@@ -304,6 +316,12 @@ export component SourcesView inherits VerticalLayout {
                     enabled: root.selected != "" && !root.busy;
                     clicked => { root.remove(root.selected); }
                 }
+                // Adding a source signs in already; this is for a token that stopped working.
+                if root.selected-signs-in : Button {
+                    text: "Sign in again";
+                    enabled: !root.busy;
+                    clicked => { root.sign-in(root.selected); }
+                }
 
                 // The menu lives inside the button's own box so it is positioned
                 // against the button rather than against the page, and nothing clips it:
@@ -314,10 +332,10 @@ export component SourcesView inherits VerticalLayout {
                     min-width: adding.preferred-width;
 
                     adding := Button {
-                        text: "Add source";
+                        text: root.adding ? "Adding…" : "Add source";
                         width: parent.width;
                         height: parent.height;
-                        enabled: !root.busy;
+                        enabled: !root.busy && !root.adding;
                         clicked => { root.menu-open = !root.menu-open; }
                     }
 

@@ -9,6 +9,13 @@ pub struct Field {
     pub label: &'static str,
     pub kind: FieldKind,
     pub required: bool,
+    /// Whether a person is ever asked for it.
+    ///
+    /// A source's sign-in produces settings nobody could type — a token an authorisation
+    /// server issued, and only to whoever just said yes in a browser. They are stored like
+    /// any other setting and left out of every form, because a field nobody can fill in is
+    /// worse than no field at all.
+    pub asked: bool,
 }
 
 /// Enough to lay out a form, and to keep a secret out of a log.
@@ -46,10 +53,16 @@ impl Field {
 
     pub const fn optional(self) -> Self {
         Self {
-            key: self.key,
-            label: self.label,
-            kind: self.kind,
             required: false,
+            ..self
+        }
+    }
+
+    /// Filled in by signing in rather than by typing: stored, never shown in a form.
+    pub const fn kept(self) -> Self {
+        Self {
+            asked: false,
+            ..self
         }
     }
 
@@ -59,6 +72,7 @@ impl Field {
             label,
             kind,
             required: true,
+            asked: true,
         }
     }
 }

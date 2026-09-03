@@ -14,47 +14,6 @@ use crate::ops::import::scan::scan;
 use crate::ops::import::sources::add_source;
 use crate::ops::now;
 
-pub(crate) fn home() -> tempfile::TempDir {
-    tempfile::tempdir().unwrap()
-}
-pub(crate) fn paths(home: &tempfile::TempDir) -> Paths {
-    Paths::rooted_at(home.path())
-}
-pub(crate) fn picked(path: &Path) -> Fields {
-    let mut config = Fields::new();
-    config.push("path", &path.display().to_string());
-    config
-}
-pub(crate) fn tree(root: &Path, files: &[&str]) {
-    for file in files {
-        let path = root.join(file);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, file.as_bytes()).unwrap();
-    }
-}
-
-/// A group to file into, made straight in the store
-pub(crate) fn group(paths: &Paths, name: &str) -> ac_groups::id::GroupId {
-    let identity = crate::ops::identity(paths).unwrap();
-    let mut groups = ac_groups::store::Groups::open(&paths.db_file(), identity.peer_id()).unwrap();
-    groups
-        .create(identity.keypair(), name, "tester", now())
-        .unwrap()
-}
-
-/// An album imported and sitting in `.unsorted`, and a group to file it into.
-pub(crate) fn imported(home: &tempfile::TempDir, files: &[&str]) -> (Paths, String) {
-    let paths = paths(home);
-    let album = home.path().join("album");
-    tree(&album, files);
-
-    let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
-    scan(&paths, &row.dir).unwrap();
-    assert_eq!(drain(&paths, None).unwrap().kept as usize, files.len());
-    (paths, row.dir)
-}
-
-/// The file index and the storage root, opened as the pump opens them.
 pub(crate) struct Fake {
     pub(crate) kind: SourceType,
     pub(crate) items: Vec<Item>,
@@ -161,9 +120,65 @@ pub(crate) fn fake(kind: SourceType, refs: &[&str]) -> Fake {
     }
 }
 
+pub(crate) fn home() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap()
+}
+
+pub(crate) fn paths(home: &tempfile::TempDir) -> Paths {
+    Paths::rooted_at(home.path())
+}
+
+pub(crate) fn picked(path: &Path) -> Fields {
+    let mut config = Fields::new();
+    config.push("path", &path.display().to_string());
+    config
+}
+
+pub(crate) fn tree(root: &Path, files: &[&str]) {
+    for file in files {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, file.as_bytes()).unwrap();
+    }
+}
+
+/// The file index and the storage root, opened as the pump opens them.
 pub(crate) fn store(paths: &Paths) -> (Files, Content) {
     let identity = crate::ops::identity(paths).unwrap();
     crate::ops::open_files(paths, &identity).unwrap()
+}
+
+/// A group to file into, made straight in the store: `ops::group::create` wants an
+/// enrolment, and what is being tested here is the filing, not the joining.
+pub(crate) fn group(paths: &Paths, name: &str) -> ac_groups::id::GroupId {
+    let identity = crate::ops::identity(paths).unwrap();
+    let mut groups = ac_groups::store::Groups::open(&paths.db_file(), identity.peer_id()).unwrap();
+    groups
+        .create(identity.keypair(), name, "tester", now())
+        .unwrap()
+}
+
+/// An album imported and sitting in `.unsorted`, and a group to file it into.
+pub(crate) fn imported(home: &tempfile::TempDir, files: &[&str]) -> (Paths, String) {
+    let paths = paths(home);
+    let album = home.path().join("album");
+    tree(&album, files);
+
+    let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+    scan(&paths, &row.dir).unwrap();
+    assert_eq!(drain(&paths, None).unwrap().kept as usize, files.len());
+    (paths, row.dir)
+}
+
+/// A source scanned but not yet fetched: it still owes what the scan found.
+pub(crate) fn home_with_owed(home: &tempfile::TempDir) -> (Paths, String) {
+    let paths = paths(home);
+    let album = home.path().join("owed");
+    tree(&album, &["a.jpg"]);
+
+    let row = add_source(&paths, "folder", "Owed", picked(&album)).unwrap();
+    scan(&paths, &row.dir).unwrap();
+    (paths, row.dir)
 }
 
 /// Reachable throughout, and refuses anyway.
@@ -179,15 +194,4 @@ impl Source for Stubborn {
     fn fetch(&self, _item: &Item, _into: &mut dyn Write) -> Result<(), SourceError> {
         unreachable!("this one never gets that far")
     }
-}
-
-/// A source scanned but not yet fetched: it still owes what the scan found.
-pub(crate) fn home_with_owed(home: &tempfile::TempDir) -> (Paths, String) {
-    let paths = paths(home);
-    let album = home.path().join("owed");
-    tree(&album, &["a.jpg"]);
-
-    let row = add_source(&paths, "folder", "Owed", picked(&album)).unwrap();
-    scan(&paths, &row.dir).unwrap();
-    (paths, row.dir)
 }

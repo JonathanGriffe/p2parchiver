@@ -160,9 +160,24 @@ pub fn add_source(paths: &Paths, source: &str, name: &str, config: Fields) -> Re
         );
     }
 
+    let mut config = config;
     config.check(entry.name, entry.config)?;
     let settings = ledger.settings(entry.name)?;
     check_settings(entry.name, entry.settings, &settings)?;
+
+    // Adding is where a sign-in belongs: it is the moment somebody is sitting there having
+    // just said which account they mean. It happens for every source that has not got a
+    // token of its own, not merely the first — adding a second Drive is how a second Google
+    // account gets connected, and it would be no use handed the first one's.
+    if entry.signs_in() && !entry.signed_in(&config) {
+        let granted = entry
+            .authorize(&settings)
+            .with_context(|| format!("signing in to {}", entry.name))?;
+        for (key, value) in granted.iter() {
+            config.push(key, value);
+        }
+    }
+
     entry
         .open(&config, &settings)
         .with_context(|| format!("checking how {name} is configured"))?;
@@ -221,7 +236,8 @@ pub fn remove_source(paths: &Paths, needle: &str) -> Result<bool> {
 /// One implementation's shared setting, and whether it is filled in.
 pub struct Setting {
     pub field: Field,
-    /// `None` for a `Secret`, whether or not it is set: it is replaced rather than displayed.
+    /// What is stored, secret or not. A value that cannot be read back cannot be checked
+    /// against the one the person meant to paste, which is the mistake worth catching here.
     pub value: Option<String>,
     pub set: bool,
 }
@@ -230,21 +246,63 @@ pub fn settings(paths: &Paths, source: &str) -> Result<Vec<Setting>> {
     let entry = implementation(source)?;
     let stored = ledger(paths)?.settings(entry.name)?;
 
+    // Only what is asked for. A setting the sign-in fills in has no row: there is nothing
+    // useful to show and nothing anyone could usefully type into it.
     Ok(entry
-        .settings
-        .iter()
+        .asked_settings()
         .map(|field| {
             let value = stored.get(field.key);
             Setting {
                 field: *field,
                 set: value.is_some_and(|value| !value.is_empty()),
-                value: match field.kind {
-                    FieldKind::Secret => None,
-                    _ => value.map(str::to_owned),
-                },
+                value: value.map(str::to_owned),
             }
         })
         .collect())
+}
+
+/// Sign in again as one configured source, replacing the token it holds.
+///
+/// Adding a source signs in on its own, so this is the repair: a token that was revoked, or
+/// an account that was meant to be a different one. It is a source rather than an
+/// implementation because that is what a token now belongs to.
+///
+/// The settings it is built from are the shared ones — the application's own credentials,
+/// which are typed — and what comes back is that source's alone.
+pub fn authorize(paths: &Paths, needle: &str) -> Result<SourceRow> {
+    let ledger = ledger(paths)?;
+    let mut row = find_source(&ledger, needle)?;
+
+    let entry = implementation(&row.source)?;
+    if !entry.signs_in() {
+        bail!(
+            "{} has nothing to sign in to; everything {} needs is typed",
+            row.name,
+            row.source
+        );
+    }
+
+    let granted = entry
+        .authorize(&ledger.settings(entry.name)?)
+        .with_context(|| format!("signing in as {}", row.name))?;
+
+    // Replaced rather than added to: a second token under the same key would leave `get`
+    // answering with the stale one, which is the failure this is meant to repair.
+    let mut config = Fields::new();
+    for (key, value) in row.config.iter() {
+        if granted.get(key).is_none() {
+            config.push(key, value);
+        }
+    }
+    for (key, value) in granted.iter() {
+        config.push(key, value);
+    }
+
+    row.config = config;
+    ledger
+        .set_source_config(&row.dir, &row.config)
+        .with_context(|| format!("storing the new sign-in for {}", row.name))?;
+    Ok(row)
 }
 
 pub fn set_setting(paths: &Paths, source: &str, key: &str, value: &str) -> Result<()> {
@@ -381,9 +439,144 @@ mod tests {
         assert_eq!(folder.config.len(), 1);
         assert_eq!(folder.config[0].key, "path");
         assert!(folder.settings.is_empty());
+        assert!(!folder.signs_in(), "a folder is answerable by being there");
 
-        let err = implementation("drive").unwrap_err().to_string();
+        let err = implementation("nextcloud").unwrap_err().to_string();
         assert!(err.contains("folder"), "it should say what there is: {err}");
+    }
+
+    /// The other shape a source comes in: reached over the network, shared credentials, and a
+    /// sign-in that cannot be typed into a form.
+    #[test]
+    fn the_build_offers_google_drive_and_knows_it_has_to_be_signed_in_to() {
+        let drive = implementation("drive").unwrap();
+        assert_eq!(drive.kind, SourceType::Remote);
+        assert!(drive.signs_in(), "there is no typing a Google account in");
+
+        // Which part of the Drive, and whose, are both the source's own — that is what
+        // lets two of them be two accounts.
+        let own: Vec<&str> = drive.config.iter().map(|field| field.key).collect();
+        assert_eq!(own, ["folder", "refresh_token"]);
+        assert!(!drive.config[0].required, "left out means the whole Drive");
+
+        // The shared half is this application's registration with Google, which every
+        // account goes through, and nothing about any of them.
+        let shared: Vec<&str> = drive.settings.iter().map(|field| field.key).collect();
+        assert_eq!(shared, ["client_id", "client_secret"]);
+
+        for field in drive.settings.iter().chain(drive.config.iter()) {
+            if matches!(field.key, "client_secret" | "refresh_token") {
+                assert_eq!(field.kind, FieldKind::Secret, "{}", field.key);
+            }
+        }
+
+        // Only what can be typed is ever put in front of anyone. The token is what signing
+        // in produces, and a form offering it would be a box nobody can fill.
+        let asked: Vec<&str> = drive.asked_settings().map(|field| field.key).collect();
+        assert_eq!(asked, ["client_id", "client_secret"]);
+        let asked: Vec<&str> = drive.asked_config().map(|field| field.key).collect();
+        assert_eq!(asked, ["folder"]);
+    }
+
+    /// Whether a source has been signed in to is read off the settings the sign-in fills in,
+    /// so adding one knows whether it still has to ask.
+    #[test]
+    fn a_source_has_been_signed_in_to_once_it_holds_what_signing_in_gives() {
+        let drive = implementation("drive").unwrap();
+
+        let mut folder_only = Fields::new();
+        folder_only.push("folder", "Photos");
+        assert!(
+            !drive.signed_in(&folder_only),
+            "saying which folder is not saying whose"
+        );
+
+        let mut empty = Fields::new();
+        empty.push("refresh_token", "");
+        assert!(!drive.signed_in(&empty), "a blank is not a token");
+
+        let mut done = Fields::new();
+        done.push("refresh_token", "rt-1");
+        assert!(drive.signed_in(&done));
+
+        // The whole point: a second source starts with nothing of its own, whatever the
+        // first one holds, so adding it asks again and can come back a different account.
+        assert!(!drive.signed_in(&Fields::new()));
+
+        // A source with no sign-in has nothing to be waiting for.
+        assert!(
+            implementation("folder").unwrap().signed_in(&Fields::new()),
+            "a folder is signed in to by being on the disk"
+        );
+    }
+
+    /// A token is one source's own, and a secret, so it never appears in what lists sources.
+    #[test]
+    fn a_sources_token_is_kept_with_it_and_out_of_what_is_shown() {
+        let drive = implementation("drive").unwrap();
+
+        let held = drive
+            .config
+            .iter()
+            .find(|field| field.key == "refresh_token")
+            .expect("it lives with the source, not with the shared credentials");
+        assert_eq!(held.kind, FieldKind::Secret);
+        assert!(!held.asked, "and is never a box on a form");
+
+        // Which is what takes it out of every listing: `without_secrets` masks by the
+        // declaration, so a token in a config is dropped the way a password would be.
+        let mut config = Fields::new();
+        config
+            .push("folder", "Photos")
+            .push("refresh_token", "rt-1");
+        let row = SourceRow {
+            dir: "d".to_owned(),
+            name: "My Drive".to_owned(),
+            source: "drive".to_owned(),
+            config,
+            added_at: 0,
+            scanned_at: 0,
+            last_error: None,
+            reachable: true,
+        };
+
+        let shown = without_secrets(row, Some(drive.config));
+        assert_eq!(shown.config.get("folder"), Some("Photos"));
+        assert_eq!(shown.config.get("refresh_token"), None);
+    }
+
+    /// The typed half is checked before the browser opens: sending someone to consent to an
+    /// application whose credentials are missing wastes the one step that needs a person.
+    #[test]
+    fn adding_a_drive_without_its_credentials_says_so_rather_than_opening_a_browser() {
+        let home = home();
+        let paths = paths(&home);
+
+        let err = add_source(&paths, "drive", "My Drive", Fields::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("OAuth client id"), "{err}");
+    }
+
+    /// Signing in again names a source rather than an implementation, because a token now
+    /// belongs to one. Both ways of getting that wrong are worth naming.
+    #[test]
+    fn signing_in_again_names_a_source_and_says_so_when_there_is_nothing_to_sign_in_to() {
+        let home = home();
+        let paths = paths(&home);
+        let album = home.path().join("album");
+        tree(&album, &["a.jpg"]);
+
+        // The implementation's name is not a source's name, and the error says how to find
+        // the ones there are.
+        let err = authorize(&paths, "drive").unwrap_err().to_string();
+        assert!(err.contains("no source called"), "{err}");
+        assert!(err.contains("source list"), "{err}");
+
+        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let err = authorize(&paths, &row.dir).unwrap_err().to_string();
+        assert!(err.contains("nothing to sign in to"), "{err}");
+        assert!(err.contains("Pictures"), "named, not a directory: {err}");
     }
 
     #[test]
@@ -508,6 +701,13 @@ mod tests {
         assert_eq!(row.dir, "family-photos", "which is nothing anybody typed");
 
         assert!(scan(&paths, "Family Photos").is_ok());
+        assert!(
+            authorize(&paths, "Family Photos")
+                .unwrap_err()
+                .to_string()
+                .contains("nothing to sign in to"),
+            "found it, and refused for its own reason rather than for not being found"
+        );
         assert!(remove_source(&paths, "Family Photos").unwrap());
     }
 
@@ -658,24 +858,6 @@ mod tests {
         assert!(without_secrets(row, None).config.is_empty());
     }
 
-    #[test]
-    fn a_source_lists_with_what_it_owes_and_what_it_brought_in() {
-        let home = home();
-        let paths = paths(&home);
-        let album = home.path().join("album");
-        tree(&album, &["a.jpg", "b.jpg", "c.jpg"]);
-
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
-        scan(&paths, &row.dir).unwrap();
-
-        let listed = sources(&paths).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].row.name, "Pictures");
-        assert_eq!(listed[0].kind, Some(SourceType::OneShot));
-        assert_eq!(listed[0].owed, 3);
-        assert_eq!(listed[0].tally, Tally::default());
-    }
-
     /// The two halves of what happens to a one-shot: it stops being worth watching once it
     /// has fetched what it found, and stops existing once its files have been dealt with.
     #[test]
@@ -753,5 +935,23 @@ mod tests {
         );
 
         let _ = dir;
+    }
+
+    #[test]
+    fn a_source_lists_with_what_it_owes_and_what_it_brought_in() {
+        let home = home();
+        let paths = paths(&home);
+        let album = home.path().join("album");
+        tree(&album, &["a.jpg", "b.jpg", "c.jpg"]);
+
+        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        scan(&paths, &row.dir).unwrap();
+
+        let listed = sources(&paths).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].row.name, "Pictures");
+        assert_eq!(listed[0].kind, Some(SourceType::OneShot));
+        assert_eq!(listed[0].owed, 3);
+        assert_eq!(listed[0].tally, Tally::default());
     }
 }
