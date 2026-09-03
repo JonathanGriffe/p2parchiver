@@ -344,7 +344,7 @@ fn describe_storage(storage: Option<&Storage>, page: &groups::Page) -> StoragePa
                 size: human_size(*bytes).into(),
                 offset,
                 fraction,
-                shade: (1.0 - 0.18 * at as f32).max(0.4),
+                at: at as i32,
             };
             offset += fraction;
             slice
@@ -357,7 +357,9 @@ fn describe_storage(storage: Option<&Storage>, page: &groups::Page) -> StoragePa
             size: human_size(storage.unsorted).into(),
             offset,
             fraction: (storage.unsorted as f64 / capacity as f64) as f32,
-            shade: 0.3,
+            // Not a group, and the only slice without a colour: what is waiting to be sorted
+            // has not been put anywhere yet, and grey is what says so.
+            at: -1,
         });
     }
 
@@ -635,6 +637,45 @@ mod tests {
 #[cfg(test)]
 mod reading {
     use super::*;
+
+    /// Every group gets a colour of its own, in a fixed order; what is waiting to be sorted
+    /// gets none, because it has not been put anywhere yet.
+    #[test]
+    fn the_storage_bar_colours_groups_and_leaves_the_unsorted_slice_grey() {
+        use ac_node::ops::file::Storage;
+
+        let group = |name: &str| crate::ui::GroupItem {
+            name: name.into(),
+            ..Default::default()
+        };
+        let storage = Storage {
+            root: std::path::PathBuf::from("/tmp"),
+            held: 300,
+            free: Some(700),
+            max: Some(1000),
+            unsorted: 100,
+            by_group: vec![
+                ("g1".to_owned(), 100),
+                ("g2".to_owned(), 100),
+                ("g3".to_owned(), 100),
+            ],
+        };
+        let page = groups::Page {
+            items: vec![group("Holidays"), group("Family"), group("Work")],
+            detail: None,
+        };
+
+        let panel = describe_storage(Some(&storage), &page);
+        let at: Vec<i32> = panel.slices.iter().map(|slice| slice.at).collect();
+
+        // Counted from zero and never repeated, which is what the theme indexes the hues by.
+        assert_eq!(at, [0, 1, 2, -1]);
+        assert_eq!(
+            panel.slices.last().map(|slice| slice.label.as_str()),
+            Some("unsorted"),
+            "and the one without a colour is the one that is not a group"
+        );
+    }
 
     /// A read does the work the page on screen needs, and no other page's.
     ///

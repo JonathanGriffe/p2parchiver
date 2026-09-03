@@ -389,6 +389,12 @@ pub fn scan(paths: &Paths, source: &str) -> Result<()> {
         "{}: {} offered, {} new, {} retried, {} gone",
         scanned.name, scanned.found, scanned.owed, scanned.again, scanned.retired
     );
+    if scanned.ignored > 0 {
+        println!(
+            "{} were not pictures or video, and were left alone",
+            scanned.ignored
+        );
+    }
     if scanned.owed > 0 {
         println!();
         println!("nothing has been downloaded yet: `ac import fetch` brings them in now,");

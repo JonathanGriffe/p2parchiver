@@ -611,6 +611,40 @@ mod tests {
         vendored.is_file().then_some(vendored)
     }
 
+    /// The build has to leave ffmpeg where the running binary looks for it, which is beside
+    /// itself — and not merely in `vendor/`, which is where only a test would think to look.
+    ///
+    /// This is the gap that made every video show a placeholder while the tests were green:
+    /// they fell back to the vendored copy through [`ffmpeg_for_test`], so the one thing that
+    /// was broken — the copy the app itself would find — was the one thing nothing checked.
+    #[test]
+    fn the_build_leaves_ffmpeg_where_the_binary_will_look_for_it() {
+        let vendored = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor")
+            .join(exe_name(&format!("{BUNDLED}-{}", env!("TEST_TARGET"))));
+        if !vendored.is_file() {
+            // Nobody has vendored for this target; there is nothing to have placed.
+            return;
+        }
+
+        // A test binary lives in `<target>/<profile>/deps`, one below the binary itself.
+        let here = std::env::current_exe().unwrap();
+        let beside = here.parent().and_then(Path::parent).unwrap();
+
+        let placed = beside.join(exe_name(BUNDLED));
+        assert!(
+            placed.is_file(),
+            "{} is vendored but was not put at {}: every video would be a placeholder",
+            vendored.display(),
+            placed.display()
+        );
+        assert_eq!(
+            std::fs::metadata(&placed).unwrap().len(),
+            std::fs::metadata(&vendored).unwrap().len(),
+            "the copy beside the binary is not the one that was vendored"
+        );
+    }
+
     /// A picture of a known size, written where the tests can point at it.
     fn picture(at: &Path, width: u32, height: u32) {
         let buffer = image::RgbImage::from_fn(width, height, |x, y| {

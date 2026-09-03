@@ -22,6 +22,9 @@ pub struct Scanned {
     pub again: u64,
     /// Exhausted references it no longer offers: the file has gone from the source.
     pub retired: u64,
+    /// Offered but not media: documents, spreadsheets, whatever else the source holds. Never
+    /// downloaded, and counted rather than listed because there can be very many.
+    pub ignored: u64,
     pub skipped: Vec<String>,
     /// False when the source could not be reached. Not a failure, and not recorded as one.
     pub reachable: bool,
@@ -105,6 +108,15 @@ pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Resul
         let mut stale = Vec::new();
         for item in &page.items {
             out.found += 1;
+
+            // Decided here rather than in each source, so one list governs every one of them
+            // and a new source cannot forget to have the rule. Counted rather than named: a
+            // Drive can hold thousands of documents and none of them is news.
+            if !ac_import::source::is_media(&item.name) {
+                out.ignored += 1;
+                continue;
+            }
+
             match known.iter().find(|(seen, _)| *seen == item.reference) {
                 Some((_, fails)) if *fails < ac_import::ledger::MAX_FETCH_ATTEMPTS => {}
                 Some(_) => stale.push(item.reference.as_str()),
@@ -266,5 +278,54 @@ mod tests {
         );
         assert_eq!(ledger.owed(&row.dir).unwrap(), 1);
         assert_eq!(ledger.claim(at, 8).unwrap().len(), 1);
+    }
+
+    /// A source offers everything it has; only pictures and video are taken. Enforced once
+    /// here rather than in each source, so a source added later cannot forget the rule.
+    #[test]
+    fn a_scan_owes_the_pictures_and_leaves_the_documents_where_they_are() {
+        let home = home();
+        let paths = paths(&home);
+        let album = home.path().join("album");
+        tree(
+            &album,
+            &[
+                "DCIM/a.jpg",
+                "DCIM/b.mp4",
+                "DCIM/c.CR3",
+                "notes.pdf",
+                "deck.pptx",
+                "budget.xlsx",
+                "README",
+            ],
+        );
+
+        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let scanned = scan(&paths, &row.dir).unwrap();
+
+        assert_eq!(scanned.found, 7, "the source offered all of it");
+        assert_eq!(scanned.owed, 3, "and only the photographs are owed");
+        assert_eq!(scanned.ignored, 4);
+
+        // Nothing was written down for them, so nothing will ever fetch them — and a second
+        // scan does not keep rediscovering them as new.
+        assert_eq!(ledger(&paths).unwrap().owed(&row.dir).unwrap(), 3);
+
+        let claimed: Vec<String> = ledger(&paths)
+            .unwrap()
+            .claim(now(), 50)
+            .unwrap()
+            .into_iter()
+            .map(|owed| owed.name)
+            .collect();
+        assert_eq!(claimed.len(), 3, "{claimed:?}");
+        assert!(
+            claimed.iter().all(|at| !at.ends_with(".pdf")),
+            "only what the pump would fetch: {claimed:?}"
+        );
+
+        let again = scan(&paths, &row.dir).unwrap();
+        assert_eq!(again.owed, 0, "nothing new the second time");
+        assert_eq!(again.ignored, 4, "and the documents are still not media");
     }
 }

@@ -187,6 +187,15 @@ fn also_skipped(notes: &[String]) -> String {
     }
 }
 
+/// How many the source offered that are not pictures or video, for the end of the line.
+fn also_ignored(ignored: u64) -> String {
+    match ignored {
+        0 => String::new(),
+        1 => ", 1 not media".to_owned(),
+        many => format!(", {many} not media"),
+    }
+}
+
 pub fn apply(window: &MainWindow, page: Page) {
     window.set_sources(ModelRc::from(Rc::new(VecModel::from(page.sources))));
     window.set_source_kinds(ModelRc::from(Rc::new(VecModel::from(page.implementations))));
@@ -208,8 +217,11 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     return Ok(format!("{} cannot be reached right now", scanned.name));
                 }
                 Ok(format!(
-                    "{}: {} offered, {} new",
-                    scanned.name, scanned.found, scanned.owed
+                    "{}: {} offered, {} new{}",
+                    scanned.name,
+                    scanned.found,
+                    scanned.owed,
+                    also_ignored(scanned.ignored)
                 ))
             });
         }
@@ -392,6 +404,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                         return Ok(said);
                     }
                     said += &format!(": {} to bring in", scanned.owed);
+                    said += &also_ignored(scanned.ignored);
                     said += &also_skipped(&scanned.skipped);
                     Ok(said)
                 },

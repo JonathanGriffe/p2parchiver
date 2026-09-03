@@ -132,9 +132,12 @@ export component SortView inherits VerticalLayout {
                     font-weight: 700;
                     overflow: elide;
                 }
+                // The source and the folder within it are what the bulk buttons select on.
+                // The folder is another entry in the same list rather than a path stuck to
+                // the source, and at the source's own root there is no folder to name.
                 Text {
                     text: root.size + " · " + root.arrived + " · " + root.source
-                        + (root.folder == "" ? "" : " / " + root.folder);
+                        + (root.folder == "" ? "" : " · " + root.folder);
                     color: Theme.dim;
                     font-size: Theme.small-size;
                     overflow: elide;
@@ -157,7 +160,11 @@ export component SortView inherits VerticalLayout {
                         min-width: 110px;
                         max-width: 220px;
                         horizontal-stretch: 1;
-                        selected(_) => { root.pick-group(self.current-index); }
+                        // `changed`, not `selected`: a ComboBox moves its own selection when
+                        // its model arrives — it clamps the index into the new list without
+                        // telling anyone it did. Listening only for a person's pick left the
+                        // box showing the first group while nothing had actually been chosen.
+                        changed current-index => { root.pick-group(self.current-index); }
                     }
                     // Where in that group it lands. Its first entry is the group's root.
                     ComboBox {
@@ -167,7 +174,7 @@ export component SortView inherits VerticalLayout {
                         min-width: 110px;
                         max-width: 220px;
                         horizontal-stretch: 1;
-                        selected(_) => { root.pick-folder(self.current-index); }
+                        changed current-index => { root.pick-folder(self.current-index); }
                     }
                     Button {
                         text: "Add folder";

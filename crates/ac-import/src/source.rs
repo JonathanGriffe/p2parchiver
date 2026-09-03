@@ -154,6 +154,44 @@ pub struct Page {
     pub skipped: Vec<String>,
 }
 
+/// The pictures and video an import is for.
+///
+/// A camera roll, a phone and a Drive folder all carry things that are not photographs —
+/// documents, spreadsheets, the odd installer — and fetching them costs the bandwidth and the
+/// disk that the photographs wanted. So a scan offers everything and only these are taken.
+///
+/// Named by extension rather than by sniffing the bytes, because the decision has to be made
+/// from a listing: the whole point is to decide before anything is downloaded.
+const PICTURES: &[&str] = &[
+    "jpg", "jpeg", "jpe", "jfif", "png", "gif", "bmp", "tif", "tiff", "webp", "avif", "heic",
+    "heif", "jxl", "svg", "ico",
+];
+
+/// Raw, which is a picture that the camera has not developed yet.
+const NEGATIVES: &[&str] = &[
+    "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef", "srw",
+    "x3f", "3fr", "erf", "kdc", "mrw", "raw",
+];
+
+const FOOTAGE: &[&str] = &[
+    "mp4", "m4v", "mov", "avi", "mkv", "webm", "3gp", "3g2", "mpg", "mpeg", "m2ts", "mts", "ts",
+    "wmv", "flv", "ogv", "mxf", "insv",
+];
+
+/// Whether this is the kind of thing an archive of photographs is for.
+///
+/// Nothing without an extension passes: a name that says nothing about itself is not worth
+/// the download on the chance that it is a photograph.
+pub fn is_media(name: &str) -> bool {
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    let ext = ext.as_str();
+
+    PICTURES.contains(&ext) || NEGATIVES.contains(&ext) || FOOTAGE.contains(&ext)
+}
+
 /// What the host knows that the inbox cannot: whether a group already holds these bytes.
 pub trait Held {
     fn held(&self, hash: &str) -> Result<bool>;
@@ -213,6 +251,60 @@ impl SourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What an archive of photographs is for, and what it is not. The cost of the second list
+    /// is a download and the disk it lands on, so the rule is "media or nothing" rather than
+    /// "everything but these".
+    #[test]
+    fn pictures_and_video_are_taken_and_everything_else_is_left_where_it_is() {
+        for wanted in [
+            "a.jpg",
+            "a.JPEG",
+            "a.png",
+            "a.gif",
+            "a.webp",
+            "a.avif",
+            "a.heic",
+            "a.tif",
+            "IMG_0001.CR3",
+            "IMG_0001.dng",
+            "a.arw",
+            "a.raf",
+            "clip.mp4",
+            "clip.MOV",
+            "clip.mkv",
+            "clip.webm",
+            "clip.3gp",
+            "clip.m2ts",
+        ] {
+            assert!(is_media(wanted), "{wanted} should have been taken");
+        }
+
+        for unwanted in [
+            "notes.pdf",
+            "deck.pptx",
+            "sheet.xlsx",
+            "letter.docx",
+            "notes.txt",
+            "archive.zip",
+            "song.mp3",
+            "setup.exe",
+            "script.sh",
+            "database.db",
+            "thumbs.db",
+            ".DS_Store",
+        ] {
+            assert!(!is_media(unwanted), "{unwanted} should have been left");
+        }
+
+        // A name that says nothing about itself is not worth a download on the chance.
+        assert!(!is_media("README"));
+        assert!(!is_media(""));
+
+        // The extension is the last one, so a document does not get in by wearing two.
+        assert!(!is_media("holiday.jpg.pdf"));
+        assert!(is_media("holiday.pdf.jpg"));
+    }
 
     #[test]
     fn only_a_one_shot_source_is_left_out_of_the_schedule() {
