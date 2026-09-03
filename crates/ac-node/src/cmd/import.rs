@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use ac_import::config::{Field, FieldKind, Fields};
 use ac_net::config::{Config, Paths};
@@ -73,7 +73,7 @@ pub fn source_add(paths: &Paths, source: &str, name: &str, set: &[String]) -> Re
 }
 
 /// Add a folder, scan it, and bring it in: the whole of an import, with no daemon running.
-pub fn from(paths: &Paths, picked: &[PathBuf], name: Option<&str>) -> Result<()> {
+pub fn from(paths: &Paths, picked: &Path, name: Option<&str>) -> Result<()> {
     let ops::import::Picked { row, added } = ops::import::from_folder(paths, name, picked)?;
     match added {
         true => println!("added {} ({})", row.name, row.source),
@@ -232,21 +232,38 @@ pub fn list(paths: &Paths, all: bool) -> Result<()> {
 }
 
 /// File one into a group, or everything that came from the same source folder.
-pub fn sort(paths: &Paths, hash: &str, group: &str, folder: bool) -> Result<()> {
+pub fn sort(
+    paths: &Paths,
+    hash: &str,
+    group: &str,
+    folder: bool,
+    into: Option<&str>,
+) -> Result<()> {
     let row = ops::import::find(paths, hash)?;
+    let into = into.unwrap_or_default();
     let filed = match folder {
-        false => ops::import::sort(paths, &row.hash, group)?,
-        true => ops::import::sort_folder(paths, &row.source_dir, &row.folder, group)?,
+        false => ops::import::sort(paths, &row.hash, group, into)?,
+        true => ops::import::sort_folder(paths, &row.source_dir, &row.folder, group, into)?,
     };
     report_filed(&filed, "filed", Some(group))
 }
 
 pub fn drop(paths: &Paths, hash: &str, folder: bool) -> Result<()> {
     let row = ops::import::find(paths, hash)?;
-    let filed = match folder {
-        false => ops::import::drop(paths, &row.hash)?,
-        true => ops::import::drop_folder(paths, &row.source_dir, &row.folder)?,
+    let (filed, gone) = match folder {
+        false => (ops::import::drop(paths, &row.hash)?, vec![row.hash.clone()]),
+        true => {
+            let hashes = ops::import::in_folder(paths, &row.source_dir, &row.folder)?;
+            (
+                ops::import::drop_folder(paths, &row.source_dir, &row.folder)?,
+                hashes,
+            )
+        }
     };
+    // Nothing here can take it back, so there is nothing to keep the bytes for.
+    for hash in &gone {
+        ops::import::forget(paths, hash)?;
+    }
     report_filed(&filed, "deleted", None)
 }
 

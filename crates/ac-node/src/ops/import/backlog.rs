@@ -116,7 +116,7 @@ pub struct Filed {
     pub failed: Vec<String>,
 }
 
-pub fn sort(paths: &Paths, hash: &str, group: &str) -> Result<Filed> {
+pub fn sort(paths: &Paths, hash: &str, group: &str, into: &str) -> Result<Filed> {
     let ledger = ledger(paths)?;
     let row = ledger
         .get(hash)?
@@ -126,19 +126,25 @@ pub fn sort(paths: &Paths, hash: &str, group: &str) -> Result<Filed> {
     crate::ops::file::writable(&session.row)?;
 
     let mut out = Filed::default();
-    sort_one(&ledger, &mut session, &row, &mut out)?;
+    sort_one(&ledger, &mut session, &row, into, &mut out)?;
     Ok(out)
 }
 
 /// File everything that came from one source folder.
-pub fn sort_folder(paths: &Paths, source_dir: &str, folder: &str, group: &str) -> Result<Filed> {
+pub fn sort_folder(
+    paths: &Paths,
+    source_dir: &str,
+    folder: &str,
+    group: &str,
+    into: &str,
+) -> Result<Filed> {
     let ledger = ledger(paths)?;
     let mut session = crate::ops::file::session(paths, group)?;
     crate::ops::file::writable(&session.row)?;
 
     let mut out = Filed::default();
     for row in ledger.in_folder(source_dir, folder)? {
-        sort_one(&ledger, &mut session, &row, &mut out)?;
+        sort_one(&ledger, &mut session, &row, into, &mut out)?;
     }
     Ok(out)
 }
@@ -147,6 +153,7 @@ fn sort_one(
     ledger: &Ledger,
     session: &mut crate::ops::file::Session,
     row: &Imported,
+    into: &str,
     out: &mut Filed,
 ) -> Result<()> {
     if row.state != State::Unsorted {
@@ -170,7 +177,7 @@ fn sort_one(
         return Ok(());
     }
 
-    let to = free_name(session, row)?;
+    let to = free_name(session, row, into)?;
     let source = session.content.locate(UNSORTED, &from);
     let modified = std::fs::metadata(&source)
         .and_then(|meta| meta.modified())
@@ -250,12 +257,103 @@ fn drop_one(ledger: &Ledger, content: &Content, row: &Imported, out: &mut Filed)
         return Ok(());
     }
 
+    // Marked, not deleted. The row is what makes it permanent — a dropped hash is never
+    // fetched again, whatever offers it — and the bytes are what make it undoable, so they
+    // stay until someone is finished with the decision. See [`forget`].
+    let _ = content;
     ledger.dropped(&row.hash)?;
-    content
-        .remove(UNSORTED, &located(row)?)
-        .with_context(|| format!("deleting {}", row.name))?;
     out.done += 1;
     Ok(())
+}
+
+/// The hashes of everything still waiting in one source folder.
+pub fn in_folder(paths: &Paths, source_dir: &str, folder: &str) -> Result<Vec<String>> {
+    Ok(ledger(paths)?
+        .in_folder(source_dir, folder)?
+        .into_iter()
+        .map(|row| row.hash)
+        .collect())
+}
+
+/// Delete the bytes behind something already thrown away.
+///
+/// Split from [`drop`] so that throwing away and being finished with it are two moments
+/// rather than one. Between them the file can be put back, which is all undo is.
+pub fn forget(paths: &Paths, hash: &str) -> Result<bool> {
+    let ledger = ledger(paths)?;
+    let Some(row) = ledger.get(hash)? else {
+        return Ok(false);
+    };
+    if row.state != State::Dropped {
+        return Ok(false);
+    }
+
+    let identity = crate::ops::identity(paths)?;
+    let (_, content) = crate::ops::open_files(paths, &identity)?;
+    content
+        .remove(UNSORTED, &located(&row)?)
+        .with_context(|| format!("deleting {}", row.name))?;
+    Ok(true)
+}
+
+/// Finish with everything thrown away that nobody is still deciding about.
+///
+/// Taking a deletion back only lasts as long as the session that made it, so by the time a
+/// node is starting there is nothing left to take back and the bytes can go. Without this a
+/// session that ended mid-sort would leave them on disk for good.
+pub fn sweep_dropped(paths: &Paths) -> Result<u64> {
+    let ledger = ledger(paths)?;
+    let mut gone = 0;
+    for row in ledger.discarded()? {
+        if forget(paths, &row.hash)? {
+            gone += 1;
+        }
+    }
+    Ok(gone)
+}
+
+/// Put back what was just done with one file: a sorted one comes back out of its group, a
+/// dropped one is simply not dropped any more.
+///
+/// Only ever the reverse of something a moment old — see `Ledger::undone` for why that is
+/// the one move backwards the rows allow.
+pub fn undo(paths: &Paths, hash: &str) -> Result<String> {
+    let ledger = ledger(paths)?;
+    let row = ledger
+        .get(hash)?
+        .ok_or_else(|| anyhow!("nothing imported has the hash {hash}"))?;
+
+    match (row.state, row.group_id.clone()) {
+        // Its bytes were never deleted, so there is nothing to carry back — unless
+        // something has since been finished with it, and then there is nothing to put back
+        // either. Refused rather than leaving a row pointing at a file that is gone.
+        (State::Dropped, _) => {
+            let identity = crate::ops::identity(paths)?;
+            let (_, content) = crate::ops::open_files(paths, &identity)?;
+            if !content.exists(UNSORTED, &located(&row)?) {
+                bail!("{} has already been deleted for good", row.name);
+            }
+            ledger.undone(hash)?;
+        }
+        (State::Sorted, Some(group)) => {
+            let mut session = crate::ops::file::session(paths, &group)?;
+            let at = session
+                .files
+                .path_of_hash(session.id, hash)?
+                .ok_or_else(|| anyhow!("{} is not in {} any more", row.name, session.row.name))?;
+
+            session
+                .content
+                .adopt(&session.dir, &at, UNSORTED, &located(&row)?)
+                .with_context(|| format!("carrying {} back out of {}", row.name, group))?;
+            // A tombstone rather than a deletion: the peers who were told it arrived have
+            // to be told it left.
+            session.files.remove(session.id, &at, now())?;
+            ledger.undone(hash)?;
+        }
+        _ => bail!("{} was not filed or thrown away", row.name),
+    }
+    Ok(format!("{} is waiting again", row.name))
 }
 
 fn settle_missing(
@@ -278,9 +376,13 @@ fn located(row: &Imported) -> Result<RelPath> {
         .with_context(|| format!("{} has no path on disk", row.name))
 }
 
-fn free_name(session: &crate::ops::file::Session, row: &Imported) -> Result<RelPath> {
-    let plain = RelPath::parse(&row.name)
-        .with_context(|| format!("{} cannot be given a name in a group", row.name))?;
+fn free_name(session: &crate::ops::file::Session, row: &Imported, into: &str) -> Result<RelPath> {
+    let into = into.trim_matches('/');
+    let plain = match into.is_empty() {
+        true => RelPath::parse(&row.name),
+        false => RelPath::under(into, &row.name),
+    }
+    .with_context(|| format!("{} cannot be given a name in a group", row.name))?;
 
     match session.files.get(session.id, &plain)? {
         Some(existing) if !existing.is_removed() => Ok(plain.conflict_name(&row.hash)),
@@ -303,7 +405,11 @@ mod tests {
 
         assert_eq!(drop(&paths, &file.row.hash).unwrap().done, 1);
 
+        // Thrown away and finished with are two moments. Until the second, the bytes are
+        // still there, which is the only reason it can be taken back.
         let (_, content) = store(&paths);
+        assert!(content.exists(UNSORTED, &file.path), "not deleted yet");
+        assert!(forget(&paths, &file.row.hash).unwrap());
         assert!(!content.exists(UNSORTED, &file.path), "the bytes are gone");
 
         let ledger = ledger(&paths).unwrap();
@@ -371,7 +477,7 @@ mod tests {
         let (_, content) = store(&paths);
         content.remove(UNSORTED, &file.path).unwrap();
 
-        let filed = sort(&paths, &file.row.hash, "Holidays").unwrap();
+        let filed = sort(&paths, &file.row.hash, "Holidays", "").unwrap();
         assert_eq!(filed.done, 0);
         assert_eq!(filed.missing, 1);
 
@@ -396,7 +502,7 @@ mod tests {
         assert_eq!(file.path.as_str(), "pictures/DCIM/a.jpg");
         assert!(!file.held, "no group has these bytes yet");
 
-        let filed = sort(&paths, &file.row.hash, "Holidays").unwrap();
+        let filed = sort(&paths, &file.row.hash, "Holidays", "").unwrap();
         assert_eq!(filed.done, 1);
         assert!(filed.failed.is_empty(), "{:?}", filed.failed);
 
@@ -442,7 +548,7 @@ mod tests {
         assert_eq!(backlog.total, 3);
         assert_eq!(backlog.in_folder, 2, "what the bulk button would name");
 
-        let filed = sort_folder(&paths, &one.row.source_dir, "DCIM", "Holidays").unwrap();
+        let filed = sort_folder(&paths, &one.row.source_dir, "DCIM", "Holidays", "").unwrap();
         assert_eq!(filed.done, 2, "both of that folder's, and nothing else");
         assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 1);
         assert_eq!(
@@ -458,7 +564,10 @@ mod tests {
         let group = group(&paths, "Holidays");
 
         for file in super::unsorted(&paths, None, 10).unwrap() {
-            assert_eq!(sort(&paths, &file.row.hash, "Holidays").unwrap().done, 1);
+            assert_eq!(
+                sort(&paths, &file.row.hash, "Holidays", "").unwrap().done,
+                1
+            );
         }
 
         let (files, _) = store(&paths);
@@ -479,5 +588,94 @@ mod tests {
 
         // No kind of path: the source's own directory is still somewhere.
         assert_eq!(path("../../etc").as_str(), "phone-a1b2/IMG_1.jpg");
+    }
+
+    #[test]
+    fn a_file_lands_in_the_folder_it_was_filed_into() {
+        let home = home();
+        let (paths, _) = imported(&home, &["a.jpg", "b.jpg"]);
+        let group = group(&paths, "Holidays");
+        let waiting = super::unsorted(&paths, None, 10).unwrap();
+
+        // Into a folder that does not exist yet: a folder in a group is the directory some
+        // file is under, so filing into it is what brings it about.
+        assert_eq!(
+            sort(&paths, &waiting[0].row.hash, "Holidays", "2024/summer")
+                .unwrap()
+                .done,
+            1
+        );
+
+        let (mut files, content) = store(&paths);
+        let dir = files.dir_for(group, "Holidays").unwrap();
+        let landed = RelPath::parse("2024/summer/a.jpg").unwrap();
+        assert!(content.exists(&dir, &landed), "it is under the folder");
+        assert!(
+            files.get(group, &landed).unwrap().is_some(),
+            "and recorded there"
+        );
+
+        // Which is what makes it offerable next time.
+        assert_eq!(
+            crate::ops::file::folders(&paths, "Holidays").unwrap(),
+            ["2024", "2024/summer"],
+            "every directory above it, so a nested one can be filed into directly"
+        );
+
+        // And the root is still the root: an empty destination is not a folder called "".
+        sort(&paths, &waiting[1].row.hash, "Holidays", "").unwrap();
+        assert!(content.exists(&dir, &RelPath::parse("b.jpg").unwrap()));
+    }
+
+    #[test]
+    fn a_filing_can_be_taken_back_and_the_file_comes_home() {
+        let home = home();
+        let (paths, _) = imported(&home, &["DCIM/a.jpg"]);
+        let group = group(&paths, "Holidays");
+        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
+
+        sort(&paths, &file.row.hash, "Holidays", "2024").unwrap();
+        let (mut files, content) = store(&paths);
+        let dir = files.dir_for(group, "Holidays").unwrap();
+        assert!(content.exists(&dir, &RelPath::parse("2024/a.jpg").unwrap()));
+
+        undo(&paths, &file.row.hash).unwrap();
+
+        // Carried back out of the group, and waiting where it was.
+        assert!(!content.exists(&dir, &RelPath::parse("2024/a.jpg").unwrap()));
+        assert!(content.exists(UNSORTED, &file.path), "it is home again");
+        assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 1);
+        assert_eq!(super::unsorted(&paths, None, 10).unwrap().len(), 1);
+
+        // A tombstone rather than a deletion: the peers told it arrived are told it left.
+        let row = files
+            .get(group, &RelPath::parse("2024/a.jpg").unwrap())
+            .unwrap();
+        assert!(row.is_some_and(|row| row.is_removed()), "left a tombstone");
+    }
+
+    #[test]
+    fn a_deletion_can_be_taken_back_until_it_is_finished_with() {
+        let home = home();
+        let (paths, _) = imported(&home, &["a.jpg"]);
+        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
+
+        drop(&paths, &file.row.hash).unwrap();
+        undo(&paths, &file.row.hash).unwrap();
+
+        let (_, content) = store(&paths);
+        assert!(content.exists(UNSORTED, &file.path), "the bytes never went");
+        assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 1);
+
+        // But once it is finished with there is nothing left to take back.
+        drop(&paths, &file.row.hash).unwrap();
+        assert_eq!(sweep_dropped(&paths).unwrap(), 1);
+        assert!(!content.exists(UNSORTED, &file.path));
+        let err = undo(&paths, &file.row.hash).unwrap_err();
+        assert!(
+            err.to_string().contains("deleted for good"),
+            "taking it back would put a row on a file that is gone: {err}"
+        );
+        assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 0);
     }
 }

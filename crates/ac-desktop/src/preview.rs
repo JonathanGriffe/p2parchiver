@@ -143,7 +143,20 @@ impl Cache {
 struct Job {
     hash: String,
     path: PathBuf,
-    show: Option<Weak<MainWindow>>,
+    /// Where to hand the pixels back. Always set, even when nothing is waiting on them: a
+    /// preview fetched ahead is decoded ahead too, which is the whole point of fetching it.
+    show: Weak<MainWindow>,
+    /// Whether this is the one on screen, or one being got ready either side of it.
+    wanted_now: bool,
+}
+
+/// A decoded preview on its way to the window. Raw pixels rather than a `slint::Image`,
+/// because that is not `Send` — and because building one from a buffer is a copy, where
+/// building one from a file is a decode.
+struct Decoded {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
 /// The worker, its cache, and what this machine can decode.
@@ -200,40 +213,46 @@ impl Previews {
         self.made.load(Ordering::Relaxed)
     }
 
-    /// The preview for what is on screen. Already cached, it is handed over now; otherwise
-    /// the tile stands until the worker has it.
+    /// The preview for what is on screen.
+    ///
+    /// Decoded already, it is handed over now and costs nothing. Otherwise the tile stands
+    /// until the worker has it — decoding here is what used to make stepping stutter, and
+    /// it is the one piece of the work that was still being done on the event loop.
     pub fn show(&self, window: &MainWindow, hash: &str, path: &Path) {
         if hash.is_empty() {
             window.set_sort_preview(Default::default());
             return;
         }
 
-        if self.cache.has(hash) {
+        if let Some(ready) = decoded(hash) {
+            window.set_sort_preview(ready);
             self.cache.touch(hash);
-            window.set_sort_preview(load(&self.cache.path(hash)));
             return;
         }
 
         window.set_sort_preview(Default::default());
-        self.enqueue(hash, path, Some(window.as_weak()));
+        self.enqueue(hash, path, window, true);
     }
 
-    /// Fetch one the reader has not asked for yet, so stepping either way is instant.
-    pub fn prefetch(&self, hash: &str, path: &Path) {
-        if hash.is_empty() || self.cache.has(hash) {
+    /// Get one ready that has not been asked for yet, so stepping either way is instant.
+    /// Fetched *and* decoded: leaving the decode until it is stepped onto would put the
+    /// slow half back where it was.
+    pub fn prefetch(&self, window: &MainWindow, hash: &str, path: &Path) {
+        if hash.is_empty() || decoded(hash).is_some() {
             return;
         }
-        self.enqueue(hash, path, None);
+        self.enqueue(hash, path, window, false);
     }
 
-    fn enqueue(&self, hash: &str, path: &Path, show: Option<Weak<MainWindow>>) {
+    fn enqueue(&self, hash: &str, path: &Path, window: &MainWindow, wanted_now: bool) {
         if !self.wanted(path) {
             return;
         }
         let _ = self.want.send(Job {
             hash: hash.to_owned(),
             path: path.to_owned(),
-            show,
+            show: window.as_weak(),
+            wanted_now,
         });
     }
 
@@ -270,22 +289,74 @@ fn work(cache: &Cache, tools: &Tools, made: &AtomicUsize, job: Job) {
     }
     cache.touch(&job.hash);
 
-    let Some(window) = job.show else {
+    // Decoded here rather than where it is shown. This is the part that was left on the
+    // event loop, and at a capped preview's size it is milliseconds every step.
+    let Some(pixels) = decode(&cache.path(&job.hash)) else {
         return;
     };
-    let at = cache.path(&job.hash);
-    let hash = job.hash;
-    let _ = window.upgrade_in_event_loop(move |window| {
-        // It may have been stepped past while the tool ran, and the file on screen now
-        // owns the preview.
-        if window.get_sort_hash() == hash.as_str() {
-            window.set_sort_preview(load(&at));
+
+    let (hash, wanted_now) = (job.hash, job.wanted_now);
+    let _ = job.show.upgrade_in_event_loop(move |window| {
+        let image = image_from(&pixels);
+        remember(&hash, image.clone());
+
+        // It may have been stepped past while the tool ran, and whatever is on screen now
+        // owns the preview. Kept either way: stepping back to it is then free.
+        if wanted_now && window.get_sort_hash() == hash.as_str() {
+            window.set_sort_preview(image);
         }
     });
 }
 
-fn load(path: &Path) -> slint::Image {
-    slint::Image::load_from_path(path).unwrap_or_default()
+/// Read a cached preview into plain pixels, off the event loop.
+fn decode(at: &Path) -> Option<Decoded> {
+    let picture = image::ImageReader::open(at).ok()?.decode().ok()?;
+    let rgba = picture.to_rgba8();
+    Some(Decoded {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw(),
+    })
+}
+
+/// The same pixels as a slint image. A copy, which is what makes it cheap enough to do
+/// where a frame is waiting.
+fn image_from(pixels: &Decoded) -> slint::Image {
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        &pixels.rgba,
+        pixels.width,
+        pixels.height,
+    );
+    slint::Image::from_rgba8(buffer)
+}
+
+// The previews already decoded, on the thread that draws them. A `slint::Image` is neither
+// `Send` nor `Sync`, so it cannot live beside the worker — and this is the one thread that
+// ever reads it.
+thread_local! {
+    static READY: std::cell::RefCell<VecDeque<(String, slint::Image)>> =
+        const { std::cell::RefCell::new(VecDeque::new()) };
+}
+
+fn decoded(hash: &str) -> Option<slint::Image> {
+    READY.with_borrow(|ready| {
+        ready
+            .iter()
+            .find(|(seen, _)| seen == hash)
+            .map(|(_, image)| image.clone())
+    })
+}
+
+/// Keep it, and drop whatever falls out of the window — the same bound the files on disk
+/// are held to, so the two cannot disagree about what is ready.
+fn remember(hash: &str, image: slint::Image) {
+    READY.with_borrow_mut(|ready| {
+        ready.retain(|(seen, _)| seen != hash);
+        ready.push_back((hash.to_owned(), image));
+        while ready.len() > PREVIEW_WINDOW {
+            ready.pop_front();
+        }
+    });
 }
 
 /// Turn one file into a capped, right-way-up preview.
@@ -546,6 +617,35 @@ mod tests {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
         });
         image::DynamicImage::ImageRgb8(buffer).save(at).unwrap();
+    }
+
+    /// Stepping used to stutter because the last piece of the work — turning the cached
+    /// file into an image — was still done where the frame was drawn. It is done on the
+    /// worker now, and what reaches the window is pixels it only has to copy.
+    #[test]
+    fn a_preview_already_decoded_costs_nothing_to_show() {
+        let tmp = tmp();
+        let at = tmp.path().join("cached.png");
+        picture(&at, 1400, 1050);
+
+        // What the worker does, off the event loop.
+        let pixels = decode(&at).expect("it did not decode");
+        assert_eq!((pixels.width, pixels.height), (1400, 1050));
+        assert_eq!(pixels.rgba.len(), 1400 * 1050 * 4, "four bytes a pixel");
+
+        i_slint_backend_testing::init_no_event_loop();
+        remember("ready", image_from(&pixels));
+
+        // What the window does: nothing but take the one already made.
+        let held = decoded("ready").expect("it was not kept");
+        assert_eq!(held.size().width, 1400);
+
+        // Bounded by the same window the files on disk are, so the two cannot disagree
+        // about what is ready.
+        for at in 0..PREVIEW_WINDOW + 1 {
+            remember(&format!("other-{at}"), image_from(&pixels));
+        }
+        assert!(decoded("ready").is_none(), "it fell out of the window");
     }
 
     #[test]
@@ -837,9 +937,11 @@ mod tests {
         let src = tmp.path().join("a.png");
         picture(&src, 32, 32);
 
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
         let previews = Previews::start(tmp.path().join("previews"), detect());
         for _ in 0..4 {
-            previews.prefetch("abc123", &src);
+            previews.prefetch(&window, "abc123", &src);
         }
 
         // The worker is a thread, so wait for it rather than racing it.
@@ -993,7 +1095,13 @@ mod through_the_window {
             "the worker never finished"
         );
 
-        // Asked for again, as the next poll does: now it is there.
+        // What the worker does once the file is cached, and what the event loop then does
+        // with that. Driven here rather than awaited: the hop between the two is
+        // `upgrade_in_event_loop`, and no event loop runs under a test.
+        let pixels = decode(&previews.cache.path("beach-hash")).expect("it did not decode");
+        remember("beach-hash", image_from(&pixels));
+
+        // Asked for again, as the next poll does: now it costs nothing.
         previews.show(&window, "beach-hash", &src);
         let shown = window.get_sort_preview().size();
         assert!(

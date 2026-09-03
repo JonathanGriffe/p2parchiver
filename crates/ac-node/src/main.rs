@@ -74,11 +74,11 @@ enum ImportCommand {
     /// Scan one source now, whatever its cadence says.
     Scan { source: String },
 
-    /// Import folders in one go: add them, scan them, and bring them in.
+    /// Import one file or folder: add it, scan it, and bring it in.
     From {
-        #[arg(required = true, value_name = "PATH")]
-        paths: Vec<PathBuf>,
-        /// What to file them under. Defaults to the name of the folder itself.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// What to file it under. Defaults to the name of what was picked.
         #[arg(long)]
         name: Option<String>,
     },
@@ -104,6 +104,9 @@ enum ImportCommand {
         /// Everything that came from the same source folder.
         #[arg(long)]
         folder: bool,
+        /// A folder within the group to file it under. Its root by default.
+        #[arg(long, value_name = "PATH")]
+        into: Option<String>,
     },
 
     /// Throw one away, permanently.
@@ -296,17 +299,17 @@ fn main() -> Result<()> {
             cmd::import::settings_set(&paths, &source, &key, &value)
         }
         Command::Import(ImportCommand::Scan { source }) => cmd::import::scan(&paths, &source),
-        Command::Import(ImportCommand::From {
-            paths: picked,
-            name,
-        }) => cmd::import::from(&paths, &picked, name.as_deref()),
+        Command::Import(ImportCommand::From { path, name }) => {
+            cmd::import::from(&paths, &path, name.as_deref())
+        }
         Command::Import(ImportCommand::Fetch { limit }) => cmd::import::fetch(&paths, limit),
         Command::Import(ImportCommand::List { all }) => cmd::import::list(&paths, all),
         Command::Import(ImportCommand::Sort {
             hash,
             group,
             folder,
-        }) => cmd::import::sort(&paths, &hash, &group, folder),
+            into,
+        }) => cmd::import::sort(&paths, &hash, &group, folder, into.as_deref()),
         Command::Import(ImportCommand::Drop { hash, folder }) => {
             cmd::import::drop(&paths, &hash, folder)
         }

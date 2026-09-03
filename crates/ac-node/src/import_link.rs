@@ -98,6 +98,16 @@ impl ImportLink {
         let content = Content::new(config.storage_root(paths));
         sweep_staging(&content);
 
+        // Taking a deletion back lasts as long as the session that made it, so by the time
+        // a node is starting there is nothing left to take back.
+        match import::sweep_dropped(paths) {
+            Ok(0) => {}
+            Ok(gone) => tracing::info!(gone, "finished with files thrown away before"),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "could not finish with them")
+            }
+        }
+
         let (sender, inbox) = mpsc::unbounded_channel();
         Ok(Self {
             paths: paths.clone(),
@@ -134,6 +144,13 @@ impl ImportLink {
         self.collect();
         self.start_scan(at);
         self.top_up();
+
+        // A one-shot is done with when its last file has been sorted or thrown away, and
+        // that can happen on any tab. Looked for here rather than at each of those places,
+        // because the tick is the one thing every route passes through.
+        if let Err(error) = import::tidy(&self.paths) {
+            tracing::debug!(error = %format!("{error:#}"), "could not tidy finished imports");
+        }
     }
 
     /// Wait for a scan or a fetch to end.
@@ -380,7 +397,7 @@ mod tests {
             std::fs::write(&path, file.as_bytes()).unwrap();
         }
 
-        let picked = import::from_folder(&paths, None, &[album]).unwrap();
+        let picked = import::from_folder(&paths, None, &album).unwrap();
         let scanned = import::scan(&paths, &picked.row.dir).unwrap();
         assert_eq!(scanned.owed as usize, files.len(), "nothing to drain");
         (paths, picked.row.dir)

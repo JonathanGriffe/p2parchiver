@@ -45,10 +45,15 @@ export component DangerButton inherits Rectangle {
     in property <bool> enabled: true;
     callback clicked();
 
-    height: 30px;
+    // The same height as a std-widgets Button, so a row may hold both without one of them
+    // standing a different size.
+    height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: Theme.danger.with-alpha(0.45);
+    // Darkened rather than tinted: a destructive control should be the one on the row that
+    // is drawn with a firm edge. Kept in the danger family so it says which kind it is, and
+    // taken from the palette so it darkens in light mode and lightens in dark.
+    border-color: Theme.danger.darker(0.5);
     // Tinted rather than filled: a solid red block reads as an error message, not a control.
     background: touch.pressed ? Theme.danger.with-alpha(0.26)
         : touch.has-hover ? Theme.danger.with-alpha(0.16)

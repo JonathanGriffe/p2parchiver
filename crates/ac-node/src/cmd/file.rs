@@ -174,6 +174,14 @@ pub fn verify(paths: &Paths, needle: &str) -> Result<()> {
         println!("  untracked  {path}");
     }
 
+    if !report.requeued.is_empty() {
+        println!();
+        println!(
+            "{} file(s) marked to be fetched again; the daemon brings them back.",
+            report.requeued.len()
+        );
+    }
+
     if report.everything_matches() {
         println!("everything matches");
     } else if !report.untracked.is_empty() {

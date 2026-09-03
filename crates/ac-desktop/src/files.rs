@@ -151,6 +151,21 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         }
     });
 
+    window.on_open_file_dir({
+        let weak = weak.clone();
+        let nudge = nudge.clone();
+        move |dir| {
+            if dir.is_empty() {
+                return;
+            }
+            let dir = PathBuf::from(dir.as_str());
+            let outcome = crate::shell::open(&dir).map(|()| format!("showing {}", dir.display()));
+            if let Some(window) = weak.upgrade() {
+                work::finish(&window, outcome, &nudge);
+            }
+        }
+    });
+
     window.on_browse({
         let paths = paths.clone();
         let selection = selection.clone();
@@ -245,7 +260,10 @@ fn describe_verify(report: &ops::file::VerifyReport) -> String {
 
     let mut parts = Vec::new();
     if !report.missing.is_empty() {
-        parts.push(format!("{} missing", report.missing.len()));
+        parts.push(match report.requeued.len() {
+            0 => format!("{} missing", report.missing.len()),
+            queued => format!("{} missing, {queued} to fetch again", report.missing.len()),
+        });
     }
     if !report.changed.is_empty() {
         parts.push(format!("{} changed", report.changed.len()));
@@ -371,6 +389,22 @@ mod tests {
 
         let report = ops::file::verify(&paths, &looking_at.group).unwrap();
 
-        assert_eq!(describe_verify(&report), "checked 1: 1 missing");
+        assert_eq!(
+            describe_verify(&report),
+            "checked 1: 1 missing, 1 to fetch again"
+        );
+        assert_eq!(report.requeued.len(), 1, "and it says so because it did it");
+
+        // The point of marking it: the row stops claiming to be held, which is the same
+        // state a file has before it has ever been fetched, and what the daemon acts on.
+        let after = read(&paths, &looking_at);
+        assert_eq!(after.files[0].held, "remote");
+        assert!(!after.files[0].have);
+
+        // Said once. A second pass finds the row already marked, so it is still missing but
+        // there is nothing left to requeue.
+        let again = ops::file::verify(&paths, &looking_at.group).unwrap();
+        assert_eq!(describe_verify(&again), "checked 1: 1 missing");
+        assert!(again.requeued.is_empty());
     }
 }

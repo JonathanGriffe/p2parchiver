@@ -10,6 +10,7 @@ mod selection;
 mod settings;
 mod shell;
 mod sort;
+mod sources;
 mod tray;
 mod view;
 mod work;
@@ -102,11 +103,12 @@ fn main() -> Result<()> {
         &nudge,
         ticks,
     );
-    view::wire(&window, &nudge);
+    view::wire(&window, &selection, &nudge);
     groups::wire(&window, &paths, &selection, &nudge);
     peers::wire(&window, &paths, &nudge);
     files::wire(&window, &paths, &selection, &nudge);
     sort::wire(&window, &paths, &selection, &nudge);
+    sources::wire(&window, &paths, &selection, &nudge);
     settings::wire(&window, &paths, &node, &nudge);
     settings::load(&window, &paths);
 

@@ -1,0 +1,107 @@
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+import { Theme, Card } from "../theme.slint";
+import { FieldItem, Field } from "sources.slint";
+
+export component AddSourceDialog inherits Rectangle {
+    in property <string> source;
+    in property <[FieldItem]> fields;
+    // The implementation's shared settings, offered here the first time so adding one is
+    // not a detour through the Settings tab.
+    in property <[FieldItem]> settings;
+    in property <bool> busy;
+
+    callback add(string);
+    callback field-edited(int, string);
+    callback field-browse(int, bool);
+    callback field-cleared(int);
+    callback setting-edited(int, string);
+    callback setting-browse(int, bool);
+    callback setting-cleared(int);
+    callback dismissed();
+
+    background: #000000.with-alpha(0.45);
+
+    TouchArea {
+        clicked => { root.dismissed(); }
+    }
+
+    Card {
+        width: min(640px, parent.width - 2 * Theme.lg);
+        height: min(self.preferred-height, parent.height - 2 * Theme.lg);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+
+        TouchArea {}
+
+        VerticalLayout {
+            padding: Theme.lg;
+            spacing: Theme.md;
+
+            Text {
+                text: "Add a " + root.source + " source";
+                color: Theme.text;
+                font-size: Theme.heading-size;
+                font-weight: 700;
+                overflow: elide;
+            }
+
+            named := LineEdit {
+                placeholder-text: "name";
+                accepted => {
+                    if (self.text != "" && !root.busy) { root.add(self.text); }
+                }
+            }
+
+            ScrollView {
+                vertical-stretch: 1;
+                preferred-height: forms.preferred-height;
+
+                forms := VerticalLayout {
+                    alignment: start;
+                    spacing: Theme.md;
+
+                    for field[at] in root.fields : Field {
+                        field: field;
+                        busy: root.busy;
+                        edited(value) => { root.field-edited(at, value); }
+                        browse(several) => { root.field-browse(at, several); }
+                        cleared => { root.field-cleared(at); }
+                    }
+
+                    // Shared by every source of this implementation, so it is asked once and
+                    // then never again — which is why it is a separate list.
+                    if root.settings.length > 0 : Rectangle {
+                        height: 1px;
+                        background: Theme.line;
+                    }
+                    // Every one of these carries `at`, which counts within this list. The
+                    // fields above have a list of their own and a counter of their own, so a
+                    // row here can only ever report to a `setting-` callback.
+                    for setting[at] in root.settings : Field {
+                        field: setting;
+                        busy: root.busy;
+                        edited(value) => { root.setting-edited(at, value); }
+                        browse(several) => { root.setting-browse(at, several); }
+                        cleared => { root.setting-cleared(at); }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+                alignment: end;
+
+                Button {
+                    text: "Cancel";
+                    clicked => { root.dismissed(); }
+                }
+                Button {
+                    text: "Add";
+                    primary: true;
+                    enabled: named.text != "" && !root.busy;
+                    clicked => { root.add(named.text); }
+                }
+            }
+        }
+    }
+}

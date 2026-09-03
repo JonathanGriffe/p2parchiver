@@ -1,0 +1,371 @@
+import { ScrollView, Button, LineEdit, CheckBox, ComboBox } from "std-widgets.slint";
+import { Theme, Card } from "../theme.slint";
+
+// One row of the sources table. Everything is already words by the time it arrives, except
+// the two counts and `state`, which picks the colour the status is shown in.
+export struct SourceItem {
+    // Its id, and what an action on the selected row is sent with.
+    dir: string,
+    name: string,
+    // Still to fetch, and brought in over its whole life.
+    owed: int,
+    downloaded: int,
+    size: string,
+    // 0 available, 1 unavailable, 2 broken. `sources::AVAILABLE` and friends.
+    state: int,
+    status: string,
+    polled: string,
+    // What went wrong, shown under the row rather than in it: an error is a sentence.
+    error: string,
+}
+
+// One field an implementation declared, and what the form was filled in with. `kind` is
+// `sort::KIND_TEXT` and friends, so neither this file nor the Settings tab knows any
+// source's fields by name.
+export struct FieldItem {
+    key: string,
+    label: string,
+    kind: int,
+    required: bool,
+    // What was answered, whole. This is what is stored.
+    value: string,
+    // The same, cut to fit if it is a long path: see `sources::shown`. A path's tail is the
+    // part worth reading, so what goes is the front of it.
+    shown: string,
+}
+
+// One declared field, laid out by its kind. A path is chosen rather than typed, so its
+// value stays Rust's; the rest are typed, and Rust is only ever told what was typed.
+/// One line of a small menu: a label, and the whole width of it clickable.
+component MenuRow inherits Rectangle {
+    in property <string> label;
+    callback chosen();
+
+    height: 28px;
+    border-radius: Theme.radius;
+    background: hover.has-hover ? Theme.accent.with-alpha(0.16) : transparent;
+
+    hover := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.chosen(); }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.sm;
+        Text {
+            text: root.label;
+            color: Theme.text;
+            font-size: Theme.small-size;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component Field inherits VerticalLayout {
+    in property <FieldItem> field;
+    in property <bool> busy;
+    callback edited(string);
+    callback browse(bool);
+    callback cleared();
+
+    // Whether the file-or-folder menu is showing.
+    property <bool> picking;
+
+    spacing: Theme.xs;
+
+    if root.field.kind != 4 : Text {
+        text: root.field.label + (root.field.required ? "" : " (optional)");
+        color: Theme.dim;
+        font-size: Theme.small-size;
+    }
+
+    // 1 is Path and 2 is Paths, which differ only in taking more than one.
+    // 1 is Path: one entry, which may be either a file or a folder. One button, because
+    // no platform offers a picker that takes both — `rfd::pick_file_or_folder` is macOS
+    // only, and GTK's and Windows' are each one or the other — so which dialog to open is
+    // asked here rather than by standing two buttons side by side. What is chosen replaces
+    // what was chosen before, so there is nothing to clear.
+    if root.field.kind == 1 : VerticalLayout {
+        spacing: Theme.xs;
+
+        if root.field.shown != "" : Text {
+            text: root.field.shown;
+            color: Theme.text;
+            font-size: Theme.small-size;
+            font-family: Theme.mono;
+            // Cut to fit in Rust already; this is the backstop for a narrow window.
+            overflow: elide;
+        }
+
+        HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "Choose…";
+                enabled: !root.busy;
+                clicked => { root.picking = !root.picking; }
+            }
+        }
+
+        // Opened in the flow rather than floating over it: these fields sit inside the
+        // dialog's scrolling area, which clips anything drawn outside a child's own box —
+        // a floating menu is simply invisible there.
+        if root.picking : VerticalLayout {
+            MenuRow {
+                label: "File…";
+                chosen => { root.picking = false; root.browse(false); }
+            }
+            MenuRow {
+                label: "Folder…";
+                chosen => { root.picking = false; root.browse(true); }
+            }
+        }
+    }
+
+    // 2 is Paths: several, one to a line, for a source that genuinely takes more than one.
+    if root.field.kind == 2 : HorizontalLayout {
+        spacing: Theme.sm;
+
+        Text {
+            text: root.field.shown;
+            color: Theme.text;
+            font-size: Theme.small-size;
+            font-family: Theme.mono;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+        Button {
+            text: "Choose…";
+            enabled: !root.busy;
+            clicked => { root.browse(true); }
+        }
+        if root.field.value != "" : Button {
+            text: "Clear";
+            enabled: !root.busy;
+            clicked => { root.cleared(); }
+        }
+    }
+
+    // 0 is Text and 3 is Secret, which is written and never read back.
+    if root.field.kind == 0 || root.field.kind == 3 : LineEdit {
+        input-type: root.field.kind == 3 ? InputType.password : InputType.text;
+        enabled: !root.busy;
+        edited => { root.edited(self.text); }
+    }
+
+    if root.field.kind == 4 : CheckBox {
+        text: root.field.label;
+        enabled: !root.busy;
+        toggled => { root.edited(self.checked ? "true" : "false"); }
+    }
+}
+
+/// One cell, so every column is spaced, weighted and elided the same way.
+component Cell inherits Text {
+    in property <bool> head;
+    in property <bool> strong;
+    // Only the status sets this; everything else takes its colour from the two flags.
+    in property <brush> tone: transparent;
+
+    color: root.tone == transparent
+        ? (root.head ? Theme.faint : root.strong ? Theme.text : Theme.dim)
+        : root.tone;
+    font-size: Theme.small-size;
+    font-weight: root.head || root.strong ? 700 : 400;
+    vertical-alignment: center;
+    overflow: elide;
+}
+
+export component SourcesView inherits VerticalLayout {
+    in property <[SourceItem]> sources;
+    in property <[string]> kinds;
+    in property <bool> busy;
+
+    callback scan(string);
+    callback remove(string);
+    // Which implementation to add. Opening the dialog is the caller's business, because it
+    // has to load that implementation's fields first.
+    callback add-source(string);
+
+    // The row picked in the table, by directory. Empty when nothing is picked, which is
+    // what the two buttons that act on a row are enabled by.
+    property <string> selected;
+
+    // Whether the Add source menu is showing. A property rather than a `PopupWindow`, so it
+    // is positioned against the button, hovers like anything else, and is part of the tree
+    // a test can look at.
+    property <bool> menu-open;
+
+    // Everything but the name is fixed, so a narrow window elides a long name rather than
+    // dropping the last column off the end.
+    property <length> col-count: 76px;
+    property <length> col-size: 84px;
+    property <length> col-status: 92px;
+    property <length> col-polled: 92px;
+
+    // The header is a row of words, so it needs little. The buttons below are left to
+    // their own height: squeezing them below it is what made them disagree. Neither grows
+    // — only the table between them stretches.
+    property <length> furniture: 22px;
+
+    spacing: Theme.md;
+
+    Card {
+        vertical-stretch: 1;
+
+        VerticalLayout {
+            padding: Theme.md;
+            spacing: Theme.sm;
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+                height: root.furniture;
+                Cell { text: "Name"; head: true; horizontal-stretch: 1; min-width: 90px; }
+                Cell { text: "To fetch"; head: true; width: root.col-count; }
+                Cell { text: "Downloaded"; head: true; width: root.col-count; }
+                Cell { text: "Size"; head: true; width: root.col-size; }
+                Cell { text: "Status"; head: true; width: root.col-status; }
+                Cell { text: "Polled"; head: true; width: root.col-polled; }
+            }
+            Rectangle { height: 1px; background: Theme.line; }
+
+            // The one part that grows: everything above and below it is fixed.
+            ScrollView {
+                vertical-stretch: 1;
+
+                VerticalLayout {
+                    alignment: start;
+
+                    for entry in root.sources : Rectangle {
+                        height: row.preferred-height;
+                        border-radius: Theme.radius;
+                        background: root.selected == entry.dir
+                            ? Theme.accent.with-alpha(0.16)
+                            : touch.has-hover ? Theme.raised : transparent;
+
+                        touch := TouchArea {
+                            mouse-cursor: pointer;
+                            // Clicking the row already picked lets go of it, so an action is
+                            // never aimed at something the reader has stopped looking at.
+                            clicked => {
+                                root.menu-open = false;
+                                root.selected = root.selected == entry.dir ? "" : entry.dir;
+                            }
+                        }
+
+                        row := VerticalLayout {
+                            padding: Theme.xs;
+                            spacing: 2px;
+
+                            HorizontalLayout {
+                                spacing: Theme.sm;
+                                Cell { text: entry.name; strong: true; horizontal-stretch: 1; min-width: 90px; }
+                                Cell { text: entry.owed; width: root.col-count; }
+                                Cell { text: entry.downloaded; width: root.col-count; }
+                                Cell { text: entry.size; width: root.col-size; }
+                                Cell {
+                                    text: entry.status;
+                                    width: root.col-status;
+                                    // Colour repeats what the word already says, so it is
+                                    // never the only signal.
+                                    tone: entry.state == 2 ? Theme.danger
+                                        : entry.state == 1 ? Theme.warn
+                                        : Theme.ok;
+                                }
+                                Cell { text: entry.polled; width: root.col-polled; }
+                            }
+
+                            // An error is a sentence, so it goes under the row rather than
+                            // into a column that would elide it.
+                            if entry.error != "" : Text {
+                                text: entry.error;
+                                color: Theme.danger;
+                                font-size: Theme.small-size;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle { height: 1px; background: Theme.line; }
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+                alignment: start;
+
+                Button {
+                    text: "Scan now";
+                    enabled: root.selected != "" && !root.busy;
+                    clicked => { root.scan(root.selected); }
+                }
+                Button {
+                    text: "Remove";
+                    enabled: root.selected != "" && !root.busy;
+                    clicked => { root.remove(root.selected); }
+                }
+
+                // The menu lives inside the button's own box so it is positioned
+                // against the button rather than against the page, and nothing clips it:
+                // it is drawn last, over the table it opens across.
+                Rectangle {
+                    // Sized by the row, like the two buttons beside it: given a height of
+                    // its own it would stand a different size from them.
+                    min-width: adding.preferred-width;
+
+                    adding := Button {
+                        text: "Add source";
+                        width: parent.width;
+                        height: parent.height;
+                        enabled: !root.busy;
+                        clicked => { root.menu-open = !root.menu-open; }
+                    }
+
+                    // Opens upward: the button row is the last thing on the page, so there
+                    // is nothing below it to open into.
+                    if root.menu-open : Rectangle {
+                        x: 0;
+                        y: -self.height - Theme.xs;
+                        width: max(200px, parent.width);
+                        height: entries.preferred-height;
+                        background: Theme.raised;
+                        border-color: Theme.line;
+                        border-width: 1px;
+                        border-radius: Theme.radius;
+
+                        entries := VerticalLayout {
+                            padding: Theme.xs;
+
+                            for kind in root.kinds : Rectangle {
+                                height: 30px;
+                                border-radius: Theme.radius;
+                                background: pick.has-hover
+                                    ? Theme.accent.with-alpha(0.16)
+                                    : transparent;
+
+                                pick := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.menu-open = false;
+                                        root.add-source(kind);
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    padding-left: Theme.sm;
+                                    Text {
+                                        text: kind;
+                                        color: Theme.text;
+                                        font-size: Theme.small-size;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+}

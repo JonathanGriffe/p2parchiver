@@ -60,6 +60,8 @@ pub struct SourceRow {
     pub added_at: i64,
     pub scanned_at: i64,
     pub last_error: Option<String>,
+    /// False when the last poll could not reach it. Not a failure: see the column.
+    pub reachable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +107,8 @@ pub struct Tally {
     pub waiting: u64,
     pub sorted: u64,
     pub dropped: u64,
+    /// What everything this source brought in came to, whatever became of it since.
+    pub bytes: u64,
 }
 
 pub struct Ledger {
@@ -130,7 +134,11 @@ impl Ledger {
                  config     TEXT NOT NULL,
                  added_at   INTEGER NOT NULL,
                  scanned_at INTEGER NOT NULL DEFAULT 0,
-                 last_error TEXT
+                 last_error TEXT,
+                 -- What the last poll found about reaching it. Only an Intermittent source
+                 -- is ever absent, and being absent is not being broken: `last_error` stays
+                 -- empty, and this is what tells the two apart.
+                 reachable  INTEGER NOT NULL DEFAULT 1
              );
              CREATE TABLE IF NOT EXISTS source_settings (
                  source TEXT NOT NULL,
@@ -237,8 +245,19 @@ impl Ledger {
 
     pub fn scanned(&self, dir: &str, at: i64) -> Result<(), LedgerError> {
         self.db.execute(
-            "UPDATE sources SET scanned_at = ?2, last_error = NULL WHERE dir = ?1",
+            "UPDATE sources SET scanned_at = ?2, last_error = NULL, reachable = 1
+              WHERE dir = ?1",
             params![dir, at],
+        )?;
+        Ok(())
+    }
+
+    /// The source was not there. Deliberately leaves `last_error` and `scanned_at` alone: a
+    /// phone that is out of the house has not failed, and has not been scanned either.
+    pub fn unreachable(&self, dir: &str) -> Result<(), LedgerError> {
+        self.db.execute(
+            "UPDATE sources SET reachable = 0 WHERE dir = ?1",
+            params![dir],
         )?;
         Ok(())
     }
@@ -272,7 +291,7 @@ impl Ledger {
         args: impl rusqlite::Params,
     ) -> Result<Vec<SourceRow>, LedgerError> {
         let mut stmt = self.db.prepare(&format!(
-            "SELECT dir, name, source, config, added_at, scanned_at, last_error
+            "SELECT dir, name, source, config, added_at, scanned_at, last_error, reachable
                FROM sources {tail}"
         ))?;
         let rows = stmt.query_map(args, |row| {
@@ -284,12 +303,13 @@ impl Ledger {
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (dir, name, source, config, added_at, scanned_at, last_error) = row?;
+            let (dir, name, source, config, added_at, scanned_at, last_error, reachable) = row?;
             out.push(SourceRow {
                 dir,
                 name,
@@ -298,6 +318,7 @@ impl Ledger {
                 added_at,
                 scanned_at,
                 last_error,
+                reachable: reachable != 0,
             });
         }
         Ok(out)
@@ -542,6 +563,34 @@ impl Ledger {
     }
 
     /// Thrown away, permanently. The row stays: it is the only thing that remembers we decided.
+    /// Put one back the way it was, for an action the reader took back.
+    ///
+    /// The one move that is not forwards. It is safe only because it is the exact reverse
+    /// of a move just made and not yet finished with: a sorted file whose bytes have been
+    /// carried back out of the group, or a dropped one whose bytes were never deleted. What
+    /// the forward-only rule protects against is a file thrown away *and gone* coming back,
+    /// and neither of those is that.
+    pub fn undone(&self, hash: &str) -> Result<bool, LedgerError> {
+        let moved = self.db.execute(
+            "UPDATE imported SET state = 'unsorted', group_id = NULL
+              WHERE hash = ?1 AND state != 'unsorted'",
+            params![hash],
+        )?;
+        Ok(moved > 0)
+    }
+
+    /// Every hash thrown away whose bytes may still be on disk, so a session that ended
+    /// before finishing with them can be finished with here.
+    pub fn discarded(&self) -> Result<Vec<Imported>, LedgerError> {
+        let mut stmt = self.db.prepare(
+            "SELECT hash, state, name, size, at, group_id,
+                    source_dir, source_name, source_ref, folder
+               FROM imported WHERE state = 'dropped'",
+        )?;
+        let rows = stmt.query_map([], read_imported)?;
+        collect(rows)
+    }
+
     pub fn dropped(&self, hash: &str) -> Result<bool, LedgerError> {
         let moved = self.db.execute(
             "UPDATE imported SET state = 'dropped', group_id = NULL
@@ -621,19 +670,21 @@ impl Ledger {
 
     pub fn tallies(&self) -> Result<Vec<(String, Tally)>, LedgerError> {
         let mut stmt = self.db.prepare(
-            "SELECT source_dir, state, COUNT(*) FROM imported GROUP BY source_dir, state",
+            "SELECT source_dir, state, COUNT(*), COALESCE(SUM(size), 0)
+               FROM imported GROUP BY source_dir, state",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?;
 
         let mut out: Vec<(String, Tally)> = Vec::new();
         for row in rows {
-            let (dir, state, count) = row?;
+            let (dir, state, count, bytes) = row?;
             let count = count.max(0) as u64;
             let tally = match out.iter_mut().find(|(seen, _)| *seen == dir) {
                 Some((_, tally)) => tally,
@@ -649,6 +700,7 @@ impl Ledger {
                 Some(State::Dropped) => tally.dropped = count,
                 None => return Err(LedgerError::CorruptRow),
             }
+            tally.bytes += bytes.max(0) as u64;
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
@@ -724,6 +776,7 @@ mod tests {
             added_at: AT,
             scanned_at: 0,
             last_error: None,
+            reachable: true,
         }
     }
 
@@ -1183,7 +1236,9 @@ mod tests {
                     Tally {
                         waiting: 1,
                         sorted: 0,
-                        dropped: 0
+                        dropped: 0,
+                        // One row, and every row here is 100 bytes.
+                        bytes: 100
                     }
                 ),
                 (
@@ -1191,7 +1246,9 @@ mod tests {
                     Tally {
                         waiting: 1,
                         sorted: 2,
-                        dropped: 1
+                        dropped: 1,
+                        // Four rows, counted whatever became of them since.
+                        bytes: 400
                     }
                 ),
             ]

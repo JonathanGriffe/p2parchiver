@@ -21,7 +21,9 @@ impl RegisteredSource for Folder {
     /// Nothing to share: what one folder import is told has no bearing on the next.
     const SETTINGS: &'static [Field] = &[];
 
-    const CONFIG: &'static [Field] = &[Field::paths("path", "Folders or files")];
+    /// One path, which may be a file or a folder. One rather than a selection: two picks
+    /// that share a basename would offer one reference for two files.
+    const CONFIG: &'static [Field] = &[Field::path("path", "File or folder")];
 
     fn open(config: &Fields, _settings: &Fields) -> Result<Box<dyn Source>> {
         Ok(Box::new(Folder::parse(config)?))
@@ -29,23 +31,9 @@ impl RegisteredSource for Folder {
 }
 
 struct Folder {
-    roots: Vec<Root>,
+    /// The one thing picked: a folder to walk, or a single file.
+    root: PathBuf,
     page: usize,
-}
-
-/// One picked path, and the folder its contents take within the source.
-struct Root {
-    path: PathBuf,
-    prefix: String,
-}
-
-impl Root {
-    fn as_file(&self) -> Option<&str> {
-        match self.prefix.is_empty() {
-            true => self.path.file_name().and_then(|name| name.to_str()),
-            false => Some(&self.prefix),
-        }
-    }
 }
 
 impl Folder {
@@ -53,42 +41,29 @@ impl Folder {
         config.check(Self::NAME, Self::CONFIG)?;
         let picked: Vec<&str> = config.all("path").filter(|path| !path.is_empty()).collect();
 
-        if picked.is_empty() {
-            return Err(refused("no paths were given"));
-        }
-
-        let mut paths: Vec<PathBuf> = Vec::with_capacity(picked.len());
-        for line in picked {
-            let path = PathBuf::from(line);
-            if !path.is_absolute() {
-                return Err(refused(format!("{line} is not an absolute path")));
-            }
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-
-        let single = paths.len() == 1;
-        let mut roots: Vec<Root> = Vec::with_capacity(paths.len());
-        for path in paths {
-            let prefix = match single {
-                true => String::new(),
-                false => free_prefix(name_of(&path)?, &roots),
+        let [path] = picked[..] else {
+            return match picked.is_empty() {
+                true => Err(refused("no path was given")),
+                false => Err(refused("one file or folder, not several")),
             };
-            roots.push(Root { path, prefix });
-        }
+        };
 
-        Ok(Self { roots, page: PAGE })
+        let root = PathBuf::from(path);
+        if !root.is_absolute() {
+            return Err(refused(format!("{path} is not an absolute path")));
+        }
+        Ok(Self { root, page: PAGE })
     }
 
-    /// Everything one picked path offers. `false` when the page filled.
-    fn visit_root(&self, root: &Root, after: Option<&str>, page: &mut Page) -> bool {
-        let meta = match fs::symlink_metadata(&root.path) {
+    /// Everything the picked path offers. `false` when the page filled.
+    fn visit_root(&self, after: Option<&str>, page: &mut Page) -> bool {
+        let root = &self.root;
+        let meta = match fs::symlink_metadata(root) {
             Ok(meta) => meta,
             Err(e) => {
                 if after.is_none() {
                     page.skipped
-                        .push(format!("skipping {}: {e}", root.path.display()));
+                        .push(format!("skipping {}: {e}", root.display()));
                 }
                 return true;
             }
@@ -97,33 +72,34 @@ impl Folder {
         if meta.is_symlink() {
             if after.is_none() {
                 page.skipped
-                    .push(format!("skipping symlink {}", root.path.display()));
+                    .push(format!("skipping symlink {}", root.display()));
             }
             return true;
         }
         if meta.is_dir() {
-            return self.visit(&root.path, &root.prefix, after, page);
+            // The picked folder is not itself a folder within the source: its contents land
+            // at the top, so `<source>/DCIM/a.jpg` and not `<source>/album/DCIM/a.jpg`.
+            return self.visit(root, "", after, page);
         }
         if !meta.is_file() {
             if after.is_none() {
-                page.skipped.push(format!(
-                    "skipping {} (not a regular file)",
-                    root.path.display()
-                ));
+                page.skipped
+                    .push(format!("skipping {} (not a regular file)", root.display()));
             }
             return true;
         }
 
-        let Ok(name) = name_of(&root.path) else {
+        let Ok(name) = name_of(root) else {
             if after.is_none() {
                 page.skipped.push(format!(
                     "skipping {} (its name is not usable)",
-                    root.path.display()
+                    root.display()
                 ));
             }
             return true;
         };
-        let reference = root.as_file().unwrap_or(name);
+        // A picked file answers to its own name and has no folder within the source.
+        let reference = name;
         if after.is_some_and(|cursor| reference <= cursor) {
             return true;
         }
@@ -239,27 +215,21 @@ impl Folder {
             return Err(gone());
         }
 
-        for root in &self.roots {
-            if root.as_file() == Some(reference) && is_file(&root.path) {
-                return Ok(root.path.clone());
-            }
-
-            let rest = if root.prefix.is_empty() {
-                Some(reference)
-            } else {
-                reference.strip_prefix(&format!("{}/", root.prefix))
-            };
-            if let Some(rest) = rest {
-                let mut candidate = root.path.clone();
-                for part in rest.split('/') {
-                    candidate.push(part);
-                }
-                if is_file(&candidate) {
-                    return Ok(candidate);
-                }
-            }
+        // A picked file answers to its own name; a picked folder to a path inside it.
+        if self.root.file_name().and_then(|name| name.to_str()) == Some(reference)
+            && is_file(&self.root)
+        {
+            return Ok(self.root.clone());
         }
-        Err(gone())
+
+        let mut candidate = self.root.clone();
+        for part in reference.split('/') {
+            candidate.push(part);
+        }
+        match is_file(&candidate) {
+            true => Ok(candidate),
+            false => Err(gone()),
+        }
     }
 }
 
@@ -269,30 +239,10 @@ impl Source for Folder {
     }
 
     fn scan(&self, from: Option<&Cursor>) -> Result<Page> {
-        let (start, within) = match from {
-            None => (0, None),
-            Some(cursor) => {
-                let unreadable = || {
-                    SourceError::Failed(format!("{} cannot resume from {cursor:?}", Folder::NAME))
-                };
-                let (index, reference) = cursor.split_once(':').ok_or_else(unreadable)?;
-                let index: usize = index.parse().map_err(|_| unreadable())?;
-                (index, Some(reference.to_owned()))
-            }
-        };
-
         let mut page = Page::default();
-        for (index, root) in self.roots.iter().enumerate().skip(start) {
-            let after = if index == start {
-                within.as_deref()
-            } else {
-                None
-            };
-            if !self.visit_root(root, after, &mut page) {
-                let last = page.items.last().map_or("", |item| item.reference.as_str());
-                page.next = Some(format!("{index}:{last}"));
-                return Ok(page);
-            }
+        if !self.visit_root(from.map(String::as_str), &mut page) {
+            let last = page.items.last().map_or("", |item| item.reference.as_str());
+            page.next = Some(last.to_owned());
         }
         Ok(page)
     }
@@ -362,16 +312,6 @@ fn name_of(path: &Path) -> Result<&str> {
     path.file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| refused(format!("{} has no usable name", path.display())))
-}
-
-fn free_prefix(name: &str, taken: &[Root]) -> String {
-    let mut candidate = name.to_owned();
-    let mut suffix = 2;
-    while taken.iter().any(|root| root.prefix == candidate) {
-        candidate = format!("{name}-{suffix}");
-        suffix += 1;
-    }
-    candidate
 }
 
 fn refused(reason: impl Into<String>) -> SourceError {
@@ -449,102 +389,56 @@ mod tests {
     }
 
     #[test]
-    fn picked_files_sit_at_the_top_of_the_source() {
+    fn a_single_picked_file_is_the_whole_of_the_source() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), &["one.jpg", "sub/two.jpg"]);
+        tree(dir.path(), &["holiday/beach.jpg", "holiday/other.jpg"]);
+        let picked = dir.path().join("holiday/beach.jpg");
 
-        let source = Folder::parse(&config(&[
-            &dir.path().join("one.jpg"),
-            &dir.path().join("sub/two.jpg"),
-        ]))
-        .unwrap();
-        let (items, _) = drain(&source);
+        let source = Folder::parse(&config(&[&picked])).unwrap();
+        let (items, skipped) = drain(&source);
 
-        let mut names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
-        names.sort();
-        assert_eq!(names, ["one.jpg", "two.jpg"]);
-        assert!(items.iter().all(|i| i.folder.is_empty()), "{items:?}");
-        assert!(
-            items.iter().all(|i| i.reference == i.name),
-            "a picked file answers to its own name: {items:?}"
-        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(items.len(), 1, "the file, and nothing beside it");
+        assert_eq!(items[0].name, "beach.jpg");
+        assert_eq!(items[0].reference, "beach.jpg");
+        assert_eq!(items[0].folder, "", "a picked file sits at the top");
+        assert_eq!(source.locate("beach.jpg").unwrap(), picked);
     }
 
     #[test]
-    fn several_picked_directories_keep_their_trees_apart() {
+    fn a_picked_folder_gives_up_its_tree_from_the_top() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), &["one/x.jpg", "two/x.jpg"]);
+        let album = dir.path().join("2024");
+        tree(&album, &["DCIM/a.jpg", "top.png"]);
 
-        let source =
-            Folder::parse(&config(&[&dir.path().join("one"), &dir.path().join("two")])).unwrap();
+        let source = Folder::parse(&config(&[&album])).unwrap();
         let (items, _) = drain(&source);
 
         let mut refs: Vec<&str> = items.iter().map(|i| i.reference.as_str()).collect();
         refs.sort();
-        assert_eq!(refs, ["one/x.jpg", "two/x.jpg"]);
-    }
-
-    #[test]
-    fn picks_that_share_a_name_are_still_told_apart() {
-        let dir = tempfile::tempdir().unwrap();
-        tree(
-            dir.path(),
-            &["a/DCIM/IMG_1.jpg", "b/DCIM/IMG_1.jpg", "c/DCIM-2/x.jpg"],
-        );
-
-        let picked = [
-            dir.path().join("a/DCIM"),
-            dir.path().join("b/DCIM"),
-            dir.path().join("c/DCIM-2"),
-            dir.path().join("a/DCIM"),
-        ];
-        let source =
-            Folder::parse(&config(&picked.iter().map(Path::new).collect::<Vec<_>>())).unwrap();
-        let (items, _) = drain(&source);
-
-        let mut refs: Vec<&str> = items.iter().map(|i| i.reference.as_str()).collect();
-        refs.sort();
+        // The picked folder's own name is not part of the reference: its contents are the
+        // source, and the source already has a directory of its own.
+        assert_eq!(refs, ["DCIM/a.jpg", "top.png"]);
         assert_eq!(
-            refs,
-            ["DCIM-2-2/x.jpg", "DCIM-2/IMG_1.jpg", "DCIM/IMG_1.jpg"]
-        );
-
-        let mut found: Vec<PathBuf> = items
-            .iter()
-            .map(|item| source.locate(&item.reference).unwrap())
-            .collect();
-        found.sort();
-        assert_eq!(
-            found,
-            [
-                dir.path().join("a/DCIM/IMG_1.jpg"),
-                dir.path().join("b/DCIM/IMG_1.jpg"),
-                dir.path().join("c/DCIM-2/x.jpg"),
-            ]
+            source.locate("DCIM/a.jpg").unwrap(),
+            album.join("DCIM/a.jpg")
         );
     }
 
     #[test]
-    fn picked_files_that_share_a_name_are_still_told_apart() {
+    fn one_path_is_the_whole_of_what_it_takes() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), &["a/beach.jpg", "b/beach.jpg"]);
+        tree(dir.path(), &["a/x.jpg", "b/x.jpg"]);
 
-        let source = Folder::parse(&config(&[
-            &dir.path().join("a/beach.jpg"),
-            &dir.path().join("b/beach.jpg"),
-        ]))
-        .unwrap();
-        let (items, _) = drain(&source);
-
-        let mut refs: Vec<&str> = items.iter().map(|i| i.reference.as_str()).collect();
-        refs.sort();
-        assert_eq!(refs, ["beach.jpg", "beach.jpg-2"]);
-
-        assert!(items.iter().all(|item| item.name == "beach.jpg"));
-        assert!(items.iter().all(|item| item.folder.is_empty()));
-        for item in &items {
-            assert!(source.locate(&item.reference).is_ok());
+        // Two would have needed a name invented for each to tell their files apart, which
+        // is exactly the machinery taking one entry does without.
+        let both = config(&[&dir.path().join("a"), &dir.path().join("b")]);
+        match Folder::parse(&both) {
+            Ok(_) => panic!("two paths should be refused"),
+            Err(e) => assert!(e.to_string().contains("not several"), "{e}"),
         }
+
+        assert!(Folder::parse(&config(&[])).is_err(), "nor none at all");
     }
 
     #[cfg(unix)]
@@ -598,33 +492,6 @@ mod tests {
             source.page = page;
             let (items, _) = drain(&source);
             assert_eq!(items, all, "a page of {page} lost or repeated something");
-        }
-    }
-
-    #[test]
-    fn paging_across_several_picks_offers_every_file_exactly_once() {
-        let dir = tempfile::tempdir().unwrap();
-        tree(
-            dir.path(),
-            &["one/a.txt", "one/b.txt", "two/c.txt", "loose.txt"],
-        );
-
-        let picks = config(&[
-            &dir.path().join("two"),
-            &dir.path().join("loose.txt"),
-            &dir.path().join("one"),
-        ]);
-
-        let all = {
-            let source = Folder::parse(&picks).unwrap();
-            drain(&source).0
-        };
-        assert_eq!(all.len(), 4);
-
-        for page in 1..=5 {
-            let mut source = Folder::parse(&picks).unwrap();
-            source.page = page;
-            assert_eq!(drain(&source).0, all, "a page of {page} lost something");
         }
     }
 

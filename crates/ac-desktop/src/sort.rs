@@ -8,15 +8,11 @@ use ac_node::ops::import::Waiting;
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::selection::{Selection, Sorting};
-use crate::ui::{FieldItem, MainWindow, SettingItem, SourceItem};
-use crate::work::{self, Nudge};
 
-/// What the picker offers when a source is being added, and what its fields are answered in.
-pub const KIND_TEXT: i32 = 0;
-pub const KIND_PATH: i32 = 1;
-pub const KIND_PATHS: i32 = 2;
-pub const KIND_SECRET: i32 = 3;
-pub const KIND_TOGGLE: i32 = 4;
+/// How the group's own root reads in the folder picker: a path, because that is what it is.
+pub const ROOT: &str = "/";
+use crate::ui::MainWindow;
+use crate::work::{self, Nudge};
 
 /// Everything the Sort tab shows.
 #[derive(Default)]
@@ -42,15 +38,20 @@ pub struct Page {
     pub group_index: i32,
     pub group_id: String,
 
-    /// The Sources section.
-    pub sources: Vec<SourceItem>,
-    /// What this build can import from, for the Add form's picker.
-    pub implementations: Vec<slint::SharedString>,
-    /// The Settings tab's Sources section, which is about the app rather than the accounts.
-    pub settings: Vec<SettingItem>,
+    /// The folders of the chosen group, with its root first. A name typed into "Add folder"
+    /// is in here too, before any file has put it on disk.
+    pub folder_names: Vec<slint::SharedString>,
+    pub folder_index: i32,
+
     /// The file either side of the one on screen, as (hash, path): what the preview worker
     /// fetches ahead so stepping is instant rather than a spawn per keypress.
     pub neighbours: Vec<(String, String)>,
+    /// Whether there is anywhere to step. Without these the ends are not ends: stepping
+    /// past the last file would keep counting up while the backlog quietly began again.
+    pub has_next: bool,
+    pub has_previous: bool,
+    /// What the Undo button would take back, or empty when there is nothing.
+    pub undo: String,
 }
 
 pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
@@ -67,14 +68,22 @@ pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
             .position(|group| group.id.to_string() == looking_at.group)
             .map_or(-1, |at| at as i32),
         group_id: looking_at.group.clone(),
-        sources: sources(paths),
-        implementations: ops::import::available()
-            .iter()
-            .map(|entry| slint::SharedString::from(entry.name))
-            .collect(),
-        settings: shared_settings(paths),
         ..Page::default()
     };
+
+    // What it would take back, not which file: a name in a button cannot elide, so it sets
+    // the width of the whole tab.
+    page.undo = match looking_at.undo.last() {
+        Some(last) => match last.dropped {
+            true => "Undo delete".to_owned(),
+            false => "Undo file".to_owned(),
+        },
+        None => String::new(),
+    };
+
+    let (folders, at) = destinations(paths, looking_at);
+    page.folder_names = folders;
+    page.folder_index = at;
 
     // Opened once for the whole read: the tab asks for the file on screen, and reopening the
     // ledger and the file index for each question is the bulk of what that costs.
@@ -102,11 +111,55 @@ pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
     page.hash = file.row.hash.clone();
     page.held = file.held;
     page.path = located(paths, &file);
+    page.has_previous = !looking_at.trail.is_empty();
+    page.has_next = ahead(&inbox, &file).is_some();
     page.neighbours = neighbours(&inbox, paths, looking_at, &file);
     page
 }
 
 /// The one behind and the one ahead, which is the whole of what gets prefetched.
+/// The folders a file may be filed into, and which one is chosen.
+///
+/// The group's root comes first and is not a folder — it is the absence of one — so it is
+/// shown as `/` rather than given a name it does not have. A folder typed into "Add folder"
+/// is included before any file has put it on disk, because until one does it exists only
+/// as the choice that was made.
+fn destinations(paths: &Paths, looking_at: &Sorting) -> (Vec<slint::SharedString>, i32) {
+    let mut folders = match looking_at.group.is_empty() {
+        true => Vec::new(),
+        false => ops::file::folders(paths, &looking_at.group).unwrap_or_default(),
+    };
+    if !looking_at.destination.is_empty() && !folders.contains(&looking_at.destination) {
+        folders.push(looking_at.destination.clone());
+        folders.sort();
+    }
+
+    let at = match looking_at.destination.is_empty() {
+        true => 0,
+        false => folders
+            .iter()
+            .position(|f| *f == looking_at.destination)
+            .map_or(0, |at| at as i32 + 1),
+    };
+
+    let mut names = vec![slint::SharedString::from(ROOT)];
+    names.extend(
+        folders
+            .iter()
+            .map(|f| slint::SharedString::from(f.as_str())),
+    );
+    (names, at)
+}
+
+/// The file after this one, if the backlog has one.
+fn ahead(inbox: &ops::import::Inbox, file: &Waiting) -> Option<Waiting> {
+    inbox
+        .page(Some((file.row.at, &file.row.hash)), 1)
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+}
+
 fn neighbours(
     inbox: &ops::import::Inbox,
     paths: &Paths,
@@ -115,7 +168,7 @@ fn neighbours(
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
 
-    let ahead = inbox.page(Some((file.row.at, &file.row.hash)), 1);
+    let ahead = ahead(inbox, file);
     let behind = match looking_at.trail.len() {
         0 | 1 => Vec::new(),
         len => {
@@ -126,7 +179,7 @@ fn neighbours(
         }
     };
 
-    for file in ahead.unwrap_or_default().iter().chain(behind.iter()) {
+    for file in ahead.iter().chain(behind.iter()) {
         out.push((file.row.hash.clone(), located(paths, file)));
     }
     out
@@ -149,7 +202,8 @@ fn current_in(inbox: &ops::import::Inbox, looking_at: &Sorting) -> Option<(Waiti
     Some((file, 1))
 }
 
-/// The same, for a caller with only the one question to ask.
+/// The same, opening the inbox for the one question. Only the tests ask that way.
+#[cfg(test)]
 fn current(paths: &Paths, looking_at: &Sorting) -> Option<Waiting> {
     Some(current_in(&ops::import::Inbox::open(paths).ok()?, looking_at)?.0)
 }
@@ -167,83 +221,6 @@ fn located(paths: &Paths, file: &Waiting) -> String {
         .to_string()
 }
 
-fn sources(paths: &Paths) -> Vec<SourceItem> {
-    ops::import::sources(paths)
-        .unwrap_or_default()
-        .iter()
-        .map(|entry| SourceItem {
-            dir: entry.row.dir.as_str().into(),
-            name: entry.row.name.as_str().into(),
-            source: entry.row.source.as_str().into(),
-            kind: match entry.kind {
-                Some(kind) => kind.to_string(),
-                None => format!("{} (not in this build)", entry.row.source),
-            }
-            .into(),
-            scanned: match entry.row.scanned_at {
-                0 => "never scanned".to_owned(),
-                at => format!("scanned {}", ago(at)),
-            }
-            .into(),
-            error: entry.row.last_error.clone().unwrap_or_default().into(),
-            tally: format!(
-                "{} waiting · {} sorted · {} deleted · {} owed",
-                entry.tally.waiting, entry.tally.sorted, entry.tally.dropped, entry.owed
-            )
-            .into(),
-        })
-        .collect()
-}
-
-pub fn shared_settings(paths: &Paths) -> Vec<SettingItem> {
-    let mut out = Vec::new();
-    for entry in ops::import::available() {
-        let Ok(settings) = ops::import::settings(paths, entry.name) else {
-            continue;
-        };
-        for setting in settings {
-            out.push(SettingItem {
-                source: entry.name.into(),
-                key: setting.field.key.into(),
-                label: setting.field.label.into(),
-                value: setting.value.unwrap_or_default().into(),
-                secret: setting.field.kind == ac_import::config::FieldKind::Secret,
-                set: setting.set,
-            });
-        }
-    }
-    out
-}
-
-/// The fields one implementation declares, as a form to fill in.
-pub fn fields(source: &str) -> Vec<FieldItem> {
-    let Ok(entry) = ops::import::implementation(source) else {
-        return Vec::new();
-    };
-    entry
-        .config
-        .iter()
-        .map(|field| FieldItem {
-            key: field.key.into(),
-            label: field.label.into(),
-            kind: kind_of(field.kind),
-            required: field.required,
-            value: Default::default(),
-        })
-        .collect()
-}
-
-pub fn kind_of(kind: ac_import::config::FieldKind) -> i32 {
-    use ac_import::config::FieldKind;
-    match kind {
-        FieldKind::Text => KIND_TEXT,
-        FieldKind::Path => KIND_PATH,
-        FieldKind::Paths => KIND_PATHS,
-        FieldKind::Secret => KIND_SECRET,
-        FieldKind::Toggle => KIND_TOGGLE,
-    }
-}
-
 pub fn apply(window: &MainWindow, page: Page) {
     window.set_sort_have(page.have);
     window.set_sort_name(page.name.into());
@@ -255,21 +232,22 @@ pub fn apply(window: &MainWindow, page: Page) {
     window.set_sort_held(page.held);
     window.set_sort_position(page.position.into());
     window.set_sort_in_folder(page.in_folder);
+    window.set_sort_has_next(page.has_next);
+    window.set_sort_has_previous(page.has_previous);
+    window.set_sort_undo(page.undo.into());
 
     window.set_sort_group_names(ModelRc::from(Rc::new(VecModel::from(page.group_names))));
     window.set_sort_group_index(page.group_index);
     window.set_sort_group_id(page.group_id.into());
-
-    window.set_sources(ModelRc::from(Rc::new(VecModel::from(page.sources))));
-    window.set_source_kinds(ModelRc::from(Rc::new(VecModel::from(page.implementations))));
-    window.set_source_settings(ModelRc::from(Rc::new(VecModel::from(page.settings))));
+    window.set_sort_folder_names(ModelRc::from(Rc::new(VecModel::from(page.folder_names))));
+    window.set_sort_folder_index(page.folder_index);
 
     window.set_sort_path(page.path.clone().into());
 
     let previews = crate::preview::previews();
     previews.show(window, &page.hash, std::path::Path::new(&page.path));
     for (hash, path) in &page.neighbours {
-        previews.prefetch(hash, std::path::Path::new(path));
+        previews.prefetch(window, hash, std::path::Path::new(path));
     }
 }
 
@@ -294,6 +272,41 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         }
     });
 
+    window.on_sort_pick_folder({
+        let weak = weak.clone();
+        let paths = paths.clone();
+        let selection = selection.clone();
+        let nudge = nudge.clone();
+        move |index| {
+            // The first entry is the group's root, which is no folder at all.
+            let (folders, _) = destinations(&paths, &selection.get().sorting);
+            let picked = match index {
+                0 => String::new(),
+                at => folders
+                    .get(at as usize)
+                    .map(|name| name.to_string())
+                    .unwrap_or_default(),
+            };
+            selection.set_sort_destination(&picked);
+            let _ = &weak;
+            nudge.now();
+        }
+    });
+
+    window.on_sort_add_folder({
+        let selection = selection.clone();
+        let nudge = nudge.clone();
+        move |name| {
+            // Not created anywhere: a folder in a group is the directory some file is
+            // under, so it comes into being when the first file is filed into it.
+            let name = name.trim().trim_matches('/').to_owned();
+            if !name.is_empty() {
+                selection.set_sort_destination(&name);
+            }
+            nudge.now();
+        }
+    });
+
     window.on_sort_step({
         let paths = paths.clone();
         let selection = selection.clone();
@@ -301,8 +314,13 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         move |forward| {
             match forward {
                 true => {
+                    // Only when something actually follows: stepping off the end would
+                    // leave the trail pointing past the backlog, and the count with it.
                     let looking_at = selection.get().sorting;
-                    if let Some(file) = current(&paths, &looking_at) {
+                    if let Ok(inbox) = ops::import::Inbox::open(&paths)
+                        && let Some(file) = current_in(&inbox, &looking_at)
+                        && ahead(&inbox, &file).is_some()
+                    {
                         selection.forward((file.row.at, file.row.hash));
                     }
                 }
@@ -319,20 +337,36 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         let nudge = nudge.clone();
         move |hash, folder| {
             let (paths, nudge) = (paths.clone(), nudge.clone());
-            let group = selection.get().sorting.group;
+            let looking_at = selection.get().sorting;
+            let (group, into) = (looking_at.group, looking_at.destination);
             let (hash, selection) = (hash.to_string(), selection.clone());
+            // Taken now, while it is still the file on screen: once it is filed it is no
+            // longer in the backlog to be looked up by.
+            let named = weak.upgrade().map(|w| w.get_sort_name().to_string());
 
             work::run(&weak, &nudge, move || {
                 let filed = match folder {
-                    false => ops::import::sort(&paths, &hash, &group)?,
+                    false => ops::import::sort(&paths, &hash, &group, &into)?,
                     true => {
                         let row = ops::import::find(&paths, &hash)?;
-                        ops::import::sort_folder(&paths, &row.source_dir, &row.folder, &group)?
+                        ops::import::sort_folder(
+                            &paths,
+                            &row.source_dir,
+                            &row.folder,
+                            &group,
+                            &into,
+                        )?
                     }
                 };
                 // What was on screen has gone from the backlog, so the trail behind it no
                 // longer points where it did.
                 selection.rewind();
+                // Only a single filing is offered back. A bulk one moves a whole folder,
+                // and a button that reversed forty without saying which would be worse to
+                // have than none.
+                if !folder && let Some(name) = named {
+                    remember(&paths, &selection, &hash, &name, false);
+                }
                 Ok(said(&filed, "filed"))
             });
         }
@@ -346,6 +380,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         move |hash, folder| {
             let (paths, nudge) = (paths.clone(), nudge.clone());
             let (hash, selection) = (hash.to_string(), selection.clone());
+            let named = weak.upgrade().map(|w| w.get_sort_name().to_string());
 
             work::run(&weak, &nudge, move || {
                 let filed = match folder {
@@ -356,6 +391,19 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     }
                 };
                 selection.rewind();
+                match (folder, named) {
+                    (false, Some(name)) => remember(&paths, &selection, &hash, &name, true),
+                    // A whole folder at once cannot be taken back, so it is finished with
+                    // straight away rather than left waiting on disk.
+                    _ => {
+                        if let Err(error) = ops::import::sweep_dropped(&paths) {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "could not finish with what was deleted"
+                            );
+                        }
+                    }
+                }
                 Ok(said(&filed, "deleted"))
             });
         }
@@ -376,248 +424,61 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         }
     });
 
-    window.on_import_pick({
+    window.on_sort_undo_last({
         let weak = weak.clone();
         let paths = paths.clone();
         let selection = selection.clone();
         let nudge = nudge.clone();
-        move |folder| {
-            let dialog = rfd::FileDialog::new().set_title(match folder {
-                true => "Import a folder",
-                false => "Import files",
-            });
-            let picked: Vec<PathBuf> = match folder {
-                true => dialog.pick_folder().into_iter().collect(),
-                false => dialog.pick_files().unwrap_or_default(),
-            };
-            if picked.is_empty() {
-                return;
-            }
-            import(&weak, &paths, picked, &selection, &nudge);
-        }
-    });
-
-    window.on_scan_source({
-        let weak = weak.clone();
-        let paths = paths.clone();
-        let nudge = nudge.clone();
-        move |dir| {
-            let (paths, nudge, dir) = (paths.clone(), nudge.clone(), dir.to_string());
-            work::run(&weak, &nudge, move || {
-                let scanned = ops::import::scan(&paths, &dir)?;
-                if !scanned.reachable {
-                    return Ok(format!("{} cannot be reached right now", scanned.name));
-                }
-                Ok(format!(
-                    "{}: {} offered, {} new",
-                    scanned.name, scanned.found, scanned.owed
-                ))
-            });
-        }
-    });
-
-    window.on_remove_source({
-        let weak = weak.clone();
-        let paths = paths.clone();
-        let nudge = nudge.clone();
-        move |dir| {
-            let (paths, nudge, dir) = (paths.clone(), nudge.clone(), dir.to_string());
-            work::run(&weak, &nudge, move || {
-                match ops::import::remove_source(&paths, &dir)? {
-                    true => Ok(format!("removed {dir}")),
-                    false => Err(anyhow::anyhow!("no source called {dir}")),
-                }
-            });
-        }
-    });
-
-    window.on_pick_source_kind({
-        let weak = weak.clone();
-        move |source| {
-            if let Some(window) = weak.upgrade() {
-                let fields = fields(source.as_ref());
-                window.set_source_fields(ModelRc::from(Rc::new(VecModel::from(fields))));
-            }
-        }
-    });
-
-    window.on_save_setting({
-        let weak = weak.clone();
-        let paths = paths.clone();
-        let nudge = nudge.clone();
-        move |source, key, value| {
-            let (paths, nudge) = (paths.clone(), nudge.clone());
-            let (source, key, value) = (source.to_string(), key.to_string(), value.to_string());
-            work::run(&weak, &nudge, move || {
-                ops::import::set_setting(&paths, &source, &key, &value)?;
-                Ok(format!("set {source} {key}"))
-            });
-        }
-    });
-
-    window.on_field_edited({
-        let weak = weak.clone();
-        move |at, value| {
-            if let Some(window) = weak.upgrade() {
-                write_field(&window, at, |_| value.to_string());
-            }
-        }
-    });
-
-    // A path is chosen rather than typed, so what was chosen is written straight into the
-    // model the Add button reads: the form never has to hand a value back.
-    window.on_field_browse({
-        let weak = weak.clone();
-        move |at, several| {
-            let dialog = rfd::FileDialog::new().set_title("Choose");
-            let picked = match several {
-                true => dialog.pick_folder(),
-                false => dialog.pick_file(),
-            };
-            let Some(picked) = picked else {
-                return;
-            };
-            let picked = picked.display().to_string();
-
-            if let Some(window) = weak.upgrade() {
-                write_field(&window, at, |had| match (several, had.is_empty()) {
-                    (true, false) => format!("{had}\n{picked}"),
-                    _ => picked.clone(),
-                });
-            }
-        }
-    });
-
-    window.on_field_cleared({
-        let weak = weak.clone();
-        move |at| {
-            if let Some(window) = weak.upgrade() {
-                write_field(&window, at, |_| String::new());
-            }
-        }
-    });
-
-    window.on_add_source({
-        let weak = weak.clone();
-        let paths = paths.clone();
-        let nudge = nudge.clone();
-        move |source, name| {
-            let Some(window) = weak.upgrade() else {
-                return;
-            };
-            let answers = answers(&window);
-            let (paths, nudge) = (paths.clone(), nudge.clone());
-            let (source, name) = (source.to_string(), name.to_string());
-
-            work::run(&weak, &nudge, move || {
-                let row = ops::import::add_source(&paths, &source, &name, answers)?;
-                Ok(format!("added {} ({})", row.name, row.source))
-            });
-        }
-    });
-}
-
-/// Change one field's answer in the model the Add button reads.
-fn write_field(window: &MainWindow, at: i32, to: impl FnOnce(&str) -> String) {
-    use slint::Model;
-
-    let fields = window.get_source_fields();
-    let Some(at) = usize::try_from(at)
-        .ok()
-        .filter(|at| *at < fields.row_count())
-    else {
-        return;
-    };
-    let Some(mut field) = fields.row_data(at) else {
-        return;
-    };
-    field.value = to(field.value.as_ref()).into();
-    fields.set_row_data(at, field);
-}
-
-/// What the Add form was filled in with, in the shape the implementation declared.
-fn answers(window: &MainWindow) -> ac_import::config::Fields {
-    use slint::Model;
-
-    let mut fields = ac_import::config::Fields::new();
-    for field in window.get_source_fields().iter() {
-        let value = field.value.to_string();
-        if value.trim().is_empty() {
-            continue;
-        }
-        // A repeatable field is one line per answer, which is how the form takes several
-        // paths without growing a widget that can add rows.
-        match field.kind == KIND_PATHS {
-            true => {
-                for line in value.lines().filter(|line| !line.trim().is_empty()) {
-                    fields.push(&field.key, line.trim());
-                }
-            }
-            false => {
-                fields.push(&field.key, value.trim());
-            }
-        }
-    }
-    fields
-}
-
-/// Add the picked folders, scan them, and bring them in, saying which file as it goes.
-fn import(
-    weak: &slint::Weak<MainWindow>,
-    paths: &Paths,
-    picked: Vec<PathBuf>,
-    selection: &Selection,
-    nudge: &Nudge,
-) {
-    work::begin(weak);
-
-    let (paths, nudge, selection) = (paths.clone(), nudge.clone(), selection.clone());
-    let progress = weak.clone();
-
-    work::action(
-        weak,
         move || {
-            let name = (picked.len() == 1)
-                .then(|| {
-                    picked[0]
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(str::to_owned)
-                })
-                .flatten();
-            let picked = ops::import::from_folder(&paths, name.as_deref(), &picked)?;
-            let scanned = ops::import::scan(&paths, &picked.row.dir)?;
+            let Some(taken) = selection.take_back() else {
+                return;
+            };
+            let (paths, nudge, selection) = (paths.clone(), nudge.clone(), selection.clone());
 
-            let mut pump = ops::import::pump(&paths, None)?;
-            let mut fetched = ops::import::Fetched::default();
-            while let Some(brought) = pump.next()? {
-                let say = format!("importing {}: {}", fetched.tried + 1, brought.name);
-                let _ = progress.upgrade_in_event_loop(move |window| {
-                    window.set_sort_progress(say.into());
-                });
-                fetched.count(&brought);
-            }
-            pump.finish()?;
+            work::run(&weak, &nudge, move || {
+                let said = ops::import::undo(&paths, &taken.hash)?;
+                // It is back in the backlog, and wherever the reader had got to no longer
+                // describes where it is.
+                selection.rewind();
+                Ok(said)
+            });
+        }
+    });
 
-            let _ = progress.upgrade_in_event_loop(|window| window.set_sort_progress("".into()));
-            selection.rewind();
+    window.on_sort_reveal({
+        let weak = weak.clone();
+        let nudge = nudge.clone();
+        move |path| {
+            if path.is_empty() {
+                return;
+            }
+            let path = PathBuf::from(path.as_str());
+            let outcome = crate::shell::reveal(&path).map(|()| match path.parent() {
+                Some(folder) => format!("showing {}", folder.display()),
+                None => format!("showing {}", path.display()),
+            });
+            if let Some(window) = weak.upgrade() {
+                work::finish(&window, outcome, &nudge);
+            }
+        }
+    });
+}
 
-            let mut said = format!(
-                "{}: {} imported ({})",
-                scanned.name,
-                fetched.kept,
-                human_size(fetched.bytes)
-            );
-            if fetched.known + fetched.held > 0 {
-                said += &format!(", {} already had", fetched.known + fetched.held);
-            }
-            for note in &fetched.failed {
-                said += &format!("\n{note}");
-            }
-            Ok(said)
-        },
-        move |window, outcome| work::finish(window, outcome, &nudge),
-    );
+/// Put one decision on the stack, and finish with whatever falls off the far end — nothing
+/// can take that one back any more, so its bytes may go.
+fn remember(paths: &Paths, selection: &Selection, hash: &str, name: &str, dropped: bool) {
+    let fell_off = selection.did(crate::selection::Undoable {
+        hash: hash.to_owned(),
+        name: name.to_owned(),
+        dropped,
+    });
+
+    if let Some(done_with) = fell_off
+        && done_with.dropped
+        && let Err(error) = ops::import::forget(paths, &done_with.hash)
+    {
+        tracing::warn!(error = %format!("{error:#}"), "could not finish with a deleted file");
+    }
 }
 
 /// One line for what a filing or a deletion did.
@@ -639,7 +500,7 @@ mod tests {
     use crate::selection::Sorting;
 
     /// An album imported and waiting to be sorted.
-    fn waiting(files: &[&str]) -> (tempfile::TempDir, Paths) {
+    pub fn waiting(files: &[&str]) -> (tempfile::TempDir, Paths) {
         let (tmp, paths) = home("jonathan");
         let album = tmp.path().join("album");
         for file in files {
@@ -648,7 +509,7 @@ mod tests {
             std::fs::write(&path, file.as_bytes()).unwrap();
         }
 
-        let picked = ops::import::from_folder(&paths, Some("Summer"), &[album]).unwrap();
+        let picked = ops::import::from_folder(&paths, Some("Summer"), &album).unwrap();
         ops::import::scan(&paths, &picked.row.dir).unwrap();
         ops::import::drain(&paths, None).unwrap();
         (tmp, paths)
@@ -665,8 +526,6 @@ mod tests {
         assert_eq!(page.source, "Summer");
         assert!(!page.path.is_empty(), "it says where the bytes are");
         assert!(!page.held, "no group has them");
-        assert_eq!(page.sources.len(), 1);
-        assert_eq!(page.sources[0].name, "Summer");
     }
 
     #[test]
@@ -693,6 +552,76 @@ mod tests {
         assert_eq!(read(&paths, &selection.get().sorting).position, "3 of 3");
     }
 
+    /// Pressing Next at the last file used to push the trail past the end: the count went
+    /// on climbing while the backlog quietly started again underneath it.
+    #[test]
+    fn stepping_stops_at_the_ends_rather_than_running_past_them() {
+        let (_tmp, paths) = waiting(&["a.jpg", "b.jpg", "c.jpg"]);
+        let selection = Selection::new();
+
+        let step = |forward: bool| {
+            let looking_at = selection.get().sorting;
+            match forward {
+                true => {
+                    if let Ok(inbox) = ops::import::Inbox::open(&paths)
+                        && let Some(file) = current_in(&inbox, &looking_at)
+                        && ahead(&inbox, &file).is_some()
+                    {
+                        selection.forward((file.row.at, file.row.hash));
+                    }
+                }
+                false => selection.back(),
+            }
+        };
+
+        // At the start there is nowhere back to go.
+        assert!(!read(&paths, &selection.get().sorting).has_previous);
+        step(false);
+        assert_eq!(read(&paths, &selection.get().sorting).position, "1 of 3");
+
+        // Forward to the last, and no further however hard it is pressed.
+        for _ in 0..10 {
+            step(true);
+        }
+        let end = read(&paths, &selection.get().sorting);
+        assert_eq!(
+            end.position, "3 of 3",
+            "the count stops where the backlog does"
+        );
+        assert!(!end.has_next, "and the button says so");
+        assert!(end.has_previous);
+
+        // And it is genuinely the last file, not the first come round again.
+        let first = read(&paths, &Sorting::default()).name;
+        assert_ne!(end.name, first, "cycling is what the runaway looked like");
+    }
+
+    /// The two pickers: a group, and where in it. The root comes first and is not a folder.
+    #[test]
+    fn the_folder_picker_offers_the_group_root_and_a_name_not_yet_on_disk() {
+        let (_tmp, paths) = waiting(&["a.jpg"]);
+        let created = ops::group::create(&paths, "holiday").unwrap();
+        let selection = Selection::new();
+
+        // No group chosen, so nowhere to file into either.
+        assert_eq!(read(&paths, &selection.get().sorting).folder_names, [ROOT]);
+
+        selection.set_sort_group(&created.id.to_string());
+        let page = read(&paths, &selection.get().sorting);
+        assert_eq!(page.folder_names, [ROOT], "an empty group has no folders");
+        assert_eq!(page.folder_index, 0, "and its root is what is chosen");
+
+        // A name typed into "Add folder" is offered before any file has put it on disk.
+        selection.set_sort_destination("2024");
+        let page = read(&paths, &selection.get().sorting);
+        assert_eq!(page.folder_names, [ROOT, "2024"]);
+        assert_eq!(page.folder_index, 1, "and it is the one chosen");
+
+        // Changing group forgets it: a folder belongs to the group it is in.
+        selection.set_sort_group("");
+        assert_eq!(read(&paths, &selection.get().sorting).folder_names, [ROOT]);
+    }
+
     #[test]
     fn a_bulk_button_names_what_it_is_about_to_act_on() {
         let (_tmp, paths) = waiting(&["DCIM/a.jpg", "DCIM/b.jpg", "other/c.jpg"]);
@@ -704,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_backlog_shows_no_file_but_still_lists_the_sources() {
+    fn an_empty_backlog_shows_no_file_at_all() {
         let (_tmp, paths) = waiting(&["a.jpg"]);
         let file = current(&paths, &Sorting::default()).unwrap();
         ops::import::drop(&paths, &file.row.hash).unwrap();
@@ -713,7 +642,7 @@ mod tests {
 
         assert!(!page.have);
         assert!(page.name.is_empty());
-        assert_eq!(page.sources.len(), 1, "the import is still listed");
+        assert_eq!(page.position, "", "and says nothing about a backlog");
     }
 
     #[test]
@@ -761,90 +690,32 @@ mod tests {
         assert_eq!(window.get_sort_position(), "1 of 3");
         assert_eq!(window.get_sort_group_id(), groups[0].id.to_string());
 
-        let filed = ElementHandle::find_by_accessible_label(&window, "File all 2 from DCIM")
+        // The count, but not the folder's name: which folder is on the line above, and a
+        // path in a button cannot elide, so it would set the width of the whole tab.
+        let filed = ElementHandle::find_by_accessible_label(&window, "File all 2 in this folder")
             .next()
-            .expect("the bulk file button names its count and its folder");
+            .expect("the bulk file button names its count");
         assert!(
             filed.accessible_enabled().unwrap_or(false),
             "a group is picked"
         );
 
         assert!(
-            ElementHandle::find_by_accessible_label(&window, "Delete all 2 from DCIM")
+            ElementHandle::find_by_accessible_label(&window, "Delete all 2 in this folder")
                 .next()
                 .is_some(),
             "and so does the bulk delete"
         );
-    }
 
-    /// The promise the registry makes, kept all the way to the window: a declaration this
-    /// file has never heard of renders a form anyway.
-    #[test]
-    fn a_form_is_rendered_from_a_declaration_no_view_knows_about() {
-        use crate::ui::MainWindow;
-        use ac_import::config::{Field, FieldKind};
-        use i_slint_backend_testing::ElementHandle;
-
-        // One of every kind, as a `drive` or a `phone` would declare them.
-        const DECLARED: &[Field] = &[
-            Field::text("account", "Account"),
-            Field::path("keyfile", "Key file"),
-            Field::paths("path", "Folders"),
-            Field::secret("token", "Refresh token"),
-            Field::toggle("videos", "Include videos").optional(),
-        ];
-
-        i_slint_backend_testing::init_no_event_loop();
-        let window = MainWindow::new().unwrap();
-        window.set_tab(4);
-
-        let rendered: Vec<FieldItem> = DECLARED
-            .iter()
-            .map(|field| FieldItem {
-                key: field.key.into(),
-                label: field.label.into(),
-                kind: kind_of(field.kind),
-                required: field.required,
-                value: Default::default(),
-            })
-            .collect();
-        window.set_source_fields(ModelRc::from(Rc::new(VecModel::from(rendered))));
-
-        for field in DECLARED {
-            // A toggle carries its own label, so it is not given a second one above it.
-            let looking_for = match (field.kind, field.required) {
-                (FieldKind::Toggle, _) | (_, true) => field.label.to_owned(),
-                (_, false) => format!("{} (optional)", field.label),
-            };
+        // The row that files a photo: which group, where in it, and a way to name a folder
+        // that is not there yet.
+        for control in ["Add folder", "File it"] {
             assert!(
-                ElementHandle::find_by_accessible_label(&window, &looking_for)
+                ElementHandle::find_by_accessible_label(&window, control)
                     .next()
                     .is_some(),
-                "{} was declared and never drawn",
-                field.label
+                "{control:?} should be on the filing row"
             );
         }
-
-        // A secret is written and never read back, whatever the model was given.
-        write_field(&window, 3, |_| "shhh".to_owned());
-        let secret = ElementHandle::find_by_accessible_label(&window, "Refresh token")
-            .next()
-            .expect("the secret field is drawn");
-        assert_ne!(
-            secret.accessible_value().unwrap_or_default(),
-            "shhh",
-            "a screenshot of this tab must not leak it"
-        );
-    }
-
-    #[test]
-    fn the_add_form_is_whatever_the_implementation_declared() {
-        let declared = fields("folder");
-
-        assert_eq!(declared.len(), 1, "one field, and no page knows its name");
-        assert_eq!(declared[0].key, "path");
-        assert_eq!(declared[0].kind, KIND_PATHS);
-        assert!(declared[0].required);
-        assert!(fields("nothing-like-this").is_empty());
     }
 }

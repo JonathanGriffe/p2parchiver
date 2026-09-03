@@ -1,7 +1,6 @@
 //! Configuring a source, and what one has been told.
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ac_files::dirname::sanitize;
 use ac_import::config::{Field, FieldKind, Fields};
@@ -45,6 +44,10 @@ pub struct Configured {
     pub kind: Option<SourceType>,
     pub owed: u64,
     pub tally: Tally,
+    /// A one-shot that has been scanned and owes nothing more. It ran, and there is nothing
+    /// further it will do — so a list of sources worth watching leaves it out. The row is
+    /// still here, and [`tidy`] is what eventually takes it away.
+    pub finished: bool,
 }
 
 pub fn sources(paths: &Paths) -> Result<Vec<Configured>> {
@@ -61,14 +64,64 @@ pub fn sources(paths: &Paths) -> Result<Vec<Configured>> {
             .map(|(_, tally)| *tally)
             .unwrap_or_default();
         let entry = registry::find(&row.source);
+        let kind = entry.map(|entry| entry.kind);
+        let owed = ledger.owed(&row.dir)?;
         out.push(Configured {
-            kind: entry.map(|entry| entry.kind),
-            owed: ledger.owed(&row.dir)?,
+            finished: done(kind, &row, owed),
+            kind,
+            owed,
             tally,
             row: without_secrets(row, entry.map(|entry| entry.config)),
         });
     }
     Ok(out)
+}
+
+/// Whether a source has run its course.
+///
+/// Only a one-shot ever does: everything else is polled again on a cadence, so there is
+/// always something more it will do. A scan has to have finished at least once — a row
+/// created a moment ago owes nothing yet, and is not finished but unstarted — and one that
+/// failed stays, because the error is the whole reason to look at it.
+fn done(kind: Option<SourceType>, row: &SourceRow, owed: u64) -> bool {
+    kind == Some(SourceType::OneShot) && row.last_error.is_none() && row.scanned_at > 0 && owed == 0
+}
+
+/// Forget a one-shot source there is nothing left to say about.
+///
+/// A one-shot import is a single act: it is scanned once, it brings in what it found, and
+/// after that it is only a name — one already copied onto every row it produced, which is
+/// why those rows were built to outlive it. So once its files have all been sorted or
+/// thrown away, the row goes, the same moment its directory frees itself.
+///
+/// Held until then rather than dropped as soon as the fetching stops, so that re-importing
+/// the same folder while its files are still waiting finds the source it already has
+/// instead of reading every file again.
+pub fn tidy(paths: &Paths) -> Result<u64> {
+    let mut ledger = ledger(paths)?;
+    let tallies = ledger.tallies()?;
+
+    let mut gone = 0;
+    for row in ledger.sources()? {
+        let kind = registry::find(&row.source).map(|entry| entry.kind);
+        if !done(kind, &row, ledger.owed(&row.dir)?) {
+            continue;
+        }
+        // Still something to sort, so the source stays: it is what a re-import matches on.
+        let waiting = tallies
+            .iter()
+            .find(|(dir, _)| *dir == row.dir)
+            .is_some_and(|(_, tally)| tally.waiting > 0);
+        if waiting {
+            continue;
+        }
+
+        if ledger.remove_source(&row.dir)? {
+            tracing::debug!(source = %row.name, "forgot a one-shot import that is done with");
+            gone += 1;
+        }
+    }
+    Ok(gone)
 }
 
 /// A source row with its credentials taken out
@@ -122,6 +175,7 @@ pub fn add_source(paths: &Paths, source: &str, name: &str, config: Fields) -> Re
         added_at: now(),
         scanned_at: 0,
         last_error: None,
+        reachable: true,
     };
     ledger
         .add_source(&row)
@@ -221,21 +275,16 @@ pub struct Picked {
 
 /// Import from folders someone picked, without their having to know what the `folder`
 /// implementation calls its fields.
-pub fn from_folder(paths: &Paths, name: Option<&str>, picked: &[PathBuf]) -> Result<Picked> {
-    let [first, ..] = picked else {
-        bail!("pick a folder to import from");
-    };
+pub fn from_folder(paths: &Paths, name: Option<&str>, picked: &Path) -> Result<Picked> {
+    if !picked.exists() {
+        bail!("{} is not there", picked.display());
+    }
+    // What was typed is rarely absolute, and the implementation takes nothing else.
+    let full = std::path::absolute(picked)
+        .with_context(|| format!("working out where {} is", picked.display()))?;
 
     let mut config = Fields::new();
-    for path in picked {
-        if !path.exists() {
-            bail!("{} is not there", path.display());
-        }
-        // What was typed is rarely absolute, and the implementation takes nothing else.
-        let full = std::path::absolute(path)
-            .with_context(|| format!("working out where {} is", path.display()))?;
-        config.push(FOLDER_PATH, &full.display().to_string());
-    }
+    config.push(FOLDER_PATH, &full.display().to_string());
 
     if let Some(row) = configured_for(&ledger(paths)?, &config)? {
         return Ok(Picked { row, added: false });
@@ -243,8 +292,7 @@ pub fn from_folder(paths: &Paths, name: Option<&str>, picked: &[PathBuf]) -> Res
 
     let named = match name {
         Some(name) => name.to_owned(),
-        None if picked.len() == 1 => folder_name(first)?,
-        None => bail!("give the import a name with --name: it is what its files are filed under"),
+        None => folder_name(picked)?,
     };
     Ok(Picked {
         row: add_source(paths, FOLDER, &named, config)?,
@@ -252,12 +300,14 @@ pub fn from_folder(paths: &Paths, name: Option<&str>, picked: &[PathBuf]) -> Res
     })
 }
 
+/// The folder source already importing from this path, if there is one.
 fn configured_for(ledger: &Ledger, config: &Fields) -> Result<Option<SourceRow>> {
-    let want: BTreeSet<&str> = config.all(FOLDER_PATH).collect();
+    let want = config.get(FOLDER_PATH);
 
-    Ok(ledger.sources()?.into_iter().find(|row| {
-        row.source == FOLDER && row.config.all(FOLDER_PATH).collect::<BTreeSet<_>>() == want
-    }))
+    Ok(ledger
+        .sources()?
+        .into_iter()
+        .find(|row| row.source == FOLDER && row.config.get(FOLDER_PATH) == want))
 }
 
 /// What a picked folder is called, as a name for the source.
@@ -321,7 +371,6 @@ mod tests {
     use crate::ops::import::fetch::drain;
     use crate::ops::import::fixtures::*;
     use crate::ops::import::scan::scan;
-
     use ac_import::ledger::State;
     use ac_import::source::SourceType;
 
@@ -508,13 +557,13 @@ mod tests {
         tree(&album, &["a.jpg", "b.jpg"]);
 
         // The three steps the CLI and the GUI both drive: find or create, scan, pump.
-        let first = from_folder(&paths, None, std::slice::from_ref(&album)).unwrap();
+        let first = from_folder(&paths, None, &album).unwrap();
         assert!(first.added);
         assert_eq!(scan(&paths, &first.row.dir).unwrap().owed, 2);
         assert_eq!(drain(&paths, None).unwrap().kept, 2);
 
         // The same pick again: the same source, rescanned, owing nothing new.
-        let again = from_folder(&paths, None, std::slice::from_ref(&album)).unwrap();
+        let again = from_folder(&paths, None, &album).unwrap();
         assert!(!again.added, "it was not added a second time");
         assert_eq!(again.row.dir, first.row.dir);
         assert_eq!(sources(&paths).unwrap().len(), 1);
@@ -525,26 +574,10 @@ mod tests {
 
         // And what is genuinely new there is picked up by that rescan.
         tree(&album, &["c.jpg"]);
-        let third = from_folder(&paths, None, std::slice::from_ref(&album)).unwrap();
+        let third = from_folder(&paths, None, &album).unwrap();
         assert!(!third.added);
         assert_eq!(scan(&paths, &third.row.dir).unwrap().owed, 1);
         assert_eq!(drain(&paths, None).unwrap().kept, 1);
-    }
-
-    #[test]
-    fn picking_the_same_folders_in_another_order_is_still_the_same_import() {
-        let home = home();
-        let paths = paths(&home);
-        let (one, two) = (home.path().join("one"), home.path().join("two"));
-        tree(&one, &["a.jpg"]);
-        tree(&two, &["b.jpg"]);
-
-        let first = from_folder(&paths, Some("Both"), &[one.clone(), two.clone()]).unwrap();
-        let again = from_folder(&paths, Some("Both"), &[two, one]).unwrap();
-
-        assert!(!again.added);
-        assert_eq!(again.row.dir, first.row.dir);
-        assert_eq!(sources(&paths).unwrap().len(), 1);
     }
 
     #[test]
@@ -554,7 +587,7 @@ mod tests {
         let album = home.path().join("Pictures 2024");
         tree(&album, &["a.jpg"]);
 
-        let picked = from_folder(&paths, None, std::slice::from_ref(&album)).unwrap();
+        let picked = from_folder(&paths, None, &album).unwrap();
         assert!(picked.added);
         assert_eq!(picked.row.name, "Pictures 2024");
         assert_eq!(picked.row.source, "folder");
@@ -565,24 +598,26 @@ mod tests {
             "the implementation takes nothing but an absolute path"
         );
 
-        // Several picks have no one name to take, so one has to be given.
-        let two = [album.clone(), home.path().join("other")];
-        std::fs::create_dir_all(&two[1]).unwrap();
-        let err = from_folder(&paths, None, &two).unwrap_err();
-        assert!(err.to_string().contains("--name"), "{err}");
+        // A name can still be given rather than taken from what was picked.
+        let other = home.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
         assert_eq!(
-            from_folder(&paths, Some("Everything"), &two)
+            from_folder(&paths, Some("Everything"), &other)
                 .unwrap()
                 .row
                 .dir,
             "everything"
         );
 
-        // A folder that is not there is refused before anything is written down.
-        let err = from_folder(&paths, None, &[home.path().join("nope")]).unwrap_err();
+        // A single file is as good a source as a folder, and is named after itself.
+        let one = home.path().join("Pictures 2024/a.jpg");
+        let file = from_folder(&paths, None, &one).unwrap();
+        assert_eq!(file.row.name, "a.jpg");
+
+        // What is not there is refused before anything is written down.
+        let err = from_folder(&paths, None, &home.path().join("nope")).unwrap_err();
         assert!(err.to_string().contains("is not there"), "{err}");
-        assert!(from_folder(&paths, None, &[]).is_err());
-        assert_eq!(sources(&paths).unwrap().len(), 2);
+        assert_eq!(sources(&paths).unwrap().len(), 3);
     }
 
     #[test]
@@ -607,6 +642,7 @@ mod tests {
             added_at: now(),
             scanned_at: 0,
             last_error: None,
+            reachable: true,
         };
 
         let shown = without_secrets(row.clone(), Some(&declared));
@@ -638,5 +674,84 @@ mod tests {
         assert_eq!(listed[0].kind, Some(SourceType::OneShot));
         assert_eq!(listed[0].owed, 3);
         assert_eq!(listed[0].tally, Tally::default());
+    }
+
+    /// The two halves of what happens to a one-shot: it stops being worth watching once it
+    /// has fetched what it found, and stops existing once its files have been dealt with.
+    #[test]
+    fn a_one_shot_is_finished_when_fetched_and_forgotten_when_sorted() {
+        let home = home();
+        let (paths, dir) = imported(&home, &["a.jpg", "b.jpg"]);
+
+        // Fetched, so there is nothing further it will do.
+        let listed = sources(&paths).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].finished, "it ran, and owes nothing more");
+
+        // But its files are still waiting, so the row stays: it is what a re-import of the
+        // same folder matches on rather than reading every file again.
+        assert_eq!(tidy(&paths).unwrap(), 0, "nothing to forget yet");
+        assert_eq!(sources(&paths).unwrap().len(), 1);
+
+        // Deal with them, and there is nothing left of it worth a row.
+        for file in crate::ops::import::backlog::unsorted(&paths, None, 10).unwrap() {
+            crate::ops::import::backlog::drop(&paths, &file.row.hash).unwrap();
+        }
+        assert_eq!(tidy(&paths).unwrap(), 1);
+        assert!(sources(&paths).unwrap().is_empty());
+
+        // What it brought in is untouched: those rows carry the name themselves, which is
+        // why they were built not to need the source.
+        let ledger = ledger(&paths).unwrap();
+        assert_eq!(
+            ledger.tallies().unwrap().len(),
+            1,
+            "the history is still there"
+        );
+        assert!(ledger.source(&dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_source_still_working_or_broken_is_never_forgotten() {
+        let home = home();
+        let (paths, dir) = home_with_owed(&home);
+
+        // Scanned and owing files: it has not run its course.
+        assert!(!sources(&paths).unwrap()[0].finished);
+        assert_eq!(tidy(&paths).unwrap(), 0);
+
+        // A row created a moment ago owes nothing yet — unstarted, not finished. Forgetting
+        // it here would delete a source out from under the scan that is about to run.
+        let ledger = ledger(&paths).unwrap();
+        ledger
+            .add_source(&SourceRow {
+                dir: "fresh".to_owned(),
+                name: "Fresh".to_owned(),
+                source: "folder".to_owned(),
+                config: picked(home.path()),
+                added_at: now(),
+                scanned_at: 0,
+                last_error: None,
+                reachable: true,
+            })
+            .unwrap();
+        assert_eq!(
+            tidy(&paths).unwrap(),
+            0,
+            "a source that has never been scanned stays"
+        );
+
+        // And one that failed stays too: the error is the whole reason to look at it.
+        ledger.scanned("fresh", now()).unwrap();
+        ledger.failed("fresh", "the folder is not there").unwrap();
+        assert_eq!(tidy(&paths).unwrap(), 0, "a broken source stays");
+        assert!(
+            !sources(&paths)
+                .unwrap()
+                .iter()
+                .any(|s| s.row.dir == "fresh" && s.finished)
+        );
+
+        let _ = dir;
     }
 }

@@ -33,12 +33,35 @@ pub(crate) fn tree(root: &Path, files: &[&str]) {
     }
 }
 
+/// A group to file into, made straight in the store
+pub(crate) fn group(paths: &Paths, name: &str) -> ac_groups::id::GroupId {
+    let identity = crate::ops::identity(paths).unwrap();
+    let mut groups = ac_groups::store::Groups::open(&paths.db_file(), identity.peer_id()).unwrap();
+    groups
+        .create(identity.keypair(), name, "tester", now())
+        .unwrap()
+}
+
+/// An album imported and sitting in `.unsorted`, and a group to file it into.
+pub(crate) fn imported(home: &tempfile::TempDir, files: &[&str]) -> (Paths, String) {
+    let paths = paths(home);
+    let album = home.path().join("album");
+    tree(&album, files);
+
+    let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+    scan(&paths, &row.dir).unwrap();
+    assert_eq!(drain(&paths, None).unwrap().kept as usize, files.len());
+    (paths, row.dir)
+}
+
+/// The file index and the storage root, opened as the pump opens them.
 pub(crate) struct Fake {
     pub(crate) kind: SourceType,
     pub(crate) items: Vec<Item>,
-    /// The bytes behind each reference. One it does not hold has left the source.
     pub(crate) bytes: Vec<(String, Vec<u8>)>,
     pub(crate) reachable: bool,
+    walks_out: bool,
+    asked: std::sync::atomic::AtomicBool,
 }
 
 impl Source for Fake {
@@ -46,9 +69,18 @@ impl Source for Fake {
         self.kind
     }
     fn reachable(&self) -> bool {
-        self.reachable
+        match self.walks_out {
+            true => !self.asked.load(std::sync::atomic::Ordering::SeqCst),
+            false => self.reachable,
+        }
     }
     fn scan(&self, from: Option<&Cursor>) -> Result<Page, SourceError> {
+        if self.walks_out {
+            self.asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(SourceError::Failed(
+                "could not reach this phone: connection reset".to_owned(),
+            ));
+        }
         assert!(from.is_none(), "this fake offers one page");
         Ok(Page {
             items: self.items.clone(),
@@ -86,6 +118,12 @@ impl Fake {
     }
 
     /// Promise something about one reference's bytes.
+    /// Here when asked, and gone by the time its pages are read.
+    pub(crate) fn walks_out(mut self) -> Self {
+        self.walks_out = true;
+        self
+    }
+
     pub(crate) fn promises(mut self, reference: &str, algo: Digest, value: &str) -> Self {
         for item in &mut self.items {
             if item.reference == reference {
@@ -104,6 +142,8 @@ pub(crate) fn fake(kind: SourceType, refs: &[&str]) -> Fake {
     Fake {
         kind,
         reachable: true,
+        walks_out: false,
+        asked: std::sync::atomic::AtomicBool::new(false),
         items: refs
             .iter()
             .map(|reference| Item {
@@ -121,29 +161,33 @@ pub(crate) fn fake(kind: SourceType, refs: &[&str]) -> Fake {
     }
 }
 
-/// A group to file into, made straight in the store
-pub(crate) fn group(paths: &Paths, name: &str) -> ac_groups::id::GroupId {
-    let identity = crate::ops::identity(paths).unwrap();
-    let mut groups = ac_groups::store::Groups::open(&paths.db_file(), identity.peer_id()).unwrap();
-    groups
-        .create(identity.keypair(), name, "tester", now())
-        .unwrap()
-}
-
-/// An album imported and sitting in `.unsorted`, and a group to file it into.
-pub(crate) fn imported(home: &tempfile::TempDir, files: &[&str]) -> (Paths, String) {
-    let paths = paths(home);
-    let album = home.path().join("album");
-    tree(&album, files);
-
-    let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
-    scan(&paths, &row.dir).unwrap();
-    assert_eq!(drain(&paths, None).unwrap().kept as usize, files.len());
-    (paths, row.dir)
-}
-
-/// The file index and the storage root, opened as the pump opens them.
 pub(crate) fn store(paths: &Paths) -> (Files, Content) {
     let identity = crate::ops::identity(paths).unwrap();
     crate::ops::open_files(paths, &identity).unwrap()
+}
+
+/// Reachable throughout, and refuses anyway.
+pub(crate) struct Stubborn;
+
+impl Source for Stubborn {
+    fn source_type(&self) -> SourceType {
+        SourceType::Remote
+    }
+    fn scan(&self, _from: Option<&Cursor>) -> Result<Page, SourceError> {
+        Err(SourceError::Failed("the drive said no".to_owned()))
+    }
+    fn fetch(&self, _item: &Item, _into: &mut dyn Write) -> Result<(), SourceError> {
+        unreachable!("this one never gets that far")
+    }
+}
+
+/// A source scanned but not yet fetched: it still owes what the scan found.
+pub(crate) fn home_with_owed(home: &tempfile::TempDir) -> (Paths, String) {
+    let paths = paths(home);
+    let album = home.path().join("owed");
+    tree(&album, &["a.jpg"]);
+
+    let row = add_source(&paths, "folder", "Owed", picked(&album)).unwrap();
+    scan(&paths, &row.dir).unwrap();
+    (paths, row.dir)
 }

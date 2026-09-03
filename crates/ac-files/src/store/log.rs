@@ -211,6 +211,18 @@ impl Files {
         )?;
         Ok(())
     }
+
+    /// Say this group wants bytes it was not waiting for a moment ago.
+    ///
+    /// Merging a catalogue notes this for itself. Marking a row unheld does not, so anything
+    /// that discovers bytes have gone has to say so here, or the content loop will sit on its
+    /// backoff with a file it now wants and no reason to go asking.
+    pub fn wanted_again(&mut self, group: GroupId) -> Result<(), FilesError> {
+        let tx = self.db.unchecked_transaction()?;
+        note_wanted(&tx, group)?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 /// Record that this group gained a row we do not hold.
 pub(super) fn note_wanted(
@@ -584,5 +596,28 @@ mod tests {
         assert_ne!(files.digest(a).unwrap(), files.digest(b).unwrap());
         assert_eq!(files.count(a).unwrap(), 1);
         assert_eq!(files.count(b).unwrap(), 0);
+    }
+
+    /// Wanting a file again is not a catalogue change either, but it does have to reach the
+    /// content loop: bytes that went missing locally are wanted from this moment, and the
+    /// group would otherwise sit on whatever backoff it was already on.
+    #[test]
+    fn wanting_bytes_again_is_news_to_the_content_loop_and_nobody_else() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+        let path = RelPath::parse("a.jpg").unwrap();
+        files.record(g, &row(me, "a.jpg", "aa"), true).unwrap();
+        files.wanted_seen(g).unwrap();
+
+        let (digest, seq) = (files.digest(g).unwrap(), files.seq(g).unwrap());
+        assert_eq!(files.wanted_news(g).unwrap(), 0, "nothing is wanted yet");
+
+        // What verify does when the bytes have gone from disk.
+        files.mark_have(g, &path, false).unwrap();
+        files.wanted_again(g).unwrap();
+
+        assert!(files.wanted_news(g).unwrap() > 0, "the loop gets told");
+        assert_eq!(files.seq(g).unwrap(), seq, "but the catalogue did not move");
+        assert_eq!(files.digest(g).unwrap(), digest, "so peers hear nothing");
     }
 }

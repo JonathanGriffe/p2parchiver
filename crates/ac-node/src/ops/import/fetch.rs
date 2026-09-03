@@ -387,7 +387,6 @@ fn fetch_one(
     brought(outcome)
 }
 
-/// Where one owed file lands
 fn destination(ledger: &Ledger, owed: &Owed) -> Result<RelPath> {
     let dest = unsorted_path(&owed.source_dir, &owed.folder, &owed.name)
         .with_context(|| format!("{} cannot be given a name on disk", owed.source_ref))?;
@@ -420,6 +419,7 @@ mod tests {
     use ac_import::config::Fields;
     use ac_import::source::{Item, SourceType};
 
+    /// One claim's worth of the pump, over whatever source the test brought.
     fn pump(
         ledger: &mut Ledger,
         files: &Files,
@@ -745,6 +745,7 @@ mod tests {
                 added_at: now(),
                 scanned_at: 0,
                 last_error: None,
+                reachable: true,
             })
             .unwrap();
         ledger

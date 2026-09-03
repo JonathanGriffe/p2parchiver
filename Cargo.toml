@@ -97,6 +97,13 @@ thiserror = "2"
 either = "1"
 anyhow = "1"
 
+# Dependencies are optimised even in a debug build. The window draws in software, so every
+# frame runs slint's per-pixel blit; unoptimised that is ~17ms for a picture-sized area, and
+# the Sort tab redraws one on every step. Our own crates stay at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

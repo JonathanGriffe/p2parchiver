@@ -12,6 +12,7 @@ use crate::groups;
 use crate::peers;
 use crate::selection::Selection;
 use crate::sort;
+use crate::sources;
 use crate::ui::{MainWindow, StorageSlice, TrafficRow};
 
 const IDLE: i32 = 0;
@@ -43,25 +44,54 @@ pub struct StoragePanel {
     pub slices: Vec<crate::ui::StorageSlice>,
 }
 
+/// What one read found, for the page that is showing and nothing else.
+///
+/// Every field is optional because a read only does the work the visible tab needs. The
+/// window is one thing, but its pages are not: rebuilding the file list on every step of
+/// the Sort tab costs more than everything the step itself does, and grows with the number
+/// of files rather than staying still.
+#[derive(Default)]
 pub struct Snapshot {
-    pub status: Status,
-    pub page: groups::Page,
-    pub directory: peers::Page,
-    pub files: files::Page,
-    pub sort: sort::Page,
+    pub status: Option<Status>,
+    pub page: Option<groups::Page>,
+    pub directory: Option<peers::Page>,
+    pub files: Option<files::Page>,
+    pub sort: Option<sort::Page>,
+    pub sources: Option<sources::Page>,
 }
+
+/// Which page is up. The nav sets it, and it is what a read is narrowed by.
+pub const STATUS: i32 = 0;
+pub const GROUPS: i32 = 1;
+pub const PEERS: i32 = 2;
+pub const FILES: i32 = 3;
+pub const SORT: i32 = 4;
+pub const SOURCES: i32 = 5;
 
 pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
     let looking_at = selection.get();
+    let tab = looking_at.tab;
+
+    // The pages that stand alone, each read only where it is being looked at.
+    let files = (tab == FILES).then(|| files::read(paths, &looking_at));
+    let sort = (tab == SORT).then(|| sort::read(paths, &looking_at.sorting));
+    let sources = (tab == SOURCES).then(|| sources::read(paths));
+
+    if !matches!(tab, STATUS | GROUPS | PEERS) {
+        return Snapshot {
+            files,
+            sort,
+            sources,
+            ..Snapshot::default()
+        };
+    }
+
     // Read once and shared: both the Groups page and the Peers page name the same people, and
     // they have to agree about what each is called.
     let known = ops::peer::list(paths).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "could not list peers");
         Vec::new()
     });
-    let files = files::read(paths, &looking_at);
-    let sort = sort::read(paths, &looking_at.sorting);
-
     let report = match ops::peer::status(paths) {
         Ok(report) => Some(report),
         Err(e) => {
@@ -78,25 +108,29 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
         None => (false, "could not read the node's status".to_owned()),
     };
 
-    let storage = ops::file::storage(paths).ok();
-    let bandwidth_max = Config::load(&paths.config_file())
-        .unwrap_or_default()
-        .bandwidth_max;
+    // The storage bar is the Status page's alone, and measuring it walks two tables.
+    let status = (tab == STATUS).then(|| {
+        let storage = ops::file::storage(paths).ok();
+        let bandwidth_max = Config::load(&paths.config_file())
+            .unwrap_or_default()
+            .bandwidth_max;
 
-    let status = Status {
-        running,
-        node_state,
-        groups_line: describe_groups(page.items.len(), report.as_ref()),
-        storage: describe_storage(storage.as_ref(), &page),
-        traffic: describe_traffic(report.as_ref(), running, bandwidth_max),
-    };
+        Status {
+            running,
+            node_state,
+            groups_line: describe_groups(page.items.len(), report.as_ref()),
+            storage: describe_storage(storage.as_ref(), &page),
+            traffic: describe_traffic(report.as_ref(), running, bandwidth_max),
+        }
+    });
 
     Snapshot {
         status,
-        page,
-        directory,
+        page: Some(page),
+        directory: Some(directory),
         files,
         sort,
+        sources,
     }
 }
 
@@ -130,6 +164,8 @@ fn describe_groups(count: usize, report: Option<&StatusReport>) -> String {
     }
 }
 
+/// Put on screen whatever was read. What was not read is left exactly as it was, which is
+/// what makes a narrow read safe: a page nobody is looking at keeps the last thing it knew.
 pub fn apply(window: &MainWindow, snapshot: Snapshot) {
     let Snapshot {
         status,
@@ -137,28 +173,53 @@ pub fn apply(window: &MainWindow, snapshot: Snapshot) {
         directory,
         files,
         sort,
+        sources,
     } = snapshot;
 
-    window.set_running(status.running);
-    window.set_node_state(status.node_state.into());
-    window.set_groups_line(status.groups_line.into());
-    window.set_storage_free(status.storage.free.into());
-    window.set_storage_used(status.storage.used.into());
-    window.set_storage_free_room(status.storage.free_room);
-    window.set_storage_used_room(status.storage.used_room);
-    window.set_storage_slices(ModelRc::from(Rc::new(VecModel::from(
-        status.storage.slices,
-    ))));
-    window.set_traffic(ModelRc::from(Rc::new(VecModel::from(status.traffic))));
-    groups::apply(window, page);
-    peers::apply(window, directory);
-    sort::apply(window, sort);
-    files::apply(window, files);
+    if let Some(status) = status {
+        window.set_running(status.running);
+        window.set_node_state(status.node_state.into());
+        window.set_groups_line(status.groups_line.into());
+        window.set_storage_free(status.storage.free.into());
+        window.set_storage_used(status.storage.used.into());
+        window.set_storage_free_room(status.storage.free_room);
+        window.set_storage_used_room(status.storage.used_room);
+        window.set_storage_slices(ModelRc::from(Rc::new(VecModel::from(
+            status.storage.slices,
+        ))));
+        window.set_traffic(ModelRc::from(Rc::new(VecModel::from(status.traffic))));
+    }
+    if let Some(page) = page {
+        groups::apply(window, page);
+    }
+    if let Some(directory) = directory {
+        peers::apply(window, directory);
+    }
+    if let Some(sort) = sort {
+        sort::apply(window, sort);
+    }
+    if let Some(sources) = sources {
+        sources::apply(window, sources);
+    }
+    if let Some(files) = files {
+        files::apply(window, files);
+    }
 }
 
 /// The Status page's one button. Copying happens in the markup, through the same clipboard
 /// the platform gives any text field; this only says that it did.
-pub fn wire(window: &MainWindow, nudge: &crate::work::Nudge) {
+pub fn wire(window: &MainWindow, selection: &Selection, nudge: &crate::work::Nudge) {
+    window.on_showing({
+        let selection = selection.clone();
+        let nudge = nudge.clone();
+        move |tab| {
+            selection.set_tab(tab);
+            // The page that just came up has whatever it last knew on it, which may be
+            // nothing at all. Read now rather than at the next tick.
+            nudge.now();
+        }
+    });
+
     let weak = window.as_weak();
     let nudge = nudge.clone();
 
@@ -292,7 +353,7 @@ fn describe_storage(storage: Option<&Storage>, page: &groups::Page) -> StoragePa
 
     if storage.unsorted > 0 {
         slices.push(StorageSlice {
-            label: "waiting to be sorted".into(),
+            label: "unsorted".into(),
             size: human_size(storage.unsorted).into(),
             offset,
             fraction: (storage.unsorted as f64 / capacity as f64) as f32,
@@ -390,7 +451,7 @@ mod tests {
         i_slint_backend_testing::init_no_event_loop();
         let window = MainWindow::new().unwrap();
         let (nudge, _ticks) = crate::work::nudge();
-        wire(&window, &nudge);
+        wire(&window, &Selection::new(), &nudge);
 
         window.set_tab(0);
         window.set_peer_id(PEER.into());
@@ -568,5 +629,101 @@ mod tests {
         let slices = describe_storage(Some(&held), &groups::Page::default()).slices;
 
         assert_eq!(slices[0].label, "01234567", "short id, not the whole thing");
+    }
+}
+
+#[cfg(test)]
+mod reading {
+    use super::*;
+
+    /// A read does the work the page on screen needs, and no other page's.
+    ///
+    /// This is what stepping through the Sort tab used to cost: the file list was rebuilt
+    /// on every press, and its cost grows with the number of files filed rather than
+    /// staying still. Nothing about a step touches it.
+    #[test]
+    fn only_the_page_on_screen_is_read() {
+        let (_tmp, paths) = crate::groups::tests::home("jonathan");
+        let selection = Selection::new();
+
+        selection.set_tab(SORT);
+        let snapshot = read(&paths, &selection);
+        assert!(snapshot.sort.is_some(), "the page being looked at");
+        assert!(snapshot.files.is_none(), "and not the one that is not");
+        assert!(snapshot.sources.is_none());
+        assert!(snapshot.status.is_none(), "nor the storage bar");
+        assert!(snapshot.page.is_none(), "nor the group list");
+
+        selection.set_tab(FILES);
+        let snapshot = read(&paths, &selection);
+        assert!(snapshot.files.is_some());
+        assert!(snapshot.sort.is_none());
+
+        selection.set_tab(SOURCES);
+        assert!(read(&paths, &selection).sources.is_some());
+
+        // The Status page is the one that needs more than itself: it counts the groups and
+        // names the slices of the storage bar after them.
+        selection.set_tab(STATUS);
+        let snapshot = read(&paths, &selection);
+        assert!(snapshot.status.is_some() && snapshot.page.is_some());
+        assert!(snapshot.files.is_none(), "but still not the file list");
+    }
+
+    /// What is not read is left alone, which is what makes a narrow read safe.
+    #[test]
+    fn a_page_that_was_not_read_keeps_what_it_had() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window.set_sort_name("beach.jpg".into());
+
+        // A snapshot with nothing in it at all: every page keeps what it knew.
+        apply(&window, Snapshot::default());
+        assert_eq!(window.get_sort_name(), "beach.jpg");
+    }
+
+    /// A window narrower than its contents clips them: the right-hand buttons go over the
+    /// edge and there is nothing to say they are there. So the declared minimum has to be
+    /// at least as wide as the widest tab, and every tab has to be able to reach it.
+    #[test]
+    fn nothing_falls_off_the_edge_at_the_smallest_window() {
+        use i_slint_backend_testing::ElementHandle;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+
+        // The Sort tab holds the widest row, and only once it has a file to show.
+        window.set_sort_have(true);
+        window.set_sort_name("IMG_20240817_181203.jpg".into());
+        window.set_sort_position("3 of 412".into());
+        window.set_sort_in_folder(128);
+        window.set_sort_folder("holidays/2024/corsica".into());
+        window.set_sort_group_id("g1".into());
+        window.set_sort_path("/photos/a.jpg".into());
+        window.set_sort_has_next(true);
+        window.set_sort_undo("Undo delete".into());
+
+        let narrowest = window.get_narrowest();
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(narrowest, 420.0));
+
+        // Every tab in the nav, the two Rust never reads for (Settings, About) included.
+        const TABS: i32 = 8;
+
+        for tab in STATUS..TABS {
+            window.set_tab(tab);
+
+            for kind in ["Button", "ComboBox", "LineEdit", "CheckBox"] {
+                for control in ElementHandle::find_by_element_type_name(&window, kind) {
+                    let right = control.absolute_position().x + control.size().width;
+                    assert!(
+                        right <= narrowest,
+                        "tab {tab}: {kind} {:?} reaches {right}, past the {narrowest} edge",
+                        control.accessible_label().unwrap_or_default()
+                    );
+                }
+            }
+        }
     }
 }

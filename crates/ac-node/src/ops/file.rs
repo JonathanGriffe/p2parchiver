@@ -251,6 +251,33 @@ pub struct Listing {
     pub rows: Vec<FileRow>,
 }
 
+/// The folders a group's files sit in, as path prefixes, shallowest first.
+///
+/// A group has no folders of its own: a folder exists only as the directory some file is
+/// under, so this is derived from the paths rather than stored. The group's own root is not
+/// in the list — it is not a folder, it is the absence of one.
+pub fn folders(paths: &Paths, needle: &str) -> Result<Vec<String>> {
+    let s = session(paths, needle)?;
+    let rows = s.files.list(s.id, None, false).context("listing files")?;
+
+    let mut out: Vec<String> = Vec::new();
+    for row in &rows {
+        let path = row.path.as_str();
+        // Every directory above the file, so a nested one can be filed into directly.
+        let mut at = 0;
+        while let Some(slash) = path[at..].find('/') {
+            at += slash;
+            let folder = &path[..at];
+            if !out.iter().any(|seen| seen == folder) {
+                out.push(folder.to_owned());
+            }
+            at += 1;
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 pub fn list(paths: &Paths, needle: &str, prefix: Option<&str>, removed: bool) -> Result<Listing> {
     let s = session(paths, needle)?;
     let rows = s
@@ -319,6 +346,9 @@ pub struct VerifyReport {
     pub untracked: Vec<RelPath>,
     /// Counted as missing too, but the reason is worth repeating.
     pub unreadable: Vec<(RelPath, String)>,
+    /// Rows the index claimed the bytes for that turned out not to be on disk, now marked
+    /// unheld so the daemon fetches them again.
+    pub requeued: Vec<RelPath>,
 }
 
 impl VerifyReport {
@@ -328,7 +358,7 @@ impl VerifyReport {
 }
 
 pub fn verify(paths: &Paths, needle: &str) -> Result<VerifyReport> {
-    let s = session(paths, needle)?;
+    let mut s = session(paths, needle)?;
     let rows = s.files.list(s.id, None, false).context("listing files")?;
 
     let mut report = VerifyReport {
@@ -337,21 +367,44 @@ pub fn verify(paths: &Paths, needle: &str) -> Result<VerifyReport> {
         changed: Vec::new(),
         untracked: Vec::new(),
         unreadable: Vec::new(),
+        requeued: Vec::new(),
     };
 
     for row in &rows {
         if !s.content.exists(&s.dir, &row.path) {
             report.missing.push(row.path.clone());
+            // Only the rows that claimed to hold it. One already marked unheld is already
+            // on the fetch loop's list, and saying it was requeued again would be a lie.
+            if row.have {
+                report.requeued.push(row.path.clone());
+            }
             continue;
         }
         match s.content.hash_at(&s.dir, &row.path) {
             Ok(hash) if hash != row.hash => report.changed.push(row.path.clone()),
             Ok(_) => {}
             Err(e) => {
+                // Not requeued: the bytes are there, this node just could not read them,
+                // and fetching over a file it cannot open would fail the same way.
                 report.unreadable.push((row.path.clone(), e.to_string()));
                 report.missing.push(row.path.clone());
             }
         }
+    }
+
+    // `have` is this node's own note about its own disk, kept out of the catalogue peers
+    // agree on, so correcting it changes nothing for anyone else. The daemon's fetch loop
+    // takes whatever is marked unheld, which is what makes this a repair and not a report.
+    for path in &report.requeued {
+        s.files
+            .mark_have(s.id, path, false)
+            .with_context(|| format!("marking {path} to be fetched again"))?;
+    }
+    if !report.requeued.is_empty() {
+        // Otherwise the group waits out whatever backoff it was on before it asks anyone.
+        s.files
+            .wanted_again(s.id)
+            .context("saying the group wants bytes again")?;
     }
 
     let indexed: std::collections::BTreeSet<_> = rows.iter().map(|r| r.path.clone()).collect();

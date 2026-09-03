@@ -3,7 +3,9 @@ import { StatusView, StorageSlice, TrafficRow } from "views/status.slint";
 import { GroupsView, GroupItem, MemberItem } from "views/groups.slint";
 import { PeersView, PeerItem } from "views/peers.slint";
 import { FilesView, FileItem } from "views/files.slint";
-import { SortView, SourceItem, FieldItem } from "views/sort.slint";
+import { SortView } from "views/sort.slint";
+import { SourcesView, SourceItem, FieldItem } from "views/sources.slint";
+import { AddSourceDialog } from "views/add-source.slint";
 import { SettingsView } from "views/settings.slint";
 import { SettingItem } from "views/sources-settings.slint";
 import { AboutView } from "views/about.slint";
@@ -56,7 +58,11 @@ export component MainWindow inherits Window {
     background: Theme.canvas;
     preferred-width: 1040px;
     preferred-height: 740px;
-    min-width: 560px;
+    // The widest tab needs this much before its right-hand buttons start going over the
+    // edge, and a window narrower than its contents clips them rather than shrinking them.
+    // Read back by the layout test that holds it to that.
+    out property <length> narrowest: 800px;
+    min-width: root.narrowest;
     min-height: 420px;
 
     // Everything below is written by Rust once per poll.
@@ -116,14 +122,22 @@ export component MainWindow inherits Window {
     in property <bool> sort-held;
     in property <string> sort-position;
     in property <int> sort-in-folder;
+    in property <bool> sort-has-next;
+    in property <bool> sort-has-previous;
+    in property <string> sort-undo;
     in property <image> sort-preview;
-    in property <string> sort-progress;
     in property <[string]> sort-group-names;
     in property <int> sort-group-index;
     in property <string> sort-group-id;
+    in property <[string]> sort-folder-names;
+    in property <int> sort-folder-index;
     in property <[SourceItem]> sources;
     in property <[string]> source-kinds;
     in-out property <[FieldItem]> source-fields;
+    // The implementation's shared settings, offered in the same dialog the first time.
+    in-out property <[FieldItem]> source-settings-fields;
+    // Which implementation the Add dialog is about, and empty when it is closed.
+    in-out property <string> adding-source;
     in property <[SettingItem]> source-settings;
 
     // The Settings page. Loaded once and after each save, never on the poll.
@@ -166,6 +180,7 @@ export component MainWindow inherits Window {
     callback browse(bool);
     callback remove-file(string);
     callback verify();
+    callback open-file-dir(string);
     callback save(bool, string, string, string);
     callback pick-storage-root(string) -> string;
     callback open-logs();
@@ -173,15 +188,21 @@ export component MainWindow inherits Window {
     callback join(string, string);
     callback copy-peer-id();
     callback sort-pick-group(int);
+    callback sort-pick-folder(int);
+    callback sort-add-folder(string);
     callback sort-step(bool);
     callback sort-file(string, bool);
     callback sort-delete(string, bool);
     callback sort-open(string);
-    callback import-pick(bool);
+    callback sort-reveal(string);
+    callback sort-undo-last();
     callback scan-source(string);
     callback remove-source(string);
     callback pick-source-kind(string);
     callback add-source(string, string);
+    callback setting-edited(int, string);
+    callback setting-browse(int, bool);
+    callback setting-cleared(int);
     callback field-edited(int, string);
     callback field-browse(int, bool);
     callback field-cleared(int);
@@ -189,6 +210,10 @@ export component MainWindow inherits Window {
 
     // Which page is up. In-out so a test can open the one it is about.
     in-out property <int> tab: 0;
+    // Rust reads only what the page on screen needs, so it has to be told when that
+    // changes rather than finding out on the next poll.
+    changed tab => { root.showing(self.tab); }
+    callback showing(int);
 
     HorizontalLayout {
         padding: Theme.md;
@@ -233,14 +258,19 @@ export component MainWindow inherits Window {
                 chosen => { root.tab = 4; }
             }
             NavItem {
-                label: "Settings";
+                label: "Sources";
                 selected: root.tab == 5;
                 chosen => { root.tab = 5; }
             }
             NavItem {
-                label: "About";
+                label: "Settings";
                 selected: root.tab == 6;
                 chosen => { root.tab = 6; }
+            }
+            NavItem {
+                label: "About";
+                selected: root.tab == 7;
+                chosen => { root.tab = 7; }
             }
 
             Rectangle { vertical-stretch: 1; }
@@ -321,6 +351,7 @@ export component MainWindow inherits Window {
                 browse(folder) => { root.browse(folder); }
                 remove(path) => { root.remove-file(path); }
                 verify() => { root.verify(); }
+                open-dir(dir) => { root.open-file-dir(dir); }
             }
 
             if root.tab == 4 : SortView {
@@ -335,33 +366,45 @@ export component MainWindow inherits Window {
                 held: root.sort-held;
                 position: root.sort-position;
                 in-folder: root.sort-in-folder;
+                has-next: root.sort-has-next;
+                has-previous: root.sort-has-previous;
+                undo: root.sort-undo;
                 preview: root.sort-preview;
-                progress: root.sort-progress;
                 group-names: root.sort-group-names;
                 group-index: root.sort-group-index;
                 group-id: root.sort-group-id;
-                sources: root.sources;
-                kinds: root.source-kinds;
-                fields: root.source-fields;
+                folder-names: root.sort-folder-names;
+                folder-index: root.sort-folder-index;
                 busy: root.busy;
                 vertical-stretch: 1;
 
                 pick-group(at) => { root.sort-pick-group(at); }
+                pick-folder(at) => { root.sort-pick-folder(at); }
+                add-folder(name) => { root.sort-add-folder(name); }
                 step(forward) => { root.sort-step(forward); }
                 file(hash, folder) => { root.sort-file(hash, folder); }
                 delete(hash, folder) => { root.sort-delete(hash, folder); }
                 open(path) => { root.sort-open(path); }
-                import(folder) => { root.import-pick(folder); }
-                scan(dir) => { root.scan-source(dir); }
-                remove(dir) => { root.remove-source(dir); }
-                pick-kind(source) => { root.pick-source-kind(source); }
-                add(source, name) => { root.add-source(source, name); }
-                field-edited(at, value) => { root.field-edited(at, value); }
-                field-browse(at, several) => { root.field-browse(at, several); }
-                field-cleared(at) => { root.field-cleared(at); }
+                reveal(path) => { root.sort-reveal(path); }
+                undo-last => { root.sort-undo-last(); }
             }
 
-            if root.tab == 5 : SettingsView {
+            if root.tab == 5 : SourcesView {
+                sources: root.sources;
+                kinds: root.source-kinds;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                scan(dir) => { root.scan-source(dir); }
+                remove(dir) => { root.remove-source(dir); }
+                // Loading the picked implementation's fields is what opens the dialog.
+                add-source(source) => {
+                    root.adding-source = source;
+                    root.pick-source-kind(source);
+                }
+            }
+
+            if root.tab == 6 : SettingsView {
                 mdns: root.mdns;
                 storage-root: root.config-storage-root;
                 storage-max: root.storage-max;
@@ -380,7 +423,7 @@ export component MainWindow inherits Window {
                 join(t, u) => { root.join(t, u); }
             }
 
-            if root.tab == 6 : AboutView {
+            if root.tab == 7 : AboutView {
                 version: root.version;
                 peer-id: root.peer-id;
                 home: root.home;
@@ -405,6 +448,22 @@ export component MainWindow inherits Window {
                 }
             }
         }
+    }
+
+    if root.adding-source != "" : AddSourceDialog {
+        source: root.adding-source;
+        fields: root.source-fields;
+        settings: root.source-settings-fields;
+        busy: root.busy;
+
+        add(name) => { root.add-source(root.adding-source, name); root.adding-source = ""; }
+        field-edited(at, value) => { root.field-edited(at, value); }
+        field-browse(at, several) => { root.field-browse(at, several); }
+        field-cleared(at) => { root.field-cleared(at); }
+        setting-edited(at, value) => { root.setting-edited(at, value); }
+        setting-browse(at, several) => { root.setting-browse(at, several); }
+        setting-cleared(at) => { root.setting-cleared(at); }
+        dismissed => { root.adding-source = ""; }
     }
 
     if root.show-enrol : EnrolDialog {

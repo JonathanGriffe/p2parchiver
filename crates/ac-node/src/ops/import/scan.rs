@@ -53,6 +53,18 @@ pub fn scan(paths: &Paths, needle: &str) -> Result<Scanned> {
 
 /// The scan itself, over an already-opened source, so the daemon and a test can drive it
 /// without going back through the registry.
+/// The source is somewhere else. Whatever the scan had got through stands; what it did not
+/// reach is simply not known yet.
+///
+/// Written down rather than merely returned: the Sources tab is read long after any scan ran,
+/// and "not there when we last looked" is what it shows. `complete` stays false, so nothing is
+/// retired on the strength of a listing that ended early.
+fn away(ledger: &Ledger, row: &SourceRow, mut out: Scanned) -> Result<Scanned> {
+    out.reachable = false;
+    ledger.unreachable(&row.dir)?;
+    Ok(out)
+}
+
 pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Result<Scanned> {
     let mut out = Scanned {
         name: row.name.clone(),
@@ -61,8 +73,7 @@ pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Resul
     };
 
     if !source.reachable() {
-        out.reachable = false;
-        return Ok(out);
+        return away(ledger, row, out);
     }
 
     let mut cursor = None;
@@ -70,6 +81,14 @@ pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Resul
         let page = match source.scan(cursor.as_ref()) {
             Ok(page) => page,
             Err(e) => {
+                // Asked again before it is called a failure. The check above is one moment,
+                // and a phone can walk out of the house during the pages that follow — which
+                // is not the source breaking, it is the source leaving. Recorded as a failure
+                // it goes red on the Sources tab, and the daemon backs off for hours instead
+                // of looking again in minutes, so a phone that came home would sit unread.
+                if !source.reachable() {
+                    return away(ledger, row, out);
+                }
                 let why = e.to_string();
                 ledger.failed(&row.dir, &why)?;
                 return Err(anyhow!(why)).with_context(|| format!("scanning {}", row.name));
@@ -116,7 +135,6 @@ mod tests {
     use crate::ops::import::fixtures::*;
     use crate::ops::import::scan;
     use crate::ops::import::sources::add_source;
-
     use ac_import::source::SourceType;
 
     #[test]
@@ -205,5 +223,48 @@ mod tests {
         );
         assert_eq!(ledger.owed(&row.dir).unwrap(), 1);
         assert_eq!(ledger.claim(at, 8).unwrap().len(), 1);
+    }
+
+    /// Being there is asked once, and the pages are read after that. A phone that leaves the
+    /// house in between is still only elsewhere — recorded as a failure it would go red on the
+    /// Sources tab, and the daemon would back off for hours rather than looking again in
+    /// minutes, leaving a phone that came home unread.
+    #[test]
+    fn a_source_that_leaves_partway_through_is_elsewhere_rather_than_broken() {
+        let home = home();
+        let paths = paths(&home);
+        let ledger = ledger(&paths).unwrap();
+
+        let row = add_source(&paths, "folder", "Phone", picked(home.path())).unwrap();
+        let phone = fake(SourceType::Intermittent, &["a.jpg"]).walks_out();
+        assert!(phone.reachable(), "it is here when the scan starts");
+
+        let scanned = scan_with(&ledger, &row, &phone).unwrap();
+        assert!(!scanned.reachable, "and elsewhere by the time it is read");
+        assert!(!scanned.complete, "so nothing may be retired on it");
+
+        let back = ledger.source(&row.dir).unwrap().unwrap();
+        assert_eq!(back.last_error, None, "leaving is not breaking");
+        assert!(!back.reachable, "it is simply not there");
+        assert_eq!(back.scanned_at, 0, "and it has not been scanned");
+    }
+
+    /// The other half: a source that is still there and still will not answer has broken, and
+    /// has to keep saying so. Without this the fix above would swallow every failure.
+    #[test]
+    fn a_source_that_is_there_and_still_fails_is_broken() {
+        let home = home();
+        let paths = paths(&home);
+        let ledger = ledger(&paths).unwrap();
+
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        assert!(scan_with(&ledger, &row, &Stubborn).is_err(), "it failed");
+
+        let back = ledger.source(&row.dir).unwrap().unwrap();
+        assert_eq!(
+            back.last_error.as_deref(),
+            Some("the drive said no"),
+            "and the reason is kept for the list to show"
+        );
     }
 }
