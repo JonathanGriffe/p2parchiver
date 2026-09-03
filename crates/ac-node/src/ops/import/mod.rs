@@ -5,6 +5,8 @@
 //! itself, where unsorted bytes wait, and the one question the host can answer that the
 //! importer cannot.
 
+use std::path::Path;
+
 use ac_files::{Files, PathError, RelPath};
 use ac_import::ledger::Ledger;
 use ac_import::source::{Held, Result as SourceResult};
@@ -20,8 +22,8 @@ pub mod sources;
 pub(crate) mod fixtures;
 
 pub use backlog::{
-    Backlog, Filed, Inbox, Waiting, backlog, drop, drop_folder, find, forget, in_folder, sort,
-    sort_folder, sweep_dropped, undo,
+    Backlog, Filed, Inbox, Waiting, adopt_unsorted, backlog, drop, drop_folder, find, forget,
+    in_folder, sort, sort_folder, sweep_dropped, undo,
 };
 pub use fetch::{Brought, Fetched, Outcome, Pace, Pump, drain, pump};
 pub use scan::{Scanned, pollable, scan, scan_with};
@@ -59,4 +61,8 @@ impl Held for HeldHere<'_> {
     fn held(&self, hash: &str) -> SourceResult<bool> {
         Ok(self.0.held_anywhere(hash).unwrap_or(false))
     }
+}
+
+pub(super) fn ledger_at(db: &Path) -> Result<Ledger> {
+    Ledger::open(db).with_context(|| format!("opening the import ledger at {}", db.display()))
 }

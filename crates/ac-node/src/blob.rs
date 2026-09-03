@@ -161,7 +161,7 @@ impl Transfers {
             let peer = want.peer;
             let group = want.group;
             let path = want.path.clone();
-            let event = match download(control, &content, &want, &db, me, &down).await {
+            let event = match bring_in(control, &content, &want, &db, me, &down).await {
                 Ok(()) => PeerEvent::BlobDone { peer, group, path },
                 Err(why) => PeerEvent::BlobFailed {
                     peer,
@@ -175,6 +175,45 @@ impl Transfers {
         });
         true
     }
+}
+
+/// Get one file into the group, from wherever it is cheapest.
+///
+/// Almost always that means asking the peer. The exception is a file this node imported and
+/// has not sorted yet: the bytes are already here, so they are moved into the group and
+/// nothing is transferred. Either way the caller sees one outcome and the row ends up held.
+async fn bring_in(
+    control: libp2p_stream::Control,
+    content: &Content,
+    want: &Wanted,
+    db: &std::path::Path,
+    me: PeerId,
+    down: &Throttle,
+) -> anyhow::Result<()> {
+    // Asked before the stream is opened, because the point is not to open one.
+    let taken = crate::ops::import::adopt_unsorted(
+        db,
+        content,
+        &want.group.to_string(),
+        &want.dir,
+        &want.path,
+        &want.hash,
+    )
+    .unwrap_or_else(|e| {
+        // Never fatal: a peer has the bytes, and fetching them is what would have happened
+        // anyway. Worth a line, because it means the import ledger is unhappy about something.
+        tracing::warn!(hash = %want.hash, error = %format!("{e:#}"), "could not take the unsorted copy");
+        false
+    });
+
+    if taken {
+        tracing::info!(%want.path, "already here unsorted; filed rather than fetched");
+        let mut files = Files::open(db, me)?;
+        files.mark_have(want.group, &want.path, true)?;
+        return Ok(());
+    }
+
+    download(control, content, want, db, me, down).await
 }
 
 /// Ask one peer for one file and write it to disk.

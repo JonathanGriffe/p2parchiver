@@ -1,12 +1,14 @@
 //! What became of the bytes: the backlog waiting to be sorted, and filing, dropping
 //! or giving one back.
 
+use std::path::Path;
+
 use ac_files::{Content, FileRow, Files, RelPath};
 use ac_import::ledger::{Imported, Ledger, State};
 use ac_net::config::Paths;
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::{UNSORTED, ledger, unsorted_path};
+use super::{UNSORTED, ledger, ledger_at, unsorted_path};
 use crate::ops::now;
 
 /// One file waiting to be sorted.
@@ -390,6 +392,61 @@ fn free_name(session: &crate::ops::file::Session, row: &Imported, into: &str) ->
     }
 }
 
+/// Take bytes already waiting to be sorted, instead of fetching them from a peer.
+///
+/// The reverse of the redundancy the pump already avoids: there, a file being imported turns
+/// out to be in a group already and is not kept. Here it is the other way round — we imported
+/// a photo, and before anybody sorted it a friend added the same photo to a group we are in.
+/// The catalogue says the group is missing those bytes, and it is, but they are on this disk.
+///
+/// Filing it is what makes this safe rather than merely quick. The bytes leave `.unsorted`, so
+/// leaving the import waiting would leave the Sort tab offering a file that is no longer
+/// there; marking it sorted into that group is exactly what sorting it by hand would have
+/// done, and it is what already happens when a group is found to hold a file at import time.
+///
+/// `false` means nothing here matched, and it has to be fetched after all — including when
+/// the move itself fails, because downloading is always a correct answer and this is only ever
+/// an optimisation.
+pub fn adopt_unsorted(
+    db: &Path,
+    content: &Content,
+    group: &str,
+    dir: &str,
+    to: &RelPath,
+    hash: &str,
+) -> Result<bool> {
+    let ledger = ledger_at(db)?;
+    let Some(row) = ledger.get(hash)? else {
+        return Ok(false);
+    };
+    // Only one that is still waiting. A sorted row's bytes are in some group already, and a
+    // dropped one's are gone or going.
+    if row.state != State::Unsorted {
+        return Ok(false);
+    }
+
+    let from = located(&row)?;
+    if !content.exists(UNSORTED, &from) {
+        return Ok(false);
+    }
+
+    // A rename, so it either happened or nothing did. The one failure worth naming is a
+    // filesystem mounted under the group's directory, which makes this a cross-device move;
+    // sorting by hand copies instead, but here there is a peer holding the bytes and asking
+    // it is simpler than reimplementing the copy.
+    if let Err(e) = content.adopt(UNSORTED, &from, dir, to) {
+        tracing::debug!(%hash, error = %e, "could not take the unsorted copy; fetching instead");
+        return Ok(false);
+    }
+
+    // After the move, the same order sorting by hand uses: the bytes are the thing that is
+    // hard to put back, so they move first and the row follows.
+    ledger
+        .sorted(hash, group)
+        .with_context(|| format!("filing {} into {group}", row.name))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +467,98 @@ mod tests {
 
         // No kind of path: the source's own directory is still somewhere.
         assert_eq!(path("../../etc").as_str(), "phone-a1b2/IMG_1.jpg");
+    }
+
+    /// The reverse of the redundancy the pump avoids: we imported a photo, and before anybody
+    /// sorted it a friend added the same photo to a group we are in. The catalogue says the
+    /// group is missing those bytes, and it is — but they are already on this disk.
+    #[test]
+    fn a_file_already_waiting_to_be_sorted_is_taken_rather_than_fetched() {
+        let home = home();
+        let (paths, _) = imported(&home, &["DCIM/a.jpg"]);
+        let group = group(&paths, "Holidays");
+
+        let waiting = super::unsorted(&paths, None, 10).unwrap();
+        let file = &waiting[0];
+
+        let (mut files, content) = store(&paths);
+        let dir = files.dir_for(group, "Holidays").unwrap();
+        let landed = RelPath::parse("a.jpg").unwrap();
+        assert!(content.exists(UNSORTED, &file.path));
+
+        let took = adopt_unsorted(
+            &paths.db_file(),
+            &content,
+            &group.to_string(),
+            &dir,
+            &landed,
+            &file.row.hash,
+        )
+        .unwrap();
+        assert!(took, "the bytes were here, so nothing had to be fetched");
+
+        assert!(!content.exists(UNSORTED, &file.path), "it left");
+        assert!(
+            content.exists(&dir, &landed),
+            "and arrived where the group wants it"
+        );
+
+        // Filed, not merely moved. Leaving it waiting would leave the Sort tab offering a
+        // file whose bytes are no longer where it would look for them.
+        let back = ledger(&paths)
+            .unwrap()
+            .get(&file.row.hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.state, State::Sorted);
+        assert_eq!(back.group_id, Some(group.to_string()));
+        assert_eq!(super::unsorted(&paths, None, 10).unwrap().len(), 0);
+
+        // Asked again it declines, which is what makes it safe to ask before every fetch.
+        let again = adopt_unsorted(
+            &paths.db_file(),
+            &content,
+            &group.to_string(),
+            &dir,
+            &landed,
+            &file.row.hash,
+        )
+        .unwrap();
+        assert!(!again, "nothing is waiting under that hash any more");
+    }
+
+    /// It is asked before every blob fetch, so the ordinary answer is no — and saying no has
+    /// to be cheap and total, because saying yes wrongly would skip a download that was owed.
+    #[test]
+    fn nothing_waiting_under_that_hash_means_fetch_it_as_usual() {
+        let home = home();
+        let (paths, _) = imported(&home, &["DCIM/a.jpg"]);
+        let group = group(&paths, "Holidays");
+
+        let (mut files, content) = store(&paths);
+        let dir = files.dir_for(group, "Holidays").unwrap();
+        let landed = RelPath::parse("a.jpg").unwrap();
+
+        let ask = |hash: &str| {
+            adopt_unsorted(
+                &paths.db_file(),
+                &content,
+                &group.to_string(),
+                &dir,
+                &landed,
+                hash,
+            )
+            .unwrap()
+        };
+
+        // A hash nothing here ever imported: the ordinary case, every fetch.
+        assert!(!ask(&"ab".repeat(32)));
+
+        // One that was imported and thrown away. Its bytes are gone or going, and taking a
+        // deleted file back into a group is the one thing the state rules exist to prevent.
+        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
+        super::drop(&paths, &file.row.hash).unwrap();
+        assert!(!ask(&file.row.hash));
     }
 
     #[test]
