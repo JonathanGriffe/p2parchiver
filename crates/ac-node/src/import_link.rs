@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,6 +18,15 @@ use crate::throttle::Throttle;
 
 /// Downloads in flight, matching what the rest of this node already allows itself.
 const FETCH_CONCURRENCY: usize = 8;
+
+/// How many references one worker leases at a time.
+///
+/// Not how long a worker runs — it runs until the queue is dry — but how much of the queue it
+/// holds while it does. A claim is a lease, so whatever one worker takes, the other seven
+/// cannot see: take the queue whole and a fifty-photograph import runs on one thread while
+/// seven others find nothing and go home. One worker's worth, so eight of them between them
+/// hold [`FETCH_CONCURRENCY`] times this and a short queue is still shared out.
+const CLAIM: usize = 8;
 
 /// First wait after a failed scan, doubling up to a full cadence.
 const MIN_BACKOFF: i64 = 60;
@@ -53,6 +63,14 @@ pub struct ImportLink {
     /// Whether the last check said there was no room, so it is said once rather than
     /// every five seconds.
     full: bool,
+    /// Told to the workers when they are to stop taking new files: the disk filled, or the
+    /// node is going down. Read between one file and the next, never during one, so a
+    /// download already under way is finished rather than abandoned.
+    ///
+    /// A worker holds a blocking thread, and a blocking thread cannot be cancelled — the
+    /// runtime waits for every one of them on the way out. Without this, a worker part-way
+    /// through a long queue would hold up the whole shutdown.
+    hold: Arc<AtomicBool>,
     space: Option<Space>,
     done: mpsc::UnboundedSender<Done>,
     inbox: mpsc::UnboundedReceiver<Done>,
@@ -65,8 +83,13 @@ pub enum Done {
         name: String,
         outcome: std::result::Result<Scanned, String>,
     },
-    /// `None` when the claim came back empty.
-    Fetch(Option<Brought>),
+    /// One file a worker has been through, whatever became of it. Sent as it happens, so a
+    /// long run is reported as it goes rather than in a heap at the end.
+    Fetch(Brought),
+    /// A worker has ended and given its thread back. `brought` is nought when it found
+    /// nothing waiting, which is what tells an idle node to send one worker looking next
+    /// time rather than eight.
+    RunEnded { brought: u64 },
 }
 
 /// The shared inbound budget, taken from a blocking thread.
@@ -128,6 +151,7 @@ impl ImportLink {
             running: 0,
             idle: false,
             full: false,
+            hold: Arc::new(AtomicBool::new(false)),
             space: None,
             done: sender,
             inbox,
@@ -213,9 +237,12 @@ impl ImportLink {
                     }
                 }
             }
-            Done::Fetch(brought) => {
+            // A file is not the end of anything: the worker that brought it is still
+            // holding its thread and still working through what it claimed.
+            Done::Fetch(_) => {}
+            Done::RunEnded { brought } => {
                 self.running = self.running.saturating_sub(1);
-                self.idle = brought.is_none();
+                self.idle = *brought == 0;
             }
         }
     }
@@ -235,7 +262,7 @@ impl ImportLink {
                 ),
                 Err(why) => tracing::warn!(source = %name, %why, "scan failed"),
             },
-            Done::Fetch(Some(brought)) => match brought.outcome {
+            Done::Fetch(brought) => match brought.outcome {
                 Outcome::Kept { size } => {
                     tracing::info!(source = %brought.source, file = %brought.name, size, "imported")
                 }
@@ -246,7 +273,7 @@ impl ImportLink {
                     tracing::debug!(source = %brought.source, file = %brought.name, "nothing to bring in")
                 }
             },
-            Done::Fetch(None) => {}
+            Done::RunEnded { brought } => tracing::debug!(brought, "an import worker finished"),
         }
     }
 
@@ -294,12 +321,16 @@ impl ImportLink {
                 tracing::warn!(?why, "no room for more imports; the queue will wait");
             }
             self.full = true;
+            // Not only the ones not started yet: a worker runs until the queue is dry, so
+            // without this the disk filling would go unnoticed until it was.
+            self.hold.store(true, Ordering::Relaxed);
             return;
         }
         if self.full {
             tracing::info!("there is room again; imports resume");
             self.full = false;
         }
+        self.hold.store(false, Ordering::Relaxed);
 
         // Nothing was owed last time we looked, so one probe answers for all eight.
         let want = match self.idle {
@@ -312,12 +343,25 @@ impl ImportLink {
     }
 
     fn spawn_fetch(&mut self) {
-        let (paths, pace, done) = (self.paths.clone(), self.pace.clone(), self.done.clone());
+        let (paths, pace) = (self.paths.clone(), self.pace.clone());
+        let (done, hold) = (self.done.clone(), self.hold.clone());
         self.running += 1;
 
         tokio::task::spawn_blocking(move || {
-            let _ = done.send(Done::Fetch(fetch_one(&paths, pace)));
+            let brought = fetch_run(&paths, pace, &hold, &done);
+            let _ = done.send(Done::RunEnded { brought });
         });
+    }
+}
+
+/// Tell the workers to stop, so a node on its way out is not waiting for the queue.
+///
+/// The runtime waits for every blocking thread it handed out, and a fetch holds one. This
+/// runs before that wait — it is the difference between a shutdown that takes one file and
+/// one that takes the whole import.
+impl Drop for ImportLink {
+    fn drop(&mut self) {
+        self.hold.store(true, Ordering::Relaxed);
     }
 }
 
@@ -341,25 +385,51 @@ fn ready(
     waiting_until.is_none_or(|until| at >= until) && due(kind, scanned_at, backoff, at)
 }
 
-/// One claim's worth of one file, on a blocking thread. Errors are logged rather than
-/// returned: a claim that could not be taken is not this tick's problem, and the row it
-/// would have taken is still owed.
-fn fetch_one(paths: &Paths, pace: Arc<dyn Pace>) -> Option<Brought> {
-    let mut pump = match import::pump(paths, Some(1)) {
-        Ok(pump) => pump.paced(pace),
+/// One worker's whole run, on a blocking thread: everything owed, a batch at a time, until
+/// the queue is dry or the node says stop. Answers with how many files it went through.
+///
+/// The pump is built once and kept for the run, which is the whole point of it. It holds the
+/// identity, two database connections and — once it reaches the first file — the opened
+/// source, with the sign-in that opening one costs. Built per file instead, as this used to
+/// be, every one of those is paid for every photograph, and nothing the pump caches is ever
+/// read a second time: it claims one reference, opens one source, and is thrown away.
+///
+/// Errors are logged rather than returned: a claim that could not be taken is not this
+/// tick's problem, and the row it would have taken is still owed.
+fn fetch_run(
+    paths: &Paths,
+    pace: Arc<dyn Pace>,
+    hold: &AtomicBool,
+    done: &mpsc::UnboundedSender<Done>,
+) -> u64 {
+    let mut pump = match import::pump(paths, None) {
+        Ok(pump) => pump.taking(CLAIM).paced(pace),
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "could not open the import pump");
-            return None;
+            return 0;
         }
     };
 
-    let brought = match pump.next() {
-        Ok(brought) => brought,
-        Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "an import fetch could not run");
-            None
+    let mut brought = 0;
+    // Asked between files and never during one, so stopping costs at most the download in
+    // hand rather than throwing it away part-written.
+    while !hold.load(Ordering::Relaxed) {
+        match pump.next() {
+            Ok(Some(one)) => {
+                brought += 1;
+                let _ = done.send(Done::Fetch(one));
+            }
+            // Nothing more is owed that this worker may take.
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "an import fetch could not run");
+                break;
+            }
         }
-    };
+    }
+
+    // Whatever is still claimed goes back, however the run ended: stopped part-way through a
+    // batch, the rest of it is owed again rather than waiting out the lease.
     if let Err(error) = pump.finish() {
         tracing::debug!(error = %format!("{error:#}"), "could not give back what was claimed");
     }
@@ -461,6 +531,81 @@ mod tests {
 
         settle(&mut link, roomy()).await;
         assert_eq!(import::ledger(&paths).unwrap().waiting().unwrap(), 2);
+    }
+
+    /// The whole of what the pump is for: a worker keeps it for the run.
+    ///
+    /// With more owed than there are workers, some worker has to come back having brought in
+    /// more than one — and every file after its first is one it did not pay a fresh identity,
+    /// two database connections and a source sign-in for. Built per file, as this used to be,
+    /// every run brings exactly one and the caches inside the pump are never read twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_keeps_its_pump_for_the_whole_run() {
+        let home = home();
+        let names: Vec<String> = (0..20).map(|n| format!("{n}.jpg")).collect();
+        let (paths, dir) = owed(&home, &names.iter().map(String::as_str).collect::<Vec<_>>());
+
+        let mut link = link(&paths);
+        let mut runs = Vec::new();
+        link.housekeeping(now(), roomy());
+        while link.running > 0 {
+            let Some(done) = link.finished().await else {
+                break;
+            };
+            if let Done::RunEnded { brought } = &done {
+                runs.push(*brought);
+            }
+            link.on_done(done);
+        }
+
+        assert_eq!(
+            import::ledger(&paths).unwrap().owed(&dir).unwrap(),
+            0,
+            "the queue drained"
+        );
+        assert_eq!(runs.iter().sum::<u64>(), 20, "every file went through once");
+        assert!(
+            runs.iter().any(|brought| *brought > 1),
+            "a pump per file would make every one of these a 1: {runs:?}"
+        );
+        // The other half of it: a run that keeps its pump must not keep the queue as well.
+        // Leasing all twenty would leave the other seven workers nothing to do, and an
+        // import small enough to fit in one claim would come in on one thread.
+        assert!(
+            runs.iter().filter(|brought| **brought > 0).count() > 1,
+            "one worker took the lot and the rest went home: {runs:?}"
+        );
+    }
+
+    /// The disk filling has to reach the workers already running, not only the ones not
+    /// started yet: a run lasts until the queue is dry, and a queue can be longer than the
+    /// disk it is landing on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_disk_tells_the_workers_already_running_to_stop() {
+        let home = home();
+        let (paths, _) = owed(&home, &["a.jpg"]);
+        let mut link = link(&paths);
+        let hold = link.hold.clone();
+
+        link.housekeeping(now(), Some(Space { free: 0, held: 0 }));
+        assert!(hold.load(Ordering::Relaxed), "stop where you are");
+
+        settle(&mut link, roomy()).await;
+        assert!(!hold.load(Ordering::Relaxed), "and carry on again");
+    }
+
+    /// A blocking thread cannot be cancelled and the runtime waits for every one, so a node
+    /// on its way out has to ask rather than simply stop listening.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_link_tells_the_workers_to_stop() {
+        let home = home();
+        let (paths, _) = owed(&home, &["a.jpg"]);
+        let link = link(&paths);
+        let hold = link.hold.clone();
+
+        assert!(!hold.load(Ordering::Relaxed));
+        drop(link);
+        assert!(hold.load(Ordering::Relaxed), "asked on the way out");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -100,6 +100,7 @@ pub fn pump(paths: &Paths, limit: Option<usize>) -> Result<Pump> {
         content,
         ledger: ledger(paths)?,
         left: limit,
+        take: BATCH,
         queue: VecDeque::new(),
         open: None,
         put_back: Vec::new(),
@@ -140,6 +141,9 @@ pub struct Pump {
     ledger: Ledger,
     /// How many more references may be claimed, or every one of them.
     left: Option<usize>,
+    /// How many to claim at a time. How long the pump lives is a separate question from how
+    /// much it holds at once — see [`Pump::taking`].
+    take: usize,
     /// The claim in hand, in source order so each source is opened once.
     queue: VecDeque<Owed>,
     /// The source the front of the queue belongs to, opened once for the run of it.
@@ -154,6 +158,18 @@ impl Pump {
     /// Hold this run to a download budget.
     pub fn paced(mut self, pace: Arc<dyn Pace>) -> Self {
         self.pace = Some(pace);
+        self
+    }
+
+    /// Claim this many at a time instead of [`BATCH`].
+    ///
+    /// A claim is a lease: what one pump takes, no other pump can see. Alone — one command,
+    /// draining everything — the biggest batch is the best one, and that is the default. Run
+    /// eight at once, it is the opposite: the first to ask would lease a short queue whole
+    /// and leave the other seven nothing, so a fifty-photograph import would run on one
+    /// thread. Taking less at a time shares the queue out without shortening the run.
+    pub fn taking(mut self, take: usize) -> Self {
+        self.take = take.max(1);
         self
     }
 
@@ -216,8 +232,8 @@ impl Pump {
     fn refill(&mut self) -> Result<bool> {
         let room = match self.left {
             Some(0) => return Ok(false),
-            Some(left) => left.min(BATCH),
-            None => BATCH,
+            Some(left) => left.min(self.take),
+            None => self.take,
         };
 
         let mut taken = self
