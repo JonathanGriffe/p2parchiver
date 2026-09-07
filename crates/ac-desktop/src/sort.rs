@@ -436,11 +436,12 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             let (paths, nudge, selection) = (paths.clone(), nudge.clone(), selection.clone());
 
             work::run(&weak, &nudge, move || {
-                let said = ops::import::undo(&paths, &taken.hash)?;
+                ops::import::undo(&paths, &taken.hash)?;
                 // It is back in the backlog, and wherever the reader had got to no longer
-                // describes where it is.
+                // describes where it is — so the file itself comes back on screen, which is
+                // the whole of what taking it back means.
                 selection.rewind();
-                Ok(said)
+                Ok(String::new())
             });
         }
     });
@@ -453,10 +454,8 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                 return;
             }
             let path = PathBuf::from(path.as_str());
-            let outcome = crate::shell::reveal(&path).map(|()| match path.parent() {
-                Some(folder) => format!("showing {}", folder.display()),
-                None => format!("showing {}", path.display()),
-            });
+            // A file manager opening is its own confirmation; only its refusal to is news.
+            let outcome = crate::shell::reveal(&path).map(|()| String::new());
             if let Some(window) = weak.upgrade() {
                 work::finish(&window, outcome, &nudge);
             }
@@ -482,7 +481,18 @@ fn remember(paths: &Paths, selection: &Selection, hash: &str, name: &str, droppe
 }
 
 /// One line for what a filing or a deletion did.
+/// What to say about a filing, and nothing at all for the ordinary one.
+///
+/// See [`crate::work::finish`] for why an empty message is the usual answer.
+///
+/// Filing the photograph on screen moves to the next one, which has already said it happened.
+/// A count is worth a line only when it is a count nobody could have seen — a bulk action, or
+/// one where something did not go through.
 fn said(filed: &ops::import::Filed, did: &str) -> String {
+    if filed.done <= 1 && filed.missing == 0 && filed.failed.is_empty() {
+        return String::new();
+    }
+
     let mut out = format!("{} {did}", filed.done);
     if filed.missing > 0 {
         out += &format!(", {} already gone from disk", filed.missing);
@@ -495,6 +505,41 @@ fn said(filed: &ops::import::Filed, did: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Filing the photograph on screen moves to the next one, which has already said what
+    /// happened. A line under it saying "1 filed" is furniture that has to be read to be
+    /// dismissed — so the ordinary success is silent, and only what cannot be seen is said.
+    #[test]
+    fn an_ordinary_filing_says_nothing_and_a_bulk_one_says_how_many() {
+        use ac_node::ops::import::Filed;
+
+        let one = Filed {
+            done: 1,
+            ..Filed::default()
+        };
+        assert_eq!(super::said(&one, "filed"), "", "the tab already moved on");
+
+        let none = Filed::default();
+        assert_eq!(super::said(&none, "filed"), "", "nothing happened, quietly");
+
+        // A count nobody could have arrived at by looking is worth the line.
+        let many = Filed {
+            done: 128,
+            ..Filed::default()
+        };
+        assert_eq!(super::said(&many, "filed"), "128 filed");
+
+        // And so is anything that did not go through.
+        let partly = Filed {
+            done: 1,
+            missing: 2,
+            ..Filed::default()
+        };
+        assert_eq!(
+            super::said(&partly, "deleted"),
+            "1 deleted, 2 already gone from disk"
+        );
+    }
+
     use super::*;
     use crate::groups::tests::home;
     use crate::selection::Sorting;

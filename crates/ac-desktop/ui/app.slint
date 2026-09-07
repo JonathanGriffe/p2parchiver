@@ -138,6 +138,10 @@ export component MainWindow inherits Window {
     in-out property <[FieldItem]> source-settings-fields;
     // Which implementation the Add dialog is about, and empty when it is closed.
     in-out property <string> adding-source;
+    // What a sign-in is waiting on, while it waits. Written by the poll, so it appears
+    // whether the sign-in was started here or from a command.
+    in property <image> pairing-code;
+    in property <string> pairing-says;
     // Whether one is being added right now. Its own flag rather than `busy`, because adding
     // can mean waiting on a browser and the rest of the tab has no reason to stop.
     in-out property <bool> source-adding;
@@ -211,6 +215,7 @@ export component MainWindow inherits Window {
     callback field-cleared(int);
     callback save-setting(string, string, string);
     callback sign-in-source(string);
+    callback stop-adding();
 
     // Which page is up. In-out so a test can open the one it is about.
     in-out property <int> tab: 0;
@@ -461,19 +466,26 @@ export component MainWindow inherits Window {
     }
 
     if root.adding-source != "" : AddSourceDialog {
+        code: root.pairing-code;
+        waiting: root.pairing-says;
         source: root.adding-source;
         fields: root.source-fields;
         settings: root.source-settings-fields;
         busy: root.busy;
 
-        add(name) => { root.add-source(root.adding-source, name); root.adding-source = ""; }
+        // The dialog stays up: a sign-in that has to show somebody a code needs somewhere
+        // to show it, and this is that somewhere. Rust closes it when the add finishes.
+        adding: root.source-adding;
+        add(name) => { root.add-source(root.adding-source, name); }
         field-edited(at, value) => { root.field-edited(at, value); }
         field-browse(at, several) => { root.field-browse(at, several); }
         field-cleared(at) => { root.field-cleared(at); }
         setting-edited(at, value) => { root.setting-edited(at, value); }
         setting-browse(at, several) => { root.setting-browse(at, several); }
         setting-cleared(at) => { root.setting-cleared(at); }
-        dismissed => { root.adding-source = ""; }
+        // Closing it stops what it was waiting for. Otherwise the button that opened this
+        // stays disabled for as long as the wait had left to run.
+        dismissed => { root.stop-adding(); root.adding-source = ""; }
     }
 
     if root.show-enrol : EnrolDialog {

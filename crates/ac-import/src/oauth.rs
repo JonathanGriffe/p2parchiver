@@ -6,8 +6,9 @@
 //! process can be reached at that address, which is what makes it safe to name as the place
 //! to return to, and what makes it work without this application owning a domain.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -23,6 +24,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Long enough that guessing one is not worth trying, in the alphabet a URL carries whole.
 const NONCE_BYTES: usize = 32;
+
+/// How often the wait looks up from the socket to see whether it has been given up on.
+const POLL: Duration = Duration::from_millis(100);
+
+/// Set when somebody closes the window this was asking through. Cleared at the start of every
+/// flow, so a sign-in given up on does not stop the next one before it begins.
+static STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// Stop waiting for the browser. Safe to call when nothing is waiting.
+pub fn cancel() {
+    STOPPED.store(true, Ordering::SeqCst);
+}
 
 /// Where a person is sent, and what is expected back.
 pub struct Flow {
@@ -72,6 +85,7 @@ impl Flow {
         // to the question this process asked. `verifier` never leaves this process until the
         // code is traded, and says the code is being spent by whoever asked for it — so a code
         // caught in transit is worth nothing on its own.
+        STOPPED.store(false, Ordering::SeqCst);
         let state = nonce()?;
         let verifier = nonce()?;
         let challenge = challenge_for(&verifier);
@@ -102,18 +116,35 @@ impl Flow {
 
     /// Sit on the socket until the browser is sent back to it.
     fn wait_for_code(&self, listener: &TcpListener, state: &str) -> Result<String> {
+        // Non-blocking, so the wait can be given up on. A blocking `accept` would hold this
+        // thread for the whole consent window whatever anybody did to the window that started
+        // it, and the button that opened the browser would stay dead until it gave up.
         listener
-            .set_nonblocking(false)
+            .set_nonblocking(true)
             .map_err(|e| SourceError::io("the waiting socket", e))?;
         let deadline = Instant::now() + CONSENT_TIMEOUT;
 
         // A browser opens connections nobody asked for — a favicon, a speculative preconnect
         // — so one that carries no answer is served and forgotten rather than ending the wait.
         while Instant::now() < deadline {
-            let (stream, _) = listener
-                .accept()
-                .map_err(|e| SourceError::io("waiting for the browser to come back", e))?;
+            if STOPPED.load(Ordering::SeqCst) {
+                return Err(SourceError::Failed("signing in was stopped".to_owned()));
+            }
 
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Nothing yet. Long enough not to spin, short enough that pressing
+                    // Cancel feels immediate.
+                    std::thread::sleep(POLL);
+                    continue;
+                }
+                Err(e) => return Err(SourceError::io("waiting for the browser", e)),
+            };
+
+            // Blocking again for this one exchange: a browser that has connected is about to
+            // say something, and reading it in slices would be a parser for no reason.
+            let _ = stream.set_nonblocking(false);
             match self.read_answer(stream, state) {
                 Ok(Some(code)) => return Ok(code),
                 Ok(None) => continue,
@@ -545,6 +576,33 @@ mod tests {
 
         let err = flow(url).run(browser_follows).unwrap_err();
         assert!(err.to_string().contains("no lasting token"), "{err}");
+    }
+
+    /// Closing the window that started a sign-in has to release the thread now, not in five
+    /// minutes. A blocking `accept` used to hold it for the whole consent window.
+    #[test]
+    fn giving_up_on_a_sign_in_releases_it_at_once() {
+        let (url, _asked) = token_endpoint("{}", 200);
+
+        let began = std::time::Instant::now();
+        let waiting = std::thread::spawn(move || {
+            flow(url).run(|_| {
+                // Nobody is going to the browser. Given up on from the other thread instead.
+            })
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        cancel();
+
+        let err = waiting.join().unwrap().unwrap_err().to_string();
+        let waited = began.elapsed();
+
+        assert!(err.contains("stopped"), "said plainly: {err}");
+        assert!(
+            waited < Duration::from_secs(10),
+            "it took {waited:?}, so it sat out the whole consent window"
+        );
+        assert!(waited < CONSENT_TIMEOUT / 2);
     }
 
     #[test]

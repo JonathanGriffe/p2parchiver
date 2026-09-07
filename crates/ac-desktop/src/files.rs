@@ -145,8 +145,9 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             let group = selection.get().group;
             let path = path.to_string();
             work::run(&weak, &nudge, move || {
-                let gone = ops::file::remove(&paths, &group, &path)?;
-                Ok(format!("removed {gone}"))
+                ops::file::remove(&paths, &group, &path)?;
+                // The row leaves the table, which has said it better than a sentence would.
+                Ok(String::new())
             });
         }
     });
@@ -159,7 +160,8 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                 return;
             }
             let dir = PathBuf::from(dir.as_str());
-            let outcome = crate::shell::open(&dir).map(|()| format!("showing {}", dir.display()));
+            // A file manager opening is its own confirmation; only its refusal to is news.
+            let outcome = crate::shell::open(&dir).map(|()| String::new());
             if let Some(window) = weak.upgrade() {
                 work::finish(&window, outcome, &nudge);
             }

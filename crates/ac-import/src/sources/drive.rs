@@ -56,6 +56,9 @@ impl RegisteredSource for Drive {
 
     const AUTH: Option<Authorize> = Some(authorize);
 
+    /// Where to look while the sign-in is out at Google.
+    const WAITING: &'static str = "finish signing in, in your browser";
+
     fn open(config: &Fields, settings: &Fields) -> Result<Box<dyn Source>> {
         Ok(Box::new(Drive::parse(config, settings)?))
     }
@@ -95,7 +98,10 @@ fn authorize(settings: &Fields) -> Result<Fields> {
         client_secret: required(settings, "client_secret")?,
     };
 
-    let granted = flow.run(|url| {
+    // So closing the window that started this actually stops it, rather than leaving the
+    // button dead until the consent window runs out.
+    crate::registry::stoppable(Some(oauth::cancel));
+    let waited = flow.run(|url| {
         // Said three ways, because the one thing worse than this failing is it failing
         // silently: a window with no console shows nothing, and someone watching a spinner
         // for five minutes deserves somewhere to look.
@@ -103,7 +109,12 @@ fn authorize(settings: &Fields) -> Result<Fields> {
         println!("If nothing opens, go to:\n\n{url}\n");
         tracing::info!(%url, "waiting for a Google Drive sign-in in the browser");
         browse(url);
-    })?;
+    });
+
+    // Held rather than asked, so this runs whichever way the sign-in went. Saying a sign-in
+    // is waiting when none is makes `stop` do something where it promises to do nothing.
+    crate::registry::stoppable(None);
+    let granted = waited?;
 
     let mut out = Fields::new();
     out.push("refresh_token", &granted.refresh_token);

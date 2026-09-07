@@ -9,6 +9,16 @@ export component AddSourceDialog inherits Rectangle {
     // not a detour through the Settings tab.
     in property <[FieldItem]> settings;
     in property <bool> busy;
+    // Raised once a sign-in is waiting on somebody, with what they are meant to do about it.
+    // While one is up the form is not: there is nothing left to type, and a code to scan is
+    // the only thing worth looking at.
+    in property <image> code;
+    in property <string> waiting;
+    // The name being typed. A property rather than an id because the field and the button
+    // that reads it are in different `if` branches, which are different scopes.
+    in-out property <string> typed;
+    // One add at a time: the button that started this is not pressable again until it ends.
+    in property <bool> adding;
 
     callback add(string);
     callback field-edited(int, string);
@@ -45,14 +55,42 @@ export component AddSourceDialog inherits Rectangle {
                 overflow: elide;
             }
 
-            named := LineEdit {
-                placeholder-text: "name";
-                accepted => {
-                    if (self.text != "" && !root.busy) { root.add(self.text); }
+            if root.code.width > 0 : VerticalLayout {
+                alignment: center;
+                spacing: Theme.md;
+
+                // The layout centres it, not the image's own alignment: that would only
+                // centre the picture inside an element still sitting against the left edge.
+                HorizontalLayout {
+                    alignment: center;
+
+                    Image {
+                        source: root.code;
+                        // Nearest, or the squares blur into each other and a camera has to
+                        // work harder than it should.
+                        image-rendering: pixelated;
+                        width: min(280px, root.width - 4 * Theme.lg);
+                        height: self.width;
+                    }
+                }
+                Text {
+                    text: root.waiting;
+                    color: Theme.dim;
+                    font-size: Theme.body-size;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
                 }
             }
 
-            ScrollView {
+            if root.code.width == 0 : LineEdit {
+                placeholder-text: "name";
+                text <=> root.typed;
+                accepted => {
+                    if (root.typed != "" && !root.busy) { root.add(root.typed); }
+                }
+            }
+
+            if root.code.width == 0 : ScrollView {
                 vertical-stretch: 1;
                 preferred-height: forms.preferred-height;
 
@@ -95,11 +133,12 @@ export component AddSourceDialog inherits Rectangle {
                     text: "Cancel";
                     clicked => { root.dismissed(); }
                 }
-                Button {
-                    text: "Add";
+                // Gone once a code is up: the next move is on the phone, not here.
+                if root.code.width == 0 : Button {
+                    text: root.adding ? "Adding…" : "Add";
                     primary: true;
-                    enabled: named.text != "" && !root.busy;
-                    clicked => { root.add(named.text); }
+                    enabled: root.typed != "" && !root.busy && !root.adding;
+                    clicked => { root.add(root.typed); }
                 }
             }
         }

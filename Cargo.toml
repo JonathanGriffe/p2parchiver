@@ -71,17 +71,13 @@ md-5 = "0.10"
 sha1 = "0.10"
 hex = "0.4"
 
-# Talking to a remote source. Blocking on purpose: `Source::scan` and `Source::fetch` are
-# synchronous, and the import worker already has a thread of its own to be slow on. Its
-# default rustls carries its own roots, so a node does not depend on a system cert store
-# being present or current — the same reason SQLite and ffmpeg are bundled.
 ureq = { version = "3", features = ["json"] }
 serde_json = "1"
-# The scan cursor of a paged remote source, and the PKCE challenge its sign-in needs.
 base64 = "0.22"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+qrcode = { version = "0.14", default-features = false }
 
-# The desktop UI, compiled from .slint markup into this binary. Chosen over a webview so a
-# node ships as one file: the same reason SQLite is bundled above.
 slint = { version = "1.17", default-features = false, features = [
     "compat-1-2", "std", "backend-winit", "renderer-software", "accessibility",
     # What the Sort tab previews with. Everything slint cannot decode gets a tile instead.

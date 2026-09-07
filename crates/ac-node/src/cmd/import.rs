@@ -20,10 +20,10 @@ pub fn available(source: Option<&str>) -> Result<()> {
 
     let entry = ops::import::implementation(source)?;
     println!("{}  {}", entry.name, entry.kind);
-    print_fields(
-        "per source, given with --set when you add one",
-        entry.config,
-    );
+    // Only what is asked for. A source whose config is filled in by pairing has fields that
+    // are stored and never typed, and offering them here would be a form nobody can fill.
+    let own: Vec<Field> = entry.asked_config().copied().collect();
+    print_fields("per source, given with --set when you add one", &own);
     let asked: Vec<Field> = entry.asked_settings().copied().collect();
     print_fields(
         "shared by every one of them, set with `ac import settings set`",
@@ -31,9 +31,75 @@ pub fn available(source: Option<&str>) -> Result<()> {
     );
     if entry.signs_in() {
         println!();
-        println!("Adding one signs in to it, in a browser. Each is its own account.");
+        println!("Adding one signs in to it, and each is its own account.");
+        if !entry.waiting().is_empty() {
+            println!("When it does: {}.", entry.waiting());
+        }
     }
     Ok(())
+}
+
+/// Watch for a sign-in raising something to look at, and print it when it does.
+///
+/// A thread because the sign-in owns the calling one until somebody acts on what it shows.
+fn watch_for_a_code(waiting: Option<&'static str>) -> Watching {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        move || {
+            let mut shown = false;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if !shown && let Some(qr) = ops::import::showing() {
+                    println!("\n{}", as_blocks(&qr));
+                    if let Some(waiting) = waiting {
+                        println!("{waiting}\n");
+                    }
+                    shown = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    });
+    Watching { stop, watcher }
+}
+
+struct Watching {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    watcher: std::thread::JoinHandle<()>,
+}
+
+impl Watching {
+    fn stop(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.watcher.join();
+    }
+}
+
+/// A QR as text. Two characters per cell, because a terminal cell is about half as wide as it
+/// is tall and a squashed code will not scan.
+fn as_blocks(qr: &ac_import::registry::Qr) -> String {
+    const QUIET: usize = 2;
+
+    let mut out = String::new();
+    for _ in 0..QUIET {
+        out.push_str(&"  ".repeat(qr.size + QUIET * 2));
+        out.push('\n');
+    }
+    for row in 0..qr.size {
+        out.push_str(&"  ".repeat(QUIET));
+        for column in 0..qr.size {
+            // Dark cells as spaces on a light field: a terminal's own background is not
+            // reliably white, so the light half is drawn rather than left to it.
+            out.push_str(if qr.at(row, column) { "  " } else { "██" });
+        }
+        out.push_str(&"  ".repeat(QUIET));
+        out.push('\n');
+    }
+    for _ in 0..QUIET {
+        out.push_str(&"  ".repeat(qr.size + QUIET * 2));
+        out.push('\n');
+    }
+    out
 }
 
 fn print_fields(what: &str, fields: &[Field]) {
@@ -64,7 +130,21 @@ fn describe(kind: FieldKind) -> &'static str {
 }
 
 pub fn source_add(paths: &Paths, source: &str, name: &str, set: &[String]) -> Result<()> {
-    let row = ops::import::add_source(paths, source, name, pairs(set)?)?;
+    // With no node running, this process can be the listener a phone answers to. Harmless
+    // when one is: the bind fails, nothing starts, and pairing says where to go instead.
+    ops::import::start_services(paths);
+
+    // A sign-in that needs looking at blocks the thread it is on, so the code it wants shown
+    // is put up while that happens. Watched from here because a terminal has nothing else
+    // that would notice.
+    let watching = watch_for_a_code(
+        ops::import::implementation(source)
+            .ok()
+            .map(|e| e.waiting()),
+    );
+    let added = ops::import::add_source(paths, source, name, pairs(set)?);
+    watching.stop();
+    let row = added?;
 
     println!("added {} ({})", row.name, row.source);
     println!(

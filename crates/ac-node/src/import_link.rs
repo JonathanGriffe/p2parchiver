@@ -108,6 +108,8 @@ impl ImportLink {
             }
         }
 
+        import::start_services(paths);
+
         let (sender, inbox) = mpsc::unbounded_channel();
         Ok(Self {
             paths: paths.clone(),

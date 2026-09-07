@@ -173,9 +173,6 @@ pub fn kind_of(kind: ac_import::config::FieldKind) -> i32 {
 }
 
 /// How many a scan passed over, for the end of the line that says what it did.
-///
-/// Which ones go to the log. A scan of a whole Drive can skip hundreds, and a bar that grows
-/// a line per file stops being a bar; the count is what tells you whether to go and look.
 fn also_skipped(notes: &[String]) -> String {
     for note in notes {
         tracing::info!("{note}");
@@ -196,7 +193,44 @@ fn also_ignored(ignored: u64) -> String {
     }
 }
 
+fn pairing_code() -> Option<slint::Image> {
+    let qr = ops::import::showing()?;
+    const QUIET: usize = 4;
+
+    let side = qr.size + QUIET * 2;
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(side as u32, side as u32);
+    let pixels = buffer.make_mut_slice();
+
+    for row in 0..side {
+        for column in 0..side {
+            let dark = row >= QUIET
+                && column >= QUIET
+                && row < side - QUIET
+                && column < side - QUIET
+                && qr.at(row - QUIET, column - QUIET);
+            let shade = if dark { 0 } else { 255 };
+            pixels[row * side + column] = slint::Rgba8Pixel {
+                r: shade,
+                g: shade,
+                b: shade,
+                a: 255,
+            };
+        }
+    }
+    Some(slint::Image::from_rgba8(buffer))
+}
+
 pub fn apply(window: &MainWindow, page: Page) {
+    match pairing_code() {
+        Some(code) => window.set_pairing_code(code),
+        None => window.set_pairing_code(slint::Image::default()),
+    }
+    window.set_pairing_says(
+        ops::import::implementation(&window.get_adding_source())
+            .map(|entry| entry.waiting())
+            .unwrap_or_default()
+            .into(),
+    );
     window.set_sources(ModelRc::from(Rc::new(VecModel::from(page.sources))));
     window.set_source_kinds(ModelRc::from(Rc::new(VecModel::from(page.implementations))));
     window.set_source_settings(ModelRc::from(Rc::new(VecModel::from(page.settings))));
@@ -235,7 +269,8 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             let (paths, nudge, dir) = (paths.clone(), nudge.clone(), dir.to_string());
             work::run(&weak, &nudge, move || {
                 match ops::import::remove_source(&paths, &dir)? {
-                    true => Ok(format!("removed {dir}")),
+                    // The row leaves the table, which says it better than a sentence.
+                    true => Ok(String::new()),
                     false => Err(anyhow::anyhow!("no source called {dir}")),
                 }
             });
@@ -276,13 +311,12 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             let (source, key, value) = (source.to_string(), key.to_string(), value.to_string());
             work::run(&weak, &nudge, move || {
                 ops::import::set_setting(&paths, &source, &key, &value)?;
-                Ok(format!("set {source} {key}"))
+                // The field is showing what was saved.
+                Ok(String::new())
             });
         }
     });
 
-    // Off the event loop like any other action, and for longer than most: it is waiting on
-    // somebody to finish in a browser, which can take minutes or never happen at all.
     window.on_sign_in_source({
         let weak = weak.clone();
         let paths = paths.clone();
@@ -306,8 +340,6 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         }
     });
 
-    // A path is chosen rather than typed, so what was chosen is written straight into the
-    // model the Add button reads: the form never has to hand a value back.
     window.on_field_browse({
         let weak = weak.clone();
         move |at, folder| {
@@ -347,6 +379,11 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         }
     });
 
+    // Closing the dialog gives up on whatever it was waiting for. The work thread wakes,
+    // reports that it was stopped, and clears `source-adding` on its way out — so nothing is
+    // left disabled by a window somebody shut.
+    window.on_stop_adding(ops::import::stop_signing_in);
+
     window.on_add_source({
         let weak = weak.clone();
         let paths = paths.clone();
@@ -363,22 +400,16 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
 
             let selection = selection.clone();
 
-            // Not `work::run`: that shuts the whole tab until the action is done, and this
-            // one can be waiting on somebody to finish in a browser. Only the Add button
-            // waits, so a sign-in that stalls leaves the rest of the tab usable.
             window.set_source_adding(true);
             window.set_message(match ops::import::implementation(&source) {
-                Ok(entry) if entry.signs_in() => "finish signing in, in your browser".into(),
-                _ => slint::SharedString::from(""),
+                Ok(entry) => entry.waiting().into(),
+                Err(_) => slint::SharedString::from(""),
             });
             window.set_message_bad(false);
 
             work::action(
                 &weak,
                 move || {
-                    // The settings go first: `add_source` refuses an implementation whose
-                    // shared fields are not filled in, and refusing here would leave what was
-                    // typed into the dialog with nowhere to have gone.
                     for (key, value) in shared.iter() {
                         ops::import::set_setting(&paths, &source, key, value)?;
                     }
@@ -386,13 +417,11 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
 
                     selection.rewind();
 
-                    // A polled source is left to the daemon. It has never been scanned, which
-                    // makes it the stalest thing there is and the next one picked up, and a whole
-                    // Drive is not something to hold a window open for.
                     let one_shot = ops::import::implementation(&source)
                         .is_ok_and(|entry| !entry.kind.polled());
                     if !one_shot {
-                        return Ok(format!("added {}, and it is being read now", row.name));
+                        // The row appears, and its counts are what say it is being read.
+                        return Ok(String::new());
                     }
 
                     // A one-shot is never due, so nothing would ever come of it: this one scan is
@@ -410,6 +439,11 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                 },
                 move |window, outcome| {
                     window.set_source_adding(false);
+                    // Closed here rather than when the button was pressed, because between
+                    // those two moments is where a sign-in shows its code.
+                    // The name typed into it goes with it: the dialog is built afresh next
+                    // time, so there is nothing to reset.
+                    window.set_adding_source("".into());
                     // Whatever the outcome, including the sign-in that never came back.
                     work::finish(window, outcome, &nudge);
                 },
@@ -423,10 +457,6 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
 const SHOWN: usize = 64;
 
 /// A path cut to fit, keeping the end.
-///
-/// The front of a path is where the boilerplate is — everyone's home directory looks the
-/// same — and the end is the album or the file that was actually picked. So what goes is
-/// the front, which is the opposite of what eliding does.
 pub fn shown(path: &str) -> String {
     if path.chars().count() <= SHOWN {
         return path.to_owned();
@@ -511,8 +541,6 @@ fn answers(model: &slint::ModelRc<FieldItem>) -> ac_import::config::Fields {
         if value.trim().is_empty() {
             continue;
         }
-        // A repeatable field is one line per answer, which is how the form takes several
-        // paths without growing a widget that can add rows.
         match field.kind == KIND_PATHS {
             true => {
                 for line in value.lines().filter(|line| !line.trim().is_empty()) {
@@ -570,7 +598,6 @@ mod tests {
         let picked = ops::import::from_folder(&paths, Some("Album"), &album).unwrap();
         ops::import::scan(&paths, &picked.row.dir).unwrap();
 
-        // Scanned but not fetched: three owed, nothing downloaded.
         let before = &read(&paths).sources[0];
         assert_eq!(before.name, "Album");
         assert_eq!(before.owed, 3);
@@ -614,8 +641,7 @@ mod tests {
             );
         }
 
-        // Nothing is picked, so the two that act on a row are shut, and the one that does
-        // not need one is open.
+        // Nothing is picked
         for (label, ready) in [("Scan now", false), ("Remove", false), ("Add source", true)] {
             let button = ElementHandle::find_by_accessible_label(&window, label)
                 .next()
@@ -848,6 +874,104 @@ mod tests {
         assert!(sources > 0.0);
         assert_eq!(previous, sources, "Sort's stepping buttons match Sources'");
         assert_eq!(file, sources, "and so do the ones that act on a file");
+    }
+
+    /// A code that sits against one edge of the dialog reads as a rendering fault, and the
+    /// obvious way to centre a picture — the image's own alignment — centres it inside an
+    /// element that is itself still on the left.
+    #[test]
+    fn the_pairing_code_is_centred_in_the_dialog() {
+        use crate::ui::MainWindow;
+        use i_slint_backend_testing::ElementHandle;
+        use slint::ComponentHandle;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(1040.0, 740.0));
+        window.set_tab(5);
+        window.set_adding_source("phone".into());
+
+        // A square of something, which is all the layout cares about.
+        let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(29, 29);
+        for pixel in pixels.make_mut_slice() {
+            *pixel = slint::Rgba8Pixel {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            };
+        }
+        window.set_pairing_code(slint::Image::from_rgba8(pixels));
+
+        let code = ElementHandle::find_by_element_type_name(&window, "Image")
+            .next()
+            .expect("the dialog shows the code");
+        let at = code.absolute_position();
+        let size = code.size();
+
+        // The dialog is itself centred in the window, so centred in one is centred in both.
+        let middle = at.x + size.width / 2.0;
+        let want = 1040.0 / 2.0;
+        assert!(
+            (middle - want).abs() <= 1.0,
+            "the code sits at {middle}, not {want}: {}px wide from x={}",
+            size.width,
+            at.x
+        );
+        assert!(size.width > 0.0, "and is actually drawn");
+    }
+
+    /// The dialog has to outlive the press. A sign-in shows its code seconds after Add is
+    /// pressed, and for a while the dialog closed on the press itself — so the code went up
+    /// inside something that no longer existed, and pairing a phone was impossible.
+    #[test]
+    fn the_add_dialog_stays_up_while_the_add_is_running() {
+        use crate::ui::MainWindow;
+        use i_slint_backend_testing::ElementHandle;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window.set_tab(5);
+        window.set_adding_source("phone".into());
+
+        let showing = |label: &str| {
+            ElementHandle::find_by_accessible_label(&window, label)
+                .next()
+                .is_some()
+        };
+        assert!(showing("Add"), "the dialog is up before the press");
+
+        // A name, or the button is not pressable.
+        ElementHandle::find_by_element_type_name(&window, "LineEdit")
+            .next()
+            .expect("the dialog asks for a name")
+            .set_accessible_value("Pixel");
+
+        // Pressed for real, because the bug was in what the press itself did.
+        ElementHandle::find_by_accessible_label(&window, "Add")
+            .next()
+            .expect("an Add button")
+            .invoke_accessible_default_action();
+
+        assert_eq!(
+            window.get_adding_source(),
+            "phone",
+            "the dialog must not close on the press: a sign-in shows its code after it"
+        );
+
+        // And while the work runs it says so, rather than inviting a second press.
+        window.set_source_adding(true);
+        assert!(showing("Adding…"));
+
+        // Only when the work ends does it go, which is what the completion handler does.
+        window.set_source_adding(false);
+        window.set_adding_source("".into());
+        assert!(
+            !showing("Add") && !showing("Adding…"),
+            "and then it is gone"
+        );
     }
 
     /// Adding a source can mean waiting on a browser, which is somebody else's pace. Only the

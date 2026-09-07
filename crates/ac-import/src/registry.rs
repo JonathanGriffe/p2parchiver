@@ -1,16 +1,68 @@
+use std::sync::Mutex;
+
 use crate::config::{Field, Fields};
 use crate::source::{Result, Source, SourceError, SourceType};
 
 type Opener = fn(&Fields, &Fields) -> Result<Box<dyn Source>>;
 
-/// Sign a person in, and hand back the settings that says they are.
-///
-/// Some sources cannot be configured by typing alone: what they need is a token only their
-/// operator can issue, and only to someone who has just said yes in a browser. Such a source
-/// declares one of these, and whatever drives it — a command, a button — asks for it rather
-/// than asking the person to produce the token by hand. It is given the settings so far and
-/// returns the ones to keep beside them.
 pub type Authorize = fn(&Fields) -> Result<Fields>;
+
+/// The info a service needs to run
+#[derive(Debug, Clone, Copy)]
+pub struct NodeInfo<'a> {
+    pub db: &'a std::path::Path,
+    pub state: &'a std::path::Path,
+    pub id: &'a str,
+}
+
+pub type Serve = fn(NodeInfo<'_>) -> Result<()>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qr {
+    pub size: usize,
+    pub dark: Vec<bool>,
+}
+
+impl Qr {
+    pub fn at(&self, row: usize, column: usize) -> bool {
+        self.dark.get(row * self.size + column).copied() == Some(true)
+    }
+}
+
+/// What a sign-in currently wants a person to look at, if one is waiting.
+static SHOWING: Mutex<Option<Qr>> = Mutex::new(None);
+
+pub fn showing() -> Option<Qr> {
+    SHOWING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// How to give up on the sign-in that is waiting, left here by the sign-in itself.
+static STOP: Mutex<Option<fn()>> = Mutex::new(None);
+
+/// Give up on whatever sign-in is waiting, if it left a way to.
+///
+/// A sign-in blocks a thread until somebody acts, and somebody may instead close the window
+/// it was asking through. Without this, the button that started it would stay disabled until
+/// the wait gave up on its own — minutes later, for no reason a person could see.
+///
+/// Nothing waiting, or a sign-in that cannot be interrupted, is a no-op: this is called from
+/// a window closing, which is not a place to be refusing things.
+pub fn stop() {
+    let hook = *STOP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(stop) = hook {
+        stop();
+    }
+}
+
+/// Say how to be given up on, around a wait. `None` takes it back.
+pub fn stoppable(with: Option<fn()>) {
+    *STOP.lock().unwrap_or_else(|e| e.into_inner()) = with;
+}
+
+/// Put something up, or take it down. Called by an `Authorize` around its wait.
+pub fn show(qr: Option<Qr>) {
+    *SHOWING.lock().unwrap_or_else(|e| e.into_inner()) = qr;
+}
 
 include!(concat!(env!("OUT_DIR"), "/registry.rs"));
 
@@ -25,6 +77,14 @@ pub trait RegisteredSource {
     /// machine. Defaulted, because most are not.
     const AUTH: Option<Authorize> = None;
 
+    /// What to say while a sign-in is waiting on somebody. Empty for a source that never
+    /// waits on anybody.
+    const WAITING: &'static str = "";
+
+    /// Something to run for as long as the node does, for a source that has to be listened
+    /// for rather than asked. Most have nothing.
+    const SERVICE: Option<Serve> = None;
+
     fn open(config: &Fields, settings: &Fields) -> Result<Box<dyn Source>>;
 }
 
@@ -35,8 +95,9 @@ pub struct Registered {
     pub settings: &'static [Field],
     pub config: &'static [Field],
     open: Opener,
-    /// Set when the source has a sign-in of its own; nothing for one that has not.
     auth: Option<Authorize>,
+    waiting: &'static str,
+    service: Option<Serve>,
 }
 
 impl Registered {
@@ -53,6 +114,8 @@ impl Registered {
             config: S::CONFIG,
             open: S::open,
             auth: S::AUTH,
+            waiting: S::WAITING,
+            service: S::SERVICE,
         }
     }
 
@@ -65,13 +128,24 @@ impl Registered {
         self.auth.is_some()
     }
 
+    /// What to say while this source's sign-in is waiting on somebody.
+    pub fn waiting(&self) -> &'static str {
+        self.waiting
+    }
+
+    /// Whether this source has something to run for as long as the node does.
+    pub fn serves(&self) -> bool {
+        self.service.is_some()
+    }
+
+    pub fn start(&self, node: NodeInfo<'_>) -> Result<()> {
+        match self.service {
+            Some(serve) => serve(node),
+            None => Ok(()),
+        }
+    }
+
     /// Whether one configured source already has been.
-    ///
-    /// Asked of that source's own config, because whose account it is belongs to the source
-    /// and not to the implementation — two of them are two accounts. Answered by the fields
-    /// the sign-in fills in: they are exactly the ones nobody is asked for, so holding them
-    /// is the same thing as having signed in. That keeps the question answerable without
-    /// every source growing a second hook to answer it.
     pub fn signed_in(&self, config: &Fields) -> bool {
         self.config
             .iter()
@@ -128,6 +202,34 @@ mod tests {
     #[test]
     fn the_build_knows_how_to_import_from_a_folder() {
         assert!(find("folder").is_some(), "the folder source is missing");
+    }
+
+    #[test]
+    fn a_source_with_nothing_to_run_starts_anyway_and_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = NodeInfo {
+            db: &dir.path().join("ac.db"),
+            state: dir.path(),
+            id: "12D3KooWTestPeerId",
+        };
+
+        for entry in known() {
+            if entry.serves() {
+                continue;
+            }
+            entry.start(node).unwrap_or_else(|e| {
+                panic!(
+                    "{} has no service and still failed to start: {e}",
+                    entry.name
+                )
+            });
+        }
+
+        let folder = find("folder").unwrap();
+        assert!(
+            !folder.serves(),
+            "a folder needs nothing running to be found"
+        );
     }
 
     #[test]
