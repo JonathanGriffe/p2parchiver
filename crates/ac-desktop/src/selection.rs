@@ -29,15 +29,25 @@ pub struct Sorting {
 /// did not mean, not a history of the afternoon.
 pub const UNDO_DEPTH: usize = 5;
 
-/// One thing done to one file, kept so it can be undone. Only what is needed to reverse it:
-/// the file itself is found by hash.
+/// One thing done, kept so it can be undone. Only what is needed to reverse it: the files
+/// themselves are found by hash.
+///
+/// A whole folder thrown away is one of these and not forty, because it was one press and the
+/// button that takes it back is one press too.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Undoable {
-    pub hash: String,
+    pub hashes: Vec<String>,
     pub name: String,
     /// True when it was thrown away rather than filed. What tells the message which it was,
     /// and what says whether bytes are still waiting to be deleted.
     pub dropped: bool,
+}
+
+impl Undoable {
+    /// Whether this was a bulk action, which is what decides how much of the stack it takes.
+    fn bulk(&self) -> bool {
+        self.hashes.len() > 1
+    }
 }
 
 impl Sorting {
@@ -101,15 +111,25 @@ impl Selection {
         self.with(|state| folder.clone_into(&mut state.sorting.destination));
     }
 
-    /// Remember one, and hand back whatever fell off the far end — which the caller has to
-    /// finish with, because nothing can take it back any more.
-    pub fn did(&self, action: Undoable) -> Option<Undoable> {
+    /// Remember one, and hand back whatever it pushed off — which the caller has to finish
+    /// with, because nothing can take those back any more.
+    ///
+    /// A bulk action arrives on an empty stack: it holds the bytes of a whole folder, and
+    /// five of those waiting on a decision nobody is going to make is a great deal of disk.
+    /// It reads right, too — the big destructive thing is the one you can take back, until
+    /// you do something else.
+    pub fn did(&self, action: Undoable) -> Vec<Undoable> {
         self.with(|state| {
+            let mut fell_off = match action.bulk() {
+                true => std::mem::take(&mut state.sorting.undo),
+                false => Vec::new(),
+            };
+
             state.sorting.undo.push(action);
-            match state.sorting.undo.len() > UNDO_DEPTH {
-                true => Some(state.sorting.undo.remove(0)),
-                false => None,
+            if state.sorting.undo.len() > UNDO_DEPTH {
+                fell_off.push(state.sorting.undo.remove(0));
             }
+            fell_off
         })
     }
 
@@ -132,10 +152,25 @@ mod tests {
 
     fn done(name: &str) -> Undoable {
         Undoable {
-            hash: name.to_owned(),
+            hashes: vec![name.to_owned()],
             name: name.to_owned(),
             dropped: true,
         }
+    }
+
+    /// A whole folder in one action, which is what a bulk delete leaves behind.
+    fn done_all(names: &[&str]) -> Undoable {
+        Undoable {
+            hashes: names.iter().map(|name| (*name).to_owned()).collect(),
+            name: "a folder".to_owned(),
+            dropped: true,
+        }
+    }
+
+    fn only(fell: &[Undoable]) -> &str {
+        assert_eq!(fell.len(), 1, "one action fell off");
+        assert_eq!(fell[0].hashes.len(), 1);
+        &fell[0].hashes[0]
     }
 
     #[test]
@@ -144,25 +179,48 @@ mod tests {
 
         for at in 0..UNDO_DEPTH {
             assert!(
-                selection.did(done(&format!("{at}"))).is_none(),
+                selection.did(done(&format!("{at}"))).is_empty(),
                 "nothing falls off until it is full"
             );
         }
 
         // The sixth pushes the first out, and the caller is handed it: nothing can take
         // that one back any more, so its bytes may go.
-        let fell = selection
-            .did(done("5"))
-            .expect("the oldest should fall off");
-        assert_eq!(fell.hash, "0");
+        let fell = selection.did(done("5"));
+        assert_eq!(only(&fell), "0");
         assert_eq!(selection.get().sorting.undo.len(), UNDO_DEPTH);
 
         // Taken back newest first.
-        assert_eq!(selection.take_back().map(|u| u.hash), Some("5".to_owned()));
-        assert_eq!(selection.take_back().map(|u| u.hash), Some("4".to_owned()));
+        let taken = |u: Undoable| u.hashes;
+        assert_eq!(selection.take_back().map(taken), Some(vec!["5".to_owned()]));
+        assert_eq!(selection.take_back().map(taken), Some(vec!["4".to_owned()]));
         for _ in 0..3 {
             assert!(selection.take_back().is_some());
         }
         assert!(selection.take_back().is_none(), "and then there are none");
+    }
+
+    /// A folder is one action however many files it held, and it arrives on an empty stack:
+    /// five folders' worth of bytes waiting on a decision nobody will make is a great deal
+    /// of disk, and everything before it is handed back to be finished with.
+    #[test]
+    fn a_bulk_action_is_one_entry_and_takes_the_stack() {
+        let selection = Selection::new();
+
+        selection.did(done("a"));
+        selection.did(done("b"));
+
+        let fell = selection.did(done_all(&["c", "d", "e"]));
+        assert_eq!(
+            fell.iter().flat_map(|action| &action.hashes).count(),
+            2,
+            "both of the singles came back to be finished with"
+        );
+        assert_eq!(selection.get().sorting.undo.len(), 1, "and only it is left");
+
+        // One press took forty away, so one press brings them back.
+        let back = selection.take_back().expect("the folder is undoable");
+        assert_eq!(back.hashes, ["c", "d", "e"]);
+        assert!(selection.take_back().is_none());
     }
 }

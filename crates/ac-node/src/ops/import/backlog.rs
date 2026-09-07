@@ -116,6 +116,10 @@ pub struct Filed {
     pub done: u64,
     pub missing: u64,
     pub failed: Vec<String>,
+    /// What was thrown away, so the whole action can be offered back at once. Empty for a
+    /// filing: that comes back out of the group it went into, and the caller filing one file
+    /// already knows which.
+    pub dropped: Vec<String>,
 }
 
 pub fn sort(paths: &Paths, hash: &str, group: &str, into: &str) -> Result<Filed> {
@@ -265,6 +269,7 @@ fn drop_one(ledger: &Ledger, content: &Content, row: &Imported, out: &mut Filed)
     let _ = content;
     ledger.dropped(&row.hash)?;
     out.done += 1;
+    out.dropped.push(row.hash.clone());
     Ok(())
 }
 
@@ -314,13 +319,44 @@ pub fn sweep_dropped(paths: &Paths) -> Result<u64> {
     Ok(gone)
 }
 
-/// Put back what was just done with one file: a sorted one comes back out of its group, a
-/// dropped one is simply not dropped any more.
+/// Put back what one action did: a sorted file comes back out of its group, a dropped one is
+/// simply not dropped any more.
+///
+/// The whole action rather than one file, because a folder thrown away was one press and has
+/// to be one press back. What can be put back is, whatever became of the rest: a file whose
+/// bytes somebody has since finished with cannot come back, and that is no reason to leave
+/// the others where they are.
 ///
 /// Only ever the reverse of something a moment old — see `Ledger::undone` for why that is
 /// the one move backwards the rows allow.
-pub fn undo(paths: &Paths, hash: &str) -> Result<String> {
+pub fn undo(paths: &Paths, hashes: &[String]) -> Result<String> {
     let ledger = ledger(paths)?;
+
+    let mut back = Vec::new();
+    let mut refused = Vec::new();
+    for hash in hashes {
+        match undo_one(paths, &ledger, hash) {
+            Ok(name) => back.push(name),
+            Err(e) => refused.push(format!("{e:#}")),
+        }
+    }
+
+    // Nothing came back, so the only thing worth saying is why not. The first refusal
+    // rather than all of them: they will be the same sentence about different files.
+    let said = match (back.len(), refused.first()) {
+        (0, Some(why)) => bail!("{why}"),
+        (0, None) => bail!("there was nothing to take back"),
+        (1, _) => format!("{} is waiting again", back[0]),
+        (many, _) => format!("{many} are waiting again"),
+    };
+
+    Ok(match refused.is_empty() {
+        true => said,
+        false => format!("{said}; {} could not be", refused.len()),
+    })
+}
+
+fn undo_one(paths: &Paths, ledger: &Ledger, hash: &str) -> Result<String> {
     let row = ledger
         .get(hash)?
         .ok_or_else(|| anyhow!("nothing imported has the hash {hash}"))?;
@@ -355,7 +391,7 @@ pub fn undo(paths: &Paths, hash: &str) -> Result<String> {
         }
         _ => bail!("{} was not filed or thrown away", row.name),
     }
-    Ok(format!("{} is waiting again", row.name))
+    Ok(row.name)
 }
 
 fn settle_missing(
@@ -684,7 +720,7 @@ mod tests {
         let dir = files.dir_for(group, "Holidays").unwrap();
         assert!(content.exists(&dir, &RelPath::parse("2024/a.jpg").unwrap()));
 
-        undo(&paths, &file.row.hash).unwrap();
+        undo(&paths, std::slice::from_ref(&file.row.hash)).unwrap();
 
         // Carried back out of the group, and waiting where it was.
         assert!(!content.exists(&dir, &RelPath::parse("2024/a.jpg").unwrap()));
@@ -706,7 +742,7 @@ mod tests {
         let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
 
         drop(&paths, &file.row.hash).unwrap();
-        undo(&paths, &file.row.hash).unwrap();
+        undo(&paths, std::slice::from_ref(&file.row.hash)).unwrap();
 
         let (_, content) = store(&paths);
         assert!(content.exists(UNSORTED, &file.path), "the bytes never went");
@@ -716,12 +752,75 @@ mod tests {
         drop(&paths, &file.row.hash).unwrap();
         assert_eq!(sweep_dropped(&paths).unwrap(), 1);
         assert!(!content.exists(UNSORTED, &file.path));
-        let err = undo(&paths, &file.row.hash).unwrap_err();
+        let err = undo(&paths, std::slice::from_ref(&file.row.hash)).unwrap_err();
         assert!(
             err.to_string().contains("deleted for good"),
             "taking it back would put a row on a file that is gone: {err}"
         );
         assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 0);
+    }
+
+    /// A folder thrown away is one decision, so it comes back as one: `drop_folder` says
+    /// which files it was, and every one of them goes back in a single press.
+    #[test]
+    fn a_whole_folder_thrown_away_comes_back_in_one_go() {
+        let home = home();
+        let (paths, _) = imported(&home, &["DCIM/a.jpg", "DCIM/b.jpg", "c.jpg"]);
+        let row = super::unsorted(&paths, None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.row.folder == "DCIM")
+            .unwrap()
+            .row;
+
+        let filed = drop_folder(&paths, &row.source_dir, &row.folder).unwrap();
+        assert_eq!(filed.done, 2);
+        assert_eq!(
+            filed.dropped.len(),
+            2,
+            "it says which, so they can come back"
+        );
+        assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 1, "c.jpg only");
+
+        // The bytes were never touched, which is what makes the whole thing undoable.
+        let (_, content) = store(&paths);
+        for row in ledger(&paths).unwrap().discarded().unwrap() {
+            assert!(
+                content.exists(UNSORTED, &located(&row).unwrap()),
+                "still on disk"
+            );
+        }
+
+        undo(&paths, &filed.dropped).unwrap();
+        assert_eq!(
+            ledger(&paths).unwrap().waiting().unwrap(),
+            3,
+            "both came back, and c.jpg never went"
+        );
+    }
+
+    /// One press put forty away and one press brought them back, so a file that cannot come
+    /// back must not hold up the rest of them.
+    #[test]
+    fn taking_a_folder_back_puts_back_what_it_can() {
+        let home = home();
+        let (paths, _) = imported(&home, &["DCIM/a.jpg", "DCIM/b.jpg"]);
+        let row = super::unsorted(&paths, None, 10).unwrap().remove(0).row;
+
+        let filed = drop_folder(&paths, &row.source_dir, &row.folder).unwrap();
+        assert_eq!(filed.dropped.len(), 2);
+
+        // One of them is finished with behind the undo's back, as the sweep at startup
+        // would have done had the session ended in between.
+        assert!(forget(&paths, &filed.dropped[0]).unwrap());
+
+        let said = undo(&paths, &filed.dropped).unwrap();
+        assert!(said.contains("could not"), "it says one was left: {said}");
+        assert_eq!(
+            ledger(&paths).unwrap().waiting().unwrap(),
+            1,
+            "the one whose bytes were still there came back"
+        );
     }
 
     #[test]

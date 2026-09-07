@@ -361,11 +361,12 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                 // What was on screen has gone from the backlog, so the trail behind it no
                 // longer points where it did.
                 selection.rewind();
-                // Only a single filing is offered back. A bulk one moves a whole folder,
-                // and a button that reversed forty without saying which would be worse to
-                // have than none.
+                // Only a single filing is offered back, where a bulk deletion is. Undoing a
+                // deletion un-marks a row and the bytes never moved; undoing a filing carries
+                // them back out of the group and leaves a tombstone for the peers who were
+                // told they arrived — forty of those is not the same kind of thing at all.
                 if !folder && let Some(name) = named {
-                    remember(&paths, &selection, &hash, &name, false);
+                    remember(&paths, &selection, vec![hash.clone()], &name, false);
                 }
                 Ok(said(&filed, "filed"))
             });
@@ -391,19 +392,16 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     }
                 };
                 selection.rewind();
-                match (folder, named) {
-                    (false, Some(name)) => remember(&paths, &selection, &hash, &name, true),
-                    // A whole folder at once cannot be taken back, so it is finished with
-                    // straight away rather than left waiting on disk.
-                    _ => {
-                        if let Err(error) = ops::import::sweep_dropped(&paths) {
-                            tracing::warn!(
-                                error = %format!("{error:#}"),
-                                "could not finish with what was deleted"
-                            );
-                        }
-                    }
-                }
+                // A folder is offered back the same way one file is, and as one press: the
+                // bytes stay until the decision falls off the stack, whether it was one
+                // photograph or forty. Nothing else is finished with on the way — that used
+                // to be a sweep of every deletion on the node, which took the bytes out from
+                // under a single delete still sitting there offering to be undone.
+                let name = match folder {
+                    true => format!("{} files", filed.done),
+                    false => named.unwrap_or_default(),
+                };
+                remember(&paths, &selection, filed.dropped.clone(), &name, true);
                 Ok(said(&filed, "deleted"))
             });
         }
@@ -436,7 +434,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             let (paths, nudge, selection) = (paths.clone(), nudge.clone(), selection.clone());
 
             work::run(&weak, &nudge, move || {
-                ops::import::undo(&paths, &taken.hash)?;
+                ops::import::undo(&paths, &taken.hashes)?;
                 // It is back in the backlog, and wherever the reader had got to no longer
                 // describes where it is — so the file itself comes back on screen, which is
                 // the whole of what taking it back means.
@@ -465,18 +463,21 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
 
 /// Put one decision on the stack, and finish with whatever falls off the far end — nothing
 /// can take that one back any more, so its bytes may go.
-fn remember(paths: &Paths, selection: &Selection, hash: &str, name: &str, dropped: bool) {
+fn remember(paths: &Paths, selection: &Selection, hashes: Vec<String>, name: &str, dropped: bool) {
     let fell_off = selection.did(crate::selection::Undoable {
-        hash: hash.to_owned(),
+        hashes,
         name: name.to_owned(),
         dropped,
     });
 
-    if let Some(done_with) = fell_off
-        && done_with.dropped
-        && let Err(error) = ops::import::forget(paths, &done_with.hash)
-    {
-        tracing::warn!(error = %format!("{error:#}"), "could not finish with a deleted file");
+    // Nothing can take these back any more, so the bytes they were holding can go. This is
+    // the only thing that deletes them: a drop marks the row and leaves the file alone.
+    for done_with in fell_off.iter().filter(|action| action.dropped) {
+        for hash in &done_with.hashes {
+            if let Err(error) = ops::import::forget(paths, hash) {
+                tracing::warn!(error = %format!("{error:#}"), "could not finish with a deleted file");
+            }
+        }
     }
 }
 
