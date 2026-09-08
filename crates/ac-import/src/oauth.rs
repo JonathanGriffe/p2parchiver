@@ -210,9 +210,11 @@ impl Flow {
 
     /// Trade the code for the lasting half.
     fn redeem(&self, code: &str, redirect: &str, verifier: &str) -> Result<Granted> {
-        let mut response = ureq::post(self.token)
+        let mut response = crate::http::agent()
+            .post(self.token)
             .config()
             .http_status_as_error(false)
+            .timeout_recv_body(Some(crate::http::SMALL_BODY))
             .build()
             .send_form([
                 ("client_id", self.client_id.as_str()),
@@ -261,9 +263,11 @@ pub fn refresh(
     client_secret: &str,
     refresh: &str,
 ) -> Result<(String, Duration)> {
-    let mut response = ureq::post(token_url)
+    let mut response = crate::http::agent()
+        .post(token_url)
         .config()
         .http_status_as_error(false)
+        .timeout_recv_body(Some(crate::http::SMALL_BODY))
         .build()
         .send_form([
             ("client_id", client_id),

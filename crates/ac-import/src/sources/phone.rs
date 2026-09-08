@@ -358,6 +358,11 @@ impl Phone {
 
         let mut response = self
             .request("/v1/items", &params)
+            .config()
+            // A page of JSON, so the whole of it can be held to a deadline. The fetch below
+            // cannot: nothing here knows how long a video ought to take.
+            .timeout_recv_body(Some(crate::http::SMALL_BODY))
+            .build()
             .call()
             .map_err(|e| self.unreachable(e))?;
 
@@ -529,15 +534,16 @@ fn pinned(cert: &str, address: &str) -> Result<ureq::Agent> {
     let cert = ureq::tls::Certificate::from_pem(cert.as_bytes())
         .map_err(|e| SourceError::config(Phone::NAME, format!("its certificate is unreadable: {e}")))?;
 
-    let config = ureq::config::Config::builder()
-        .tls_config(
+    let config = crate::http::bounded(
+        ureq::config::Config::builder().tls_config(
             ureq::tls::TlsConfig::builder()
                 // The only root. A certificate signed by anybody else — including every
                 // public authority — is refused, which is the point of pinning.
                 .root_certs(ureq::tls::RootCerts::new_with_certs(&[cert]))
                 .build(),
-        )
-        .build();
+        ),
+    )
+    .build();
 
     let to: Vec<std::net::SocketAddr> = address.to_socket_addrs().map(Iterator::collect).map_err(
         |e| SourceError::config(Phone::NAME, format!("{address} is not somewhere to connect: {e}")),
@@ -663,8 +669,9 @@ mod tests {
     fn phone(at: &FakePhone) -> Phone {
         Phone {
             // Plain, because the fake speaks plain HTTP. What pinning does is asserted
-            // against a real handshake in the listener's own tests, not faked here.
-            agent: ureq::Agent::new_with_defaults(),
+            // against a real handshake in the listener's own tests, not faked here. Bounded
+            // like the real one, so a fake that stopped answering fails rather than hangs.
+            agent: crate::http::agent(),
             address: at.base.trim_start_matches("http://").to_owned(),
             base: at.base.clone(),
             token: "tok-123".to_owned(),
@@ -713,6 +720,25 @@ mod tests {
         assert_eq!(phone.address, "192.168.1.42:8765", "and dialled here");
         assert_eq!(phone.device, "Pixel");
         assert_eq!(phone.source_type(), SourceType::Intermittent);
+    }
+
+    /// A phone that took the connection and then went quiet used to hold the thread for ever,
+    /// and a blocking thread cannot be cancelled: the node would not shut down either. The
+    /// pinned agent has to carry the bounds, whatever else building it has to say.
+    #[test]
+    fn a_phone_that_goes_quiet_is_given_up_on_rather_than_waited_for() {
+        let phone = Phone::parse(&paired()).unwrap();
+        let timeouts = phone.agent.config().timeouts();
+
+        assert!(timeouts.connect.is_some(), "dialling a phone that is gone");
+        assert!(
+            timeouts.recv_response.is_some(),
+            "and one that answers the dial and then says nothing"
+        );
+        assert_eq!(
+            timeouts.recv_body, None,
+            "but a video is as long as it is, and fetch reads through this agent"
+        );
     }
 
     #[test]

@@ -132,6 +132,9 @@ struct Drive {
     token: Mutex<Option<(String, Instant)>>,
     /// The id `folder` resolved to, kept once found: it costs a request per path segment.
     top: Mutex<Option<String>>,
+    /// Bounded, so a call cannot hang for ever, and kept, so a scan's hundreds of calls to
+    /// the one host can share a connection.
+    agent: ureq::Agent,
 }
 
 /// Written out by hand because two of its fields are the whole of someone's access to their
@@ -168,6 +171,7 @@ impl Drive {
             folder: config.get("folder").unwrap_or_default().trim_matches('/').to_owned(),
             token: Mutex::new(None),
             top: Mutex::new(None),
+            agent: crate::http::agent(),
         })
     }
 
@@ -262,6 +266,11 @@ impl Drive {
     fn get<T: for<'de> Deserialize<'de>>(&self, url: &str, params: &[(&str, &str)]) -> Result<T> {
         let mut response = self
             .request(url, params)?
+            .config()
+            // JSON, so the whole answer can be held to a deadline. `fetch` reads a file
+            // through the same builder and deliberately does not.
+            .timeout_recv_body(Some(crate::http::SMALL_BODY))
+            .build()
             .call()
             .map_err(|e| SourceError::Failed(format!("could not reach Google Drive: {e}")))?;
 
@@ -295,7 +304,9 @@ impl Drive {
             .map(|(key, value)| format!("{key}={}", encode(value)))
             .collect();
 
-        Ok(ureq::get(format!("{url}?{}", query.join("&")))
+        Ok(self
+            .agent
+            .get(format!("{url}?{}", query.join("&")))
             .config()
             .http_status_as_error(false)
             .build()
@@ -593,6 +604,21 @@ mod tests {
         assert!(!shown.contains("a-secret"), "{shown}");
         assert!(!shown.contains("a-token"), "{shown}");
         assert!(shown.contains("an-id"), "the id is not a secret: {shown}");
+    }
+
+    /// A scan runs on a blocking thread, and a blocking thread cannot be cancelled: a call
+    /// that hangs for ever is a node that will not shut down.
+    #[test]
+    fn a_drive_that_stops_answering_is_given_up_on_rather_than_waited_for() {
+        let drive = Drive::parse(&signed_in(), &settings()).unwrap();
+        let timeouts = drive.agent.config().timeouts();
+
+        assert!(timeouts.connect.is_some());
+        assert!(timeouts.recv_response.is_some());
+        assert_eq!(
+            timeouts.recv_body, None,
+            "a file is as long as it is; only the JSON calls ask for a body deadline"
+        );
     }
 
     #[test]
