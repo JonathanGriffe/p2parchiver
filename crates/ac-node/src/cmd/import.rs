@@ -5,8 +5,10 @@ use ac_net::config::{Config, Paths};
 use ac_peers::sync::{Limits, Space};
 use anyhow::{Result, bail};
 
+use crate::blob;
 use crate::ops::format::{ago, human_size};
 use crate::ops::{self};
+use crate::throttle::Throttle;
 
 /// The one command that needs no node: what this build can import from is a fact about the
 /// binary, not about anything on disk.
@@ -213,6 +215,20 @@ fn no_room(paths: &Paths) -> Option<String> {
         .map(|why| format!("there is no room to import: {why:?}"))
 }
 
+/// The download cap, for a command that is doing the downloading itself.
+///
+/// `bandwidth_max` is a setting about this machine rather than about the daemon, so a fetch
+/// typed at a terminal answers to it the same way the daemon's own workers do. Its own
+/// throttle rather than the daemon's, because the two do not run at once: the daemon holds a
+/// lock, and these commands are what somebody uses instead of it.
+struct Limit(Throttle);
+
+impl ops::import::Pace for Limit {
+    fn take(&self, bytes: usize) {
+        self.0.consume_blocking(bytes);
+    }
+}
+
 fn work(paths: &Paths, limit: Option<usize>) -> Result<ops::import::Fetched> {
     use ops::import::Outcome;
 
@@ -220,7 +236,12 @@ fn work(paths: &Paths, limit: Option<usize>) -> Result<ops::import::Fetched> {
         bail!("{why}");
     }
 
-    let mut pump = ops::import::pump(paths, limit)?;
+    let capped = Config::load(&paths.config_file())
+        .unwrap_or_default()
+        .bandwidth_max;
+    let pace = std::sync::Arc::new(Limit(Throttle::from_config(capped, blob::THROTTLE_BURST)));
+
+    let mut pump = ops::import::pump(paths, limit)?.paced(pace);
     let mut fetched = ops::import::Fetched::default();
     while let Some(brought) = pump.next()? {
         match &brought.outcome {

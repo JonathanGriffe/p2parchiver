@@ -64,31 +64,48 @@ impl Throttle {
     /// Wait until `n` bytes may move, then account for them.
     pub async fn consume(&self, n: usize) {
         self.moved.fetch_add(n as u64, Ordering::Relaxed);
-
-        let Some(bucket) = &self.bucket else {
-            return;
-        };
-
         let mut owed = n as f64;
-        while owed > 0.0 {
-            let wait = {
-                // Not held across the await below: the sleep happens outside this block.
-                let mut b = bucket.lock().unwrap_or_else(|e| e.into_inner());
-                b.refill();
-
-                let taken = owed.min(b.tokens);
-                b.tokens -= taken;
-                owed -= taken;
-
-                if owed <= 0.0 {
-                    return;
-                }
-
-                let bite = owed.min(b.burst);
-                Duration::from_secs_f64((bite - b.tokens).max(0.0) / b.rate)
-            };
+        while let Some(wait) = self.take(&mut owed) {
             tokio::time::sleep(wait).await;
         }
+    }
+
+    /// The same, for a caller with no runtime to await in.
+    ///
+    /// The CLI's import is one: `main` is not async, and the pump runs on the thread that
+    /// typed the command. Sleeping it is the whole intent — there is nothing else on it.
+    pub fn consume_blocking(&self, n: usize) {
+        self.moved.fetch_add(n as u64, Ordering::Relaxed);
+        let mut owed = n as f64;
+        while let Some(wait) = self.take(&mut owed) {
+            std::thread::sleep(wait);
+        }
+    }
+
+    /// Spend what the bucket holds against `owed`, and say how long until it is worth asking
+    /// again. `None` once nothing is owed, which is immediately when there is no limit.
+    ///
+    /// Split out so the waiting is the only thing the two callers above do differently: the
+    /// lock is never held across either sleep.
+    fn take(&self, owed: &mut f64) -> Option<Duration> {
+        if *owed <= 0.0 {
+            return None;
+        }
+        let bucket = self.bucket.as_ref()?;
+
+        let mut b = bucket.lock().unwrap_or_else(|e| e.into_inner());
+        b.refill();
+
+        let taken = owed.min(b.tokens);
+        b.tokens -= taken;
+        *owed -= taken;
+
+        if *owed <= 0.0 {
+            return None;
+        }
+
+        let bite = owed.min(b.burst);
+        Some(Duration::from_secs_f64((bite - b.tokens).max(0.0) / b.rate))
     }
 }
 
@@ -147,6 +164,36 @@ mod tests {
             took >= Duration::from_secs(3) && took <= Duration::from_secs(5),
             "4 KiB at 1 KiB/s should take about four seconds, took {took:?}"
         );
+    }
+
+    /// Deliberately not a `tokio::test`: the CLI's import runs under a plain `fn main`, and
+    /// the point of this path is that it needs no runtime to wait in. Time cannot be paused
+    /// without one, so the numbers are small enough to wait out for real.
+    #[test]
+    fn a_blocking_caller_waits_without_a_runtime() {
+        let t = Throttle::new(4096, 4096);
+        let start = std::time::Instant::now();
+        t.consume_blocking(1024);
+        let took = start.elapsed();
+
+        assert!(
+            took >= Duration::from_millis(150) && took < Duration::from_secs(2),
+            "1 KiB at 4 KiB/s should take about a quarter second, took {took:?}"
+        );
+        assert_eq!(t.moved(), 1024, "and it is counted like any other byte");
+    }
+
+    /// The other half: no limit means no wait, and still no runtime.
+    #[test]
+    fn a_blocking_caller_with_no_limit_never_waits() {
+        let t = Throttle::none();
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            t.consume_blocking(1024 * 1024);
+        }
+
+        assert!(start.elapsed() < Duration::from_millis(50));
+        assert_eq!(t.moved(), 1000 * 1024 * 1024);
     }
 
     #[tokio::test(start_paused = true)]
