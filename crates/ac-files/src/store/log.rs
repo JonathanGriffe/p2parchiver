@@ -13,46 +13,85 @@
 
 use ac_groups::id::GroupId;
 use ac_net::PeerId;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::store::row::{FileRow, row_to_file};
 use crate::store::{Files, FilesError};
 
 impl Files {
+    /// Say this group wants bytes it was not waiting for a moment ago.
+    ///
+    /// Merging a catalogue notes this for itself. Marking a row unheld does not, so anything
+    /// that discovers bytes have gone has to say so here, or the content loop will sit on its
+    /// backoff with a file it now wants and no reason to go asking.
+    pub fn wanted_again(&mut self, group: GroupId) -> Result<(), FilesError> {
+        let tx = self.db.unchecked_transaction()?;
+        note_wanted(&tx, group)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One page of this group's log, for a peer that has read up to `cursor`.
+    ///
+    /// Writes, where a read would do, because this is the moment rows leave the node: what
+    /// goes out here is what somebody may hand back later, and [`Store::remove`] has to be
+    /// able to tell that from a row nobody has ever seen. The peer's own cursor counts as
+    /// served too — it can only have come from us.
     pub fn changes_since(
-        &self,
+        &mut self,
         group: GroupId,
         cursor: u64,
         limit: usize,
     ) -> Result<(Vec<FileRow>, u64), FilesError> {
-        let mut stmt = self.db.prepare(
-            "SELECT path, size, hash, modified, added_at, added_by, removed_at, have, seen_seq
-             FROM files
-             WHERE group_id = ?1 AND seen_seq > ?2
-             ORDER BY seen_seq
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let (out, highest) = {
+            let mut stmt = tx.prepare(
+                "SELECT path, size, hash, modified, added_at, added_by, removed_at, have, seen_seq
+                 FROM files
+                 WHERE group_id = ?1 AND seen_seq > ?2
+                 ORDER BY seen_seq
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    group.to_string(),
+                    i64::try_from(cursor).unwrap_or(i64::MAX),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                row_to_file,
+            )?;
+
+            let mut out = Vec::new();
+            let mut highest = cursor;
+            for row in rows {
+                match row? {
+                    Ok(file) => {
+                        highest = highest.max(file.seen_seq);
+                        out.push(file);
+                    }
+                    Err(e) => tracing::warn!(error = %e, "skipping an unreadable file row"),
+                }
+            }
+            (out, highest)
+        };
+
+        // Only ever forwards. A peer asking again from further back does not un-serve what
+        // an earlier one was already given.
+        tx.execute(
+            "INSERT INTO file_state (group_id, served_seq) VALUES (?1, ?2)
+             ON CONFLICT(group_id) DO UPDATE
+                 SET served_seq = MAX(file_state.served_seq, excluded.served_seq)",
             params![
                 group.to_string(),
-                i64::try_from(cursor).unwrap_or(i64::MAX),
-                i64::try_from(limit).unwrap_or(i64::MAX),
+                i64::try_from(highest).unwrap_or(i64::MAX)
             ],
-            row_to_file,
         )?;
+        tx.commit()?;
 
-        let mut out = Vec::new();
-        let mut highest = cursor;
-        for row in rows {
-            match row? {
-                Ok(file) => {
-                    highest = highest.max(file.seen_seq);
-                    out.push(file);
-                }
-                Err(e) => tracing::warn!(error = %e, "skipping an unreadable file row"),
-            }
-        }
         Ok((out, highest))
     }
 
@@ -211,19 +250,8 @@ impl Files {
         )?;
         Ok(())
     }
-
-    /// Say this group wants bytes it was not waiting for a moment ago.
-    ///
-    /// Merging a catalogue notes this for itself. Marking a row unheld does not, so anything
-    /// that discovers bytes have gone has to say so here, or the content loop will sit on its
-    /// backoff with a file it now wants and no reason to go asking.
-    pub fn wanted_again(&mut self, group: GroupId) -> Result<(), FilesError> {
-        let tx = self.db.unchecked_transaction()?;
-        note_wanted(&tx, group)?;
-        tx.commit()?;
-        Ok(())
-    }
 }
+
 /// Record that this group gained a row we do not hold.
 pub(super) fn note_wanted(
     tx: &rusqlite::Transaction<'_>,
@@ -253,18 +281,45 @@ pub(super) fn note_local(
     Ok(())
 }
 
+/// Take the next position in this group's log.
+///
+/// Counted rather than measured. Read off `MAX(seen_seq)` it would go backwards whenever the
+/// row holding the highest one left, and the number would be handed out a second time — see
+/// [`Store::remove`], which is where a row can now leave.
 pub(super) fn next_seq(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<u64, FilesError> {
-    Ok(seq_in(tx, group)? + 1)
+    tx.execute(
+        "INSERT INTO file_state (group_id, seq) VALUES (?1, 1)
+         ON CONFLICT(group_id) DO UPDATE SET seq = file_state.seq + 1",
+        params![group.to_string()],
+    )?;
+    seq_in(tx, group)
 }
 
 /// The highest position this group has handed out, or zero.
 fn seq_in(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<u64, FilesError> {
-    let highest: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seen_seq), 0) FROM files WHERE group_id = ?1",
-        params![group.to_string()],
-        |row| row.get(0),
-    )?;
-    Ok(highest.max(0) as u64)
+    let highest: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM file_state WHERE group_id = ?1",
+            params![group.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(highest.unwrap_or(0).max(0) as u64)
+}
+
+/// The highest position that has ever been served to a peer from this group.
+pub(super) fn served_seq(
+    tx: &rusqlite::Transaction<'_>,
+    group: GroupId,
+) -> Result<u64, FilesError> {
+    let highest: Option<i64> = tx
+        .query_row(
+            "SELECT served_seq FROM file_state WHERE group_id = ?1",
+            params![group.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(highest.unwrap_or(0).max(0) as u64)
 }
 
 #[cfg(test)]
@@ -272,7 +327,7 @@ mod tests {
     use super::*;
     use crate::content::Content;
     use crate::path::RelPath;
-    use crate::store::fixtures::{AT, group_id, peer, row, store};
+    use crate::store::fixtures::{AT, group_id, peer, row, served, store};
 
     #[test]
     fn a_forgotten_group_does_not_leave_its_digest_behind() {
@@ -570,6 +625,7 @@ mod tests {
         let g = group_id(1);
         let r = row(me, "a.jpg", "aa");
         files.record(g, &r, false).unwrap();
+        served(&mut files, g);
         let before = files.digest(g).unwrap();
 
         files.remove(g, &r.path, AT + 1).unwrap();

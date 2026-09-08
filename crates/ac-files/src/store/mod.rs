@@ -17,7 +17,7 @@ mod row;
 
 pub use row::{FileRow, Merged, Recorded};
 
-use log::{next_seq, note_local, note_wanted};
+use log::{next_seq, note_local, note_wanted, served_seq};
 use row::{row_to_file, wins_hash, wins_path};
 
 /// How long to wait for another process's write lock before giving up.
@@ -88,7 +88,13 @@ impl Files {
                  digest_seq  INTEGER NOT NULL DEFAULT 0,
                  last_change INTEGER NOT NULL DEFAULT 0,
                  changes     INTEGER NOT NULL DEFAULT 0,
-                 wanted      INTEGER NOT NULL DEFAULT 0
+                 wanted      INTEGER NOT NULL DEFAULT 0,
+                 -- The last position handed out in this group's log. Kept rather than read
+                 -- off the rows, so that a row leaving cannot hand its number back out.
+                 seq         INTEGER NOT NULL DEFAULT 0,
+                 -- The highest position that has ever left this node, for any peer. What
+                 -- separates a row somebody may be holding from one nobody has ever seen.
+                 served_seq  INTEGER NOT NULL DEFAULT 0
              );",
         )?;
 
@@ -544,23 +550,54 @@ impl Files {
         Ok(out)
     }
 
-    /// Mark a file removed. The row stays; the caller deletes the bytes.
+    /// Take a file out of a group. The caller deletes the bytes.
+    ///
+    /// Ordinarily a tombstone: the row stays, saying it went. That is what makes a removal
+    /// stick, because a peer still holding the file hands it straight back otherwise — a
+    /// merge against nothing takes the incoming row as it stands.
+    ///
+    /// A row that has never left this node has nobody to hand it back, so there is nothing
+    /// for a tombstone to defend against and the row simply goes. What decides it is
+    /// `served_seq`: everything above it is still only ours. Anyone admitted later reads the
+    /// log from the beginning and never learns the file existed, which is the truth.
     pub fn remove(&mut self, group: GroupId, path: &RelPath, at: i64) -> Result<bool, FilesError> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let seq = next_seq(&tx, group)?;
-        let changed = tx.execute(
-            "UPDATE files SET removed_at = ?3, have = 0, seen_seq = ?4
-             WHERE group_id = ?1 AND path = ?2 AND removed_at IS NULL",
-            params![
-                group.to_string(),
-                path.as_str(),
-                at,
-                i64::try_from(seq).map_err(|_| FilesError::CorruptRow)?,
-            ],
-        )?;
+        let Some(row) = read_row(&tx, group, path)? else {
+            return Ok(false);
+        };
+        if row.is_removed() {
+            return Ok(false);
+        }
+
+        let changed = match row.seen_seq > served_seq(&tx, group)? {
+            true => {
+                // The position it held is spent even though no row carries it now. The
+                // catalogue changed, and the digest is cached against the log's position —
+                // without this the removal would be invisible to everything that asks.
+                next_seq(&tx, group)?;
+                tx.execute(
+                    "DELETE FROM files WHERE group_id = ?1 AND path = ?2",
+                    params![group.to_string(), path.as_str()],
+                )?
+            }
+            false => {
+                let seq = next_seq(&tx, group)?;
+                tx.execute(
+                    "UPDATE files SET removed_at = ?3, have = 0, seen_seq = ?4
+                     WHERE group_id = ?1 AND path = ?2 AND removed_at IS NULL",
+                    params![
+                        group.to_string(),
+                        path.as_str(),
+                        at,
+                        i64::try_from(seq).map_err(|_| FilesError::CorruptRow)?,
+                    ],
+                )?
+            }
+        };
+
         if changed > 0 {
             note_local(&tx, group, at)?;
         }
@@ -716,7 +753,7 @@ pub enum FilesError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::fixtures::{AT, group_id, peer, row, store};
+    use crate::store::fixtures::{AT, group_id, peer, row, served, store};
     use ac_groups::store::Groups;
 
     #[test]
@@ -778,6 +815,8 @@ mod tests {
         let g = group_id(1);
         let r = row(me, "a.jpg", "aa");
         files.record(g, &r, false).unwrap();
+        // A peer has it, so the removal is owed a note saying it went.
+        served(&mut files, g);
 
         assert!(files.remove(g, &r.path, AT + 5).unwrap());
         assert!(files.list(g, None, false).unwrap().is_empty());
@@ -1067,6 +1106,94 @@ mod tests {
         assert_eq!(files.held_any_of(&asked).unwrap().len(), hashes.len());
     }
 
+    /// A tombstone is what stops a peer handing a removed file straight back, so it is owed
+    /// only to a peer that could. Nothing has left this node, so the row simply goes.
+    #[test]
+    fn removing_a_file_nobody_was_ever_given_leaves_no_tombstone() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+        let path = RelPath::parse("a.jpg").unwrap();
+        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
+
+        assert!(files.remove(g, &path, AT).unwrap());
+
+        assert!(files.get(g, &path).unwrap().is_none(), "no row at all");
+        let (changes, _) = files.changes_since(g, 0, 100).unwrap();
+        assert!(changes.is_empty(), "and nothing in the log to replicate");
+    }
+
+    /// Once it has gone out, it has to be remembered as gone: a peer still holding it merges
+    /// against nothing and hands it back.
+    #[test]
+    fn removing_a_file_a_peer_has_seen_leaves_a_tombstone() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+        let path = RelPath::parse("a.jpg").unwrap();
+        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
+
+        // Served, so from here on somebody may be holding it.
+        let (_, served) = files.changes_since(g, 0, 100).unwrap();
+        assert!(served > 0);
+
+        assert!(files.remove(g, &path, AT).unwrap());
+
+        let row = files.get(g, &path).unwrap().expect("the row stays");
+        assert!(row.is_removed(), "saying it went");
+        assert!(
+            row.seen_seq > served,
+            "and after the addition in the log, so a peer reading forward sees it"
+        );
+    }
+
+    /// The invariant the whole thing rests on: a position handed out once is never handed out
+    /// again. Counted rather than read off the rows, because a row can now leave.
+    #[test]
+    fn a_position_in_the_log_is_never_handed_out_twice() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+
+        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
+        files.record(g, &row(me, "b.jpg", "bb"), false).unwrap();
+        let highest = files.seq(g).unwrap();
+
+        // The one holding the highest position goes, taking its number with it.
+        files
+            .remove(g, &RelPath::parse("b.jpg").unwrap(), AT)
+            .unwrap();
+
+        files.record(g, &row(me, "c.jpg", "cc"), false).unwrap();
+        let after = files.seq(g).unwrap();
+        assert!(
+            after > highest,
+            "the next row took a fresh position, not the one b.jpg gave up: {after} vs {highest}"
+        );
+    }
+
+    /// A peer's own cursor counts as served, whatever it did or did not fetch: it can only
+    /// have got that number from us.
+    #[test]
+    fn a_cursor_a_peer_reports_is_enough_to_owe_it_a_tombstone() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+        let path = RelPath::parse("a.jpg").unwrap();
+        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
+        let at = files.seq(g).unwrap();
+
+        // Asked from where it had already got to, so there is nothing to send — and it is
+        // still holding everything up to there.
+        let (changes, _) = files.changes_since(g, at, 100).unwrap();
+        assert!(changes.is_empty());
+
+        files.remove(g, &path, AT).unwrap();
+        assert!(
+            files
+                .get(g, &path)
+                .unwrap()
+                .is_some_and(|row| row.is_removed()),
+            "a tombstone is still owed to whoever reported that cursor"
+        );
+    }
+
     #[test]
     fn forgetting_a_group_leaves_no_work_behind() {
         let (mut files, me) = store();
@@ -1120,6 +1247,8 @@ mod tests {
         let g = group_id(1);
         let r = row(me, "a.jpg", "aa");
         files.record(g, &r, false).unwrap();
+        // Served, so there is a row left to look at afterwards.
+        served(&mut files, g);
         files.remove(g, &r.path, AT).unwrap();
 
         let stored = files.list(g, None, true).unwrap();
@@ -1385,6 +1514,9 @@ mod tests {
         let g = group_id(1);
         let r = row(me, "a.jpg", "aa");
         files.record(g, &r, false).unwrap();
+        // It went out, so the removal leaves a tombstone — which is the thing the stale
+        // re-add below has to lose to.
+        served(&mut files, g);
         files.remove(g, &r.path, AT + 100).unwrap();
 
         // A re-add stamped before the removal must not resurrect it.

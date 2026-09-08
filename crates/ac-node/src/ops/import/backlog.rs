@@ -728,7 +728,29 @@ mod tests {
         assert_eq!(ledger(&paths).unwrap().waiting().unwrap(), 1);
         assert_eq!(super::unsorted(&paths, None, 10).unwrap().len(), 1);
 
-        // A tombstone rather than a deletion: the peers told it arrived are told it left.
+        // Nothing was ever served out of this group, so there is nobody to tell and no
+        // tombstone to leave: the row goes with the file.
+        let row = files
+            .get(group, &RelPath::parse("2024/a.jpg").unwrap())
+            .unwrap();
+        assert!(row.is_none(), "left no residue");
+    }
+
+    #[test]
+    fn taking_back_a_filing_a_peer_was_told_about_leaves_a_tombstone() {
+        let home = home();
+        let (paths, _) = imported(&home, &["DCIM/a.jpg"]);
+        let group = group(&paths, "Holidays");
+        let file = super::unsorted(&paths, None, 10).unwrap().remove(0);
+
+        sort(&paths, &file.row.hash, "Holidays", "2024").unwrap();
+
+        // Somebody asked for the catalogue, so the row has been out of this node.
+        let (mut files, _) = store(&paths);
+        files.changes_since(group, 0, 100).unwrap();
+
+        undo(&paths, std::slice::from_ref(&file.row.hash)).unwrap();
+
         let row = files
             .get(group, &RelPath::parse("2024/a.jpg").unwrap())
             .unwrap();

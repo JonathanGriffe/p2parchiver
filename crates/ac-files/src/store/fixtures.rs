@@ -36,3 +36,9 @@ pub fn row(me: PeerId, path: &str, hash: &str) -> FileRow {
         seen_seq: 0,
     }
 }
+
+/// Hand this group's log out, so what is in it now counts as somebody else's too — and a
+/// removal from here on owes them a tombstone.
+pub fn served(files: &mut Files, group: GroupId) {
+    files.changes_since(group, 0, 1000).unwrap();
+}

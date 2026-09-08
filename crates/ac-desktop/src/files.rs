@@ -362,9 +362,17 @@ mod tests {
         assert!(read(&paths, &looking_at).files.is_empty());
     }
 
+    /// Hand this group's log to a peer, so what is in it now counts as shared.
+    fn shared(paths: &Paths, group: &str) {
+        let mut session = ops::file::session(paths, group).unwrap();
+        session.files.changes_since(session.id, 0, 100).unwrap();
+    }
+
     #[test]
     fn a_removed_file_only_shows_when_asked_for() {
         let (_tmp, paths, looking_at) = with_a_file();
+        // Somebody else has it, so removing it has to leave a note saying so.
+        shared(&paths, &looking_at.group);
         ops::file::remove(&paths, &looking_at.group, "notes.txt").unwrap();
 
         assert!(read(&paths, &looking_at).files.is_empty());
@@ -377,6 +385,23 @@ mod tests {
         assert_eq!(page.files.len(), 1);
         assert_eq!(page.files[0].held, "removed");
         assert!(page.files[0].removed);
+    }
+
+    /// The other half, and what a reader actually sees of it: a file nobody was ever given
+    /// leaves nothing behind, so "Removed" in a group of one's own stays empty.
+    #[test]
+    fn a_file_nobody_was_given_leaves_nothing_to_show() {
+        let (_tmp, paths, looking_at) = with_a_file();
+        ops::file::remove(&paths, &looking_at.group, "notes.txt").unwrap();
+
+        let asked = State {
+            removed: true,
+            ..looking_at
+        };
+        assert!(
+            read(&paths, &asked).files.is_empty(),
+            "there is no tombstone to show"
+        );
     }
 
     #[test]
