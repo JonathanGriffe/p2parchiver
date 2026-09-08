@@ -1,11 +1,12 @@
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use ac_net::config::{Config, Paths};
 use ac_node::ops;
 use ac_node::ops::format::human_size;
 use anyhow::{Context, Result, anyhow};
-use slint::ComponentHandle;
+use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::node::Node;
 use crate::ui::MainWindow;
@@ -43,6 +44,14 @@ pub fn load(window: &MainWindow, paths: &Paths) {
             .into(),
     );
     window.set_enrolled(config.server.is_some());
+
+    // The Sources section, which is read here rather than on the poll for the same reason as
+    // everything above it: these are boxes somebody types into, and a poll would take the
+    // text back out from under them. What an implementation shares is fixed by the build, so
+    // reading it once is reading it whenever it could have changed.
+    window.set_source_settings(ModelRc::from(Rc::new(VecModel::from(
+        crate::sources::shared_settings(paths),
+    ))));
 }
 
 pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
@@ -308,6 +317,7 @@ fn start(node: &Shared, paths: &Paths) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use i_slint_backend_testing::ElementHandle;
+    use slint::Model as _;
 
     use super::*;
 
@@ -395,6 +405,46 @@ mod tests {
         view::describe_node(&window, &paths).unwrap();
         assert_eq!(window.get_username(), "alice");
         assert_eq!(window.get_server_host(), "ac.example.net");
+    }
+
+    /// The Settings page, as `app.slint` numbers the tabs. Only here: nothing in the poll
+    /// narrows by it, which is the whole reason this page is loaded instead.
+    const SETTINGS_TAB: i32 = 6;
+
+    /// The Settings tab is where a source's shared settings are changed, and it is reachable
+    /// without ever opening the Sources tab. Filled only by the Sources page's own poll, the
+    /// section was gated on a list that was still empty and did not appear at all.
+    #[test]
+    fn the_sources_section_is_there_without_opening_the_sources_tab() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        let (_tmp, paths) = crate::groups::tests::home("jonathan");
+        ops::import::set_setting(&paths, "drive", "client_secret", "shh-1234").unwrap();
+
+        // Tall enough that the whole page is laid out: a lookup finds only what is on screen.
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(1200, 3000));
+
+        // Straight to Settings, which is what somebody changing a credential does.
+        window.set_tab(SETTINGS_TAB);
+        assert_eq!(
+            window.get_source_settings().iter().count(),
+            0,
+            "nothing has filled it yet"
+        );
+
+        load(&window, &paths);
+
+        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+        assert_eq!(showing("SOURCES"), 1, "the section is on the page");
+        assert!(
+            window
+                .get_source_settings()
+                .iter()
+                .any(|item| item.key == "client_secret" && item.value == "shh-1234"),
+            "with what is stored in it, ready to be changed"
+        );
     }
 
     /// A refusal over the username should not cost someone the token they pasted, so the
