@@ -51,7 +51,11 @@ pub struct Configured {
 }
 
 pub fn sources(paths: &Paths) -> Result<Vec<Configured>> {
-    let ledger = ledger(paths)?;
+    sources_with(&ledger(paths)?)
+}
+
+/// The same, for a caller that already has the ledger open.
+pub fn sources_with(ledger: &Ledger) -> Result<Vec<Configured>> {
     let tallies = ledger
         .tallies()
         .context("counting what each source brought in")?;
@@ -243,8 +247,13 @@ pub struct Setting {
 }
 
 pub fn settings(paths: &Paths, source: &str) -> Result<Vec<Setting>> {
+    settings_with(&ledger(paths)?, source)
+}
+
+/// The same, for a caller asking about several implementations at once.
+pub fn settings_with(ledger: &Ledger, source: &str) -> Result<Vec<Setting>> {
     let entry = implementation(source)?;
-    let stored = ledger(paths)?.settings(entry.name)?;
+    let stored = ledger.settings(entry.name)?;
 
     // Only what is asked for. A setting the sign-in fills in has no row: there is nothing
     // useful to show and nothing anyone could usefully type into it.

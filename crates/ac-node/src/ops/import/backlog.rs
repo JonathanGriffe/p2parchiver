@@ -29,7 +29,11 @@ pub struct Backlog {
 }
 
 pub fn backlog(paths: &Paths, folder: Option<(&str, &str)>) -> Result<Backlog> {
-    let ledger = ledger(paths)?;
+    backlog_with(&ledger(paths)?, folder)
+}
+
+/// The same, for a caller that already has the ledger open.
+pub fn backlog_with(ledger: &Ledger, folder: Option<(&str, &str)>) -> Result<Backlog> {
     Ok(Backlog {
         total: ledger.waiting()?,
         in_folder: match folder {
@@ -55,6 +59,11 @@ impl Inbox {
             ledger: ledger(paths)?,
             files,
         })
+    }
+
+    /// How many are waiting, off the ledger this inbox already holds.
+    pub fn backlog(&self, folder: Option<(&str, &str)>) -> Result<Backlog> {
+        backlog_with(&self.ledger, folder)
     }
 
     /// One page of what is waiting, oldest first.

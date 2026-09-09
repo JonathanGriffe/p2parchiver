@@ -55,7 +55,13 @@ pub struct Page {
 }
 
 pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
-    let backlog = ops::import::backlog(paths, None).unwrap_or_default();
+    // Opened once for the whole read: every question below is off the same ledger, and
+    // reopening it per question is a schema check per question.
+    let opened = ops::import::Inbox::open(paths).ok();
+    let backlog = opened
+        .as_ref()
+        .and_then(|it| it.backlog(None).ok())
+        .unwrap_or_default();
     let groups = ops::group::list(paths).unwrap_or_default();
 
     let mut page = Page {
@@ -85,9 +91,6 @@ pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
     page.folder_names = folders;
     page.folder_index = at;
 
-    // Opened once for the whole read: the tab asks for the file on screen, and reopening the
-    // ledger and the file index for each question is the bulk of what that costs.
-    let opened = ops::import::Inbox::open(paths).ok();
     let found = opened.as_ref().and_then(|it| current_in(it, looking_at));
     let (Some(inbox), Some((file, here))) = (opened, found) else {
         page.position = match backlog.total {
@@ -97,7 +100,8 @@ pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
         return page;
     };
 
-    let in_folder = ops::import::backlog(paths, Some((&file.row.source_dir, &file.row.folder)))
+    let in_folder = inbox
+        .backlog(Some((&file.row.source_dir, &file.row.folder)))
         .unwrap_or_default();
 
     page.have = true;
@@ -318,7 +322,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     // leave the trail pointing past the backlog, and the count with it.
                     let looking_at = selection.get().sorting;
                     if let Ok(inbox) = ops::import::Inbox::open(&paths)
-                        && let Some(file) = current_in(&inbox, &looking_at)
+                        && let Some((file, _)) = current_in(&inbox, &looking_at)
                         && ahead(&inbox, &file).is_some()
                     {
                         selection.forward((file.row.at, file.row.hash));
@@ -610,7 +614,7 @@ mod tests {
             match forward {
                 true => {
                     if let Ok(inbox) = ops::import::Inbox::open(&paths)
-                        && let Some(file) = current_in(&inbox, &looking_at)
+                        && let Some((file, _)) = current_in(&inbox, &looking_at)
                         && ahead(&inbox, &file).is_some()
                     {
                         selection.forward((file.row.at, file.row.hash));

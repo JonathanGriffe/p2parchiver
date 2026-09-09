@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use ac_import::ledger::Ledger;
 use ac_net::config::Paths;
 use ac_node::ops;
 use ac_node::ops::format::{ago, human_size};
@@ -35,18 +36,24 @@ pub struct Page {
 }
 
 pub fn read(paths: &Paths) -> Page {
+    // One open for the whole page: both halves ask the same ledger, and the settings half
+    // asks it once per implementation.
+    let ledger = ops::import::ledger(paths).ok();
     Page {
-        sources: sources(paths),
+        sources: ledger.as_ref().map(sources).unwrap_or_default(),
         implementations: ops::import::available()
             .iter()
             .map(|entry| slint::SharedString::from(entry.name))
             .collect(),
-        settings: shared_settings(paths),
+        settings: ledger
+            .as_ref()
+            .map(shared_settings_with)
+            .unwrap_or_default(),
     }
 }
 
-fn sources(paths: &Paths) -> Vec<SourceItem> {
-    ops::import::sources(paths)
+fn sources(ledger: &Ledger) -> Vec<SourceItem> {
+    ops::import::sources_with(ledger)
         .unwrap_or_default()
         .iter()
         // A one-shot that has run is not a source to watch any more: it fetched what it
@@ -100,9 +107,18 @@ fn standing(entry: &ops::import::Configured) -> (i32, &'static str) {
 }
 
 pub fn shared_settings(paths: &Paths) -> Vec<SettingItem> {
+    match ops::import::ledger(paths) {
+        Ok(ledger) => shared_settings_with(&ledger),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The same, for a caller that already has the ledger open. One open for every
+/// implementation rather than one each: the list grows as sources are added.
+pub fn shared_settings_with(ledger: &Ledger) -> Vec<SettingItem> {
     let mut out = Vec::new();
     for entry in ops::import::available() {
-        let Ok(settings) = ops::import::settings(paths, entry.name) else {
+        let Ok(settings) = ops::import::settings_with(ledger, entry.name) else {
             continue;
         };
         for setting in settings {
