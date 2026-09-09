@@ -1196,6 +1196,11 @@ mod tests {
         })
         .await;
 
+        // The status file is written on a tick, and the mirror lands between two of them:
+        // whether one follows before the hang-up is down to how the machine schedules, so
+        // ask for one rather than read whatever the last one happened to say.
+        bob.tick();
+
         let db = Paths::rooted_at(bob.dir.path()).db_file();
         let snapshot = Published::open(&db).unwrap().read().unwrap();
 

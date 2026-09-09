@@ -16,7 +16,7 @@ pub fn reveal(file: &Path) -> Result<()> {
         command
             .spawn()
             .with_context(|| format!("showing {}", file.display()))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "windows"))]
