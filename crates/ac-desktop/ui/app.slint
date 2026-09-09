@@ -61,7 +61,12 @@ export component MainWindow inherits Window {
     // The widest tab needs this much before its right-hand buttons start going over the
     // edge, and a window narrower than its contents clips them rather than shrinking them.
     // Read back by the layout test that holds it to that.
-    out property <length> narrowest: 800px;
+    //
+    // With room to spare, because the widest row is sized by text: two combo boxes and the
+    // buttons beside them are as wide as the font draws them, and a machine without the
+    // fonts this one has draws them wider. Measured at 757px here and failing CI at 802px,
+    // so the margin is the point rather than the number.
+    out property <length> narrowest: 880px;
     min-width: root.narrowest;
     min-height: 420px;
 
