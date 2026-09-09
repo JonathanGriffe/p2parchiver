@@ -55,6 +55,15 @@ pub fn ledger(paths: &Paths) -> Result<Ledger> {
     Ledger::open(&db).with_context(|| format!("opening the import ledger at {}", db.display()))
 }
 
+/// Bytes held by files imported and not yet sorted. Content this node is holding, so it
+/// counts against the same budget peer transfers answer to, and it is part of what the
+/// storage bar calls held.
+pub fn unsorted_bytes(ledger: &Ledger) -> Result<u64> {
+    ledger
+        .unsorted_bytes()
+        .context("measuring what is waiting to be sorted")
+}
+
 /// What the host knows that the inbox cannot: whether a group already holds these bytes.
 pub struct HeldHere<'a>(pub &'a Files);
 

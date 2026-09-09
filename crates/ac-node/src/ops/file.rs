@@ -225,9 +225,7 @@ pub fn storage(paths: &Paths) -> Result<Storage> {
         root.parent().map(Path::to_path_buf)
     };
 
-    let unsorted = super::import::ledger(paths)?
-        .unsorted_bytes()
-        .context("measuring what is waiting to be sorted")?;
+    let unsorted = super::import::unsorted_bytes(&super::import::ledger(paths)?)?;
 
     Ok(Storage {
         held: files

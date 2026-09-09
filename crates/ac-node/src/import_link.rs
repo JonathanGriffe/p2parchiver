@@ -158,10 +158,9 @@ impl ImportLink {
         })
     }
 
-    /// Bytes held by files imported and not yet sorted. Content this node is holding, so it
-    /// counts against the same budget peer transfers answer to.
+    /// Bytes held by files imported and not yet sorted, off the ledger this link holds.
     pub fn unsorted_bytes(&self) -> u64 {
-        self.ledger.unsorted_bytes().unwrap_or(0)
+        crate::ops::import::unsorted_bytes(&self.ledger).unwrap_or(0)
     }
 
     /// Start a scan if one is due, and keep the download pool full.
