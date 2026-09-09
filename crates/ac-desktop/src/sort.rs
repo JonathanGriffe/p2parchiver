@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use ac_net::config::Paths;
@@ -91,6 +91,11 @@ pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
     page.folder_names = folders;
     page.folder_index = at;
 
+    // Read once for the whole page: the file on screen and both neighbours are paths under
+    // the same storage root.
+    let root = ac_net::config::Config::load(&paths.config_file())
+        .ok()
+        .map(|config| config.storage_root(paths));
     let found = opened.as_ref().and_then(|it| current_in(it, looking_at));
     let (Some(inbox), Some((file, here))) = (opened, found) else {
         page.position = match backlog.total {
@@ -114,10 +119,10 @@ pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
     page.folder = file.row.folder.clone();
     page.hash = file.row.hash.clone();
     page.held = file.held;
-    page.path = located(paths, &file);
+    page.path = located(root.as_deref(), &file);
     page.has_previous = !looking_at.trail.is_empty();
     page.has_next = ahead(&inbox, &file).is_some();
-    page.neighbours = neighbours(&inbox, paths, looking_at, &file);
+    page.neighbours = neighbours(&inbox, root.as_deref(), looking_at, &file);
     page
 }
 
@@ -166,13 +171,16 @@ fn ahead(inbox: &ops::import::Inbox, file: &Waiting) -> Option<Waiting> {
 
 fn neighbours(
     inbox: &ops::import::Inbox,
-    paths: &Paths,
+    root: Option<&Path>,
     looking_at: &Sorting,
     file: &Waiting,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
 
     let ahead = ahead(inbox, file);
+    // The trail holds the cursor *before* each file stepped onto, so its last entry is what
+    // the file on screen came after, and the one before that is what its predecessor came
+    // after. Fewer than two entries means there is nothing behind to fetch ahead for.
     let behind = match looking_at.trail.len() {
         0 | 1 => Vec::new(),
         len => {
@@ -184,7 +192,7 @@ fn neighbours(
     };
 
     for file in ahead.iter().chain(behind.iter()) {
-        out.push((file.row.hash.clone(), located(paths, file)));
+        out.push((file.row.hash.clone(), located(root, file)));
     }
     out
 }
@@ -213,13 +221,11 @@ fn current(paths: &Paths, looking_at: &Sorting) -> Option<Waiting> {
 }
 
 /// Where the bytes are, absolute, for opening and previewing.
-fn located(paths: &Paths, file: &Waiting) -> String {
-    let Ok(config) = ac_net::config::Config::load(&paths.config_file()) else {
+fn located(root: Option<&Path>, file: &Waiting) -> String {
+    let Some(root) = root else {
         return String::new();
     };
-    config
-        .storage_root(paths)
-        .join(ops::import::UNSORTED)
+    root.join(ops::import::UNSORTED)
         .join(file.path.as_str())
         .display()
         .to_string()
