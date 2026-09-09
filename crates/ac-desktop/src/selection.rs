@@ -14,7 +14,9 @@ pub struct State {
 /// Where the Sort tab has got to
 #[derive(Clone, Default)]
 pub struct Sorting {
-    pub trail: Vec<(i64, String)>,
+    /// Behind an `Arc` because [`Selection::get`] clones the whole state on every poll and
+    /// on every step, and this grows by one hash for every file stepped past.
+    pub trail: Arc<Vec<(i64, String)>>,
     pub group: String,
     /// What has been done that can still be taken back, oldest first. Session-only: a
     /// decision survives a restart, and taking it back does not.
@@ -81,18 +83,18 @@ impl Selection {
 
     /// Step to the next file, remembering the one being left so `back` can return to it.
     pub fn forward(&self, from: (i64, String)) {
-        self.with(|state| state.sorting.trail.push(from));
+        self.with(|state| Arc::make_mut(&mut state.sorting.trail).push(from));
     }
 
     pub fn back(&self) {
         self.with(|state| {
-            state.sorting.trail.pop();
+            Arc::make_mut(&mut state.sorting.trail).pop();
         });
     }
 
     /// Start again at the oldest
     pub fn rewind(&self) {
-        self.with(|state| state.sorting.trail.clear());
+        self.with(|state| Arc::make_mut(&mut state.sorting.trail).clear());
     }
 
     pub fn set_sort_group(&self, group: &str) {
