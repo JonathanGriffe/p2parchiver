@@ -169,6 +169,15 @@ pub struct Previews {
     made: Arc<AtomicUsize>,
 }
 
+/// Which pending job to work next: the one on screen if any is waiting on a preview, else
+/// whatever has waited longest.
+fn next_up(pending: &VecDeque<Job>) -> usize {
+    pending
+        .iter()
+        .position(|job| job.wanted_now)
+        .unwrap_or_default()
+}
+
 /// The one worker for the process. It owns a thread and a directory, so there is no sense
 /// in a second.
 pub fn previews() -> &'static Previews {
@@ -194,7 +203,24 @@ impl Previews {
             move || {
                 // Off the event loop by construction: an ffmpeg run is far too slow to do
                 // anywhere a frame is waiting on it.
-                while let Ok(job) = jobs.recv() {
+                //
+                // Taken out of order on purpose: the file on screen is the only preview
+                // anyone is waiting on, and stepping quickly queues a prefetch either side
+                // of every file passed through. Strictly first-in, the visible one would
+                // wait behind them — up to a tool timeout each.
+                let mut pending: VecDeque<Job> = VecDeque::new();
+                loop {
+                    if pending.is_empty() {
+                        match jobs.recv() {
+                            Ok(job) => pending.push_back(job),
+                            Err(_) => break,
+                        }
+                    }
+                    pending.extend(jobs.try_iter());
+
+                    let Some(job) = pending.remove(next_up(&pending)) else {
+                        break;
+                    };
                     work(&cache, &mine, &made, job);
                 }
             }
@@ -617,6 +643,37 @@ mod tests {
     /// This is the gap that made every video show a placeholder while the tests were green:
     /// they fell back to the vendored copy through [`ffmpeg_for_test`], so the one thing that
     /// was broken — the copy the app itself would find — was the one thing nothing checked.
+    /// Stepping quickly queues a prefetch either side of every file passed through, so the
+    /// one on screen has to be taken out of turn or it waits behind them — a tool timeout
+    /// each, for something nobody is looking at yet.
+    #[test]
+    fn the_preview_on_screen_is_taken_before_the_ones_fetched_ahead() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        let job = |hash: &str, wanted_now| Job {
+            hash: hash.to_owned(),
+            path: PathBuf::from(hash),
+            show: window.as_weak(),
+            wanted_now,
+        };
+
+        let mut pending: VecDeque<Job> = VecDeque::new();
+        pending.push_back(job("ahead", false));
+        pending.push_back(job("behind", false));
+        assert_eq!(
+            next_up(&pending),
+            0,
+            "nothing on screen waiting, so the oldest"
+        );
+
+        pending.push_back(job("on-screen", true));
+        assert_eq!(
+            pending[next_up(&pending)].hash,
+            "on-screen",
+            "it goes first however long the others have been queued"
+        );
+    }
+
     #[test]
     fn the_build_leaves_ffmpeg_where_the_binary_will_look_for_it() {
         let vendored = Path::new(env!("CARGO_MANIFEST_DIR"))
