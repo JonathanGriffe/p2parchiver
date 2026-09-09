@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -164,8 +165,8 @@ pub struct Previews {
     cache: Arc<Cache>,
     tools: Tools,
     want: Sender<Job>,
-    /// Previews actually produced
-    #[allow(dead_code)]
+    /// Previews actually produced. Only the tests count them.
+    #[cfg(test)]
     made: Arc<AtomicUsize>,
 }
 
@@ -194,11 +195,14 @@ fn cache_dir() -> PathBuf {
 impl Previews {
     pub fn start(dir: PathBuf, tools: Tools) -> Self {
         let cache = Arc::new(Cache::at(dir));
+        #[cfg(test)]
         let made = Arc::new(AtomicUsize::new(0));
         let (want, jobs) = channel::<Job>();
 
         std::thread::spawn({
-            let (cache, made) = (Arc::clone(&cache), Arc::clone(&made));
+            let cache = Arc::clone(&cache);
+            #[cfg(test)]
+            let made = Arc::clone(&made);
             let mine = tools.clone();
             move || {
                 // Off the event loop by construction: an ffmpeg run is far too slow to do
@@ -221,7 +225,13 @@ impl Previews {
                     let Some(job) = pending.remove(next_up(&pending)) else {
                         break;
                     };
-                    work(&cache, &mine, &made, job);
+                    work(
+                        &cache,
+                        &mine,
+                        #[cfg(test)]
+                        &made,
+                        job,
+                    );
                 }
             }
         });
@@ -230,6 +240,7 @@ impl Previews {
             cache,
             tools,
             want,
+            #[cfg(test)]
             made,
         }
     }
@@ -291,7 +302,7 @@ impl Previews {
     }
 }
 
-fn work(cache: &Cache, tools: &Tools, made: &AtomicUsize, job: Job) {
+fn work(cache: &Cache, tools: &Tools, #[cfg(test)] made: &AtomicUsize, job: Job) {
     // Asked for twice while it sat in the queue, or fetched as a neighbour and then
     // stepped onto. Either way it is here, and running the tool again buys nothing.
     if !cache.has(&job.hash) {
@@ -311,6 +322,7 @@ fn work(cache: &Cache, tools: &Tools, made: &AtomicUsize, job: Job) {
             let _ = std::fs::remove_file(&building);
             return;
         }
+        #[cfg(test)]
         made.fetch_add(1, Ordering::Relaxed);
     }
     cache.touch(&job.hash);
