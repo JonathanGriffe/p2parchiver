@@ -144,9 +144,6 @@ main() {
     start_server
 
     say "enrolling"
-    # Erin is enrolled here but joins nothing until section 10. Everything from 1 to 9 is
-    # calibrated on this network, and section 5 in particular asserts that it falls silent —
-    # a fifth node mirroring a group is exactly the noise that test exists to not see.
     enrol alice; enrol bob; enrol carol; enrol dave; enrol erin
 
     BOB=$(ac bob id)
@@ -279,13 +276,6 @@ main() {
     fi
 
     say "10. the node inside the desktop app is the same node"
-    # What the desktop app rests on: `ac run` and the app's daemon thread are one
-    # implementation, not two. So erin joins on the terms bob and carol did, started the other
-    # way, and has to end up in the same place — the group learned with no --dial, both files
-    # mirrored unasked, byte for byte.
-    #
-    # Alice was stopped in section 8 and is the only member who can admit anyone, so she comes
-    # back first. Everything already asserted has been asserted by now.
     run_node alice
     run_desktop_node erin
     sleep 2

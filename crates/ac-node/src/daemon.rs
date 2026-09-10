@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -5,9 +6,12 @@ use libp2p::futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, rendezvous, request_response, upnp};
 
+use crate::blob;
 use crate::file_link::FileLink;
 use crate::group_link::GroupLink;
+use crate::import_link::ImportLink;
 use crate::peer_link::PeerLink;
+use crate::throttle::Throttle;
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_groups::wire::{GroupRequest, GroupResponse};
 use ac_net::admission_link::AdmissionLink;
@@ -114,12 +118,23 @@ pub async fn run(
 
     let mut groups = GroupLink::open(paths, identity)?;
     let mut files = FileLink::open(paths, identity)?;
+
+    // Only the download throttle is created here as only download is done in two places
+    // Upload is only done in peer link
+    let down = Arc::new(Throttle::from_config(
+        config.bandwidth_max,
+        blob::THROTTLE_BURST,
+    ));
+
     let mut peers = PeerLink::open(
         paths,
         identity,
         link.as_ref().map(|l| l.server),
         attest::now(),
+        down.clone(),
     )?;
+
+    let mut imports = ImportLink::open(paths, down.clone())?;
 
     let mut blobs = FileLink::accept_blobs(&mut swarm)?;
     let mut connectivity = Connectivity::default();
@@ -142,7 +157,15 @@ pub async fn run(
 
                 groups.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
                 files.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
-                peers.housekeeping(&mut swarm, &mut files, &mut groups, &roster, attest::now());
+
+                // Measured once and given to both, which is what makes them one budget.
+                let space = peers.space(&files, imports.unsorted_bytes());
+                peers.housekeeping(&mut swarm, &mut files, &mut groups, &roster, attest::now(), space);
+                imports.housekeeping(attest::now(), space);
+            }
+
+            Some(done) = imports.finished() => {
+                imports.on_done(done);
             }
 
             event = swarm.select_next_some() => {

@@ -29,6 +29,7 @@ export component FilesView inherits VerticalLayout {
     callback browse(bool);
     callback remove(string);
     callback verify();
+    callback open-dir(string);
 
     spacing: Theme.md;
 
@@ -86,15 +87,15 @@ export component FilesView inherits VerticalLayout {
                     vertical-alignment: center;
                     overflow: elide;
                     horizontal-stretch: 1;
+                    min-width: 0px;
                 }
-            }
 
-            if root.dir != "" : Text {
-                text: root.dir;
-                color: Theme.faint;
-                font-size: Theme.small-size;
-                font-family: Theme.mono;
-                overflow: elide;
+                // Where the bytes are, opened rather than spelled out.
+                Button {
+                    text: "Show in folder";
+                    enabled: root.dir != "" && !root.busy;
+                    clicked => { root.open-dir(root.dir); }
+                }
             }
         }
     }

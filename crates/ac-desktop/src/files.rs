@@ -145,9 +145,26 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             let group = selection.get().group;
             let path = path.to_string();
             work::run(&weak, &nudge, move || {
-                let gone = ops::file::remove(&paths, &group, &path)?;
-                Ok(format!("removed {gone}"))
+                ops::file::remove(&paths, &group, &path)?;
+                // The row leaves the table, which has said it better than a sentence would.
+                Ok(String::new())
             });
+        }
+    });
+
+    window.on_open_file_dir({
+        let weak = weak.clone();
+        let nudge = nudge.clone();
+        move |dir| {
+            if dir.is_empty() {
+                return;
+            }
+            let dir = PathBuf::from(dir.as_str());
+            // A file manager opening is its own confirmation; only its refusal to is news.
+            let outcome = crate::shell::open(&dir).map(|()| String::new());
+            if let Some(window) = weak.upgrade() {
+                work::finish(&window, outcome, &nudge);
+            }
         }
     });
 
@@ -220,17 +237,24 @@ fn add(
 
             let _ = progress.upgrade_in_event_loop(|window| window.set_file_progress("".into()));
 
+            // Counted here, named in the log. One line can say how it went; it cannot list
+            // every file it went that way for.
+            for note in planned.skipped.iter().chain(failed.iter()) {
+                tracing::info!("{note}");
+            }
+
             let mut said = format!("added {added} file(s)");
-            for skipped in &planned.skipped {
-                said += &format!("\nskipped {skipped}");
+            if !planned.skipped.is_empty() {
+                said += &format!(", {} skipped", planned.skipped.len());
             }
-            for failure in &failed {
-                said += &format!("\n{failure}");
-            }
-            if failed.is_empty() {
-                Ok(said)
-            } else {
-                Err(anyhow::anyhow!(said))
+            match failed.first() {
+                None => Ok(said),
+                // The first one by name, because one failure is the common case and naming
+                // it saves a trip to the log. The rest are a count.
+                Some(first) => Err(anyhow::anyhow!(match failed.len() {
+                    1 => format!("{said}, but {first}"),
+                    more => format!("{said}, but {more} did not: {first}"),
+                })),
             }
         },
         move |window, outcome| work::finish(window, outcome, &nudge),
@@ -245,7 +269,10 @@ fn describe_verify(report: &ops::file::VerifyReport) -> String {
 
     let mut parts = Vec::new();
     if !report.missing.is_empty() {
-        parts.push(format!("{} missing", report.missing.len()));
+        parts.push(match report.requeued.len() {
+            0 => format!("{} missing", report.missing.len()),
+            queued => format!("{} missing, {queued} to fetch again", report.missing.len()),
+        });
     }
     if !report.changed.is_empty() {
         parts.push(format!("{} changed", report.changed.len()));
@@ -335,9 +362,17 @@ mod tests {
         assert!(read(&paths, &looking_at).files.is_empty());
     }
 
+    /// Hand this group's log to a peer, so what is in it now counts as shared.
+    fn shared(paths: &Paths, group: &str) {
+        let mut session = ops::file::session(paths, group).unwrap();
+        session.files.changes_since(session.id, 0, 100).unwrap();
+    }
+
     #[test]
     fn a_removed_file_only_shows_when_asked_for() {
         let (_tmp, paths, looking_at) = with_a_file();
+        // Somebody else has it, so removing it has to leave a note saying so.
+        shared(&paths, &looking_at.group);
         ops::file::remove(&paths, &looking_at.group, "notes.txt").unwrap();
 
         assert!(read(&paths, &looking_at).files.is_empty());
@@ -350,6 +385,23 @@ mod tests {
         assert_eq!(page.files.len(), 1);
         assert_eq!(page.files[0].held, "removed");
         assert!(page.files[0].removed);
+    }
+
+    /// The other half, and what a reader actually sees of it: a file nobody was ever given
+    /// leaves nothing behind, so "Removed" in a group of one's own stays empty.
+    #[test]
+    fn a_file_nobody_was_given_leaves_nothing_to_show() {
+        let (_tmp, paths, looking_at) = with_a_file();
+        ops::file::remove(&paths, &looking_at.group, "notes.txt").unwrap();
+
+        let asked = State {
+            removed: true,
+            ..looking_at
+        };
+        assert!(
+            read(&paths, &asked).files.is_empty(),
+            "there is no tombstone to show"
+        );
     }
 
     #[test]
@@ -371,6 +423,22 @@ mod tests {
 
         let report = ops::file::verify(&paths, &looking_at.group).unwrap();
 
-        assert_eq!(describe_verify(&report), "checked 1: 1 missing");
+        assert_eq!(
+            describe_verify(&report),
+            "checked 1: 1 missing, 1 to fetch again"
+        );
+        assert_eq!(report.requeued.len(), 1, "and it says so because it did it");
+
+        // The point of marking it: the row stops claiming to be held, which is the same
+        // state a file has before it has ever been fetched, and what the daemon acts on.
+        let after = read(&paths, &looking_at);
+        assert_eq!(after.files[0].held, "remote");
+        assert!(!after.files[0].have);
+
+        // Said once. A second pass finds the row already marked, so it is still missing but
+        // there is nothing left to requeue.
+        let again = ops::file::verify(&paths, &looking_at.group).unwrap();
+        assert_eq!(describe_verify(&again), "checked 1: 1 missing");
+        assert!(again.requeued.is_empty());
     }
 }

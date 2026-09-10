@@ -22,6 +22,44 @@ export global Theme {
     out property <brush> warn: dark ? #e0a94a : #b7791f;
     out property <brush> danger: dark ? #e57373 : #c0392b;
 
+    // Identity, not state: which group a slice of the storage bar belongs to. Eight hues in a
+    // fixed order, ordered so that neighbours in the bar are the pairs furthest apart — every
+    // touching pair is separated for a red-green reader as well as a full-colour one, checked
+    // against both surfaces. They hold in either scheme, so unlike everything above they do
+    // not change with it. Every slice is labelled beside its dot, which is what carries the
+    // few that sit under 3:1 against their surface.
+    out property <brush> group-1: #2563eb;
+    out property <brush> group-2: #c2410c;
+    out property <brush> group-3: #0e9488;
+    out property <brush> group-4: #a21caf;
+    out property <brush> group-5: #4d7c0f;
+    out property <brush> group-6: #0891b2;
+    out property <brush> group-7: #be185d;
+    out property <brush> group-8: #a16207;
+
+    /// What one slice of the storage bar is drawn in. Negative for the unsorted slice, which
+    /// is not a group and is the one thing here deliberately without a colour.
+    ///
+    /// Past the eighth group the hues come round again a step darker rather than repeating
+    /// outright, so two slices are never the same colour while the order stays fixed.
+    public pure function slice(at: int) -> brush {
+        if (at < 0) {
+            return root.faint;
+        }
+        return root.hue(Math.mod(at, 8)).darker(0.3 * Math.floor(at / 8));
+    }
+
+    pure function hue(at: int) -> brush {
+        return at == 0 ? root.group-1
+            : at == 1 ? root.group-2
+            : at == 2 ? root.group-3
+            : at == 3 ? root.group-4
+            : at == 4 ? root.group-5
+            : at == 5 ? root.group-6
+            : at == 6 ? root.group-7
+            : root.group-8;
+    }
+
     // A 4px rhythm, so spacing is chosen from a scale rather than invented per view.
     out property <length> xs: 4px;
     out property <length> sm: 8px;
@@ -45,10 +83,15 @@ export component DangerButton inherits Rectangle {
     in property <bool> enabled: true;
     callback clicked();
 
-    height: 30px;
+    // The same height as a std-widgets Button, so a row may hold both without one of them
+    // standing a different size.
+    height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: Theme.danger.with-alpha(0.45);
+    // Darkened rather than tinted: a destructive control should be the one on the row that
+    // is drawn with a firm edge. Kept in the danger family so it says which kind it is, and
+    // taken from the palette so it darkens in light mode and lightens in dark.
+    border-color: Theme.danger.darker(0.5);
     // Tinted rather than filled: a solid red block reads as an error message, not a control.
     background: touch.pressed ? Theme.danger.with-alpha(0.26)
         : touch.has-hover ? Theme.danger.with-alpha(0.16)

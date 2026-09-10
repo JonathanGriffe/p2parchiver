@@ -127,6 +127,12 @@ pub fn quiet(window: &MainWindow, nudge: &Nudge) {
 }
 
 /// Say what an action did, let the buttons go, and get the change on screen at once.
+///
+/// **An empty message says nothing, and that is the usual answer for an action that worked.**
+/// The line is worth spending on a failure, or on something the screen does not already show
+/// — a count nobody could total by looking, a consequence that is not visible, a restart that
+/// will be needed. A row vanishing from a table has already said it was removed, and saying
+/// so again is a line of furniture that has to be read to be dismissed.
 pub fn finish(window: &MainWindow, outcome: anyhow::Result<String>, nudge: &Nudge) {
     window.set_busy(false);
     match outcome {

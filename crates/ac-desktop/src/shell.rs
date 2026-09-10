@@ -2,6 +2,32 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// Show a file where it lives, in whatever the desktop browses folders with.
+///
+/// Windows can point at the file itself; nothing else can portably, so elsewhere this opens
+/// the folder it is in and leaves the finding to the reader.
+pub fn reveal(file: &Path) -> Result<()> {
+    anyhow::ensure!(file.exists(), "{} is not there any more", file.display());
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = std::process::Command::new("explorer");
+        command.arg(format!("/select,{}", file.display()));
+        command
+            .spawn()
+            .with_context(|| format!("showing {}", file.display()))?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let folder = file
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} is not in a folder", file.display()))?;
+        open(folder)
+    }
+}
+
 /// Hand a directory to whatever the desktop opens directories with.
 pub fn open(dir: &Path) -> Result<()> {
     anyhow::ensure!(

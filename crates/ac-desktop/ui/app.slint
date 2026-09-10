@@ -3,13 +3,17 @@ import { StatusView, StorageSlice, TrafficRow } from "views/status.slint";
 import { GroupsView, GroupItem, MemberItem } from "views/groups.slint";
 import { PeersView, PeerItem } from "views/peers.slint";
 import { FilesView, FileItem } from "views/files.slint";
+import { SortView } from "views/sort.slint";
+import { SourcesView, SourceItem, FieldItem } from "views/sources.slint";
+import { AddSourceDialog } from "views/add-source.slint";
 import { SettingsView } from "views/settings.slint";
+import { SettingItem } from "views/sources-settings.slint";
 import { AboutView } from "views/about.slint";
 import { EnrolDialog } from "views/enrol.slint";
 import { AddMemberDialog } from "views/add-member.slint";
 
 // Re-exported so slint-build generates the Rust structs the models are built from.
-export { GroupItem, MemberItem, PeerItem, FileItem, StorageSlice, TrafficRow }
+export { GroupItem, MemberItem, PeerItem, FileItem, StorageSlice, TrafficRow, SourceItem, FieldItem, SettingItem }
 
 component NavItem inherits Rectangle {
     in property <string> label;
@@ -54,7 +58,16 @@ export component MainWindow inherits Window {
     background: Theme.canvas;
     preferred-width: 1040px;
     preferred-height: 740px;
-    min-width: 560px;
+    // The widest tab needs this much before its right-hand buttons start going over the
+    // edge, and a window narrower than its contents clips them rather than shrinking them.
+    // Read back by the layout test that holds it to that.
+    //
+    // With room to spare, because the widest row is sized by text: two combo boxes and the
+    // buttons beside them are as wide as the font draws them, and a machine without the
+    // fonts this one has draws them wider. Measured at 757px here and failing CI at 802px,
+    // so the margin is the point rather than the number.
+    out property <length> narrowest: 880px;
+    min-width: root.narrowest;
     min-height: 420px;
 
     // Everything below is written by Rust once per poll.
@@ -102,6 +115,43 @@ export component MainWindow inherits Window {
     in property <[FileItem]> files;
     in property <string> file-progress;
 
+    // The Sort page.
+    in property <bool> sort-have;
+    in property <string> sort-name;
+    in property <string> sort-size;
+    in property <string> sort-arrived;
+    in property <string> sort-source;
+    in property <string> sort-folder;
+    in property <string> sort-hash;
+    in property <string> sort-path;
+    in property <bool> sort-held;
+    in property <string> sort-position;
+    in property <int> sort-in-folder;
+    in property <bool> sort-has-next;
+    in property <bool> sort-has-previous;
+    in property <string> sort-undo;
+    in property <image> sort-preview;
+    in property <[string]> sort-group-names;
+    in property <int> sort-group-index;
+    in property <string> sort-group-id;
+    in property <[string]> sort-folder-names;
+    in property <int> sort-folder-index;
+    in property <[SourceItem]> sources;
+    in property <[string]> source-kinds;
+    in-out property <[FieldItem]> source-fields;
+    // The implementation's shared settings, offered in the same dialog the first time.
+    in-out property <[FieldItem]> source-settings-fields;
+    // Which implementation the Add dialog is about, and empty when it is closed.
+    in-out property <string> adding-source;
+    // What a sign-in is waiting on, while it waits. Written by the poll, so it appears
+    // whether the sign-in was started here or from a command.
+    in property <image> pairing-code;
+    in property <string> pairing-says;
+    // Whether one is being added right now. Its own flag rather than `busy`, because adding
+    // can mean waiting on a browser and the rest of the tab has no reason to stop.
+    in-out property <bool> source-adding;
+    in property <[SettingItem]> source-settings;
+
     // The Settings page. Loaded once and after each save, never on the poll.
     in-out property <bool> mdns;
     in-out property <string> config-storage-root;
@@ -142,15 +192,42 @@ export component MainWindow inherits Window {
     callback browse(bool);
     callback remove-file(string);
     callback verify();
+    callback open-file-dir(string);
     callback save(bool, string, string, string);
     callback pick-storage-root(string) -> string;
     callback open-logs();
     callback restart();
     callback join(string, string);
     callback copy-peer-id();
+    callback sort-pick-group(int);
+    callback sort-pick-folder(int);
+    callback sort-add-folder(string);
+    callback sort-step(bool);
+    callback sort-file(string, bool);
+    callback sort-delete(string, bool);
+    callback sort-open(string);
+    callback sort-reveal(string);
+    callback sort-undo-last();
+    callback scan-source(string);
+    callback remove-source(string);
+    callback pick-source-kind(string);
+    callback add-source(string, string);
+    callback setting-edited(int, string);
+    callback setting-browse(int, bool);
+    callback setting-cleared(int);
+    callback field-edited(int, string);
+    callback field-browse(int, bool);
+    callback field-cleared(int);
+    callback save-setting(string, string, string);
+    callback sign-in-source(string);
+    callback stop-adding();
 
     // Which page is up. In-out so a test can open the one it is about.
     in-out property <int> tab: 0;
+    // Rust reads only what the page on screen needs, so it has to be told when that
+    // changes rather than finding out on the next poll.
+    changed tab => { root.showing(self.tab); }
+    callback showing(int);
 
     HorizontalLayout {
         padding: Theme.md;
@@ -190,14 +267,24 @@ export component MainWindow inherits Window {
                 chosen => { root.tab = 3; }
             }
             NavItem {
-                label: "Settings";
+                label: "Sort";
                 selected: root.tab == 4;
                 chosen => { root.tab = 4; }
             }
             NavItem {
-                label: "About";
+                label: "Sources";
                 selected: root.tab == 5;
                 chosen => { root.tab = 5; }
+            }
+            NavItem {
+                label: "Settings";
+                selected: root.tab == 6;
+                chosen => { root.tab = 6; }
+            }
+            NavItem {
+                label: "About";
+                selected: root.tab == 7;
+                chosen => { root.tab = 7; }
             }
 
             Rectangle { vertical-stretch: 1; }
@@ -278,26 +365,81 @@ export component MainWindow inherits Window {
                 browse(folder) => { root.browse(folder); }
                 remove(path) => { root.remove-file(path); }
                 verify() => { root.verify(); }
+                open-dir(dir) => { root.open-file-dir(dir); }
             }
 
-            if root.tab == 4 : SettingsView {
+            if root.tab == 4 : SortView {
+                have: root.sort-have;
+                name: root.sort-name;
+                size: root.sort-size;
+                arrived: root.sort-arrived;
+                source: root.sort-source;
+                folder: root.sort-folder;
+                hash: root.sort-hash;
+                path: root.sort-path;
+                held: root.sort-held;
+                position: root.sort-position;
+                in-folder: root.sort-in-folder;
+                has-next: root.sort-has-next;
+                has-previous: root.sort-has-previous;
+                undo: root.sort-undo;
+                preview: root.sort-preview;
+                group-names: root.sort-group-names;
+                group-index: root.sort-group-index;
+                group-id: root.sort-group-id;
+                folder-names: root.sort-folder-names;
+                folder-index: root.sort-folder-index;
+                busy: root.busy;
+                vertical-stretch: 1;
+
+                pick-group(at) => { root.sort-pick-group(at); }
+                pick-folder(at) => { root.sort-pick-folder(at); }
+                add-folder(name) => { root.sort-add-folder(name); }
+                step(forward) => { root.sort-step(forward); }
+                file(hash, folder) => { root.sort-file(hash, folder); }
+                delete(hash, folder) => { root.sort-delete(hash, folder); }
+                open(path) => { root.sort-open(path); }
+                reveal(path) => { root.sort-reveal(path); }
+                undo-last => { root.sort-undo-last(); }
+            }
+
+            if root.tab == 5 : SourcesView {
+                sources: root.sources;
+                kinds: root.source-kinds;
+                busy: root.busy;
+                adding: root.source-adding;
+                vertical-stretch: 1;
+
+                scan(dir) => { root.scan-source(dir); }
+                remove(dir) => { root.remove-source(dir); }
+                sign-in(dir) => { root.sign-in-source(dir); }
+                // Loading the picked implementation's fields is what opens the dialog.
+                add-source(source) => {
+                    root.adding-source = source;
+                    root.pick-source-kind(source);
+                }
+            }
+
+            if root.tab == 6 : SettingsView {
                 mdns: root.mdns;
                 storage-root: root.config-storage-root;
                 storage-max: root.storage-max;
                 bandwidth-max: root.bandwidth-max;
                 server: root.server;
                 enrolled: root.enrolled;
+                source-settings: root.source-settings;
                 busy: root.busy;
                 vertical-stretch: 1;
 
                 save(m, r, s, b) => { root.save(m, r, s, b); }
+                save-setting(source, key, value) => { root.save-setting(source, key, value); }
                 pick-storage-root(current) => { return root.pick-storage-root(current); }
                 open-logs() => { root.open-logs(); }
                 restart() => { root.restart(); }
                 join(t, u) => { root.join(t, u); }
             }
 
-            if root.tab == 5 : AboutView {
+            if root.tab == 7 : AboutView {
                 version: root.version;
                 peer-id: root.peer-id;
                 home: root.home;
@@ -316,12 +458,39 @@ export component MainWindow inherits Window {
                         text: root.message;
                         color: root.message-bad ? Theme.danger : Theme.dim;
                         font-size: Theme.small-size;
-                        wrap: word-wrap;
+                        // One line, and held to it. What will not fit belongs in the log,
+                        // not in a bar that pushes the page around as it grows.
+                        wrap: no-wrap;
+                        overflow: elide;
                         horizontal-stretch: 1;
+                        min-width: 0px;
                     }
                 }
             }
         }
+    }
+
+    if root.adding-source != "" : AddSourceDialog {
+        code: root.pairing-code;
+        waiting: root.pairing-says;
+        source: root.adding-source;
+        fields: root.source-fields;
+        settings: root.source-settings-fields;
+        busy: root.busy;
+
+        // The dialog stays up: a sign-in that has to show somebody a code needs somewhere
+        // to show it, and this is that somewhere. Rust closes it when the add finishes.
+        adding: root.source-adding;
+        add(name) => { root.add-source(root.adding-source, name); }
+        field-edited(at, value) => { root.field-edited(at, value); }
+        field-browse(at, several) => { root.field-browse(at, several); }
+        field-cleared(at) => { root.field-cleared(at); }
+        setting-edited(at, value) => { root.setting-edited(at, value); }
+        setting-browse(at, several) => { root.setting-browse(at, several); }
+        setting-cleared(at) => { root.setting-cleared(at); }
+        // Closing it stops what it was waiting for. Otherwise the button that opened this
+        // stays disabled for as long as the wait had left to run.
+        dismissed => { root.stop-adding(); root.adding-source = ""; }
     }
 
     if root.show-enrol : EnrolDialog {

@@ -31,8 +31,18 @@ an icon in the system tray; the window shows what it is doing and drives everyth
 command can, which is installed alongside it.
 """
 
+# The ffmpeg this app previews video with, fetched by CI into `vendor/` rather than
+# committed. The packager appends the target triple when it looks for the file and installs
+# it beside our own binaries, so `preview::beside_us` finds it wherever a platform puts them.
+# Named `ac-ffmpeg`, never `ffmpeg`: on a .deb these land in the same directory as the
+# system's own, and taking that name would collide with it.
+external-binaries = ["vendor/ac-ffmpeg"]
+
 resources = [
   { src = "../../LICENSE", target = "LICENSE" },
+  # LGPL-2.1 requires the licence travel with the binary, and a written offer for its
+  # source. Both live here rather than in the README, so an installed copy carries them.
+  { src = "vendor/FFMPEG-LICENSE", target = "FFMPEG-LICENSE" },
 ]
 
 [package.metadata.packager.deb]
@@ -44,6 +54,10 @@ libs = ["libxkbcommon.so.0", "libfontconfig.so.1"]
 [dependencies]
 ac-node.workspace = true
 ac-net.workspace = true
+# For the field declarations the Sort tab's Add form is generated from.
+ac-import.workspace = true
+image.workspace = true
+heif-oxide.workspace = true
 slint.workspace = true
 clap.workspace = true
 tokio.workspace = true

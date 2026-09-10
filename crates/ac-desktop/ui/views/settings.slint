@@ -1,5 +1,6 @@
 import { ScrollView, Button, LineEdit, CheckBox } from "std-widgets.slint";
 import { Theme, Card } from "../theme.slint";
+import { SettingItem } from "sources-settings.slint";
 
 component Row inherits VerticalLayout {
     in property <string> label;
@@ -40,8 +41,10 @@ export component SettingsView inherits ScrollView {
 
     in property <bool> busy;
     in property <bool> enrolled;
+    in property <[SettingItem]> source-settings;
 
     callback save(bool, string, string, string);
+    callback save-setting(string, string, string);
     // Hands back what the field should read, which is what it already read if nothing was
     // chosen.
     callback pick-storage-root(string) -> string;
@@ -177,6 +180,37 @@ export component SettingsView inherits ScrollView {
                         }
                     }
                 }
+            }
+        }
+
+        if root.source-settings.length > 0 : SectionTitle { text: "SOURCES"; }
+
+        if root.source-settings.length > 0 : Card {
+            VerticalLayout {
+                padding: Theme.md;
+                spacing: Theme.md;
+
+                for setting in root.source-settings : Row {
+                    label: setting.source + " · " + setting.label;
+
+                    HorizontalLayout {
+                        spacing: Theme.sm;
+                        // Shown, secret or not. This is the one place these are managed, and
+                        // a value you cannot read is one you cannot check against the one you
+                        // meant to paste.
+                        value := LineEdit {
+                            text: setting.value;
+                            enabled: !root.busy;
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "Save";
+                            enabled: !root.busy;
+                            clicked => { root.save-setting(setting.source, setting.key, value.text); }
+                        }
+                    }
+                }
+
             }
         }
 

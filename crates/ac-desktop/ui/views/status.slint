@@ -8,8 +8,9 @@ export struct StorageSlice {
     // Both are fractions of the whole bar, 0 to 1.
     offset: float,
     fraction: float,
-    // How far to fade the one accent colour, so groups read as slices of one thing.
-    shade: float,
+    // Which group this is, in the fixed order the colours are assigned in. Negative for the
+    // unsorted slice, which is not a group.
+    at: int,
 }
 
 // One direction's traffic: what has moved through it, and what is moving now.
@@ -173,10 +174,11 @@ export component StatusView inherits VerticalLayout {
 
                 for slice in root.storage-slices : Rectangle {
                     x: parent.width * slice.offset;
-                    width: parent.width * slice.fraction;
+                    // A hair short of its share, so touching slices are told apart by a gap
+                    // in the surface colour rather than by their colours alone.
+                    width: max(1px, parent.width * slice.fraction - 2px);
                     height: parent.height;
-                    background: Theme.accent;
-                    opacity: slice.shade;
+                    background: Theme.slice(slice.at);
                 }
             }
 
@@ -193,7 +195,7 @@ export component StatusView inherits VerticalLayout {
                 height: 20px;
                 VerticalLayout {
                     alignment: center;
-                    Dot { tint: Theme.accent; opacity: slice.shade; }
+                    Dot { tint: Theme.slice(slice.at); }
                 }
                 Text {
                     text: slice.label;

@@ -1,0 +1,146 @@
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+import { Theme, Card } from "../theme.slint";
+import { FieldItem, Field } from "sources.slint";
+
+export component AddSourceDialog inherits Rectangle {
+    in property <string> source;
+    in property <[FieldItem]> fields;
+    // The implementation's shared settings, offered here the first time so adding one is
+    // not a detour through the Settings tab.
+    in property <[FieldItem]> settings;
+    in property <bool> busy;
+    // Raised once a sign-in is waiting on somebody, with what they are meant to do about it.
+    // While one is up the form is not: there is nothing left to type, and a code to scan is
+    // the only thing worth looking at.
+    in property <image> code;
+    in property <string> waiting;
+    // The name being typed. A property rather than an id because the field and the button
+    // that reads it are in different `if` branches, which are different scopes.
+    in-out property <string> typed;
+    // One add at a time: the button that started this is not pressable again until it ends.
+    in property <bool> adding;
+
+    callback add(string);
+    callback field-edited(int, string);
+    callback field-browse(int, bool);
+    callback field-cleared(int);
+    callback setting-edited(int, string);
+    callback setting-browse(int, bool);
+    callback setting-cleared(int);
+    callback dismissed();
+
+    background: #000000.with-alpha(0.45);
+
+    TouchArea {
+        clicked => { root.dismissed(); }
+    }
+
+    Card {
+        width: min(640px, parent.width - 2 * Theme.lg);
+        height: min(self.preferred-height, parent.height - 2 * Theme.lg);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+
+        TouchArea {}
+
+        VerticalLayout {
+            padding: Theme.lg;
+            spacing: Theme.md;
+
+            Text {
+                text: "Add a " + root.source + " source";
+                color: Theme.text;
+                font-size: Theme.heading-size;
+                font-weight: 700;
+                overflow: elide;
+            }
+
+            if root.code.width > 0 : VerticalLayout {
+                alignment: center;
+                spacing: Theme.md;
+
+                // The layout centres it, not the image's own alignment: that would only
+                // centre the picture inside an element still sitting against the left edge.
+                HorizontalLayout {
+                    alignment: center;
+
+                    Image {
+                        source: root.code;
+                        // Nearest, or the squares blur into each other and a camera has to
+                        // work harder than it should.
+                        image-rendering: pixelated;
+                        width: min(280px, root.width - 4 * Theme.lg);
+                        height: self.width;
+                    }
+                }
+                Text {
+                    text: root.waiting;
+                    color: Theme.dim;
+                    font-size: Theme.body-size;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+
+            if root.code.width == 0 : LineEdit {
+                placeholder-text: "name";
+                text <=> root.typed;
+                accepted => {
+                    if (root.typed != "" && !root.busy) { root.add(root.typed); }
+                }
+            }
+
+            if root.code.width == 0 : ScrollView {
+                vertical-stretch: 1;
+                preferred-height: forms.preferred-height;
+
+                forms := VerticalLayout {
+                    alignment: start;
+                    spacing: Theme.md;
+
+                    for field[at] in root.fields : Field {
+                        field: field;
+                        busy: root.busy;
+                        edited(value) => { root.field-edited(at, value); }
+                        browse(several) => { root.field-browse(at, several); }
+                        cleared => { root.field-cleared(at); }
+                    }
+
+                    // Shared by every source of this implementation, so it is asked once and
+                    // then never again — which is why it is a separate list.
+                    if root.settings.length > 0 : Rectangle {
+                        height: 1px;
+                        background: Theme.line;
+                    }
+                    // Every one of these carries `at`, which counts within this list. The
+                    // fields above have a list of their own and a counter of their own, so a
+                    // row here can only ever report to a `setting-` callback.
+                    for setting[at] in root.settings : Field {
+                        field: setting;
+                        busy: root.busy;
+                        edited(value) => { root.setting-edited(at, value); }
+                        browse(several) => { root.setting-browse(at, several); }
+                        cleared => { root.setting-cleared(at); }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: Theme.sm;
+                alignment: end;
+
+                Button {
+                    text: "Cancel";
+                    clicked => { root.dismissed(); }
+                }
+                // Gone once a code is up: the next move is on the phone, not here.
+                if root.code.width == 0 : Button {
+                    text: root.adding ? "Adding…" : "Add";
+                    primary: true;
+                    enabled: root.typed != "" && !root.busy && !root.adding;
+                    clicked => { root.add(root.typed); }
+                }
+            }
+        }
+    }
+}

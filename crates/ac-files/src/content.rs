@@ -67,6 +67,17 @@ impl Sink {
     }
 }
 
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Sink::write(self, buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
 /// Flush the directory entry itself, so a rename that has landed stays landed.
 ///
 /// Unix only. Windows refuses to open a directory as a file at all, and journals the
@@ -280,10 +291,19 @@ impl Content {
         Ok(file)
     }
 
-    /// Move a file to another path inside the same group.
-    pub fn rename(&self, dir: &str, from: &RelPath, to: &RelPath) -> io::Result<()> {
-        let source = self.locate(dir, from);
-        let dest = self.locate(dir, to);
+    /// Move a file from one path under the root to another.
+    ///
+    /// The two directories may be the same one — filing a file into a group and moving it
+    /// within a group are the same operation, and were once two methods with the same body.
+    pub fn adopt(
+        &self,
+        from_dir: &str,
+        from: &RelPath,
+        to_dir: &str,
+        to: &RelPath,
+    ) -> io::Result<()> {
+        let source = self.locate(from_dir, from);
+        let dest = self.locate(to_dir, to);
 
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
@@ -293,9 +313,8 @@ impl Content {
             sync_dir(parent)?;
         }
 
-        // The source's directories may now be empty. Same sweep as `remove`, and it stops at
-        // the group directory for the same reason.
-        self.prune_above(dir, &source);
+        // Prune under the directory it left, not the one it arrived in.
+        self.prune_above(from_dir, &source);
         Ok(())
     }
 
@@ -465,6 +484,76 @@ mod tests {
         assert_eq!(
             fs::read_to_string(content.locate("g", &path)).unwrap(),
             "hello"
+        );
+    }
+
+    #[test]
+    fn adopting_moves_a_file_between_directories_under_one_root() {
+        let (content, tmp) = content();
+        let src = source(tmp.path(), "in.txt", b"hello");
+        let from = rel("DCIM/2024/IMG_1.jpg");
+        let to = rel("photos/IMG_1.jpg");
+
+        let staged = content.stage(".unsorted", &from, &src).unwrap();
+        content.commit(staged).unwrap();
+
+        content.adopt(".unsorted", &from, "g", &to).unwrap();
+
+        assert!(!content.exists(".unsorted", &from), "it left");
+        assert!(content.exists("g", &to), "and arrived");
+        assert_eq!(
+            fs::read_to_string(content.locate("g", &to)).unwrap(),
+            "hello",
+            "with its bytes, having never been read"
+        );
+
+        // The directories it came through are pruned, but the one it came from is not.
+        assert!(!content.group_dir(".unsorted").join("DCIM").exists());
+        assert!(content.group_dir(".unsorted").exists());
+    }
+
+    /// The same directory on both sides, which is what the store's dedup does when it moves a
+    /// file onto the path it is keeping. It was a method of its own until the two turned out
+    /// to have the same body.
+    #[test]
+    fn adopting_within_one_directory_moves_the_file_and_prunes_behind_it() {
+        let (content, tmp) = content();
+        let src = source(tmp.path(), "in.txt", b"hello");
+        let from = rel("DCIM/2024/IMG_1.jpg");
+        let to = rel("kept.jpg");
+
+        let staged = content.stage("g", &from, &src).unwrap();
+        content.commit(staged).unwrap();
+
+        content.adopt("g", &from, "g", &to).unwrap();
+
+        assert!(!content.exists("g", &from));
+        assert!(content.exists("g", &to));
+        assert_eq!(
+            fs::read_to_string(content.locate("g", &to)).unwrap(),
+            "hello"
+        );
+        assert!(
+            !content.group_dir("g").join("DCIM").exists(),
+            "and what it left behind is swept, as a move across directories is"
+        );
+    }
+
+    #[test]
+    fn a_sink_can_be_written_to_as_a_plain_writer() {
+        // What lets an importer's `fetch` write bytes without seeing a path or a hasher.
+        let (content, _tmp) = content();
+        let path = rel("a.txt");
+
+        let mut sink = content.resume(".unsorted", &path, 0).unwrap();
+        let written = io::copy(&mut &b"hello"[..], &mut sink).unwrap();
+        assert_eq!(written, 5);
+
+        let staged = sink.finish().unwrap();
+        assert_eq!(
+            staged.hash,
+            // sha256("hello"): the generic path hashes exactly as the inherent one does.
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
 

@@ -54,6 +54,99 @@ enum Command {
 
     #[command(subcommand)]
     File(FileCommand),
+
+    #[command(subcommand)]
+    Import(ImportCommand),
+}
+
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// What this build can import from, and what each source needs to be told.
+    Available { source: Option<String> },
+
+    #[command(subcommand)]
+    Source(ImportSourceCommand),
+
+    /// One implementation's settings, shared by every source built from it.
+    #[command(subcommand)]
+    Settings(SettingsCommand),
+
+    /// Sign in again as one source, in a browser. Adding one already does this.
+    Auth { source: String },
+
+    /// Scan one source now, whatever its cadence says.
+    Scan { source: String },
+
+    /// Import one file or folder: add it, scan it, and bring it in.
+    From {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// What to file it under. Defaults to the name of what was picked.
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Bring in what the sources are owed, without waiting for the daemon.
+    Fetch {
+        /// Stop after this many files.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
+    /// What is waiting to be sorted.
+    List {
+        /// Every page of it, rather than the first.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// File one into a group.
+    Sort {
+        hash: String,
+        group: String,
+        /// Everything that came from the same source folder.
+        #[arg(long)]
+        folder: bool,
+        /// A folder within the group to file it under. Its root by default.
+        #[arg(long, value_name = "PATH")]
+        into: Option<String>,
+    },
+
+    /// Throw one away, permanently.
+    Drop {
+        hash: String,
+        #[arg(long)]
+        folder: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportSourceCommand {
+    Add {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        name: String,
+        /// Answer one of the source's fields. Repeatable: `--set path=~/Pictures`.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+    },
+    List,
+    Remove {
+        source: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SettingsCommand {
+    Show {
+        source: String,
+    },
+    Set {
+        source: String,
+        key: String,
+        value: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -190,6 +283,40 @@ fn main() -> Result<()> {
             cmd::file::remove(&paths, &group, &path)
         }
         Command::File(FileCommand::Verify { group }) => cmd::file::verify(&paths, &group),
+        Command::Import(ImportCommand::Available { source }) => {
+            cmd::import::available(source.as_deref())
+        }
+        Command::Import(ImportCommand::Source(ImportSourceCommand::Add { source, name, set })) => {
+            cmd::import::source_add(&paths, &source, &name, &set)
+        }
+        Command::Import(ImportCommand::Source(ImportSourceCommand::List)) => {
+            cmd::import::source_list(&paths)
+        }
+        Command::Import(ImportCommand::Source(ImportSourceCommand::Remove { source })) => {
+            cmd::import::source_remove(&paths, &source)
+        }
+        Command::Import(ImportCommand::Settings(SettingsCommand::Show { source })) => {
+            cmd::import::settings_show(&paths, &source)
+        }
+        Command::Import(ImportCommand::Settings(SettingsCommand::Set { source, key, value })) => {
+            cmd::import::settings_set(&paths, &source, &key, &value)
+        }
+        Command::Import(ImportCommand::Auth { source }) => cmd::import::auth(&paths, &source),
+        Command::Import(ImportCommand::Scan { source }) => cmd::import::scan(&paths, &source),
+        Command::Import(ImportCommand::From { path, name }) => {
+            cmd::import::from(&paths, &path, name.as_deref())
+        }
+        Command::Import(ImportCommand::Fetch { limit }) => cmd::import::fetch(&paths, limit),
+        Command::Import(ImportCommand::List { all }) => cmd::import::list(&paths, all),
+        Command::Import(ImportCommand::Sort {
+            hash,
+            group,
+            folder,
+            into,
+        }) => cmd::import::sort(&paths, &hash, &group, folder, into.as_deref()),
+        Command::Import(ImportCommand::Drop { hash, folder }) => {
+            cmd::import::drop(&paths, &hash, folder)
+        }
     }
 }
 

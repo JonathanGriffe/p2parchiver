@@ -1,0 +1,262 @@
+import { Button, ComboBox, LineEdit } from "std-widgets.slint";
+import { Theme, Card, DangerButton } from "../theme.slint";
+
+export component SortView inherits VerticalLayout {
+    in property <bool> have;
+    in property <string> name;
+    in property <string> size;
+    in property <string> arrived;
+    in property <string> source;
+    in property <string> folder;
+    in property <string> hash;
+    in property <string> path;
+    in property <bool> held;
+    in property <string> position;
+    in property <int> in-folder;
+    in property <bool> has-next;
+    in property <bool> has-previous;
+    // What the Undo button would take back, and empty when there is nothing.
+    in property <string> undo;
+    in property <image> preview;
+
+    in property <[string]> group-names;
+    in property <int> group-index;
+    in property <string> group-id;
+
+    // Where in the group it lands. The first entry is the group's own root.
+    in property <[string]> folder-names;
+    in property <int> folder-index;
+
+    in property <bool> busy;
+
+    callback pick-group(int);
+    callback pick-folder(int);
+    callback add-folder(string);
+    callback step(bool);
+    callback file(string, bool);
+    callback delete(string, bool);
+    callback open(string);
+    callback reveal(string);
+    callback undo-last();
+
+    // Whether the new-folder name is being typed.
+    property <bool> naming;
+
+    // What the bulk buttons are about, said once so the two buttons cannot disagree. The
+    // folder is named on the line above rather than in here: a button cannot elide, so a
+    // path in its label sets the width of the whole tab.
+    property <string> bulk: root.folder == ""
+        ? "all " + root.in-folder + " from this import"
+        : "all " + root.in-folder + " in this folder";
+
+    spacing: Theme.md;
+
+    VerticalLayout {
+        vertical-stretch: 1;
+
+        if root.have : Card {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: Theme.md;
+                spacing: Theme.sm;
+
+                HorizontalLayout {
+                    spacing: Theme.sm;
+                    Text {
+                        text: root.position;
+                        color: Theme.dim;
+                        font-size: Theme.small-size;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                        min-width: 0px;
+                    }
+                    // Beside the stepping, because taking back the last decision is a way
+                    // of going back too.
+                    Button {
+                        text: root.undo == "" ? "Undo" : root.undo;
+                        enabled: root.undo != "" && !root.busy;
+                        clicked => { root.undo-last(); }
+                    }
+                    Button {
+                        text: "Previous";
+                        enabled: root.has-previous && !root.busy;
+                        clicked => { root.step(false); }
+                    }
+                    Button {
+                        text: "Next";
+                        enabled: root.has-next && !root.busy;
+                        clicked => { root.step(true); }
+                    }
+                }
+
+                // The one part that grows: the rows above and below it are furniture and
+                // take what they need, and the picture takes the rest of the window.
+                Rectangle {
+                    vertical-stretch: 1;
+                    min-height: 160px;
+                    background: Theme.raised;
+                    border-radius: Theme.radius;
+
+                    if root.preview.width > 0 : Image {
+                        source: root.preview;
+                        image-fit: contain;
+                        width: parent.width - Theme.md;
+                        height: parent.height - Theme.md;
+                    }
+
+                    if root.preview.width == 0 : VerticalLayout {
+                        alignment: center;
+                        spacing: Theme.sm;
+                        Text {
+                            text: root.name;
+                            color: Theme.dim;
+                            font-size: Theme.body-size;
+                            horizontal-alignment: center;
+                            overflow: elide;
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Open";
+                                enabled: root.path != "";
+                                clicked => { root.open(root.path); }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.name;
+                    color: Theme.text;
+                    font-size: Theme.body-size;
+                    font-weight: 700;
+                    overflow: elide;
+                }
+                // The source and the folder within it are what the bulk buttons select on.
+                // The folder is another entry in the same list rather than a path stuck to
+                // the source, and at the source's own root there is no folder to name.
+                Text {
+                    text: root.size + " · " + root.arrived + " · " + root.source
+                        + (root.folder == "" ? "" : " · " + root.folder);
+                    color: Theme.dim;
+                    font-size: Theme.small-size;
+                    overflow: elide;
+                }
+                if root.held : Text {
+                    text: "a group already holds these bytes";
+                    color: Theme.dim;
+                    font-size: Theme.small-size;
+                }
+
+                // Where it lands. Apart from the buttons that act on it, so neither row has
+                // to be wide enough for the other.
+                HorizontalLayout {
+                    spacing: Theme.sm;
+
+                    ComboBox {
+                        model: root.group-names;
+                        current-index: root.group-index;
+                        enabled: root.group-names.length > 0 && !root.busy;
+                        min-width: 110px;
+                        max-width: 220px;
+                        horizontal-stretch: 1;
+                        // `changed`, not `selected`: a ComboBox moves its own selection when
+                        // its model arrives — it clamps the index into the new list without
+                        // telling anyone it did. Listening only for a person's pick left the
+                        // box showing the first group while nothing had actually been chosen.
+                        changed current-index => { root.pick-group(self.current-index); }
+                    }
+                    // Where in that group it lands. Its first entry is the group's root.
+                    ComboBox {
+                        model: root.folder-names;
+                        current-index: root.folder-index;
+                        enabled: root.group-id != "" && !root.busy;
+                        min-width: 110px;
+                        max-width: 220px;
+                        horizontal-stretch: 1;
+                        changed current-index => { root.pick-folder(self.current-index); }
+                    }
+                    Button {
+                        text: "Add folder";
+                        enabled: root.group-id != "" && !root.busy;
+                        clicked => { root.naming = !root.naming; }
+                    }
+                    // Away on the right: it is about where the file sits rather than about
+                    // what to do with it.
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Show in folder";
+                        enabled: root.path != "" && !root.busy;
+                        clicked => { root.reveal(root.path); }
+                    }
+                }
+
+                // Opened in the flow under the row, the way the source picker's menu is:
+                // a folder does not exist until a file is filed into it, so this only has
+                // to take a name.
+                if root.naming : HorizontalLayout {
+                    spacing: Theme.sm;
+
+                    named := LineEdit {
+                        placeholder-text: "folder in the group";
+                        horizontal-stretch: 1;
+                        accepted => {
+                            if (self.text != "") {
+                                root.add-folder(self.text);
+                                self.text = "";
+                                root.naming = false;
+                            }
+                        }
+                    }
+                    Button {
+                        text: "Add";
+                        enabled: named.text != "" && !root.busy;
+                        clicked => {
+                            root.add-folder(named.text);
+                            named.text = "";
+                            root.naming = false;
+                        }
+                    }
+                }
+
+                // What to do with it: filing on the left, throwing away on the right of it.
+                HorizontalLayout {
+                    spacing: Theme.sm;
+                    Button {
+                        text: "File it";
+                        primary: true;
+                        enabled: root.group-id != "" && !root.busy;
+                        clicked => { root.file(root.hash, false); }
+                    }
+                    Button {
+                        text: "File " + root.bulk;
+                        enabled: root.group-id != "" && !root.busy;
+                        clicked => { root.file(root.hash, true); }
+                    }
+                    DangerButton {
+                        label: "Delete";
+                        enabled: !root.busy;
+                        clicked => { root.delete(root.hash, false); }
+                    }
+                    DangerButton {
+                        label: "Delete " + root.bulk;
+                        enabled: !root.busy;
+                        clicked => { root.delete(root.hash, true); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+            }
+
+        if !root.have : Card {
+            VerticalLayout {
+                padding: Theme.md;
+                Text {
+                    text: root.position;
+                    color: Theme.dim;
+                    font-size: Theme.small-size;
+                }
+            }
+        }
+    }
+}

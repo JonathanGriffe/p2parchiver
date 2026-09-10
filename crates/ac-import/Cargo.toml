@@ -1,0 +1,29 @@
+[package]
+name = "ac-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+hex.workspace = true
+ureq.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+tracing.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+qrcode.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

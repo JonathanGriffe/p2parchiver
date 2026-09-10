@@ -39,9 +39,7 @@ pub struct StandingBody {
     pub peer: String,
     pub seq: u64,
     pub position: Position,
-    /// What this member calls itself. Their own claim, signed with their own key — the chain
-    /// carries no name, so this is the only place a member is named, and nobody but them can
-    /// write it. Unverified beyond its shape: it says who they say they are, not who they are.
+    /// What this member calls itself
     pub username: String,
     pub at: i64,
 }

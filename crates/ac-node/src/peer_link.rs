@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use libp2p::multiaddr::Protocol;
@@ -12,7 +13,7 @@ use ac_net::roster::Roster;
 use ac_files::content::Content;
 use ac_files::store::Files;
 use ac_groups::store::Groups;
-use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers};
+use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers, Space};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
 use crate::blob::{self, Transfers};
@@ -20,6 +21,7 @@ use crate::daemon::ClientSwarm;
 use crate::file_link::{FileLink, RoundOutcome};
 use crate::group_link::GroupLink;
 use crate::status::{Bandwidth, Published};
+use crate::throttle::Throttle;
 
 /// Candidate direct addresses kept per peer
 const MAX_DIRECT_ADDRS: usize = 8;
@@ -60,6 +62,7 @@ impl PeerLink {
         identity: &Identity,
         server: Option<PeerId>,
         at: i64,
+        down: Arc<Throttle>,
     ) -> Result<Self> {
         let path = paths.db_file();
         let me = identity.peer_id();
@@ -79,7 +82,7 @@ impl PeerLink {
                 storage_max: config.storage_max,
                 ..Limits::default()
             }),
-            transfers: Transfers::new(path.clone(), me, config.bandwidth_max),
+            transfers: Transfers::new(path.clone(), me, down),
             proposals: HashMap::new(),
             presence: HashMap::new(),
             server,
@@ -248,11 +251,15 @@ impl PeerLink {
         groups: &mut GroupLink,
         roster: &Roster,
         at: i64,
+        space: Option<Space>,
     ) {
         self.collect(swarm, files, groups, roster);
 
-        if let Some((free, held)) = self.disk(files) {
-            self.peers.on(PeerEvent::Space { free, held });
+        if let Some(space) = space {
+            self.peers.on(PeerEvent::Space {
+                free: space.free,
+                held: space.held,
+            });
         }
 
         let actions = self.peers.on(PeerEvent::Tick { at });
@@ -295,7 +302,7 @@ impl PeerLink {
     }
 
     /// Free bytes on the storage volume, and bytes of content this node holds.
-    fn disk(&self, files: &FileLink) -> Option<(u64, u64)> {
+    pub fn space(&self, files: &FileLink, unsorted: u64) -> Option<Space> {
         let probe = if self.root.exists() {
             self.root.clone()
         } else {
@@ -309,7 +316,10 @@ impl PeerLink {
                 return None;
             }
         };
-        Some((free, files.held_bytes()?))
+        Some(Space {
+            free,
+            held: files.held_bytes()?.saturating_add(unsorted),
+        })
     }
 
     /// A peer asking whether we are finished with it, and our answers to the same question.
@@ -639,7 +649,14 @@ mod tests {
                 swarm,
                 link: FileLink::open(&paths, &identity).unwrap(),
                 groups: GroupLink::open(&paths, &identity).unwrap(),
-                peers: PeerLink::open(&paths, &identity, None, AT).unwrap(),
+                peers: PeerLink::open(
+                    &paths,
+                    &identity,
+                    None,
+                    AT,
+                    Arc::new(Throttle::from_config(None, blob::THROTTLE_BURST)),
+                )
+                .unwrap(),
                 blobs,
                 roster: Roster::default(),
                 peer: identity.peer_id(),
@@ -730,12 +747,14 @@ mod tests {
                 .housekeeping(&mut self.swarm, &self.roster, Instant::now(), self.at);
             self.link
                 .housekeeping(&mut self.swarm, &self.roster, Instant::now(), self.at);
+            let space = self.peers.space(&self.link, 0);
             self.peers.housekeeping(
                 &mut self.swarm,
                 &mut self.link,
                 &mut self.groups,
                 &self.roster,
                 self.at,
+                space,
             );
         }
 
@@ -1176,6 +1195,11 @@ mod tests {
             !b.swarm.is_connected(&alice_peer)
         })
         .await;
+
+        // The status file is written on a tick, and the mirror lands between two of them:
+        // whether one follows before the hang-up is down to how the machine schedules, so
+        // ask for one rather than read whatever the last one happened to say.
+        bob.tick();
 
         let db = Paths::rooted_at(bob.dir.path()).db_file();
         let snapshot = Published::open(&db).unwrap().read().unwrap();

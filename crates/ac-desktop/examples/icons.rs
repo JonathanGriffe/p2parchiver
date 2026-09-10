@@ -1,26 +1,11 @@
-//! Write the installer icons from the same drawing the tray uses.
-//!
-//! An example rather than a binary, so it is never part of what ships, and it pulls the tray's
-//! icon module in by path rather than copying the geometry — two drawings that were meant to
-//! be one icon would drift the first time either was touched.
-//!
-//!     cargo run -p ac-desktop --example icons
-//!
-//! The output is committed, because packaging must not depend on being able to run this, and
-//! because a changed icon should be visible in a diff.
-
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-// The whole module comes in, though only `rgba` is wanted here; the rest belongs to the
-// tray backends and has no caller in an example.
 #[allow(dead_code)]
 #[path = "../src/tray/icon.rs"]
 mod icon;
 
-/// What an installer wants. Larger than the tray's sizes: this one is shown in a launcher and
-/// a store listing, not squeezed into a panel.
 const APP: [u32; 5] = [32, 64, 128, 256, 512];
 
 /// What goes inside the Windows `.ico`. 256 is the one Explorer uses for large icons.
@@ -60,9 +45,6 @@ fn png(size: u32) -> std::io::Result<Vec<u8>> {
 }
 
 /// An `.ico` holding PNG-compressed entries, which every Windows since Vista reads.
-///
-/// The format is a six-byte header, then one sixteen-byte directory entry per image, then the
-/// images themselves — so every offset depends on how many entries there are.
 fn ico(path: &Path, sizes: &[u32]) -> std::io::Result<()> {
     let images: Vec<(u32, Vec<u8>)> = sizes
         .iter()

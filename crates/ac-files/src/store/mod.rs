@@ -1,70 +1,36 @@
+use std::collections::HashSet;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 use ac_groups::id::GroupId;
 use ac_net::PeerId;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use sha2::{Digest, Sha256};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 
 use crate::content::Content;
 use crate::dirname::sanitize;
 use crate::path::RelPath;
 
+#[cfg(test)]
+pub(crate) mod fixtures;
+mod log;
+mod row;
+
+pub use row::{FileRow, Merged, Recorded};
+
+use log::{next_seq, note_local, note_wanted, served_seq};
+use row::{row_to_file, wins_hash, wins_path};
+
 /// How long to wait for another process's write lock before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// What this node knows about one file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileRow {
-    pub path: RelPath,
-    pub size: u64,
-    pub hash: String,
-    pub modified: i64,
-    pub added_at: i64,
-    pub added_by: PeerId,
-    pub removed_at: Option<i64>,
-    pub have: bool,
-    pub seen_seq: u64,
-}
+/// How many hashes one `IN (...)` may name, under SQLite's variable limit.
+const BIND_LIMIT: usize = 500;
 
-impl FileRow {
-    pub fn is_removed(&self) -> bool {
-        self.removed_at.is_some()
-    }
-
-    /// When this row last changed, in the clock of whoever changed it.
-    pub fn changed_at(&self) -> i64 {
-        self.removed_at.unwrap_or(self.added_at).max(self.added_at)
-    }
-}
-
-/// What one [`Files::merge`] did with a row from a peer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Merged {
-    Unchanged,
-    Rejected,
-    Applied,
-    Conflicted { moved: RelPath },
-    Deduplicated { kept: RelPath, dropped: RelPath },
-}
-
-/// Which of two versions of one path is true.
-fn wins_path(a: &FileRow, b: &FileRow) -> bool {
-    (a.changed_at(), &a.hash) > (b.changed_at(), &b.hash)
-}
-
-/// Which of two paths keeps content the group holds twice.
-fn wins_hash(a: &FileRow, b: &FileRow) -> bool {
-    (a.added_at, &a.path) < (b.added_at, &b.path)
-}
-
-/// What one [`Files::record`] changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Recorded {
-    Added,
-    Unchanged,
-    Replaced,
+/// What counts as held
+macro_rules! held {
+    () => {
+        "have = 1 AND removed_at IS NULL"
+    };
 }
 
 pub struct Files {
@@ -122,7 +88,13 @@ impl Files {
                  digest_seq  INTEGER NOT NULL DEFAULT 0,
                  last_change INTEGER NOT NULL DEFAULT 0,
                  changes     INTEGER NOT NULL DEFAULT 0,
-                 wanted      INTEGER NOT NULL DEFAULT 0
+                 wanted      INTEGER NOT NULL DEFAULT 0,
+                 -- The last position handed out in this group's log. Kept rather than read
+                 -- off the rows, so that a row leaving cannot hand its number back out.
+                 seq         INTEGER NOT NULL DEFAULT 0,
+                 -- The highest position that has ever left this node, for any peer. What
+                 -- separates a row somebody may be holding from one nobody has ever seen.
+                 served_seq  INTEGER NOT NULL DEFAULT 0
              );",
         )?;
 
@@ -398,6 +370,41 @@ impl Files {
             .transpose()
     }
 
+    /// Whether any group has these bytes on this disk
+    pub fn held_anywhere(&self, hash: &str) -> Result<bool, FilesError> {
+        let found: Option<i64> = self
+            .db
+            .query_row(
+                concat!(
+                    "SELECT 1 FROM files WHERE hash = ?1 AND ",
+                    held!(),
+                    " LIMIT 1"
+                ),
+                params![hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Which of `hashes` some group has on this disk
+    pub fn held_any_of(&self, hashes: &[&str]) -> Result<HashSet<String>, FilesError> {
+        let mut out = HashSet::new();
+        // SQLite caps how many variables one statement may bind, so ask in batches.
+        for batch in hashes.chunks(BIND_LIMIT) {
+            let places = vec!["?"; batch.len()].join(",");
+            let mut stmt = self.db.prepare(&format!(
+                "SELECT DISTINCT hash FROM files WHERE hash IN ({places}) AND {}",
+                held!()
+            ))?;
+            let rows = stmt.query_map(params_from_iter(batch), |row| row.get(0))?;
+            for hash in rows {
+                out.insert(hash?);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn mark_have(
         &mut self,
         group: GroupId,
@@ -410,199 +417,6 @@ impl Files {
         )?;
         Ok(())
     }
-
-    pub fn changes_since(
-        &self,
-        group: GroupId,
-        cursor: u64,
-        limit: usize,
-    ) -> Result<(Vec<FileRow>, u64), FilesError> {
-        let mut stmt = self.db.prepare(
-            "SELECT path, size, hash, modified, added_at, added_by, removed_at, have, seen_seq
-             FROM files
-             WHERE group_id = ?1 AND seen_seq > ?2
-             ORDER BY seen_seq
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(
-            params![
-                group.to_string(),
-                i64::try_from(cursor).unwrap_or(i64::MAX),
-                i64::try_from(limit).unwrap_or(i64::MAX),
-            ],
-            row_to_file,
-        )?;
-
-        let mut out = Vec::new();
-        let mut highest = cursor;
-        for row in rows {
-            match row? {
-                Ok(file) => {
-                    highest = highest.max(file.seen_seq);
-                    out.push(file);
-                }
-                Err(e) => tracing::warn!(error = %e, "skipping an unreadable file row"),
-            }
-        }
-        Ok((out, highest))
-    }
-
-    pub fn has_changes_after(&self, group: GroupId, cursor: u64) -> Result<bool, FilesError> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT 1 FROM files WHERE group_id = ?1 AND seen_seq > ?2 LIMIT 1",
-                params![group.to_string(), i64::try_from(cursor).unwrap_or(i64::MAX)],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-    }
-
-    pub fn cursor(&self, group: GroupId, peer: &PeerId) -> Result<u64, FilesError> {
-        let found: Option<i64> = self
-            .db
-            .query_row(
-                "SELECT cursor FROM file_sync WHERE group_id = ?1 AND peer = ?2",
-                params![group.to_string(), peer.to_base58()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(found.unwrap_or(0).max(0) as u64)
-    }
-
-    pub fn set_cursor(
-        &mut self,
-        group: GroupId,
-        peer: &PeerId,
-        cursor: u64,
-    ) -> Result<(), FilesError> {
-        self.db.execute(
-            "INSERT INTO file_sync (group_id, peer, cursor) VALUES (?1, ?2, ?3)
-             ON CONFLICT(group_id, peer) DO UPDATE SET cursor = excluded.cursor",
-            params![
-                group.to_string(),
-                peer.to_base58(),
-                i64::try_from(cursor).unwrap_or(i64::MAX),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn digest(&self, group: GroupId) -> Result<[u8; 32], FilesError> {
-        let tx = self.db.unchecked_transaction()?;
-
-        let seq = seq_in(&tx, group)?;
-        let cached: Option<(Option<Vec<u8>>, i64)> = tx
-            .query_row(
-                "SELECT digest, digest_seq FROM file_state WHERE group_id = ?1",
-                params![group.to_string()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-
-        if let Some((Some(bytes), at_seq)) = cached
-            && at_seq as u64 == seq
-            && let Ok(digest) = <[u8; 32]>::try_from(bytes.as_slice())
-        {
-            return Ok(digest);
-        }
-
-        let mut stmt = tx.prepare(
-            "SELECT path, hash, added_at, removed_at FROM files
-             WHERE group_id = ?1 ORDER BY path",
-        )?;
-        let mut rows = stmt.query(params![group.to_string()])?;
-
-        let mut hasher = Sha256::new();
-        hasher.update([0x03u8]);
-
-        while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            let hash: String = row.get(1)?;
-            let added_at: i64 = row.get(2)?;
-            let removed_at: Option<i64> = row.get(3)?;
-
-            hasher.update((path.len() as u64).to_be_bytes());
-            hasher.update(path.as_bytes());
-            hasher.update((hash.len() as u64).to_be_bytes());
-            hasher.update(hash.as_bytes());
-            hasher.update(added_at.to_be_bytes());
-            hasher.update(removed_at.unwrap_or(0).to_be_bytes());
-        }
-
-        let digest: [u8; 32] = hasher.finalize().into();
-        drop(rows);
-        drop(stmt);
-        drop(tx);
-
-        if let Ok(seq) = i64::try_from(seq) {
-            let stored = self.db.execute(
-                "INSERT INTO file_state (group_id, digest, digest_seq) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(group_id) DO UPDATE SET
-                     digest = excluded.digest, digest_seq = excluded.digest_seq",
-                params![group.to_string(), digest.as_slice(), seq],
-            );
-            if let Err(e) = stored {
-                tracing::debug!(%group, error = %e, "could not cache the catalogue digest");
-            }
-        }
-
-        Ok(digest)
-    }
-
-    /// This group's change counter: the highest position handed out in its log.
-    pub fn seq(&self, group: GroupId) -> Result<u64, FilesError> {
-        let tx = self.db.unchecked_transaction()?;
-        seq_in(&tx, group)
-    }
-
-    /// What this node has changed here since the group was last told: how many, and when last.
-    pub fn local_news(&self, group: GroupId) -> Result<(u64, i64), FilesError> {
-        let row: Option<(i64, i64)> = self
-            .db
-            .query_row(
-                "SELECT changes, last_change FROM file_state WHERE group_id = ?1",
-                params![group.to_string()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let (changes, last) = row.unwrap_or((0, 0));
-        Ok((changes.max(0) as u64, last))
-    }
-
-    /// Rows this group has gained that we do not hold, since the count was last taken.
-    pub fn wanted_news(&self, group: GroupId) -> Result<u64, FilesError> {
-        let n: Option<i64> = self
-            .db
-            .query_row(
-                "SELECT wanted FROM file_state WHERE group_id = ?1",
-                params![group.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(n.unwrap_or(0).max(0) as u64)
-    }
-
-    /// Taken account of: the group may ask around again.
-    pub fn wanted_seen(&mut self, group: GroupId) -> Result<(), FilesError> {
-        self.db.execute(
-            "UPDATE file_state SET wanted = 0 WHERE group_id = ?1",
-            params![group.to_string()],
-        )?;
-        Ok(())
-    }
-
-    /// The group has been told. Anything after this is a fresh change.
-    pub fn news_told(&mut self, group: GroupId) -> Result<(), FilesError> {
-        self.db.execute(
-            "INSERT INTO file_state (group_id, changes) VALUES (?1, 0)
-             ON CONFLICT(group_id) DO UPDATE SET changes = 0",
-            params![group.to_string()],
-        )?;
-        Ok(())
-    }
-
     /// How many live rows in this group we do not hold the bytes for.
     pub fn missing_count(&self, group: GroupId) -> Result<u64, FilesError> {
         let n: i64 = self.db.query_row(
@@ -736,23 +550,54 @@ impl Files {
         Ok(out)
     }
 
-    /// Mark a file removed. The row stays; the caller deletes the bytes.
+    /// Take a file out of a group. The caller deletes the bytes.
+    ///
+    /// Ordinarily a tombstone: the row stays, saying it went. That is what makes a removal
+    /// stick, because a peer still holding the file hands it straight back otherwise — a
+    /// merge against nothing takes the incoming row as it stands.
+    ///
+    /// A row that has never left this node has nobody to hand it back, so there is nothing
+    /// for a tombstone to defend against and the row simply goes. What decides it is
+    /// `served_seq`: everything above it is still only ours. Anyone admitted later reads the
+    /// log from the beginning and never learns the file existed, which is the truth.
     pub fn remove(&mut self, group: GroupId, path: &RelPath, at: i64) -> Result<bool, FilesError> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let seq = next_seq(&tx, group)?;
-        let changed = tx.execute(
-            "UPDATE files SET removed_at = ?3, have = 0, seen_seq = ?4
-             WHERE group_id = ?1 AND path = ?2 AND removed_at IS NULL",
-            params![
-                group.to_string(),
-                path.as_str(),
-                at,
-                i64::try_from(seq).map_err(|_| FilesError::CorruptRow)?,
-            ],
-        )?;
+        let Some(row) = read_row(&tx, group, path)? else {
+            return Ok(false);
+        };
+        if row.is_removed() {
+            return Ok(false);
+        }
+
+        let changed = match row.seen_seq > served_seq(&tx, group)? {
+            true => {
+                // The position it held is spent even though no row carries it now. The
+                // catalogue changed, and the digest is cached against the log's position —
+                // without this the removal would be invisible to everything that asks.
+                next_seq(&tx, group)?;
+                tx.execute(
+                    "DELETE FROM files WHERE group_id = ?1 AND path = ?2",
+                    params![group.to_string(), path.as_str()],
+                )?
+            }
+            false => {
+                let seq = next_seq(&tx, group)?;
+                tx.execute(
+                    "UPDATE files SET removed_at = ?3, have = 0, seen_seq = ?4
+                     WHERE group_id = ?1 AND path = ?2 AND removed_at IS NULL",
+                    params![
+                        group.to_string(),
+                        path.as_str(),
+                        at,
+                        i64::try_from(seq).map_err(|_| FilesError::CorruptRow)?,
+                    ],
+                )?
+            }
+        };
+
         if changed > 0 {
             note_local(&tx, group, at)?;
         }
@@ -821,7 +666,7 @@ fn move_bytes(
     from: &RelPath,
     to: &RelPath,
 ) -> Result<bool, FilesError> {
-    match content.rename(dir, from, to) {
+    match content.adopt(dir, from, dir, to) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(%from, "the index claimed bytes that are not on disk");
@@ -867,42 +712,6 @@ fn read_twin(
     .transpose()
 }
 
-/// Record that this group gained a row we do not hold.
-fn note_wanted(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<(), FilesError> {
-    tx.execute(
-        "INSERT INTO file_state (group_id, wanted) VALUES (?1, 1)
-         ON CONFLICT(group_id) DO UPDATE SET wanted = file_state.wanted + 1",
-        params![group.to_string()],
-    )?;
-    Ok(())
-}
-
-/// Record that this node changed this group's catalogue.
-fn note_local(tx: &rusqlite::Transaction<'_>, group: GroupId, at: i64) -> Result<(), FilesError> {
-    tx.execute(
-        "INSERT INTO file_state (group_id, last_change, changes) VALUES (?1, ?2, 1)
-         ON CONFLICT(group_id) DO UPDATE SET
-             last_change = excluded.last_change,
-             changes     = file_state.changes + 1",
-        params![group.to_string(), at],
-    )?;
-    Ok(())
-}
-
-fn next_seq(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<u64, FilesError> {
-    Ok(seq_in(tx, group)? + 1)
-}
-
-/// The highest position this group has handed out, or zero.
-fn seq_in(tx: &rusqlite::Transaction<'_>, group: GroupId) -> Result<u64, FilesError> {
-    let highest: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seen_seq), 0) FROM files WHERE group_id = ?1",
-        params![group.to_string()],
-        |row| row.get(0),
-    )?;
-    Ok(highest.max(0) as u64)
-}
-
 fn dir_taken(tx: &rusqlite::Transaction<'_>, dir: &str) -> Result<bool, FilesError> {
     Ok(tx
         .query_row(
@@ -921,35 +730,6 @@ fn escape_like(raw: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_")
 }
-
-type RowResult = rusqlite::Result<Result<FileRow, FilesError>>;
-
-fn row_to_file(row: &rusqlite::Row<'_>) -> RowResult {
-    let path: String = row.get(0)?;
-    let size: i64 = row.get(1)?;
-    let hash: String = row.get(2)?;
-    let modified: i64 = row.get(3)?;
-    let added_at: i64 = row.get(4)?;
-    let added_by: String = row.get(5)?;
-    let removed_at: Option<i64> = row.get(6)?;
-    let have: i64 = row.get(7)?;
-    let seen_seq: i64 = row.get(8)?;
-
-    Ok((|| {
-        Ok(FileRow {
-            path: RelPath::parse(&path).map_err(|_| FilesError::CorruptRow)?,
-            size: u64::try_from(size).map_err(|_| FilesError::CorruptRow)?,
-            hash,
-            modified,
-            added_at,
-            added_by: PeerId::from_str(&added_by).map_err(|_| FilesError::CorruptRow)?,
-            removed_at,
-            have: have != 0,
-            seen_seq: u64::try_from(seen_seq).map_err(|_| FilesError::CorruptRow)?,
-        })
-    })())
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum FilesError {
     #[error(transparent)]
@@ -973,40 +753,8 @@ pub enum FilesError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::fixtures::{AT, group_id, peer, row, served, store};
     use ac_groups::store::Groups;
-    use ac_net::identity::Keypair;
-
-    const AT: i64 = 1_000_000;
-
-    fn peer() -> PeerId {
-        Keypair::generate_ed25519().public().to_peer_id()
-    }
-
-    fn group_id(seed: u8) -> GroupId {
-        GroupId::from_str(&hex::encode([seed; 32])).unwrap()
-    }
-
-    /// A store and the peer it belongs to, kept apart so a row can be built while the store
-    /// is borrowed mutably.
-    fn store() -> (Files, PeerId) {
-        let me = peer();
-        (Files::in_memory(me).unwrap(), me)
-    }
-
-    fn row(me: PeerId, path: &str, hash: &str) -> FileRow {
-        FileRow {
-            path: RelPath::parse(path).unwrap(),
-            size: 3,
-            hash: hash.to_owned(),
-            modified: AT,
-            added_at: AT,
-            added_by: me,
-            removed_at: None,
-            have: true,
-            // Assigned by the store on write, so what a caller puts here is ignored.
-            seen_seq: 0,
-        }
-    }
 
     #[test]
     fn a_file_round_trips() {
@@ -1067,6 +815,8 @@ mod tests {
         let g = group_id(1);
         let r = row(me, "a.jpg", "aa");
         files.record(g, &r, false).unwrap();
+        // A peer has it, so the removal is owed a note saying it went.
+        served(&mut files, g);
 
         assert!(files.remove(g, &r.path, AT + 5).unwrap());
         assert!(files.list(g, None, false).unwrap().is_empty());
@@ -1209,142 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn a_forgotten_group_does_not_leave_its_digest_behind() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        let before = files.digest(g).unwrap();
-
-        files.forget_group(g).unwrap();
-        files.record(g, &row(me, "b.jpg", "bb"), false).unwrap();
-
-        assert_eq!(files.seq(g).unwrap(), 1, "the counter did restart");
-        assert_ne!(
-            files.digest(g).unwrap(),
-            before,
-            "a different catalogue at the same counter position"
-        );
-    }
-
-    #[test]
-    fn the_cached_digest_is_invalidated_by_the_writes_it_covers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("node.db");
-        let me = peer();
-        let mut files = Files::open(&path, me).unwrap();
-        let g = group_id(1);
-
-        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        let first = files.digest(g).unwrap();
-        assert_eq!(
-            files.digest(g).unwrap(),
-            first,
-            "served again from the cache"
-        );
-
-        // Another process entirely.
-        let mut other = Files::open(&path, me).unwrap();
-        other.record(g, &row(me, "b.jpg", "bb"), false).unwrap();
-
-        assert_ne!(
-            files.digest(g).unwrap(),
-            first,
-            "the writer advanced the counter, which is all the invalidation there is"
-        );
-    }
-
-    #[test]
-    fn taking_a_copy_does_not_count_as_a_catalogue_change() {
-        // `have` is local and excluded from the digest, and `mark_have` is the one write that
-        // does not advance the counter. The two facts have to agree: if fetching bytes moved the
-        // counter, every download would look like news and be announced to the whole group.
-        let (mut files, me) = store();
-        let g = group_id(1);
-        let path = RelPath::parse("a.jpg").unwrap();
-        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-
-        let (digest, seq) = (files.digest(g).unwrap(), files.seq(g).unwrap());
-        files.mark_have(g, &path, false).unwrap();
-
-        assert_eq!(files.seq(g).unwrap(), seq, "not a change to the catalogue");
-        assert_eq!(files.digest(g).unwrap(), digest);
-    }
-
-    #[test]
-    fn the_pause_is_measured_from_the_change_not_from_reading_it_twice() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-
-        let mut edit = row(me, "a.jpg", "aa");
-        edit.added_at = 100;
-        files.record(g, &edit, false).unwrap();
-        assert_eq!(
-            files.local_news(g).unwrap(),
-            (1, 100),
-            "the edit is news, stamped when it was made"
-        );
-        assert_eq!(
-            files.local_news(g).unwrap(),
-            (1, 100),
-            "and reading it again does not push the pause forward"
-        );
-
-        let mut second = row(me, "b.jpg", "bb");
-        second.added_at = 200;
-        files.record(g, &second, false).unwrap();
-        assert_eq!(files.local_news(g).unwrap(), (2, 200), "a second edit");
-
-        files.news_told(g).unwrap();
-        assert_eq!(
-            files.local_news(g).unwrap().0,
-            0,
-            "and nothing is owed once the group has been told"
-        );
-    }
-
-    #[test]
-    fn a_row_from_a_peer_is_not_our_news() {
-        // The whole reason the writer stamps this rather than the supervisor inferring it: the
-        // group's sequence moves for a merged row exactly as it does for an edit, so telling the
-        // group about what it just told us would be one message per member per member.
-        let (mut files, _me) = store();
-        let g = group_id(1);
-        let dir = files.dir_for(g, "holiday").unwrap();
-        let content = Content::new(tempfile::tempdir().unwrap().path().to_path_buf());
-
-        let theirs = row(PeerId::random(), "theirs.jpg", "cc");
-        files.merge(g, &theirs, &content, &dir).unwrap();
-
-        assert_eq!(
-            files.local_news(g).unwrap().0,
-            0,
-            "we did not change anything; they did"
-        );
-        assert!(files.seq(g).unwrap() > 0, "though the log did move");
-    }
-
-    #[test]
-    fn a_removal_is_news_like_any_other_change() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-
-        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        files.news_told(g).unwrap();
-
-        assert!(
-            files
-                .remove(g, &RelPath::parse("a.jpg").unwrap(), 500)
-                .unwrap(),
-            "the row was there to remove"
-        );
-        assert_eq!(
-            files.local_news(g).unwrap(),
-            (1, 500),
-            "taking a file out is a change the group has to hear about"
-        );
-    }
-
-    #[test]
     fn held_bytes_by_group_splits_the_same_total() {
         let (mut files, me) = store();
         let (g, other) = (group_id(1), group_id(2));
@@ -1423,6 +1037,164 @@ mod tests {
     }
 
     #[test]
+    fn held_anywhere_asks_about_bytes_not_about_a_group() {
+        let (mut files, me) = store();
+        let (g, other) = (group_id(1), group_id(2));
+
+        files.record(g, &row(me, "here.jpg", "aa"), true).unwrap();
+        assert!(files.held_anywhere("aa").unwrap());
+        assert!(!files.held_anywhere("zz").unwrap());
+
+        // The point of it: `path_of_hash` answers one group at a time and would say no here.
+        assert!(files.path_of_hash(other, "aa").unwrap().is_none());
+        assert!(files.held_anywhere("aa").unwrap());
+
+        // Catalogued but not fetched is not held, or an import would throw away bytes we have
+        // in order to wait for a peer to send them back.
+        files
+            .record(g, &row(me, "elsewhere.jpg", "bb"), true)
+            .unwrap();
+        files
+            .mark_have(g, &RelPath::parse("elsewhere.jpg").unwrap(), false)
+            .unwrap();
+        assert!(!files.held_anywhere("bb").unwrap());
+
+        // And a removal stops it being held, which is why `imported` has to remember instead.
+        files
+            .remove(g, &RelPath::parse("here.jpg").unwrap(), AT)
+            .unwrap();
+        assert!(!files.held_anywhere("aa").unwrap());
+    }
+
+    /// Asking about a page at once has to answer exactly what asking row by row would.
+    #[test]
+    fn held_any_of_agrees_with_asking_one_at_a_time() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+
+        files.record(g, &row(me, "here.jpg", "aa"), true).unwrap();
+        files.record(g, &row(me, "also.jpg", "bb"), true).unwrap();
+        // Catalogued but not fetched, so not held.
+        files.record(g, &row(me, "wanted.jpg", "cc"), true).unwrap();
+        files
+            .mark_have(g, &RelPath::parse("wanted.jpg").unwrap(), false)
+            .unwrap();
+
+        let asked = ["aa", "bb", "cc", "zz"];
+        let batch = files.held_any_of(&asked).unwrap();
+        for hash in asked {
+            assert_eq!(batch.contains(hash), files.held_anywhere(hash).unwrap());
+        }
+
+        assert!(files.held_any_of(&[]).unwrap().is_empty());
+    }
+
+    /// More hashes than one statement may bind, so the batching has to hold.
+    #[test]
+    fn held_any_of_asks_about_more_than_one_batch() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+
+        let hashes: Vec<String> = (0..BIND_LIMIT + 20).map(|i| format!("h{i:05}")).collect();
+        for (i, hash) in hashes.iter().enumerate() {
+            files
+                .record(g, &row(me, &format!("f{i}.jpg"), hash), true)
+                .unwrap();
+        }
+
+        let asked: Vec<&str> = hashes.iter().map(|h| h.as_str()).collect();
+        assert_eq!(files.held_any_of(&asked).unwrap().len(), hashes.len());
+    }
+
+    /// A tombstone is what stops a peer handing a removed file straight back, so it is owed
+    /// only to a peer that could. Nothing has left this node, so the row simply goes.
+    #[test]
+    fn removing_a_file_nobody_was_ever_given_leaves_no_tombstone() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+        let path = RelPath::parse("a.jpg").unwrap();
+        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
+
+        assert!(files.remove(g, &path, AT).unwrap());
+
+        assert!(files.get(g, &path).unwrap().is_none(), "no row at all");
+        let (changes, _) = files.changes_since(g, 0, 100).unwrap();
+        assert!(changes.is_empty(), "and nothing in the log to replicate");
+    }
+
+    /// Once it has gone out, it has to be remembered as gone: a peer still holding it merges
+    /// against nothing and hands it back.
+    #[test]
+    fn removing_a_file_a_peer_has_seen_leaves_a_tombstone() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+        let path = RelPath::parse("a.jpg").unwrap();
+        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
+
+        // Served, so from here on somebody may be holding it.
+        let (_, served) = files.changes_since(g, 0, 100).unwrap();
+        assert!(served > 0);
+
+        assert!(files.remove(g, &path, AT).unwrap());
+
+        let row = files.get(g, &path).unwrap().expect("the row stays");
+        assert!(row.is_removed(), "saying it went");
+        assert!(
+            row.seen_seq > served,
+            "and after the addition in the log, so a peer reading forward sees it"
+        );
+    }
+
+    /// The invariant the whole thing rests on: a position handed out once is never handed out
+    /// again. Counted rather than read off the rows, because a row can now leave.
+    #[test]
+    fn a_position_in_the_log_is_never_handed_out_twice() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+
+        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
+        files.record(g, &row(me, "b.jpg", "bb"), false).unwrap();
+        let highest = files.seq(g).unwrap();
+
+        // The one holding the highest position goes, taking its number with it.
+        files
+            .remove(g, &RelPath::parse("b.jpg").unwrap(), AT)
+            .unwrap();
+
+        files.record(g, &row(me, "c.jpg", "cc"), false).unwrap();
+        let after = files.seq(g).unwrap();
+        assert!(
+            after > highest,
+            "the next row took a fresh position, not the one b.jpg gave up: {after} vs {highest}"
+        );
+    }
+
+    /// A peer's own cursor counts as served, whatever it did or did not fetch: it can only
+    /// have got that number from us.
+    #[test]
+    fn a_cursor_a_peer_reports_is_enough_to_owe_it_a_tombstone() {
+        let (mut files, me) = store();
+        let g = group_id(1);
+        let path = RelPath::parse("a.jpg").unwrap();
+        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
+        let at = files.seq(g).unwrap();
+
+        // Asked from where it had already got to, so there is nothing to send — and it is
+        // still holding everything up to there.
+        let (changes, _) = files.changes_since(g, at, 100).unwrap();
+        assert!(changes.is_empty());
+
+        files.remove(g, &path, AT).unwrap();
+        assert!(
+            files
+                .get(g, &path)
+                .unwrap()
+                .is_some_and(|row| row.is_removed()),
+            "a tombstone is still owed to whoever reported that cursor"
+        );
+    }
+
+    #[test]
     fn forgetting_a_group_leaves_no_work_behind() {
         let (mut files, me) = store();
         let g = group_id(1);
@@ -1436,194 +1208,6 @@ mod tests {
             0,
             "and a cursor into a log we no longer hold would skip rows on re-joining"
         );
-    }
-
-    #[test]
-    fn changes_are_visible_to_a_separate_connection() {
-        // The CLI writes; a running daemon reads the same file without restarting.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.sqlite");
-        let me = peer();
-
-        let mut writer = Files::open(&path, me).unwrap();
-        let g = group_id(1);
-        writer.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-
-        let reader = Files::open(&path, me).unwrap();
-        assert_eq!(reader.list(g, None, false).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn every_write_takes_a_new_position_in_the_log() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-
-        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        files.record(g, &row(me, "b.jpg", "bb"), false).unwrap();
-        let (changes, next) = files.changes_since(g, 0, 100).unwrap();
-
-        assert_eq!(changes.len(), 2);
-        assert_eq!(next, 2);
-        assert!(
-            changes[0].seen_seq < changes[1].seen_seq,
-            "the log is ordered"
-        );
-    }
-
-    #[test]
-    fn a_removal_is_news_and_advances_the_log() {
-        // A peer already past this row must still hear that the file went.
-        let (mut files, me) = store();
-        let g = group_id(1);
-        let r = row(me, "a.jpg", "aa");
-        files.record(g, &r, false).unwrap();
-        let (_, after_add) = files.changes_since(g, 0, 100).unwrap();
-
-        files.remove(g, &r.path, AT + 5).unwrap();
-
-        let (changes, next) = files.changes_since(g, after_add, 100).unwrap();
-        assert_eq!(changes.len(), 1, "the removal is a change");
-        assert!(changes[0].is_removed());
-        assert!(next > after_add);
-    }
-
-    #[test]
-    fn a_row_learned_late_still_travels() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-
-        files
-            .record(g, &row(me, "recent.jpg", "rr"), false)
-            .unwrap();
-        let (_, caught_up) = files.changes_since(g, 0, 100).unwrap();
-
-        let ancient = FileRow {
-            added_at: AT - 100_000,
-            ..row(me, "ancient.jpg", "an")
-        };
-        files.record(g, &ancient, false).unwrap();
-
-        let (changes, _) = files.changes_since(g, caught_up, 100).unwrap();
-        assert_eq!(
-            changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
-            vec!["ancient.jpg"],
-            "an old file learned late is still new to a peer"
-        );
-    }
-
-    #[test]
-    fn changes_are_paginated_and_report_where_to_resume() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-        for i in 0..10 {
-            files
-                .record(g, &row(me, &format!("f{i}.jpg"), "aa"), false)
-                .unwrap();
-        }
-
-        let (first, next) = files.changes_since(g, 0, 4).unwrap();
-        assert_eq!(first.len(), 4);
-        assert!(files.has_changes_after(g, next).unwrap());
-
-        let (second, next) = files.changes_since(g, next, 4).unwrap();
-        assert_eq!(second.len(), 4);
-
-        let (third, next) = files.changes_since(g, next, 4).unwrap();
-        assert_eq!(third.len(), 2);
-        assert!(!files.has_changes_after(g, next).unwrap(), "drained");
-    }
-
-    #[test]
-    fn a_cursor_defaults_to_the_beginning() {
-        let (mut files, _me) = store();
-        let g = group_id(1);
-        let them = peer();
-
-        assert_eq!(files.cursor(g, &them).unwrap(), 0);
-        files.set_cursor(g, &them, 412).unwrap();
-        assert_eq!(files.cursor(g, &them).unwrap(), 412);
-    }
-
-    #[test]
-    fn cursors_are_per_peer_and_per_group() {
-        let (mut files, _me) = store();
-        let (a, b) = (group_id(1), group_id(2));
-        let (p, q) = (peer(), peer());
-
-        files.set_cursor(a, &p, 10).unwrap();
-        assert_eq!(files.cursor(a, &q).unwrap(), 0, "another peer's log");
-        assert_eq!(files.cursor(b, &p).unwrap(), 0, "another group's log");
-    }
-
-    #[test]
-    fn identical_catalogues_agree_on_a_digest() {
-        let (mut one, me) = store();
-        let (mut two, _) = store();
-        let g = group_id(1);
-
-        // Inserted in opposite orders, so the digest cannot depend on insertion order.
-        for path in ["a.jpg", "b.jpg", "c.jpg"] {
-            one.record(g, &row(me, path, path), false).unwrap();
-        }
-        for path in ["c.jpg", "b.jpg", "a.jpg"] {
-            two.record(g, &row(me, path, path), false).unwrap();
-        }
-
-        assert_eq!(one.digest(g).unwrap(), two.digest(g).unwrap());
-    }
-
-    #[test]
-    fn a_digest_ignores_what_is_local() {
-        // `have` and `seen_seq` are this node's business. If either reached the digest, two
-        // peers with the same catalogue and different downloads would resync for ever.
-        let (mut one, me) = store();
-        let (mut two, _) = store();
-        let g = group_id(1);
-
-        one.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        two.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        // Diverge both local columns.
-        two.mark_have(g, &RelPath::parse("a.jpg").unwrap(), false)
-            .unwrap();
-        two.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-
-        assert_eq!(one.digest(g).unwrap(), two.digest(g).unwrap());
-    }
-
-    #[test]
-    fn a_digest_notices_a_removal() {
-        // A tombstone is shared state. If it were left out, a peer that has seen a deletion
-        // would disagree with one that has not, and neither could tell why.
-        let (mut files, me) = store();
-        let g = group_id(1);
-        let r = row(me, "a.jpg", "aa");
-        files.record(g, &r, false).unwrap();
-        let before = files.digest(g).unwrap();
-
-        files.remove(g, &r.path, AT + 1).unwrap();
-        assert_ne!(files.digest(g).unwrap(), before);
-    }
-
-    #[test]
-    fn a_digest_notices_content_changing_under_one_path() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        let before = files.digest(g).unwrap();
-
-        files.record(g, &row(me, "a.jpg", "bb"), true).unwrap();
-        assert_ne!(files.digest(g).unwrap(), before);
-    }
-
-    #[test]
-    fn a_digest_is_scoped_to_its_group() {
-        let (mut files, me) = store();
-        let (a, b) = (group_id(1), group_id(2));
-        files.record(a, &row(me, "x.jpg", "aa"), false).unwrap();
-
-        assert_ne!(files.digest(a).unwrap(), files.digest(b).unwrap());
-        assert_eq!(files.count(a).unwrap(), 1);
-        assert_eq!(files.count(b).unwrap(), 0);
     }
 
     #[test]
@@ -1663,6 +1247,8 @@ mod tests {
         let g = group_id(1);
         let r = row(me, "a.jpg", "aa");
         files.record(g, &r, false).unwrap();
+        // Served, so there is a row left to look at afterwards.
+        served(&mut files, g);
         files.remove(g, &r.path, AT).unwrap();
 
         let stored = files.list(g, None, true).unwrap();
@@ -1928,6 +1514,9 @@ mod tests {
         let g = group_id(1);
         let r = row(me, "a.jpg", "aa");
         files.record(g, &r, false).unwrap();
+        // It went out, so the removal leaves a tombstone — which is the thing the stale
+        // re-add below has to lose to.
+        served(&mut files, g);
         files.remove(g, &r.path, AT + 100).unwrap();
 
         // A re-add stamped before the removal must not resurrect it.

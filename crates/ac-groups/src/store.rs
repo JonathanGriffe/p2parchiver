@@ -416,9 +416,6 @@ impl Groups {
             return Err(StoreError::Duplicate { group: id });
         }
 
-        // An admin is never invited to their own group, so nothing else would ever prompt them
-        // to author a standing — and without one they would be the only member of it with no
-        // name. Written here, in the same transaction, so a group is never briefly nameless.
         let standing = Standing::author(
             key,
             id,

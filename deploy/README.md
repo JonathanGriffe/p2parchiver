@@ -167,7 +167,7 @@ issuing a fresh invite: a revoked peer cannot even reach the enrolment listener,
 ## Relay bandwidth
 
 This is the operating cost. A circuit is capped at 8 MiB or ten minutes, whichever comes
-first, and one client may open 16 of them a minute (an IP, 64) — so a client's sustained
+first, and one client may open 16 of them a minute (an IP, 64), so a client's sustained
 ceiling is 128 MiB a minute. Sized for hole-punch coordination, not for carrying media:
 two peers that fail to hole punch get a working connection, not a fast one.
 

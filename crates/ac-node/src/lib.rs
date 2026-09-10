@@ -10,6 +10,7 @@ mod contacts;
 mod directory;
 mod file_link;
 mod group_link;
+mod import_link;
 mod peer_link;
 mod status;
 mod throttle;
