@@ -417,11 +417,13 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             let selection = selection.clone();
 
             window.set_source_adding(true);
-            window.set_message(match ops::import::implementation(&source) {
-                Ok(entry) => entry.waiting().into(),
-                Err(_) => slint::SharedString::from(""),
-            });
-            window.set_message_bad(false);
+            work::holding(
+                &window,
+                match ops::import::implementation(&source) {
+                    Ok(entry) => entry.waiting(),
+                    Err(_) => "",
+                },
+            );
 
             work::action(
                 &weak,

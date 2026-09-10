@@ -212,8 +212,15 @@ pub fn wire(window: &MainWindow, selection: &Selection, nudge: &crate::work::Nud
     window.on_showing({
         let selection = selection.clone();
         let nudge = nudge.clone();
+        let weak = window.as_weak();
         move |tab| {
             selection.set_tab(tab);
+            // What the last action said was about the page it was done on, and the line is
+            // shared: carrying it to another page would leave it there to be read as that
+            // page's.
+            if let Some(window) = weak.upgrade() {
+                crate::work::clear(&window);
+            }
             // The page that just came up has whatever it last knew on it, which may be
             // nothing at all. Read now rather than at the next tick.
             nudge.now();
@@ -440,6 +447,30 @@ fn name_of(id: &str, page: &groups::Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The line is shared by every page, so what one page's action said cannot be left on
+    /// screen when another comes up: read there, it would look like that page's own.
+    #[test]
+    fn what_a_page_said_does_not_follow_the_reader_to_the_next_one() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        let (nudge, _ticks) = crate::work::nudge();
+        wire(&window, &Selection::new(), &nudge);
+
+        window.set_tab(SORT);
+        crate::work::finish(&window, Ok("40 filed".to_owned()), &nudge);
+        assert_eq!(window.get_message(), "40 filed");
+
+        window.set_tab(FILES);
+        // `changed tab` is run where property changes are, which is the loop the real window
+        // has and this one does not. A moment of mock time is what stands in for it.
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
+        assert_eq!(
+            window.get_message(),
+            "",
+            "left behind on the page it was about"
+        );
+    }
 
     /// The button copies in the markup, so what a test can hold to is that pressing it is
     /// wired to the node's own id and says so. Whether the platform took the text is the
