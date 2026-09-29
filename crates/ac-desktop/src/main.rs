@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod autostart;
 mod files;
 mod groups;
 mod log;
@@ -60,6 +61,11 @@ fn main() -> Result<()> {
     let _logging = log::init(&paths, cli.headless)?;
 
     let _lock = NodeLock::take(&paths)?;
+
+    // An entry naming a binary that has since moved would start nothing at the next login.
+    if let Err(e) = autostart::repair() {
+        tracing::warn!(error = %e, "could not check the autostart entry");
+    }
 
     // No window, so nothing needs the main thread and the daemon can have it.
     if cli.headless {
