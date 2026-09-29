@@ -53,47 +53,38 @@ pub fn disable() -> Result<()> {
     imp::clear()
 }
 
-/// Point an existing entry at this binary, if the one it names is gone.
+/// Bring the entry in line with this binary at startup, before Settings reads it.
 ///
-/// Only a dangling entry is rewritten. One that names another binary that still exists, say
-/// an installed copy while a development build runs, is left alone and Settings reports it
-/// instead: whichever copy happened to launch last should not quietly take over the login.
-pub fn repair() -> Result<bool> {
-    let exe = this_binary()?;
-    match classify(imp::read()?, &exe) {
-        State::Stale { was } if !was.exists() => {
-            imp::write(&exe)?;
-            tracing::info!(was = %was.display(), now = %exe.display(), "moved the autostart entry");
-            Ok(true)
-        }
-        State::Stale { was } => {
-            tracing::info!(
-                recorded = %was.display(),
-                this = %exe.display(),
-                "the autostart entry starts another copy of this app, leaving it"
-            );
-            Ok(false)
-        }
-        _ => Ok(false),
-    }
-}
-
-/// Turn the entry on the first time a released build runs here, which is what makes this
-/// opt-out rather than opt-in.
-///
-/// Once only, and the marker is written before the entry: if anything fails in between, the
-/// box shows off and can be ticked, which beats turning back on someone who turned it off.
-/// An entry that is already there, even one naming another copy, is left as it is.
-pub fn default_on(paths: &Paths) -> Result<()> {
-    if !SUPPORTED || !released() || !first_time(&paths.root.join(DEFAULTED_FILENAME))? {
+/// The first run is claimed before the entry is even read, whatever it says, so turning it
+/// off afterwards stays off. If anything fails after the claim the box shows off and can be
+/// ticked, which beats turning back on someone who turned it off.
+pub fn settle(paths: &Paths) -> Result<()> {
+    if !SUPPORTED {
         return Ok(());
     }
 
-    if state()? == State::Off {
-        enable()?;
-        tracing::info!("starting with the session from now on, which is the default");
+    let first_run = released() && claim_first_run(&paths.root.join(DEFAULTED_FILENAME))?;
+    let exe = this_binary()?;
+    let state = classify(imp::read()?, &exe);
+    if wants_writing(&state, first_run) {
+        imp::write(&exe)?;
+        tracing::info!(?state, now = %exe.display(), "pointed the autostart entry at this binary");
     }
     Ok(())
+}
+
+/// Whether startup should point the entry at this binary.
+///
+/// The first run turns it on, which is what makes this opt-out rather than opt-in. After that
+/// only a dangling entry is rewritten. One that names another binary that still exists, say
+/// an installed copy while a development build runs, is left alone and Settings reports it
+/// instead: whichever copy happened to launch last should not quietly take over the login.
+fn wants_writing(state: &State, first_run: bool) -> bool {
+    match state {
+        State::Off => first_run,
+        State::Stale { was } => !was.exists(),
+        State::On | State::Unsupported => false,
+    }
 }
 
 /// A build CI stamped with a release version. Everything else, `cargo run` included, is
@@ -102,8 +93,8 @@ fn released() -> bool {
     env!("CARGO_PKG_VERSION") != "0.0.0"
 }
 
-/// Leave the marker, and say whether this call is the one that did.
-fn first_time(marker: &Path) -> Result<bool> {
+/// Leave the first-run marker, and say whether this call is the one that did.
+fn claim_first_run(marker: &Path) -> Result<bool> {
     match std::fs::File::create_new(marker) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -319,18 +310,47 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_applied_once() {
+    fn the_first_run_is_claimed_once() {
         // Turning it off in Settings only sticks if the run that turned it on is remembered.
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join(DEFAULTED_FILENAME);
-        assert!(first_time(&marker).unwrap());
-        assert!(!first_time(&marker).unwrap());
+        assert!(claim_first_run(&marker).unwrap());
+        assert!(!claim_first_run(&marker).unwrap());
+    }
+
+    #[test]
+    fn startup_turns_it_on_once_and_otherwise_only_mends_a_dangling_entry() {
+        let installed = tempfile::NamedTempFile::new().unwrap();
+        let gone = State::Stale {
+            was: PathBuf::from("/gone/ac-desktop"),
+        };
+        let other_copy = State::Stale {
+            was: installed.path().to_path_buf(),
+        };
+
+        assert!(wants_writing(&State::Off, true), "on by default");
+        assert!(
+            !wants_writing(&State::Off, false),
+            "and off stays off after that"
+        );
+        assert!(
+            wants_writing(&gone, false),
+            "an entry naming nothing is mended"
+        );
+        assert!(
+            !wants_writing(&other_copy, true),
+            "an entry naming another copy is left to it, even on a first run"
+        );
+        for first_run in [true, false] {
+            assert!(!wants_writing(&State::On, first_run));
+            assert!(!wants_writing(&State::Unsupported, first_run));
+        }
     }
 
     #[test]
     fn the_flag_is_not_mistaken_for_part_of_the_path() {
         // The bug this guards is silent: read the whole line back as the path and it can
-        // never equal this binary, so `state()` answers Stale forever and `repair()` rewrites
+        // never equal this binary, so `state()` answers Stale forever and `settle()` rewrites
         // the entry on every single launch.
         let path = PathBuf::from("/opt/archiverclient/ac-desktop");
         let line = command(&path);

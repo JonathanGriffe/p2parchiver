@@ -62,20 +62,16 @@ fn main() -> Result<()> {
 
     let _lock = NodeLock::take(&paths)?;
 
-    // An entry naming a binary that has since moved would start nothing at the next login.
-    if let Err(e) = autostart::repair() {
-        tracing::warn!(error = %e, "could not check the autostart entry");
-    }
-
     // No window, so nothing needs the main thread and the daemon can have it.
     if cli.headless {
         tracing::info!("running headless");
         return node::run_here(paths);
     }
 
-    // After the headless return on purpose: that has no Settings page to turn it off from.
-    if let Err(e) = autostart::default_on(&paths) {
-        tracing::warn!(error = %e, "could not turn on starting with the session");
+    // Before Settings reads it. Not headless: the entry starts the windowed app, and a headless
+    // run has no Settings page to say what was done or to turn it off from.
+    if let Err(e) = autostart::settle(&paths) {
+        tracing::warn!(error = %e, "could not settle the autostart entry");
     }
 
     // Shared so the Settings page can restart it, always off the event loop since that joins.
