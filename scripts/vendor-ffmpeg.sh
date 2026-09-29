@@ -6,19 +6,22 @@ TRIPLE="${1:?usage: vendor-ffmpeg.sh <target-triple>}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR="$HERE/crates/ac-desktop/vendor"
 
-RELEASE="autobuild-2026-09-02-13-13"
+# Pin a month-end auto-build only (autobuild-YYYY-MM-<last day>-*). BtbN/FFmpeg-Builds
+# deletes daily auto-builds after about two weeks but keeps month-end ones for much longer,
+# so pinning a daily build breaks packaging with a 404 once it expires.
+RELEASE="autobuild-2026-08-31-13-27"
 BUILD="ffmpeg-n9.0.1-11-ge47273f4d9"
 BASE="https://github.com/BtbN/FFmpeg-Builds/releases/download/$RELEASE"
 
 case "$TRIPLE" in
   x86_64-unknown-linux-gnu)
     ARCHIVE="$BUILD-linux64-lgpl-9.0.tar.xz"
-    SHA256="bce5103c29b51d4b6937de78a01fa39f6a30e22201bf85fbf74b0a13b662c0ff"
+    SHA256="204fc02692b11249c3e688ad18538ce2939129a1fc6abc32a6b2638a024496cf"
     BINARY="ffmpeg"
     ;;
   x86_64-pc-windows-msvc)
     ARCHIVE="$BUILD-win64-lgpl-9.0.zip"
-    SHA256="14ce996102bcaccdc8de62e404dd96c9e6eb4c7ae28a25eb3537817f1e4d60fd"
+    SHA256="2484854ad6988d34560f4e6ea7a6ecb9dde0af7c229d2591815d056b04ec4f56"
     BINARY="ffmpeg.exe"
     ;;
   *)
