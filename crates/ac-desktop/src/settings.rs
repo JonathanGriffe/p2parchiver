@@ -138,17 +138,21 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
         let weak = weak.clone();
         let nudge = nudge.clone();
         move |wanted| {
-            let result = if wanted {
-                autostart::enable()
-            } else {
-                autostart::disable()
-            };
-            if let Some(window) = weak.upgrade() {
-                // The tick follows what is recorded, not what was asked for, and it is all
-                // a success needs to say.
-                show_autostart(&window, autostart::state());
-                work::finish(&window, result.map(|()| String::new()), &nudge);
-            }
+            let nudge = nudge.clone();
+            work::begin(&weak);
+            work::action(
+                &weak,
+                move || match wanted {
+                    true => autostart::enable(),
+                    false => autostart::disable(),
+                },
+                move |window, outcome| {
+                    // The tick follows what is recorded, not what was asked for, and it is
+                    // all a success needs to say.
+                    show_autostart(window, autostart::state());
+                    work::finish(window, outcome.map(|()| String::new()), &nudge);
+                },
+            );
         }
     });
 
