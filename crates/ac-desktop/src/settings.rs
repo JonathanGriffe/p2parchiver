@@ -53,28 +53,18 @@ pub fn load(window: &MainWindow, paths: &Paths) {
         crate::sources::shared_settings(paths),
     ))));
 
-    load_autostart(window);
+    show_autostart(window, autostart::state());
 }
 
 /// The tick, and the warning that goes with a recorded path that is no longer this binary.
-fn load_autostart(window: &MainWindow) {
-    let state = autostart::SUPPORTED.then(autostart::state);
-    show_autostart(window, state);
-}
-
-/// `None` where this platform has no way to start with the session, which hides the option.
-fn show_autostart(window: &MainWindow, state: Option<Result<autostart::State>>) {
-    let Some(state) = state else {
-        window.set_autostart_supported(false);
-        window.set_autostart(false);
-        window.set_autostart_warning("".into());
-        return;
-    };
-
-    let (on, warning) = match state {
-        Ok(autostart::State::On) => (true, String::new()),
-        Ok(autostart::State::Off) => (false, String::new()),
+/// Where the platform has no way to start with the session, the option is not shown at all.
+fn show_autostart(window: &MainWindow, state: Result<autostart::State>) {
+    let (supported, on, warning) = match state {
+        Ok(autostart::State::Unsupported) => (false, false, String::new()),
+        Ok(autostart::State::On) => (true, true, String::new()),
+        Ok(autostart::State::Off) => (true, false, String::new()),
         Ok(autostart::State::Stale { was }) => (
+            true,
             false,
             format!(
                 "The recorded entry starts {}, which is not this program. Turn this on to \
@@ -82,10 +72,14 @@ fn show_autostart(window: &MainWindow, state: Option<Result<autostart::State>>) 
                 was.display()
             ),
         ),
-        Err(e) => (false, format!("could not read the autostart entry: {e:#}")),
+        Err(e) => (
+            true,
+            false,
+            format!("could not read the autostart entry: {e:#}"),
+        ),
     };
 
-    window.set_autostart_supported(true);
+    window.set_autostart_supported(supported);
     window.set_autostart(on);
     window.set_autostart_warning(warning.into());
 }
@@ -150,13 +144,10 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
                 autostart::disable()
             };
             if let Some(window) = weak.upgrade() {
-                // The tick follows what is recorded, not what was asked for.
-                load_autostart(&window);
-                let said = match wanted {
-                    true => "this app will start when you log in",
-                    false => "this app will not start when you log in",
-                };
-                work::finish(&window, result.map(|()| said.to_owned()), &nudge);
+                // The tick follows what is recorded, not what was asked for, and it is all
+                // a success needs to say.
+                show_autostart(&window, autostart::state());
+                work::finish(&window, result.map(|()| String::new()), &nudge);
             }
         }
     });
@@ -533,19 +524,19 @@ mod tests {
                 .unwrap()
         };
 
-        show_autostart(&window, None);
+        show_autostart(&window, Ok(autostart::State::Unsupported));
         assert_eq!(checkboxes(), 0, "hidden where there is no implementation");
 
-        show_autostart(&window, Some(Ok(autostart::State::Off)));
+        show_autostart(&window, Ok(autostart::State::Off));
         assert_eq!(checkboxes(), 1, "shown where there is one");
         assert!(!ticked(), "off by default");
 
-        show_autostart(&window, Some(Ok(autostart::State::On)));
+        show_autostart(&window, Ok(autostart::State::On));
         assert!(ticked());
         assert_eq!(window.get_autostart_warning(), "");
 
         let was = PathBuf::from("/gone/ac-desktop");
-        show_autostart(&window, Some(Ok(autostart::State::Stale { was })));
+        show_autostart(&window, Ok(autostart::State::Stale { was }));
         assert!(
             !ticked(),
             "an entry that starts something else is not this one on"
@@ -554,7 +545,7 @@ mod tests {
         assert!(warning.contains("/gone/ac-desktop"), "got {warning:?}");
         assert_eq!(showing(&warning), 1, "and the warning is on the page");
 
-        show_autostart(&window, None);
+        show_autostart(&window, Ok(autostart::State::Unsupported));
         assert_eq!(showing(&warning), 0, "nor is a warning about it");
     }
 
@@ -567,7 +558,7 @@ mod tests {
             .window()
             .set_size(slint::PhysicalSize::new(1200, 3000));
         window.set_tab(SETTINGS_TAB);
-        show_autostart(&window, Some(Ok(autostart::State::Off)));
+        show_autostart(&window, Ok(autostart::State::Off));
 
         let asked = Rc::new(std::cell::Cell::new(None));
         window.on_set_autostart({
@@ -576,7 +567,7 @@ mod tests {
             move |wanted| {
                 asked.set(Some(wanted));
                 // What a failed write reads back as.
-                show_autostart(&weak.upgrade().unwrap(), Some(Ok(autostart::State::Off)));
+                show_autostart(&weak.upgrade().unwrap(), Ok(autostart::State::Off));
             }
         });
 
@@ -588,7 +579,7 @@ mod tests {
         assert!(!window.get_autostart());
 
         // And a later success still gets through to the box.
-        show_autostart(&window, Some(Ok(autostart::State::On)));
+        show_autostart(&window, Ok(autostart::State::On));
         assert_eq!(checkbox().accessible_checked(), Some(true));
     }
 

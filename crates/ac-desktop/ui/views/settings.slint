@@ -235,7 +235,7 @@ export component SettingsView inherits ScrollView {
                     toggled => { root.set-autostart(self.checked); }
                 }
 
-                if root.autostart-supported && root.autostart-warning != "" : Text {
+                if root.autostart-warning != "" : Text {
                     text: root.autostart-warning;
                     color: Theme.warn;
                     font-size: Theme.small-size;

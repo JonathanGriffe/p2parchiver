@@ -8,28 +8,34 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use imp::SUPPORTED;
+
 /// The name under which the entry is recorded, on either platform.
-pub const ENTRY: &str = "archiverclient";
+const ENTRY: &str = "archiverclient";
 
-/// The flag the recorded command carries. A node started with the session belongs in the tray,
-/// not in a window nobody asked for.
+/// The flag the recorded command carries, and the one `Cli` declares with it. A node started
+/// with the session belongs in the tray, not in a window nobody asked for.
 pub const BACKGROUND: &str = "background";
-
-/// Whether this platform has an implementation. Settings hides the option where it does not.
-pub const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "windows"));
 
 /// Set by the AppImage runtime to the image itself, which is what outlives this session.
 const APPIMAGE: &str = "APPIMAGE";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum State {
+    /// This platform has no way to start with the session, so there is nothing to offer.
+    Unsupported,
     Off,
     On,
-    Stale { was: PathBuf },
+    Stale {
+        was: PathBuf,
+    },
 }
 
 /// Whether this binary starts with the session.
 pub fn state() -> Result<State> {
+    if !SUPPORTED {
+        return Ok(State::Unsupported);
+    }
     Ok(classify(imp::read()?, &this_binary()?))
 }
 
@@ -117,6 +123,8 @@ mod imp {
     use anyhow::{Context, anyhow};
     use std::path::PathBuf;
 
+    pub const SUPPORTED: bool = true;
+
     fn path() -> Result<PathBuf> {
         let dirs = directories::BaseDirs::new()
             .ok_or_else(|| anyhow!("could not find this user's config directory"))?;
@@ -189,8 +197,14 @@ mod imp {
     use anyhow::Context;
     use std::path::{Path, PathBuf};
 
+    pub const SUPPORTED: bool = true;
+
     /// Where Windows looks for things to start when this user logs in.
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    /// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`, which is how `windows-registry` says there
+    /// is no such value. Anything else is a real failure, and has to be said as one.
+    const NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
 
     /// Per-user, deliberately: the app writes this itself and an installer must not, so that
     /// the toggle in the UI is the only thing that owns it.
@@ -204,7 +218,8 @@ mod imp {
         match key()?.get_string(ENTRY) {
             Ok(value) => Ok(Some(PathBuf::from(recorded_path(&value)))),
             // Absent is the normal "not enabled" answer, not a failure.
-            Err(_) => Ok(None),
+            Err(e) if e.code().0 == NOT_FOUND => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading HKCU\\{RUN_KEY}\\{ENTRY}")),
         }
     }
 
@@ -216,8 +231,8 @@ mod imp {
 
     pub fn clear() -> Result<()> {
         match key()?.remove_value(ENTRY) {
-            Ok(()) => Ok(()),
-            Err(_) => Ok(()),
+            Err(e) if e.code().0 == NOT_FOUND => Ok(()),
+            other => other.with_context(|| format!("removing HKCU\\{RUN_KEY}\\{ENTRY}")),
         }
     }
 }
@@ -226,6 +241,8 @@ mod imp {
 mod imp {
     use super::Result;
     use std::path::{Path, PathBuf};
+
+    pub const SUPPORTED: bool = false;
 
     pub fn read() -> Result<Option<PathBuf>> {
         Ok(None)
@@ -251,10 +268,15 @@ mod tests {
     }
 
     #[test]
-    fn the_recorded_command_asks_for_the_tray_rather_than_a_window() {
-        // Without this the session opens a window at every login, which is not what a
-        // background sync client is for.
-        assert!(command(Path::new("/opt/ac-desktop")).ends_with(" --background"));
+    fn the_recorded_command_is_one_this_binary_accepts_and_asks_for_the_tray() {
+        // A flag the parser does not know fails every login with no window to say so, and
+        // one it knows but is not this starts a window nobody asked for.
+        use clap::Parser;
+
+        let line = command(Path::new("/home/a b/ac-desktop"));
+        let args = line.rsplit('"').next().unwrap().split_whitespace();
+        let cli = crate::Cli::try_parse_from(std::iter::once("ac-desktop").chain(args)).unwrap();
+        assert!(cli.background);
     }
 
     #[test]

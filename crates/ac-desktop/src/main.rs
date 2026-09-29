@@ -47,7 +47,7 @@ struct Cli {
 
     /// Start in the tray with no window. What the autostart entry uses, so logging in does
     /// not put a window in front of you.
-    #[arg(long)]
+    #[arg(long = autostart::BACKGROUND)]
     background: bool,
 }
 
