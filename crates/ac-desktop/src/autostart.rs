@@ -149,9 +149,9 @@ fn recorded_path(value: &str) -> &str {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::{ENTRY, Result, command};
+    use super::{ENTRY, Result, command, recorded_path};
     use anyhow::{Context, anyhow};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     pub const SUPPORTED: bool = true;
 
@@ -165,16 +165,16 @@ mod imp {
     }
 
     pub fn read() -> Result<Option<PathBuf>> {
-        super::linux::read_at(&path()?)
+        read_at(&path()?)
     }
 
-    pub fn write(exe: &std::path::Path) -> Result<()> {
+    pub fn write(exe: &Path) -> Result<()> {
         let path = path()?;
         let dir = path
             .parent()
             .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        std::fs::write(&path, super::linux::entry(&command(exe)))
+        std::fs::write(&path, entry(&command(exe)))
             .with_context(|| format!("writing {}", path.display()))
     }
 
@@ -186,13 +186,6 @@ mod imp {
             Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-mod linux {
-    use std::path::{Path, PathBuf};
-
-    use anyhow::{Context, Result};
 
     pub fn entry(exec: &str) -> String {
         format!(
@@ -217,7 +210,7 @@ mod linux {
         Ok(text
             .lines()
             .find_map(|line| line.strip_prefix("Exec="))
-            .map(|exec| PathBuf::from(super::recorded_path(exec))))
+            .map(|exec| PathBuf::from(recorded_path(exec))))
     }
 }
 
@@ -378,7 +371,7 @@ mod tests {
     fn no_entry_reads_as_off() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("archiverclient.desktop");
-        assert_eq!(linux::read_at(&path).unwrap(), None);
+        assert_eq!(imp::read_at(&path).unwrap(), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -388,9 +381,9 @@ mod tests {
         let path = dir.path().join("archiverclient.desktop");
         let exe = PathBuf::from("/opt/archiverclient/ac-desktop");
 
-        std::fs::write(&path, linux::entry(&command(&exe))).unwrap();
+        std::fs::write(&path, imp::entry(&command(&exe))).unwrap();
 
-        assert_eq!(linux::read_at(&path).unwrap(), Some(exe));
+        assert_eq!(imp::read_at(&path).unwrap(), Some(exe));
     }
 
     #[cfg(target_os = "linux")]
@@ -399,9 +392,9 @@ mod tests {
         // What `cargo clean`, or an install that relocated the binary, leaves behind.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("archiverclient.desktop");
-        std::fs::write(&path, linux::entry("\"/gone/ac-desktop\"")).unwrap();
+        std::fs::write(&path, imp::entry("\"/gone/ac-desktop\"")).unwrap();
 
-        let recorded = linux::read_at(&path).unwrap().unwrap();
+        let recorded = imp::read_at(&path).unwrap().unwrap();
         assert!(!same_target(&recorded, Path::new("/opt/ac-desktop")));
     }
 
@@ -410,7 +403,7 @@ mod tests {
     fn the_entry_says_it_is_an_application_and_wants_no_terminal() {
         // A .desktop file missing either is skipped by some session managers and opens a
         // terminal in others.
-        let entry = linux::entry("\"/opt/ac-desktop\"");
+        let entry = imp::entry("\"/opt/ac-desktop\"");
         assert!(entry.contains("Type=Application"));
         assert!(entry.contains("Terminal=false"));
         assert!(entry.starts_with("[Desktop Entry]"));
