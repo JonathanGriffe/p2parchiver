@@ -413,14 +413,12 @@ fn describe_traffic(
     vec![
         TrafficRow {
             label: "download".into(),
-            total: human_size(moved.down).into(),
             rate: rate(down_rate).into(),
             limit: limit.clone().into(),
             live: down_rate > 0,
         },
         TrafficRow {
             label: "upload".into(),
-            total: human_size(moved.up).into(),
             rate: rate(up_rate).into(),
             limit: limit.into(),
             live: up_rate > 0,
@@ -598,15 +596,14 @@ mod tests {
 
         let rows = describe_traffic(Some(&report(moved)), true, None);
 
-        assert_eq!(rows[0].total, "2.0 KB");
         assert_eq!(
             rows[0].rate, "idle",
             "0 B/s is a number that reads as broken"
         );
         assert!(!rows[0].live);
         assert_eq!(
-            rows[1].total, "0 B",
-            "nothing sent is still a fact worth stating"
+            rows[1].rate, "idle",
+            "and the same for a direction never used"
         );
     }
 
@@ -642,7 +639,6 @@ mod tests {
         assert_eq!(rows[0].rate, "idle");
         assert_eq!(rows[1].rate, "idle");
         assert!(!rows[0].live && !rows[1].live);
-        assert_eq!(rows[0].total, "900 B", "but what it did move still stands");
     }
 
     #[test]
@@ -650,8 +646,8 @@ mod tests {
         let rows = describe_traffic(None, false, None);
 
         assert_eq!(rows.len(), 2, "the section keeps its shape");
-        assert_eq!(rows[0].total, "0 B");
-        assert_eq!(rows[1].total, "0 B");
+        assert_eq!(rows[0].rate, "idle");
+        assert_eq!(rows[1].rate, "idle");
     }
 
     #[test]

@@ -13,10 +13,9 @@ export struct StorageSlice {
     at: int,
 }
 
-// One direction's traffic: what has moved through it, and what is moving now.
+// One direction's traffic: what is moving through it now.
 export struct TrafficRow {
     label: string,
-    total: string,
     rate: string,
     // The configured ceiling, empty when there is none.
     limit: string,
@@ -238,18 +237,12 @@ export component StatusView inherits VerticalLayout {
                     width: 68px;
                 }
                 Text {
-                    text: row.total;
-                    color: Theme.text;
-                    font-size: Theme.body-size;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                    overflow: elide;
-                }
-                Text {
                     text: row.rate;
                     color: row.live ? Theme.text : Theme.dim;
                     font-size: Theme.body-size;
                     vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
                 }
                 Text {
                     text: row.limit;

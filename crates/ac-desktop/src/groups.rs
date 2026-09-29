@@ -51,15 +51,12 @@ fn name_for(member: &ops::group::MemberView, known: &[ops::Known]) -> String {
     // Our own name is not somebody else's claim about us, so it is never marked. The directory
     // leaves this node out entirely, which is why it has to be handled before the lookup.
     if member.is_me {
-        return member
-            .username
-            .clone()
-            .unwrap_or_else(|| member.peer.to_base58()[..8].to_owned());
+        return member.username.clone().unwrap_or_default();
     }
     if let Some(entry) = known.iter().find(|k| k.peer == member.peer) {
-        return peers::display_name(entry.name.as_deref(), entry.source, &entry.peer);
+        return peers::display_name(entry.name.as_deref(), entry.source);
     }
-    peers::display_name(member.username.as_deref(), ops::Source::Group, &member.peer)
+    peers::display_name(member.username.as_deref(), ops::Source::Group)
 }
 
 fn membership(state: State) -> i32 {
@@ -260,7 +257,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         // `ac group create` says this too: it is the one fact about a new group that cannot
         // be undone later, so it is said at the moment it becomes true.
         Ok(format!(
-            "created {} ({}). You are its only admin, and that cannot be transferred.",
+            "created group {} ({}).",
             created.name,
             created.id.short()
         ))
@@ -729,14 +726,40 @@ pub mod tests {
     fn a_member_who_has_not_spoken_yet_is_shown_by_id_and_marked_as_unanswered() {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
-        let them = somebody_else();
-        ops::group::add(&paths, &created.id.to_string(), &them).unwrap();
+        let them_id = somebody_else();
+        ops::group::add(&paths, &created.id.to_string(), &them_id).unwrap();
 
         let detail = page(&paths, &created.id.to_string()).detail.unwrap();
         let them = detail.members.iter().find(|m| !m.is_me).unwrap();
 
-        assert_eq!(them.username, them.peer.to_string()[..8].to_string());
+        assert_eq!(
+            them.username, "",
+            "nothing is claimed about what they are called"
+        );
+        assert_eq!(them.peer, them_id.to_string(), "the id is the whole of it");
         assert_eq!(them.note, "invited, no answer yet");
+    }
+
+    /// The front of every peer id is the same, so a name cut from one would call every
+    /// member who has published nothing by the same name.
+    #[test]
+    fn two_members_who_have_published_no_name_are_still_told_apart() {
+        let (_tmp, paths) = home("jonathan");
+        let created = ops::group::create(&paths, "holiday").unwrap();
+        let (one, two) = (somebody_else(), somebody_else());
+        ops::group::add(&paths, &created.id.to_string(), &one).unwrap();
+        ops::group::add(&paths, &created.id.to_string(), &two).unwrap();
+
+        let detail = page(&paths, &created.id.to_string()).detail.unwrap();
+        let rows: Vec<(String, String)> = detail
+            .members
+            .iter()
+            .filter(|m| !m.is_me)
+            .map(|m| (m.username.to_string(), m.peer.to_string()))
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0], rows[1], "one row cannot stand for both of them");
     }
 
     /// A name this node chose for itself outranks silence, so someone added to a group who is

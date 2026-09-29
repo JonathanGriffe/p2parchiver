@@ -23,8 +23,9 @@ export struct MemberItem {
     is_me: bool,
 }
 
-// A destructive action explains itself before it happens, in the same words the CLI uses
-// when it has already happened. That prose is the product; it should not be lost to buttons.
+// A destructive action worth explaining says it before it happens, in the same words the CLI
+// uses when it has already happened. The body is optional: where the title already says the
+// whole of it, a paragraph under it is furniture to be read past.
 export component Confirm inherits Rectangle {
     in property <string> title;
     in property <string> body;
@@ -60,7 +61,9 @@ export component Confirm inherits Rectangle {
                 wrap: word-wrap;
             }
 
-            Text {
+            // Left out where the title is the whole of it, rather than left empty: an
+            // unset body would still take a line's worth of room above the buttons.
+            if root.body != "" : Text {
                 text: root.body;
                 color: Theme.dim;
                 font-size: Theme.body-size;
@@ -350,7 +353,10 @@ export component GroupsView inherits Rectangle {
                                 tint: member.departed ? Theme.faint : Theme.ok;
                                 y: (parent.height - self.height) / 2;
                             }
-                            Text {
+                            // Left out rather than left blank for a member who has published
+                            // no name: the column would otherwise hold 120px of nothing and
+                            // push the id away from the dot that belongs to it.
+                            if member.username != "" : Text {
                                 text: member.username;
                                 color: member.departed ? Theme.dim : Theme.text;
                                 font-size: Theme.body-size;
@@ -421,10 +427,6 @@ export component GroupsView inherits Rectangle {
 
     if root.asking == 3 : Confirm {
         title: "Remove " + root.asking-peer-name + "?";
-        // What `ac group remove` says once it has done it.
-        body: "They stop being served by every member that has seen this, and will find out "
-            + "themselves next time they ask. It does not reach back: anything already shared "
-            + "with them is theirs, and no membership change can undo that.";
         verb: "Remove";
         confirmed => { root.asking = 0; root.remove-member(root.selected, root.asking-peer); }
         dismissed => { root.asking = 0; }

@@ -34,13 +34,9 @@ pub fn list(paths: &Paths) -> Result<()> {
         return Ok(());
     }
 
-    // A peer met through a group who has published nothing is shown by the only thing this
-    // node knows about them.
-    let shown = |k: &crate::ops::Known| {
-        k.name
-            .clone()
-            .unwrap_or_else(|| k.peer.to_base58()[..8].to_owned())
-    };
+    // A peer met through a group who has published nothing is left unnamed: the id is the
+    // last column of every row, and the front of one is the same for every node there is.
+    let shown = |k: &crate::ops::Known| k.name.clone().unwrap_or_default();
     let widest = known.iter().map(|k| shown(k).len()).max().unwrap_or(0);
     for entry in known {
         let via = match entry.source {

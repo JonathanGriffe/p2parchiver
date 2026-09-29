@@ -39,7 +39,9 @@ export component PeerCard inherits Card {
             spacing: 2px;
             horizontal-stretch: 1;
 
-            Text {
+            // Left out rather than left blank for somebody who has published no name: an
+            // empty line above the id is a gap the eye has to account for.
+            if root.peer.name != "" : Text {
                 text: root.peer.name;
                 color: Theme.text;
                 font-size: Theme.body-size;

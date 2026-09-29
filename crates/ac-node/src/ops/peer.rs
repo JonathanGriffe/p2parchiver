@@ -122,12 +122,9 @@ pub fn status(paths: &Paths) -> Result<StatusReport> {
             .into_iter()
             .filter_map(|entry| Some((entry.peer, entry.name?)))
             .collect();
-    let name = |peer: &PeerId| {
-        names
-            .get(peer)
-            .cloned()
-            .unwrap_or_else(|| peer.to_base58()[..8].to_owned())
-    };
+    // Whole, where there is no name: these are read on their own — "pulling from X" — with
+    // no id beside them to make sense of a piece of one.
+    let name = |peer: &PeerId| names.get(peer).cloned().unwrap_or_else(|| peer.to_base58());
 
     let group_rows = snapshot
         .groups

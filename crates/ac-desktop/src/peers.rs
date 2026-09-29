@@ -24,13 +24,14 @@ pub struct Page {
 ///
 /// A name this node chose stands as it is. A name the person chose for themselves is marked,
 /// because nothing verifies it: it is what they say they are called, not who they are.
-pub fn display_name(name: Option<&str>, source: Source, peer: &ac_net::PeerId) -> String {
+pub fn display_name(name: Option<&str>, source: Source) -> String {
     match (name, source) {
         (Some(name), Source::Contact) => name.to_owned(),
         (Some(name), Source::Group) => format!("~ {name}"),
-        // Nobody has told us anything, so there is nothing to mark up. A short id is not a
-        // claim, and dressing it as one would say they call themselves "12D3KooW".
-        (None, _) => peer.to_base58()[..8].to_owned(),
+        // Nobody has told us anything, so nothing is said. The id is shown beside this and
+        // stands on its own; a name cut from the front of one would read as "12D3KooW" for
+        // every node there is, which tells them apart from nobody.
+        (None, _) => String::new(),
     }
 }
 
@@ -45,7 +46,7 @@ pub fn read(known: &[ops::Known], report: Option<&StatusReport>) -> Page {
         let contact = matches!(entry.source, Source::Contact);
 
         let item = PeerItem {
-            name: display_name(entry.name.as_deref(), entry.source, &entry.peer).into(),
+            name: display_name(entry.name.as_deref(), entry.source).into(),
             peer: entry.peer.to_string().into(),
             state: state.into(),
             tone,
@@ -139,10 +140,11 @@ mod tests {
         let page = page(&paths);
 
         assert!(page.contacts.is_empty(), "never told about them directly");
-        // They have published no standing, so there is no name to mark up: the short id is
-        // the only thing this node actually knows about them.
+        // They have published no standing, so nothing is said about what they are called.
+        // The row is their id, which is the whole of what this node knows.
         assert_eq!(page.discovered.len(), 1);
-        assert_eq!(page.discovered[0].name, them.to_base58()[..8].to_owned());
+        assert_eq!(page.discovered[0].name, "");
+        assert_eq!(page.discovered[0].peer, them.to_string());
     }
 
     /// Adding someone as a contact is what promotes them out of the discovered list, so the
