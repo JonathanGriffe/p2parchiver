@@ -87,10 +87,11 @@ fn wants_writing(state: &State, first_run: bool) -> bool {
     }
 }
 
-/// A build CI stamped with a release version. Everything else, `cargo run` included, is
-/// still 0.0.0, and running one of those once should not make it start at every login.
+/// Whether CI built this as a release. Its package job sets `AC_RELEASE` to the version it
+/// released, and to nothing for a pull request, so neither `cargo run` nor a pull request's
+/// packages make themselves start at every login just by running once.
 fn released() -> bool {
-    env!("CARGO_PKG_VERSION") != "0.0.0"
+    option_env!("AC_RELEASE").is_some_and(|version| !version.is_empty())
 }
 
 /// Leave the first-run marker, and say whether this call is the one that did.

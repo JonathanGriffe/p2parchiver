@@ -131,7 +131,11 @@ jobs:
           sed -i "s/^version = \"0.0.0\"/version = \"$version\"/" Cargo.toml
           grep -m1 '^version' Cargo.toml
 
+      # `AC_RELEASE` is read by ac-desktop when it compiles: only a released build turns start
+      # at login on by default, so a pull request's packages leave it empty.
       - name: Build
+        env:
+          AC_RELEASE: ${{ needs.release.outputs.version }}
         run: cargo build --release -p ac-desktop -p ac-node
 
       # The app previews video by spawning ffmpeg, and a stock Windows has none while most
