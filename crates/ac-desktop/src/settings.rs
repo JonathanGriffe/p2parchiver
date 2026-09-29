@@ -529,7 +529,7 @@ mod tests {
 
         show_autostart(&window, Ok(autostart::State::Off));
         assert_eq!(checkboxes(), 1, "shown where there is one");
-        assert!(!ticked(), "off by default");
+        assert!(!ticked(), "and clear when nothing is recorded");
 
         show_autostart(&window, Ok(autostart::State::On));
         assert!(ticked());

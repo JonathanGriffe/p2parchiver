@@ -73,6 +73,11 @@ fn main() -> Result<()> {
         return node::run_here(paths);
     }
 
+    // After the headless return on purpose: that has no Settings page to turn it off from.
+    if let Err(e) = autostart::default_on(&paths) {
+        tracing::warn!(error = %e, "could not turn on starting with the session");
+    }
+
     // Shared so the Settings page can restart it, always off the event loop since that joins.
     let node: settings::Shared = Arc::new(Mutex::new(node::Node::start(paths.clone())?));
 

@@ -1,11 +1,13 @@
 //! Starting with the session: an XDG autostart entry on Linux, a `Run` value on Windows.
 //!
-//! Opt-in from Settings, and owned by the app alone: nothing else writes the entry, so what
-//! Settings shows is what is recorded.
+//! On unless turned off: the first run of a released build turns it on, once, and after that
+//! the toggle in Settings owns it. Nothing else writes the entry, so what Settings shows is
+//! what is recorded.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use ac_net::config::Paths;
 use anyhow::{Context, Result};
 
 use imp::SUPPORTED;
@@ -19,6 +21,10 @@ pub const BACKGROUND: &str = "background";
 
 /// Set by the AppImage runtime to the image itself, which is what outlives this session.
 const APPIMAGE: &str = "APPIMAGE";
+
+/// Left in the node's directory by the run that turned the entry on by default, so that it
+/// happens once and turning it off stays off.
+const DEFAULTED_FILENAME: &str = "autostart-defaulted";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum State {
@@ -69,6 +75,39 @@ pub fn repair() -> Result<bool> {
             Ok(false)
         }
         _ => Ok(false),
+    }
+}
+
+/// Turn the entry on the first time a released build runs here, which is what makes this
+/// opt-out rather than opt-in.
+///
+/// Once only, and the marker is written before the entry: if anything fails in between, the
+/// box shows off and can be ticked, which beats turning back on someone who turned it off.
+/// An entry that is already there, even one naming another copy, is left as it is.
+pub fn default_on(paths: &Paths) -> Result<()> {
+    if !SUPPORTED || !released() || !first_time(&paths.root.join(DEFAULTED_FILENAME))? {
+        return Ok(());
+    }
+
+    if state()? == State::Off {
+        enable()?;
+        tracing::info!("starting with the session from now on, which is the default");
+    }
+    Ok(())
+}
+
+/// A build CI stamped with a release version. Everything else, `cargo run` included, is
+/// still 0.0.0, and running one of those once should not make it start at every login.
+fn released() -> bool {
+    env!("CARGO_PKG_VERSION") != "0.0.0"
+}
+
+/// Leave the marker, and say whether this call is the one that did.
+fn first_time(marker: &Path) -> Result<bool> {
+    match std::fs::File::create_new(marker) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("creating {}", marker.display())),
     }
 }
 
@@ -277,6 +316,15 @@ mod tests {
         let args = line.rsplit('"').next().unwrap().split_whitespace();
         let cli = crate::Cli::try_parse_from(std::iter::once("ac-desktop").chain(args)).unwrap();
         assert!(cli.background);
+    }
+
+    #[test]
+    fn the_default_is_applied_once() {
+        // Turning it off in Settings only sticks if the run that turned it on is remembered.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(DEFAULTED_FILENAME);
+        assert!(first_time(&marker).unwrap());
+        assert!(!first_time(&marker).unwrap());
     }
 
     #[test]
