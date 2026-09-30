@@ -397,7 +397,7 @@ impl FileSync {
         if self.inflight.contains_key(&(peer, group)) {
             return;
         }
-        if self.inflight.len() >= MAX_INFLIGHT {
+        if !self.has_slot() {
             self.defer(peer, group);
             return;
         }
@@ -427,20 +427,24 @@ impl FileSync {
 
     /// Start whatever the freed slots have room for.
     fn drain_deferred(&mut self, actions: &mut Vec<FileAction>, roster: &Roster) {
-        while self.inflight.len() < MAX_INFLIGHT {
+        while self.has_slot() {
             let Some((peer, group)) = self.deferred.pop_front() else {
                 return;
             };
 
-            // Both can have moved on while it waited: the peer may be gone, and their log may
-            // already be being read.
-            if !roster.is_admitted(&peer) || self.inflight.contains_key(&(peer, group)) {
+            // The peer may have gone while it waited.
+            if !roster.is_admitted(&peer) {
                 continue;
             }
 
             let after = self.files.cursor(group, &peer).unwrap_or(0);
             self.read(actions, peer, group, after, false);
         }
+    }
+
+    /// Whether another read can go out now.
+    fn has_slot(&self) -> bool {
+        self.inflight.len() < MAX_INFLIGHT
     }
 
     /// Whether a catalogue read from this peer is under way or waiting for a slot.
