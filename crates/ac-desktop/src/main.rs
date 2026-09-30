@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod autostart;
 mod files;
 mod groups;
 mod log;
@@ -46,7 +47,7 @@ struct Cli {
 
     /// Start in the tray with no window. What the autostart entry uses, so logging in does
     /// not put a window in front of you.
-    #[arg(long)]
+    #[arg(long = autostart::BACKGROUND)]
     background: bool,
 }
 
@@ -65,6 +66,13 @@ fn main() -> Result<()> {
     if cli.headless {
         tracing::info!("running headless");
         return node::run_here(paths);
+    }
+
+    // Before Settings reads it. Not headless: the entry starts the windowed app, and a headless
+    // run has no Settings page to say what was done or to turn it off from. `cli.home` is set
+    // by `--home` or `AC_HOME`: only a run with neither is sure to use the home the entry starts.
+    if let Err(e) = autostart::settle(&paths, cli.home.is_none()) {
+        tracing::warn!(error = %e, "could not settle the autostart entry");
     }
 
     // Shared so the Settings page can restart it, always off the event loop since that joins.

@@ -39,11 +39,18 @@ export component SettingsView inherits ScrollView {
     in property <string> bandwidth-max;
     in property <string> server;
 
+    // Only where this platform can start the app with the session.
+    in property <bool> autostart-supported;
+    // What is recorded, not what was last clicked: two-way so that Rust setting it after the
+    // click is what the tick ends up showing.
+    in-out property <bool> autostart;
+    in property <string> autostart-warning;
     in property <bool> busy;
     in property <bool> enrolled;
     in property <[SettingItem]> source-settings;
 
     callback save(bool, string, string, string);
+    callback set-autostart(bool);
     callback save-setting(string, string, string);
     // Hands back what the field should read, which is what it already read if nothing was
     // chosen.
@@ -220,6 +227,20 @@ export component SettingsView inherits ScrollView {
             VerticalLayout {
                 padding: Theme.md;
                 spacing: Theme.sm;
+
+                if root.autostart-supported : CheckBox {
+                    text: "Start when I log in";
+                    checked <=> root.autostart;
+                    enabled: !root.busy;
+                    toggled => { root.set-autostart(self.checked); }
+                }
+
+                if root.autostart-warning != "" : Text {
+                    text: root.autostart-warning;
+                    color: Theme.warn;
+                    font-size: Theme.small-size;
+                    wrap: word-wrap;
+                }
 
                 HorizontalLayout {
                     alignment: start;

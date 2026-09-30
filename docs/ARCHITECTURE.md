@@ -100,7 +100,7 @@ These are deliberate for now:
 - **One permanent admin per group**, with no transfer, removal or key rotation.
 - **Revocation reaches other nodes only through expiry**, up to 24 h later.
 - **One rendezvous namespace per server**, so every enrolled client can discover every other.
-- **Platform gaps.** The tray and "show in folder" work only on Linux and Windows, and ffmpeg
+- **Platform gaps.** The tray, start at login and "show in folder" work only on Linux and Windows, and ffmpeg
   is vendored only for x86_64 Linux and Windows.
 - **Import backoff lives in memory**, so a restart scans again.
 

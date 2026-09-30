@@ -11,7 +11,7 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 use crate::node::Node;
 use crate::ui::MainWindow;
 use crate::work::{self, Nudge};
-use crate::{log, shell, view};
+use crate::{autostart, log, shell, view};
 
 pub type Shared = Arc<Mutex<Node>>;
 
@@ -52,6 +52,36 @@ pub fn load(window: &MainWindow, paths: &Paths) {
     window.set_source_settings(ModelRc::from(Rc::new(VecModel::from(
         crate::sources::shared_settings(paths),
     ))));
+
+    show_autostart(window, autostart::state());
+}
+
+/// The tick, and the warning that goes with a recorded path that is no longer this binary.
+/// Where the platform has no way to start with the session, the option is not shown at all.
+fn show_autostart(window: &MainWindow, state: Result<autostart::State>) {
+    let (supported, on, warning) = match state {
+        Ok(autostart::State::Unsupported) => (false, false, String::new()),
+        Ok(autostart::State::On) => (true, true, String::new()),
+        Ok(autostart::State::Off) => (true, false, String::new()),
+        Ok(autostart::State::Stale { was }) => (
+            true,
+            false,
+            format!(
+                "The recorded entry starts {}, which is not this program. Turn this on to \
+                 start this one instead.",
+                was.display()
+            ),
+        ),
+        Err(e) => (
+            true,
+            false,
+            format!("could not read the autostart entry: {e:#}"),
+        ),
+    };
+
+    window.set_autostart_supported(supported);
+    window.set_autostart(on);
+    window.set_autostart_warning(warning.into());
 }
 
 pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
@@ -101,6 +131,28 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
                 .map(|dir| dir.display().to_string().into())
                 // Dismissed, so the field keeps whatever it already read.
                 .unwrap_or(current)
+        }
+    });
+
+    window.on_set_autostart({
+        let weak = weak.clone();
+        let nudge = nudge.clone();
+        move |wanted| {
+            let nudge = nudge.clone();
+            work::begin(&weak);
+            work::action(
+                &weak,
+                move || match wanted {
+                    true => autostart::enable(),
+                    false => autostart::disable(),
+                },
+                move |window, outcome| {
+                    // The tick follows what is recorded, not what was asked for, and it is
+                    // all a success needs to say.
+                    show_autostart(window, autostart::state());
+                    work::finish(window, outcome.map(|()| String::new()), &nudge);
+                },
+            );
         }
     });
 
@@ -445,6 +497,94 @@ mod tests {
                 .any(|item| item.key == "client_secret" && item.value == "shh-1234"),
             "with what is stored in it, ready to be changed"
         );
+    }
+
+    /// The "Start when I log in" box itself, not the text inside it that carries the same label.
+    fn start_at_login(window: &MainWindow) -> impl Iterator<Item = ElementHandle> {
+        ElementHandle::find_by_accessible_label(window, "Start when I log in").filter(|e| {
+            e.accessible_role() == Some(i_slint_backend_testing::AccessibleRole::Checkbox)
+        })
+    }
+
+    /// Where the platform has no way to start with the session there is nothing to offer; where
+    /// it has, the tick says what is recorded, and an entry naming another binary is said out
+    /// loud rather than left to fail at the next login.
+    #[test]
+    fn start_at_login_is_offered_only_where_it_works_and_says_what_is_recorded() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(1200, 3000));
+        window.set_tab(SETTINGS_TAB);
+
+        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+        let checkboxes = || start_at_login(&window).count();
+        let ticked = || {
+            start_at_login(&window)
+                .next()
+                .unwrap()
+                .accessible_checked()
+                .unwrap()
+        };
+
+        show_autostart(&window, Ok(autostart::State::Unsupported));
+        assert_eq!(checkboxes(), 0, "hidden where there is no implementation");
+
+        show_autostart(&window, Ok(autostart::State::Off));
+        assert_eq!(checkboxes(), 1, "shown where there is one");
+        assert!(!ticked(), "and clear when nothing is recorded");
+
+        show_autostart(&window, Ok(autostart::State::On));
+        assert!(ticked());
+        assert_eq!(window.get_autostart_warning(), "");
+
+        let was = PathBuf::from("/gone/ac-desktop");
+        show_autostart(&window, Ok(autostart::State::Stale { was }));
+        assert!(
+            !ticked(),
+            "an entry that starts something else is not this one on"
+        );
+        let warning = window.get_autostart_warning().to_string();
+        assert!(warning.contains("/gone/ac-desktop"), "got {warning:?}");
+        assert_eq!(showing(&warning), 1, "and the warning is on the page");
+
+        show_autostart(&window, Ok(autostart::State::Unsupported));
+        assert_eq!(showing(&warning), 0, "nor is a warning about it");
+    }
+
+    /// The tick follows what is recorded, not the click: a refused write leaves it clear.
+    #[test]
+    fn the_tick_follows_what_was_recorded_rather_than_the_click() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(1200, 3000));
+        window.set_tab(SETTINGS_TAB);
+        show_autostart(&window, Ok(autostart::State::Off));
+
+        let asked = Rc::new(std::cell::Cell::new(None));
+        window.on_set_autostart({
+            let weak = window.as_weak();
+            let asked = asked.clone();
+            move |wanted| {
+                asked.set(Some(wanted));
+                // What a failed write reads back as.
+                show_autostart(&weak.upgrade().unwrap(), Ok(autostart::State::Off));
+            }
+        });
+
+        let checkbox = || start_at_login(&window).next().unwrap();
+        checkbox().invoke_accessible_default_action();
+
+        assert_eq!(asked.get(), Some(true), "the click asked to turn it on");
+        assert_eq!(checkbox().accessible_checked(), Some(false));
+        assert!(!window.get_autostart());
+
+        // And a later success still gets through to the box.
+        show_autostart(&window, Ok(autostart::State::On));
+        assert_eq!(checkbox().accessible_checked(), Some(true));
     }
 
     /// A refusal over the username should not cost someone the token they pasted, so the

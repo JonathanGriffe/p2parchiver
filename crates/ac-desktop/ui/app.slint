@@ -166,6 +166,10 @@ export component MainWindow inherits Window {
     in-out property <int> enrol-phase;
     in-out property <string> enrol-error;
     in-out property <string> enrol-summary;
+    // Starting with the session. Hidden where the platform has no way to.
+    in-out property <bool> autostart-supported;
+    in-out property <bool> autostart;
+    in-out property <string> autostart-warning;
 
     // What the last action did, and whether it went wrong. Set by Rust, cleared when the
     // next one starts.
@@ -194,6 +198,7 @@ export component MainWindow inherits Window {
     callback verify();
     callback open-file-dir(string);
     callback save(bool, string, string, string);
+    callback set-autostart(bool);
     callback pick-storage-root(string) -> string;
     callback open-logs();
     callback restart();
@@ -428,10 +433,14 @@ export component MainWindow inherits Window {
                 server: root.server;
                 enrolled: root.enrolled;
                 source-settings: root.source-settings;
+                autostart-supported: root.autostart-supported;
+                autostart <=> root.autostart;
+                autostart-warning: root.autostart-warning;
                 busy: root.busy;
                 vertical-stretch: 1;
 
                 save(m, r, s, b) => { root.save(m, r, s, b); }
+                set-autostart(on) => { root.set-autostart(on); }
                 save-setting(source, key, value) => { root.save-setting(source, key, value); }
                 pick-storage-root(current) => { return root.pick-storage-root(current); }
                 open-logs() => { root.open-logs(); }
