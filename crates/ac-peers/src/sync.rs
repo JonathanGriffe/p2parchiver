@@ -728,21 +728,22 @@ impl Peers {
             let _ = self.groups.news_told(group);
         }
 
-        if at >= self.state[&group].heartbeat_at {
-            let covered = self
-                .members_of(group)
-                .into_iter()
-                .any(|peer| self.pending.contains(&peer));
-
+        if at < self.state[&group].heartbeat_at {
+            return;
+        }
+        let covered = self
+            .members_of(group)
+            .into_iter()
+            .any(|peer| self.pending.contains(&peer));
+        if !covered {
             // Nobody reachable: the heartbeat stays due until somebody is.
-            let called = covered
-                || self
-                    .next_member(group, &HashSet::new())
-                    .map(|peer| self.pending.insert(peer))
-                    .is_some();
-            if called && let Some(state) = self.state.get_mut(&group) {
-                state.heartbeat_at = at + HEARTBEAT;
-            }
+            let Some(peer) = self.next_member(group, &HashSet::new()) else {
+                return;
+            };
+            self.pending.insert(peer);
+        }
+        if let Some(state) = self.state.get_mut(&group) {
+            state.heartbeat_at = at + HEARTBEAT;
         }
     }
 
