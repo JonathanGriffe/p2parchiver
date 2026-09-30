@@ -70,7 +70,7 @@ fn main() -> Result<()> {
 
     // Before Settings reads it. Not headless: the entry starts the windowed app, and a headless
     // run has no Settings page to say what was done or to turn it off from. `cli.home` is set
-    // by `--home` or `AC_HOME`, either of which is a home the entry does not start.
+    // by `--home` or `AC_HOME`: only a run with neither is sure to use the home the entry starts.
     if let Err(e) = autostart::settle(&paths, cli.home.is_none()) {
         tracing::warn!(error = %e, "could not settle the autostart entry");
     }

@@ -1,8 +1,8 @@
 //! Starting with the session: an XDG autostart entry on Linux, a `Run` value on Windows.
 //!
 //! On unless turned off: the first run of a released build on the default home turns it on,
-//! once, and after that the toggle in Settings owns it. Nothing else writes the entry, so what Settings shows is
-//! what is recorded.
+//! once, and after that the toggle in Settings owns it. Nothing else writes the entry, so
+//! what Settings shows is what is recorded.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -59,8 +59,8 @@ pub fn disable() -> Result<()> {
 /// off afterwards stays off. If anything fails after the claim the box shows off and can be
 /// ticked, which beats turning back on someone who turned it off.
 ///
-/// `default_home` is whether this run uses the home the recorded command starts. Only that
-/// home's first run counts: the entry is one per user, and it starts the default home.
+/// `default_home` is whether this run is sure to use the home the recorded command starts.
+/// Only that home's first run counts: the entry is one per user and records no home.
 pub fn settle(paths: &Paths, default_home: bool) -> Result<()> {
     if !SUPPORTED {
         return Ok(());
