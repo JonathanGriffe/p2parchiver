@@ -1,0 +1,58 @@
+# ac-net
+
+The networking layer of the projects. It owns a node's identity key and on-disk config, builds the libp2p swarm (transports, NAT traversal, relay and rendezvous) for each of the three process roles, and defines the wire protocols for enrolment, attestation and presence. It also runs the admission layer, which decides which peers count as trusted: every peer must present an attestation signed by the server that both sides enrolled with.
+
+Paths below are relative to `crates/ac-net/`.
+
+## Features
+
+- **Re-export**: It re-exports a few types (`PeerId`, `Multiaddr` and `Protocol`) in `src/lib.rs` from libp2p that will be used by other layers that do not depend on libp2p.
+- **Identity**: handles the identity of the node in `src/identity.rs`.
+- **Config**: Owns the config in `src/config.rs`.
+- **Enrollment**: It creates the protocol for enrollment in `src/proto.rs` and `src/invite.rs`.
+- **Attestation**: It implements attestation and admission, ie issuing an attestation and handling it in the node in `src/attest.rs`, the protocol to ask the server for one and the protocol for admission in in `src/proto.rs`, and the admission state machine in `src/admission.rs`. It connects the admission to the swarm through the `AdmissionLink` in `src/admission_link.rs`
+- **Handling connections** in `src/roster.rs`, `src/connectivity`, keeps the connection to the server alive and using server services in `src/link.rs`.
+- **Authorizing connections**: implements policies for the server and node to accept or reject connections in `src/authz.rs`
+- **Limits and Budget**: setting network limits in `src/limits.rs` and a budget of requests to answer in `src/budgets.rs`
+- **Swarm**: building the swarm for each role (node, server and enrollment server) in `src/swarm.rs`.
+
+## Design
+
+### Enrollment, attestation and admission
+
+To enter the p2p network, a peer must be enrolled with the server, who stores which users are enrolled.
+Only enrolled peers can use the server's services such as rendezvous, discovery and presence.
+Enrolled peers can also get an attestation (ie certificate of enrollment) from the server. This attestation has an expiry, so peers can be eventually revoked.
+
+When connecting to other peers, first libp2p will ensure peers really own the peer id they claim, then they will admit each other by requesting the other's certificate and verifying it. They will only answer other protocols once the peers are admitted, else they will disconnect.
+The certificates are verified using the server's public key, which is recovered from its peer id as in this system the peer ids are not hashed.
+
+### Connections
+
+When the server connection comes up, the client asks for a relay reservation by listening on `<server>/p2p-circuit`. It then registers under the rendezvous namespace `"ac"` and runs discovery. Registration is refreshed and discovery re-run every 300 s.
+Only the server connection is pinged, every 25 s, to keep the client's NAT mapping open.
+
+When peers connect, they do so through the server, then try to upgrade the connection to a direct connection by attempting hole punching. If they fail, the connection stays relayed and the communication proceeds.
+A connection is deemed usable once admission has completed successfully and the connection is settled, ie either upgraded to direct or attempting to upgrade has timed out.
+
+### Swarm
+
+The swarm mounts ac-net's protocols and has a slot so that other layers can also mount their own protocols.
+
+### Limits
+
+The number of connections and total memory used are capped. The connections limit per peer must be at least 2, as during hole punch a peer can hold at the same time a direct and a relayed connection to the same peer at the same time.
+
+### Invite token
+
+Inviting into a network is done through one single token, which holds the invite secret as well as the info necessary to connect to the network, such as the server address.
+
+## On-disk files
+- `identity.key`: a protobuf-encoded keypair. It is written through a temp file created with mode `0600`, renamed into place, and followed by an fsync of the directory, so the key is never briefly readable by others and the rename survives power loss. A world-readable key only produces a warning, because refusing to start "would lock someone out of their own node".
+- `attestation.cbor`: the CBOR `Attestation`.
+- `config.toml` holds the node config
+- `state.sqlite` and `files/` are only named here. Other crates own them.
+
+## Database
+
+None. ac-net has no SQLite dependency and creates or queries no tables.
