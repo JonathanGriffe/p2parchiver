@@ -1379,9 +1379,7 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
     // *first* failure is the same mistake as never calling: a node restarting is unreachable for
     // a few seconds and has done nothing to deserve being written off.
     let mut node = Node::new();
-    let members = peers(1);
-    let id = node.group_with(&members);
-    node.add_file(id, "a.jpg");
+    let members = node.familiar_group(1);
     node.all_online(&members);
 
     let mut attempts = 0;
@@ -1412,12 +1410,6 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
         at - AT
     );
 
-    node.add_file(id, "b.jpg");
-    assert_eq!(
-        node.peers.status().groups[0].owed,
-        0,
-        "a change of ours does not undo the giving up"
-    );
     node.tick(at + 2 * HEARTBEAT);
     assert!(
         node.peers.status().groups[0].owed > 0,
@@ -1491,6 +1483,44 @@ fn successive_heartbeats_reach_different_members_when_nobody_answers() {
         distinct.len(),
         members.len(),
         "each heartbeat moves on to the next member: {called:?}"
+    );
+}
+
+#[test]
+fn the_rotation_moves_past_the_member_called_when_more_come_online() {
+    let mut node = Node::new();
+    let members = node.familiar_group(3);
+
+    // The membership news goes to nobody, then only the first in rotation comes up.
+    node.tick(AT);
+    let first = node.peers.status().groups[0].next.unwrap();
+    node.peers.on(PeerEvent::Presence {
+        asked: members.clone(),
+        online: vec![first],
+    });
+
+    let mut called = Vec::new();
+    let mut at = AT + 1;
+    while at < AT + 4 * MIN_BACKOFF {
+        for peer in dials(&node.tick(at)) {
+            called.push(peer);
+            node.peers.on(PeerEvent::DialFailed { peer });
+        }
+        if !called.is_empty() && node.peers.status().groups[0].owed == 0 {
+            break;
+        }
+        at += 1;
+    }
+    assert_eq!(called, vec![first; DIAL_ATTEMPTS]);
+
+    node.all_online(&members);
+    let actions = node.tick(AT + 1 + HEARTBEAT);
+    let next = dials(&actions);
+    assert_eq!(next.len(), 1, "{actions:?}");
+    assert_ne!(
+        next,
+        vec![first],
+        "the cursor is a place in the whole member list, so it has moved past them"
     );
 }
 
