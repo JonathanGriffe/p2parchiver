@@ -738,8 +738,20 @@ impl Peers {
                 .into_iter()
                 .any(|peer| self.pending.contains(&peer));
 
-            if !covered && let Some(peer) = self.peek_member(group) {
-                self.pending.insert(peer);
+            if !covered {
+                let reachable = self.reachable(group);
+                let skip: HashSet<PeerId> = self
+                    .members_of(group)
+                    .into_iter()
+                    .filter(|p| !reachable.contains(p))
+                    .collect();
+                // Nobody reachable: dial blind, as presence can be stale.
+                if let Some(peer) = self
+                    .next_member(group, &skip)
+                    .or_else(|| self.take_member(group))
+                {
+                    self.pending.insert(peer);
+                }
             }
         }
     }
@@ -1312,6 +1324,16 @@ impl Peers {
         }
         let at = self.state.get(&group).map(|s| s.rotation).unwrap_or(0);
         members.get(at % members.len()).copied()
+    }
+
+    /// Whose turn it is, reachable or not, moving the rotation past them.
+    fn take_member(&mut self, group: GroupId) -> Option<PeerId> {
+        let peer = self.peek_member(group)?;
+        let count = self.members_of(group).len();
+        if let Some(state) = self.state.get_mut(&group) {
+            state.rotation = (state.rotation % count + 1) % count;
+        }
+        Some(peer)
     }
 
     /// Nothing left that *this peer* can do for us.

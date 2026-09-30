@@ -1408,6 +1408,72 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
 }
 
 #[test]
+fn the_heartbeat_passes_over_an_offline_member_for_an_online_one() {
+    let mut node = Node::new();
+    let members = peers(2);
+    node.group_with(&members);
+
+    let offline = node.peers.status().groups[0].next.unwrap();
+    let online = *members.iter().find(|p| **p != offline).unwrap();
+    node.peers.on(PeerEvent::Presence {
+        asked: members.clone(),
+        online: vec![online],
+    });
+
+    let (settled, _) = settle(&mut node, AT);
+    assert!(
+        rounds(&node.tick_connecting(settled + 1)).is_empty(),
+        "nothing of ours left to say"
+    );
+    assert_eq!(
+        node.peers.status().groups[0].next,
+        Some(offline),
+        "the offline member is still first in rotation"
+    );
+    node.hang_up(&members);
+
+    let actions = node.tick_connecting(settled + HEARTBEAT + 1);
+    assert_eq!(
+        dials(&actions),
+        vec![online],
+        "the heartbeat calls the member who is up: {actions:?}"
+    );
+}
+
+#[test]
+fn successive_heartbeats_reach_different_members_when_nobody_answers() {
+    let mut node = Node::new();
+    let members = peers(3);
+    node.group_with(&members);
+
+    let mut called = Vec::new();
+    let mut at = AT;
+    for _ in 0..members.len() {
+        let mut first = None;
+        let start = at;
+        while at < start + 4 * MIN_BACKOFF {
+            for peer in dials(&node.tick(at)) {
+                first.get_or_insert(peer);
+                node.peers.on(PeerEvent::DialFailed { peer });
+            }
+            if first.is_some() && node.peers.status().groups[0].owed == 0 {
+                break;
+            }
+            at += 1;
+        }
+        called.push(first.expect("the heartbeat puts somebody on the list"));
+        at = start + HEARTBEAT + 1;
+    }
+
+    let distinct: HashSet<PeerId> = called.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        members.len(),
+        "each heartbeat moves on to the next member: {called:?}"
+    );
+}
+
+#[test]
 fn backoff_advances_on_the_attempt_and_resets_on_verified() {
     // On the attempt, not the failure: a dial whose failure is never observed must still back
     // off. And on `Verified`, not `Connected`, so a peer that connects and then fails
