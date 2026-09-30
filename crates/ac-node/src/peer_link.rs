@@ -1175,6 +1175,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_peer_whose_catalogue_read_is_queued_is_not_proposed_a_hang_up() {
+        let mut n = Node::new();
+        let member = || {
+            libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id()
+        };
+        let (bob, carol, dave) = (member(), member(), member());
+
+        let key = n.key();
+        let store = n.link.sync().groups_mut();
+        let mut ids = Vec::new();
+        for _ in 0..ac_files::sync::MAX_INFLIGHT {
+            let id = store.create(&key, "holiday", "alice", AT).unwrap();
+            for peer in [bob, carol, dave] {
+                store
+                    .author(
+                        &key,
+                        id,
+                        Op::Add {
+                            peer: peer.to_base58(),
+                        },
+                        AT,
+                    )
+                    .unwrap();
+            }
+            ids.push(id);
+        }
+        for peer in [bob, carol, dave] {
+            n.roster.admitted(peer);
+        }
+        n.roster.promote(&Connectivity::default());
+
+        // Bob's catalogues differ from ours and take every read slot, so carol's read waits.
+        let heads = |named: &[GroupId]| {
+            named
+                .iter()
+                .map(|&group| ac_files::wire::FileHead {
+                    group,
+                    digest: [7u8; 32],
+                    count: 1,
+                })
+                .collect::<Vec<_>>()
+        };
+        for (peer, named) in [(bob, &ids[..]), (carol, &ids[..1])] {
+            n.link.sync().on(
+                ac_files::sync::FileEvent::Heads {
+                    peer,
+                    heads: heads(named),
+                },
+                &n.roster,
+            );
+        }
+
+        assert!(
+            n.peers.drained(&dave, &n.link, &n.groups, &n.roster),
+            "a peer with nothing outstanding may be hung up on"
+        );
+        assert!(!n.peers.drained(&bob, &n.link, &n.groups, &n.roster));
+        assert!(
+            !n.peers.drained(&carol, &n.link, &n.groups, &n.roster),
+            "a read still waiting to go out is work outstanding with carol"
+        );
+
+        n.peers.dispatch(
+            &mut n.swarm,
+            &mut n.link,
+            &mut n.groups,
+            &n.roster,
+            vec![PeerAction::ProposeClose { peer: carol }],
+        );
+        assert!(
+            n.peers.proposals.is_empty(),
+            "carol is not asked to hang up"
+        );
+    }
+
+    #[tokio::test]
     async fn the_supervisor_publishes_what_it_is_waiting_on() {
         let (mut alice, mut bob) = (Node::new(), Node::new());
         let id = share_group(&mut alice, &mut bob);

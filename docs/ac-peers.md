@@ -83,13 +83,12 @@ call list ─► dial ─► connect ─► chain round ─► catalogue round �
 4. **Catalogue round**
 
    ```
-   ask ─► heads ─┬─► same digest ───────────────────────────────────┬─► settled
-                 ├─► their log already being read ──────────────────┤
-                 └─► read log pages ─► merge ─► compare ─┬─► same ──┘
-                                                         └─► different: reset cursor, read again once
+   ask ─► heads ─┬─► same digest ──────────────────────────────────────────────────────┬─► settled
+                 └─► wait for a slot ─► read log pages ─► merge ─► compare ─┬─► same ──┘
+                                                                            └─► different: reset cursor, read again once
    ```
 
-   The node asks the peer for the heads of the catalogues shared with us, and the peer is off the call list as soon as they answer. For each group, the `ac-files` sync machine settles at once when the digests match, or when this peer's log of the group is already being read. Otherwise it reads the peer's log from its stored cursor, alongside any other peer's log of the same group, a page of up to 2048 rows at a time, merging each row, then compares the digests again. If they still differ, it resets the cursor and reads the whole log once more, and settles either way.
+   The node asks the peer for the heads of the catalogues shared with us, and the peer is off the call list as soon as they answer. For each group, the `ac-files` sync machine settles at once when the digests match. Otherwise it reads the peer's log, alongside any other peer's log of the same group, and when no read slot is free the read waits for one rather than settling. It reads from the stored cursor, a page of up to 2048 rows at a time, merging each row, then compares the digests again. If they still differ, it resets the cursor and reads the whole log once more, and settles either way.
 
 5. **Downloads**
 
@@ -111,7 +110,7 @@ call list ─► dial ─► connect ─► chain round ─► catalogue round �
                             └─► Busy, or no answer ─► stay, propose again after 30 s
    ```
 
-   Nothing is left once no round or transfer is outstanding with the peer and no group could still download from them. `ac-node` also checks that its own links and transfers are idle before proposing over `/ac/session/1.0.0`, and counts it as `Busy` if not. The peer answers `Ready` only if it has nothing outstanding with us either, and the node disconnects if it is still idle itself. An agreed hang-up is logged as such rather than as a disconnection.
+   Nothing is left once no round or transfer is outstanding with the peer and no group could still download from them. `ac-node` also checks that its own links and transfers are idle, including catalogue reads still waiting for a slot, before proposing over `/ac/session/1.0.0`, and counts it as `Busy` if not. The peer answers `Ready` only if it has nothing outstanding with us either, and the node disconnects if it is still idle itself. An agreed hang-up is logged as such rather than as a disconnection.
 
 A round that fails, goes 60 s unanswered, or is deferred because a chain exchange with the peer is still outstanding, is asked again after 5 s, at most twice.
 

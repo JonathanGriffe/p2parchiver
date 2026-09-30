@@ -24,9 +24,9 @@ const ANSWERS_PER_TICK: u32 = 8;
 /// Catalogue reads outstanding at once, across all peers and groups.
 pub const MAX_INFLIGHT: usize = 8;
 
-/// Reads waiting for a slot. Bounded, so a peer naming more than this node can hold does
-/// not turn a queue into a memory leak.
-pub const MAX_DEFERRED: usize = 256;
+/// Reads waiting for a slot, as (peer, group) pairs: a full answer of heads from each of 16
+/// connections. Bounded, so peers naming more than that cannot grow the queue for ever.
+pub const MAX_DEFERRED: usize = 16 * MAX_HEADS_PER_ANSWER;
 
 /// What the machine wants done. The daemon is the only thing that can do any of it.
 #[derive(Debug, Clone, PartialEq)]
@@ -109,17 +109,6 @@ pub struct FileSync {
     deferred: VecDeque<(PeerId, GroupId)>,
     budget: TickBudget,
     now_at: i64,
-}
-
-/// What [`FileSync::read`] did about a page it was asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reading {
-    /// The request is going out now.
-    Started,
-    /// No room for it yet; the read is queued and starts when a slot frees.
-    Queued,
-    /// This peer's log of this group is already being read.
-    Busy,
 }
 
 impl FileSync {
@@ -285,12 +274,7 @@ impl FileSync {
             // We differ, so there is something to read. Queued is not settled: saying it was
             // would have this node pull content against a catalogue it knows is short.
             let after = self.files.cursor(head.group, &peer).unwrap_or(0);
-            if self.read(&mut actions, peer, head.group, after, false) == Reading::Busy {
-                actions.push(FileAction::Settled {
-                    peer,
-                    group: head.group,
-                });
-            }
+            self.read(&mut actions, peer, head.group, after, false);
         }
         actions
     }
@@ -399,6 +383,8 @@ impl FileSync {
     }
 
     // ---- outbound ----
+
+    /// Read a page of this peer's log now, or queue the read if there is no slot for it.
     fn read(
         &mut self,
         actions: &mut Vec<FileAction>,
@@ -406,13 +392,14 @@ impl FileSync {
         group: GroupId,
         after: u64,
         retried: bool,
-    ) -> Reading {
+    ) {
+        // Already under way, and that read settles them.
         if self.inflight.contains_key(&(peer, group)) {
-            return Reading::Busy;
+            return;
         }
         if self.inflight.len() >= MAX_INFLIGHT {
             self.defer(peer, group);
-            return Reading::Queued;
+            return;
         }
         self.inflight.insert(
             (peer, group),
@@ -423,7 +410,6 @@ impl FileSync {
             },
         );
         actions.push(FileAction::FetchChanges { peer, group, after });
-        Reading::Started
     }
 
     /// Remember a read there was no room for yet.
@@ -455,6 +441,11 @@ impl FileSync {
             let after = self.files.cursor(group, &peer).unwrap_or(0);
             self.read(actions, peer, group, after, false);
         }
+    }
+
+    /// Whether a catalogue read from this peer is under way or waiting for a slot.
+    pub fn has_work_with(&self, peer: &PeerId) -> bool {
+        self.inflight.keys().any(|(p, _)| p == peer) || self.deferred.iter().any(|(p, _)| p == peer)
     }
 
     fn tick(&mut self, now: Instant, at: i64, roster: &Roster) -> Vec<FileAction> {

@@ -1083,3 +1083,54 @@ fn two_peers_logs_of_one_group_are_read_side_by_side() {
 
     assert_eq!(alice.paths(id), vec!["from-bob.jpg", "from-carol.jpg"]);
 }
+
+#[test]
+fn heads_from_a_peer_being_read_do_not_settle_them_early() {
+    let (mut alice, mut bob) = (Node::new(), Node::new());
+    let id = share_group(&mut [&mut alice, &mut bob]);
+    bob.add(id, "from-bob.jpg", b"bob's", AT);
+
+    let from_bob = heads_of(&mut alice, &mut bob);
+    assert_eq!(reads(&from_bob), vec![id]);
+    let again = heads_of(&mut alice, &mut bob);
+    assert!(
+        again.is_empty(),
+        "the read under way settles bob, not his heads: {again:?}"
+    );
+
+    let done = read_through(&mut alice, &mut bob, &from_bob);
+    assert!(settled_with(&done, bob.peer()));
+    assert_eq!(alice.paths(id), vec!["from-bob.jpg"]);
+}
+
+#[test]
+fn a_read_waiting_for_a_slot_is_work_outstanding_with_its_peer() {
+    let (mut alice, mut bob, mut carol) = (Node::new(), Node::new(), Node::new());
+    let ids = shared_groups(&mut alice, &mut bob, MAX_INFLIGHT);
+    let other = share_group(&mut [&mut bob, &mut carol]);
+    carol.add(other, "from-carol.jpg", b"carol's", AT);
+
+    let from_alice = heads_of(&mut bob, &mut alice);
+    assert_eq!(reads(&from_alice).len(), MAX_INFLIGHT);
+
+    let from_carol = heads_of(&mut bob, &mut carol);
+    assert!(
+        from_carol.is_empty(),
+        "no slot, so carol's read waits, unsettled: {from_carol:?}"
+    );
+    assert!(bob.sync.has_work_with(&carol.peer()));
+
+    let freed = bob.sync_on(FileEvent::Unavailable {
+        peer: alice.peer(),
+        group: ids[0],
+    });
+    assert_eq!(
+        reads(&freed),
+        vec![other],
+        "carol's read takes the freed slot"
+    );
+
+    let done = read_through(&mut bob, &mut carol, &freed);
+    assert!(settled_with(&done, carol.peer()));
+    assert!(!bob.sync.has_work_with(&carol.peer()));
+}
