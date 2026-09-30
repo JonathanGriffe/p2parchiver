@@ -89,9 +89,13 @@ pub fn status(paths: &Paths) -> Result<()> {
             None => println!("  pulling   nothing to fetch"),
         }
         if let Some(name) = &group.next {
-            println!("  next      {name}");
+            println!("  rotation  at {name}");
         }
-        println!("  heartbeat in {}s", (group.heartbeat_at - now).max(0));
+        if group.heartbeat_at > now {
+            println!("  heartbeat in {}s", group.heartbeat_at - now);
+        } else {
+            println!("  heartbeat waiting for a member to be reachable");
+        }
     }
 
     if report.peers.is_empty() {
