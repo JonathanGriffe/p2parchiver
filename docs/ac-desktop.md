@@ -12,9 +12,10 @@ Paths below are relative to `crates/ac-desktop/`.
 - **Pages**: Status in `src/view.rs`, Groups in `src/groups.rs`, Peers in `src/peers.rs`, Files in `src/files.rs`, Sort in `src/sort.rs`, Sources in `src/sources.rs`, and Settings and enrolment in `src/settings.rs`, laid out in `ui/`.
 - **Previews**: the Sort page's previews of photos, RAW files and videos in `src/preview.rs`.
 - **Tray**: the tray icon on Linux and Windows in `src/tray/`, with the icon drawn in code in `src/tray/icon.rs`.
+- **Start at login**: the login entry on Linux and Windows, and the Settings toggle that owns it, in `src/autostart.rs`.
 - **Logs**: the log files in `src/log.rs`.
 - **File manager**: opening a file or folder, or showing a file in its folder, in `src/shell.rs`.
-- **Build**: `build.rs` compiles the Slint UI and puts the bundled ffmpeg beside development builds.
+- **Build**: `build.rs` compiles the Slint UI and puts the bundled ffmpeg beside development builds. `AC_RELEASE`, which CI sets only when it builds a release, is read at compile time and decides whether start at login is on by default.
 
 ## Design
 
@@ -58,6 +59,14 @@ Closing the window hides it to the tray while there is one. Without a tray, incl
 
 A node that has not enrolled shows the enrol dialog at startup. Enrolling stops the node, joins, and starts the node again whatever the outcome, so a refusal never leaves it stopped.
 
+### Start at login
+
+On Linux and Windows the app can start in the tray when its user logs in, through a login entry that records `"<binary>" --background`. Elsewhere, Settings does not offer it.
+- **On by default.** The first windowed run of a released build on the default home turns it on, once, and leaves a marker so it never does again. After that the toggle in Settings owns it, and turning it off stays off. The entry is one per user and records no home, so only a run with neither `--home` nor `AC_HOME` may turn it on. Development builds and `--headless` runs never do.
+- **Repairs.** At startup, an entry naming a binary that no longer exists is pointed at this one. An entry naming another copy that still exists, such as an installed build while a development build runs, is left alone and reported in Settings.
+- **The toggle** shows what is recorded, read again after every change, rather than the last click. An entry that cannot be read gets a warning beside the box, and a change that fails is reported on the message line.
+- **AppImage.** The entry names the image rather than its temporary mount, which is gone by the next login.
+
 ### Layout
 
 - The window is at least 880 px wide, and a test checks that every button, drop-down, text field and checkbox on every page fits at that width. Button labels never contain paths, since a button cannot shorten its text.
@@ -68,6 +77,8 @@ A node that has not enrolled shows the enrol dialog at startup. Enrolling stops 
 ## On-disk files
 
 - `logs/ac-desktop.<date>.log` in the node's home: one file per day, keeping the last 7.
+- `autostart-defaulted` in the default home: left by the run that turned start at login on by default, so it happens once.
+- The login entry, per user and outside the home: `autostart/archiverclient.desktop` in the user's config directory, `~/.config` by default, on Linux, and the `archiverclient` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows.
 - `previews/<hash>.png` in the platform's cache directory, such as `~/.cache/archiverclient/` on Linux: the Sort page's previews, keeping the last 3.
 - The node's home itself, `--home`, `AC_HOME` or the same per-OS directory as `ac`, belongs to `ac-node`.
 
