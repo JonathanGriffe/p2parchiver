@@ -729,22 +729,19 @@ impl Peers {
         }
 
         if at >= self.state[&group].heartbeat_at {
-            if let Some(state) = self.state.get_mut(&group) {
-                state.heartbeat_at = at + HEARTBEAT;
-            }
-
             let covered = self
                 .members_of(group)
                 .into_iter()
                 .any(|peer| self.pending.contains(&peer));
 
-            // Nobody reachable: dial blind, as presence can be stale.
-            if !covered
-                && let Some(peer) = self
+            // Nobody reachable: the heartbeat stays due until somebody is.
+            let called = covered
+                || self
                     .next_member(group, &HashSet::new())
-                    .or_else(|| self.rotate(group, |_| true))
-            {
-                self.pending.insert(peer);
+                    .map(|peer| self.pending.insert(peer))
+                    .is_some();
+            if called && let Some(state) = self.state.get_mut(&group) {
+                state.heartbeat_at = at + HEARTBEAT;
             }
         }
     }
@@ -1313,19 +1310,6 @@ impl Peers {
         members.get(at % members.len()).copied()
     }
 
-    /// From the rotation on, the first member `pick` accepts, moving the rotation past them.
-    fn rotate(&mut self, group: GroupId, pick: impl Fn(&PeerId) -> bool) -> Option<PeerId> {
-        let members = self.members_of(group);
-        let start = self.state.get(&group).map_or(0, |s| s.rotation);
-        let at = (0..members.len())
-            .map(|i| (start + i) % members.len())
-            .find(|&at| pick(&members[at]))?;
-        if let Some(state) = self.state.get_mut(&group) {
-            state.rotation = (at + 1) % members.len();
-        }
-        Some(members[at])
-    }
-
     /// Nothing left that *this peer* can do for us.
     pub fn drained(&self, peer: PeerId) -> bool {
         let busy = self.peers.get(&peer).is_some_and(|s| s.transfers > 0) || self.offer_open(&peer);
@@ -1587,7 +1571,16 @@ impl Peers {
             return Some(*peer);
         }
 
-        self.rotate(group, |p| members.contains(p))
+        // The rotation runs over the whole member list, the cursor `peek_member` reads.
+        let all = self.members_of(group);
+        let start = self.state.get(&group).map_or(0, |s| s.rotation);
+        let at = (0..all.len())
+            .map(|i| (start + i) % all.len())
+            .find(|&at| members.contains(&all[at]))?;
+        if let Some(state) = self.state.get_mut(&group) {
+            state.rotation = (at + 1) % all.len();
+        }
+        Some(all[at])
     }
 
     /// Whether this peer may be called right now, the dial backoff, and nothing else.
