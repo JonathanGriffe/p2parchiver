@@ -1,7 +1,7 @@
 //! Starting with the session: an XDG autostart entry on Linux, a `Run` value on Windows.
 //!
-//! On unless turned off: the first run of a released build turns it on, once, and after that
-//! the toggle in Settings owns it. Nothing else writes the entry, so what Settings shows is
+//! On unless turned off: the first run of a released build on the default home turns it on,
+//! once, and after that the toggle in Settings owns it. Nothing else writes the entry, so what Settings shows is
 //! what is recorded.
 
 use std::ffi::OsString;
@@ -22,7 +22,7 @@ pub const BACKGROUND: &str = "background";
 /// Set by the AppImage runtime to the image itself, which is what outlives this session.
 const APPIMAGE: &str = "APPIMAGE";
 
-/// Left in the node's directory by the run that turned the entry on by default, so that it
+/// Left in the default home by the run that turned the entry on by default, so that it
 /// happens once and turning it off stays off.
 const DEFAULTED_FILENAME: &str = "autostart-defaulted";
 
@@ -58,12 +58,16 @@ pub fn disable() -> Result<()> {
 /// The first run is claimed before the entry is even read, whatever it says, so turning it
 /// off afterwards stays off. If anything fails after the claim the box shows off and can be
 /// ticked, which beats turning back on someone who turned it off.
-pub fn settle(paths: &Paths) -> Result<()> {
+///
+/// `default_home` is whether this run uses the home the recorded command starts. Only that
+/// home's first run counts: the entry is one per user, and it starts the default home.
+pub fn settle(paths: &Paths, default_home: bool) -> Result<()> {
     if !SUPPORTED {
         return Ok(());
     }
 
-    let first_run = released() && claim_first_run(&paths.root.join(DEFAULTED_FILENAME))?;
+    let marker = paths.root.join(DEFAULTED_FILENAME);
+    let first_run = is_first_run(released(), default_home, &marker)?;
     let exe = this_binary()?;
     let state = classify(imp::read()?, &exe);
     if wants_writing(&state, first_run) {
@@ -92,6 +96,11 @@ fn wants_writing(state: &State, first_run: bool) -> bool {
 /// packages make themselves start at every login just by running once.
 fn released() -> bool {
     option_env!("AC_RELEASE").is_some_and(|version| !version.is_empty())
+}
+
+/// Whether this run turns the entry on by default, claiming the first run if so.
+fn is_first_run(released: bool, default_home: bool, marker: &Path) -> Result<bool> {
+    Ok(released && default_home && claim_first_run(marker)?)
 }
 
 /// Leave the first-run marker, and say whether this call is the one that did.
@@ -310,6 +319,23 @@ mod tests {
         let marker = dir.path().join(DEFAULTED_FILENAME);
         assert!(claim_first_run(&marker).unwrap());
         assert!(!claim_first_run(&marker).unwrap());
+    }
+
+    #[test]
+    fn only_the_default_home_of_a_release_claims_the_first_run() {
+        // The entry starts the default home, so another home's first run must not turn it on.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(DEFAULTED_FILENAME);
+
+        assert!(!is_first_run(true, false, &marker).unwrap(), "another home");
+        assert!(
+            !is_first_run(false, true, &marker).unwrap(),
+            "a build not released"
+        );
+        assert!(!marker.exists(), "neither claims it");
+
+        assert!(is_first_run(true, true, &marker).unwrap());
+        assert!(!is_first_run(true, true, &marker).unwrap(), "and only once");
     }
 
     #[test]
