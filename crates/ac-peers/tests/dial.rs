@@ -162,6 +162,17 @@ impl Node {
             .unwrap();
     }
 
+    /// A group whose members have all answered, so presence alone calls none of them.
+    fn familiar_group(&mut self, n: usize) -> Vec<PeerId> {
+        let keys: Vec<Keypair> = (0..n).map(|_| Keypair::generate_ed25519()).collect();
+        let members: Vec<PeerId> = keys.iter().map(|k| k.public().to_peer_id()).collect();
+        let id = self.group_with(&members);
+        for key in &keys {
+            self.accept_invite(id, key);
+        }
+        members
+    }
+
     /// Tick, then answer whatever circuit it opened and whatever hang-up it proposed.
     fn tick_connecting(&mut self, at: i64) -> Vec<PeerAction> {
         let actions = self.tick(at);
@@ -1335,36 +1346,41 @@ fn a_peer_that_acquires_a_file_later_is_asked_again() {
 // ---- dialling ----
 
 #[test]
-fn a_member_the_registry_calls_away_is_dialled_anyway() {
+fn a_heartbeat_with_nobody_online_waits_for_somebody() {
     let mut node = Node::new();
-    let members = peers(3);
-    let id = node.group_with(&members);
-    node.add_file(id, "a.jpg");
+    let members = node.familiar_group(3);
 
-    // Presence says nobody is up.
     node.peers.on(PeerEvent::Presence {
         asked: members.clone(),
         online: Vec::new(),
     });
-
     let actions = node.tick(AT);
     assert!(
-        !dials(&actions).is_empty(),
-        "we owe them the news, so we call them: {actions:?}"
+        dials(&actions).is_empty(),
+        "nobody is up, so nobody is called: {actions:?}"
+    );
+
+    node.peers.on(PeerEvent::Presence {
+        asked: members.clone(),
+        online: vec![members[1]],
+    });
+    let actions = node.tick(AT + PRESENCE_INTERVAL);
+    assert_eq!(
+        dials(&actions),
+        vec![members[1]],
+        "the heartbeat is still due, so the member who came up is called: {actions:?}"
     );
 }
 
 #[test]
 fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
-    // The other half of dialling blind, and the reason it is affordable. Without an ending, a
-    // member who is switched off keeps a group looking as though it had something outstanding
-    // for ever and keeps spending circuits to prove it. Ending it on the *first* failure is the
-    // same mistake as never calling: a node restarting is unreachable for a few seconds and has
-    // done nothing to deserve being written off.
+    // Without an ending, a member who never answers keeps a group looking as though it had
+    // something outstanding for ever and keeps spending circuits to prove it. Ending it on the
+    // *first* failure is the same mistake as never calling: a node restarting is unreachable for
+    // a few seconds and has done nothing to deserve being written off.
     let mut node = Node::new();
-    let members = peers(1);
-    let id = node.group_with(&members);
-    node.add_file(id, "a.jpg");
+    let members = node.familiar_group(1);
+    node.all_online(&members);
 
     let mut attempts = 0;
     let mut at = AT;
@@ -1394,16 +1410,117 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
         at - AT
     );
 
-    node.add_file(id, "b.jpg");
-    assert_eq!(
-        node.peers.status().groups[0].owed,
-        0,
-        "a change of ours does not undo the giving up"
-    );
     node.tick(at + 2 * HEARTBEAT);
     assert!(
         node.peers.status().groups[0].owed > 0,
         "but the interval does: giving up is the end of one attempt, not a memory"
+    );
+}
+
+#[test]
+fn the_heartbeat_passes_over_an_offline_member_for_an_online_one() {
+    let mut node = Node::new();
+    let members = peers(2);
+    node.group_with(&members);
+
+    let offline = node.peers.status().groups[0].next.unwrap();
+    let online = *members.iter().find(|p| **p != offline).unwrap();
+    node.peers.on(PeerEvent::Presence {
+        asked: members.clone(),
+        online: vec![online],
+    });
+
+    let (settled, _) = settle(&mut node, AT);
+    assert!(
+        rounds(&node.tick_connecting(settled + 1)).is_empty(),
+        "nothing of ours left to say"
+    );
+    assert_eq!(
+        node.peers.status().groups[0].next,
+        Some(offline),
+        "the offline member is still first in rotation"
+    );
+    node.hang_up(&members);
+
+    let actions = node.tick_connecting(settled + HEARTBEAT + 1);
+    assert_eq!(
+        dials(&actions),
+        vec![online],
+        "the heartbeat calls the member who is up: {actions:?}"
+    );
+}
+
+#[test]
+fn successive_heartbeats_reach_different_members_when_nobody_answers() {
+    let mut node = Node::new();
+    let members = node.familiar_group(3);
+
+    // The membership news goes to nobody, so every call below is a heartbeat's.
+    node.tick(AT);
+    node.all_online(&members);
+
+    let mut called = Vec::new();
+    let mut at = AT + 1;
+    for _ in 0..members.len() {
+        let mut first = None;
+        let start = at;
+        while at < start + 4 * MIN_BACKOFF {
+            for peer in dials(&node.tick(at)) {
+                first.get_or_insert(peer);
+                node.peers.on(PeerEvent::DialFailed { peer });
+            }
+            if first.is_some() && node.peers.status().groups[0].owed == 0 {
+                break;
+            }
+            at += 1;
+        }
+        called.push(first.expect("the heartbeat puts somebody on the list"));
+        at = start + HEARTBEAT + 1;
+    }
+
+    let distinct: HashSet<PeerId> = called.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        members.len(),
+        "each heartbeat moves on to the next member: {called:?}"
+    );
+}
+
+#[test]
+fn the_rotation_moves_past_the_member_called_when_more_come_online() {
+    let mut node = Node::new();
+    let members = node.familiar_group(3);
+
+    // The membership news goes to nobody, then only the first in rotation comes up.
+    node.tick(AT);
+    let first = node.peers.status().groups[0].next.unwrap();
+    node.peers.on(PeerEvent::Presence {
+        asked: members.clone(),
+        online: vec![first],
+    });
+
+    let mut called = Vec::new();
+    let mut at = AT + 1;
+    while at < AT + 4 * MIN_BACKOFF {
+        for peer in dials(&node.tick(at)) {
+            called.push(peer);
+            node.peers.on(PeerEvent::DialFailed { peer });
+        }
+        if !called.is_empty() && node.peers.status().groups[0].owed == 0 {
+            break;
+        }
+        at += 1;
+    }
+    assert_eq!(called, vec![first; DIAL_ATTEMPTS]);
+
+    node.all_online(&members);
+    let actions = node.tick(AT + 1 + HEARTBEAT);
+    let next = dials(&actions);
+    assert_eq!(next.len(), 1, "{actions:?}");
+    assert_ne!(
+        next,
+        vec![first],
+        "the cursor is a place in the whole member list, so it has moved past them"
     );
 }
 

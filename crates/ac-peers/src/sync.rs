@@ -728,19 +728,22 @@ impl Peers {
             let _ = self.groups.news_told(group);
         }
 
-        if at >= self.state[&group].heartbeat_at {
-            if let Some(state) = self.state.get_mut(&group) {
-                state.heartbeat_at = at + HEARTBEAT;
-            }
-
-            let covered = self
-                .members_of(group)
-                .into_iter()
-                .any(|peer| self.pending.contains(&peer));
-
-            if !covered && let Some(peer) = self.peek_member(group) {
-                self.pending.insert(peer);
-            }
+        if at < self.state[&group].heartbeat_at {
+            return;
+        }
+        let covered = self
+            .members_of(group)
+            .into_iter()
+            .any(|peer| self.pending.contains(&peer));
+        if !covered {
+            // Nobody reachable: the heartbeat stays due until somebody is.
+            let Some(peer) = self.next_member(group, &HashSet::new()) else {
+                return;
+            };
+            self.pending.insert(peer);
+        }
+        if let Some(state) = self.state.get_mut(&group) {
+            state.heartbeat_at = at + HEARTBEAT;
         }
     }
 
@@ -862,13 +865,7 @@ impl Peers {
                 continue;
             }
 
-            let mut skip = spent.clone();
-            skip.extend(
-                self.members_of(*group)
-                    .into_iter()
-                    .filter(|p| !reachable.contains(p)),
-            );
-            let Some(peer) = self.next_member(*group, &skip) else {
+            let Some(peer) = self.next_member(*group, &spent) else {
                 continue;
             };
 
@@ -1550,15 +1547,12 @@ impl Peers {
         }
     }
 
-    /// The next member worth talking to about this group.
+    /// The next reachable member worth talking to about this group.
     fn next_member(&mut self, group: GroupId, skip: &HashSet<PeerId>) -> Option<PeerId> {
         let members: Vec<PeerId> = self
-            .groups
-            .members(group)
-            .ok()?
-            .iter()
-            .map(|m| m.peer)
-            .filter(|p| *p != self.me && !skip.contains(p) && !self.dialing.contains(p))
+            .reachable(group)
+            .into_iter()
+            .filter(|p| !skip.contains(p) && !self.dialing.contains(p))
             .collect();
 
         if members.is_empty() {
@@ -1578,17 +1572,16 @@ impl Peers {
             return Some(*peer);
         }
 
-        let start = self.state.get(&group).map(|s| s.rotation).unwrap_or(0);
-        for i in 0..members.len() {
-            let at = (start + i) % members.len();
-            if self.callable(&members[at]) {
-                if let Some(state) = self.state.get_mut(&group) {
-                    state.rotation = (at + 1) % members.len();
-                }
-                return Some(members[at]);
-            }
+        // The rotation runs over the whole member list, the cursor `peek_member` reads.
+        let all = self.members_of(group);
+        let start = self.state.get(&group).map_or(0, |s| s.rotation);
+        let at = (0..all.len())
+            .map(|i| (start + i) % all.len())
+            .find(|&at| members.contains(&all[at]))?;
+        if let Some(state) = self.state.get_mut(&group) {
+            state.rotation = (at + 1) % all.len();
         }
-        None
+        Some(all[at])
     }
 
     /// Whether this peer may be called right now, the dial backoff, and nothing else.
