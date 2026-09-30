@@ -738,20 +738,13 @@ impl Peers {
                 .into_iter()
                 .any(|peer| self.pending.contains(&peer));
 
-            if !covered {
-                let reachable = self.reachable(group);
-                let skip: HashSet<PeerId> = self
-                    .members_of(group)
-                    .into_iter()
-                    .filter(|p| !reachable.contains(p))
-                    .collect();
-                // Nobody reachable: dial blind, as presence can be stale.
-                if let Some(peer) = self
-                    .next_member(group, &skip)
-                    .or_else(|| self.take_member(group))
-                {
-                    self.pending.insert(peer);
-                }
+            // Nobody reachable: dial blind, as presence can be stale.
+            if !covered
+                && let Some(peer) = self
+                    .next_member(group, &HashSet::new())
+                    .or_else(|| self.rotate(group, |_| true))
+            {
+                self.pending.insert(peer);
             }
         }
     }
@@ -874,13 +867,7 @@ impl Peers {
                 continue;
             }
 
-            let mut skip = spent.clone();
-            skip.extend(
-                self.members_of(*group)
-                    .into_iter()
-                    .filter(|p| !reachable.contains(p)),
-            );
-            let Some(peer) = self.next_member(*group, &skip) else {
+            let Some(peer) = self.next_member(*group, &spent) else {
                 continue;
             };
 
@@ -1326,14 +1313,17 @@ impl Peers {
         members.get(at % members.len()).copied()
     }
 
-    /// Whose turn it is, reachable or not, moving the rotation past them.
-    fn take_member(&mut self, group: GroupId) -> Option<PeerId> {
-        let peer = self.peek_member(group)?;
-        let count = self.members_of(group).len();
+    /// From the rotation on, the first member `pick` accepts, moving the rotation past them.
+    fn rotate(&mut self, group: GroupId, pick: impl Fn(&PeerId) -> bool) -> Option<PeerId> {
+        let members = self.members_of(group);
+        let start = self.state.get(&group).map_or(0, |s| s.rotation);
+        let at = (0..members.len())
+            .map(|i| (start + i) % members.len())
+            .find(|&at| pick(&members[at]))?;
         if let Some(state) = self.state.get_mut(&group) {
-            state.rotation = (state.rotation % count + 1) % count;
+            state.rotation = (at + 1) % members.len();
         }
-        Some(peer)
+        Some(members[at])
     }
 
     /// Nothing left that *this peer* can do for us.
@@ -1572,15 +1562,12 @@ impl Peers {
         }
     }
 
-    /// The next member worth talking to about this group.
+    /// The next reachable member worth talking to about this group.
     fn next_member(&mut self, group: GroupId, skip: &HashSet<PeerId>) -> Option<PeerId> {
         let members: Vec<PeerId> = self
-            .groups
-            .members(group)
-            .ok()?
-            .iter()
-            .map(|m| m.peer)
-            .filter(|p| *p != self.me && !skip.contains(p) && !self.dialing.contains(p))
+            .reachable(group)
+            .into_iter()
+            .filter(|p| !skip.contains(p) && !self.dialing.contains(p))
             .collect();
 
         if members.is_empty() {
@@ -1600,17 +1587,7 @@ impl Peers {
             return Some(*peer);
         }
 
-        let start = self.state.get(&group).map(|s| s.rotation).unwrap_or(0);
-        for i in 0..members.len() {
-            let at = (start + i) % members.len();
-            if self.callable(&members[at]) {
-                if let Some(state) = self.state.get_mut(&group) {
-                    state.rotation = (at + 1) % members.len();
-                }
-                return Some(members[at]);
-            }
-        }
-        None
+        self.rotate(group, |p| members.contains(p))
     }
 
     /// Whether this peer may be called right now, the dial backoff, and nothing else.

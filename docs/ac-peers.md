@@ -19,10 +19,10 @@ Paths below are relative to `crates/ac-peers/`.
 A member is called because something changed, or because a group has been quiet for a while:
 - A membership change this node made puts every reachable member of the group on the call list.
 - A catalogue change this node made is shared once the catalogue has been still for 2 minutes, or after 1000 changes, so a large import is not announced file by file.
-- Each group has its own 4 h heartbeat, first due on the tick the group is first seen. When a group's heartbeat comes due and none of its members is on the list already, one is put on it: the next member in rotation who is connected, or online with their dial backoff run out, or else the next member in rotation, reachable or not. Unless the member chosen was already connected, the rotation moves past them, so successive heartbeats reach different members.
+- Each group has its own 4 h heartbeat, first due on the tick the group is first seen. When a group's heartbeat comes due and none of its members is on the list already, one is put on it: a connected member if there is one, those who have answered the group's invitation first; else the next member in rotation who is online with their dial backoff run out; else the next member in rotation, reachable or not. A member taken from the rotation moves it past them, so successive heartbeats reach different members. The rotation is kept over the whole member list and shared with downloads.
 - A member who has not answered a group's invitation is called when the server says they are online, ahead of everyone else.
 
-A change only puts a member on the list if the node is connected to them or the server says they are online. The heartbeat prefers such a member, and dials blind only when there is none, since presence can be stale. Changes learned from peers are not news, so they are not told again.
+A change only puts a member on the list if the node is connected to them or the server says they are online. The heartbeat prefers such a member whose dial backoff has run out, and dials blind only when there is none, since presence can be stale. Changes learned from peers are not news, so they are not told again.
 
 The node asks the server which members of its active groups are online every 5 minutes, and at once when a membership change was made.
 

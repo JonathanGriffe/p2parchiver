@@ -1474,6 +1474,38 @@ fn successive_heartbeats_reach_different_members_when_nobody_answers() {
 }
 
 #[test]
+fn a_heartbeat_that_dials_blind_moves_on_from_the_member_called_last() {
+    let mut node = Node::new();
+    let members = peers(3);
+    node.group_with(&members);
+
+    let first = node.peers.status().groups[0].next.unwrap();
+    node.peers.on(PeerEvent::Presence {
+        asked: members.clone(),
+        online: vec![first],
+    });
+    let (settled, _) = settle(&mut node, AT);
+    node.hang_up(&members);
+
+    let (settled, seen) = settle(&mut node, settled + HEARTBEAT + 1);
+    assert_eq!(
+        dials(&seen),
+        vec![first],
+        "the heartbeat calls the member who is up"
+    );
+    node.hang_up(&members);
+    node.peers.on(PeerEvent::Presence {
+        asked: members.clone(),
+        online: Vec::new(),
+    });
+
+    let actions = node.tick(settled + HEARTBEAT + 1);
+    let called = dials(&actions);
+    assert_eq!(called.len(), 1, "nobody is up, so one is dialed blind");
+    assert_ne!(called, vec![first], "and not the one called last time");
+}
+
+#[test]
 fn backoff_advances_on_the_attempt_and_resets_on_verified() {
     // On the attempt, not the failure: a dial whose failure is never observed must still back
     // off. And on `Verified`, not `Connected`, so a peer that connects and then fails
