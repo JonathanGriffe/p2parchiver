@@ -84,12 +84,12 @@ call list ─► dial ─► connect ─► chain round ─► catalogue round �
 
    ```
    ask ─► heads ─┬─► same digest ───────────────────────────────────┬─► settled
-                 ├─► group read from another peer ──────────────────┤
+                 ├─► their log already being read ──────────────────┤
                  └─► read log pages ─► merge ─► compare ─┬─► same ──┘
                                                          └─► different: reset cursor, read again once
    ```
 
-   The node asks the peer for the heads of the catalogues shared with us, and the peer is off the call list as soon as they answer. For each group, the `ac-files` sync machine settles at once when the digests match, or when the group is already being read from another peer. Otherwise it reads the peer's log from its stored cursor, a page of up to 2048 rows at a time, merging each row, then compares the digests again. If they still differ, it resets the cursor and reads the whole log once more, and settles either way.
+   The node asks the peer for the heads of the catalogues shared with us, and the peer is off the call list as soon as they answer. For each group, the `ac-files` sync machine settles at once when the digests match, or when this peer's log of the group is already being read. Otherwise it reads the peer's log from its stored cursor, alongside any other peer's log of the same group, a page of up to 2048 rows at a time, merging each row, then compares the digests again. If they still differ, it resets the cursor and reads the whole log once more, and settles either way.
 
 5. **Downloads**
 

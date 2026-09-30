@@ -24,7 +24,7 @@ const ANSWERS_PER_TICK: u32 = 8;
 /// Catalogue reads outstanding at once, across all peers and groups.
 pub const MAX_INFLIGHT: usize = 8;
 
-/// Groups waiting for a slot. Bounded, so a peer naming more than this node can hold does
+/// Reads waiting for a slot. Bounded, so a peer naming more than this node can hold does
 /// not turn a queue into a memory leak.
 pub const MAX_DEFERRED: usize = 256;
 
@@ -88,10 +88,10 @@ pub fn may_serve(
     (!row.is_removed() && row.have).then_some(row.size)
 }
 
-/// One outstanding catalogue read. Keyed by group, so there is one episode per group at a time.
+/// One outstanding catalogue read. Keyed by peer and group, so peers' logs of one group are
+/// read side by side.
 #[derive(Debug, Clone)]
 struct InFlight {
-    peer: PeerId,
     after: u64,
     retried: bool,
     deadline: Instant,
@@ -103,9 +103,9 @@ pub struct FileSync {
     content: Content,
     dirs: HashMap<GroupId, String>,
     me: PeerId,
-    inflight: HashMap<GroupId, InFlight>,
-    /// Groups there was no room to read yet, oldest first. Where to read from is worked out
-    /// when the request goes out, since the cursor moves while a group waits.
+    inflight: HashMap<(PeerId, GroupId), InFlight>,
+    /// Reads there was no room for yet, oldest first. Where to read from is worked out when
+    /// the request goes out, since the cursor moves while a read waits.
     deferred: VecDeque<(PeerId, GroupId)>,
     budget: TickBudget,
     now_at: i64,
@@ -116,9 +116,9 @@ pub struct FileSync {
 enum Reading {
     /// The request is going out now.
     Started,
-    /// No room for it yet; the group is queued and read when a slot frees.
+    /// No room for it yet; the read is queued and starts when a slot frees.
     Queued,
-    /// Somebody is already reading this group.
+    /// This peer's log of this group is already being read.
     Busy,
 }
 
@@ -306,15 +306,14 @@ impl FileSync {
         more: bool,
         digest: [u8; 32],
     ) -> Vec<FileAction> {
-        let expected = matches!(
-            self.inflight.get(&group),
-            Some(f) if f.peer == peer && f.after == after
-        );
-        if !expected {
+        let Some(flight) = self.inflight.get(&(peer, group)) else {
+            return Vec::new();
+        };
+        if flight.after != after {
             return Vec::new();
         }
-        let retried = self.inflight.get(&group).is_some_and(|f| f.retried);
-        self.inflight.remove(&group);
+        let retried = flight.retried;
+        self.inflight.remove(&(peer, group));
 
         let Some(dir) = self.dir_of(group) else {
             tracing::warn!(%group, "no directory for this group; cannot merge its catalogue");
@@ -408,7 +407,7 @@ impl FileSync {
         after: u64,
         retried: bool,
     ) -> Reading {
-        if self.inflight.contains_key(&group) {
+        if self.inflight.contains_key(&(peer, group)) {
             return Reading::Busy;
         }
         if self.inflight.len() >= MAX_INFLIGHT {
@@ -416,9 +415,8 @@ impl FileSync {
             return Reading::Queued;
         }
         self.inflight.insert(
-            group,
+            (peer, group),
             InFlight {
-                peer,
                 after,
                 retried,
                 deadline: Instant::now() + REQUEST_TIMEOUT,
@@ -428,13 +426,13 @@ impl FileSync {
         Reading::Started
     }
 
-    /// Remember a group there was no room to read yet.
+    /// Remember a read there was no room for yet.
     fn defer(&mut self, peer: PeerId, group: GroupId) {
-        if self.deferred.iter().any(|(_, g)| *g == group) {
+        if self.deferred.contains(&(peer, group)) {
             return;
         }
         if self.deferred.len() >= MAX_DEFERRED {
-            tracing::debug!(%group, "no room to read this catalogue and none to remember it");
+            tracing::debug!(%peer, %group, "no room to read this catalogue and none to remember it");
             return;
         }
         tracing::debug!(%peer, %group, "no room to read this catalogue yet; queued");
@@ -448,9 +446,9 @@ impl FileSync {
                 return;
             };
 
-            // Both can have moved on while it waited: the peer may be gone, and the group
-            // may already be being read from somebody else.
-            if !roster.is_admitted(&peer) || self.inflight.contains_key(&group) {
+            // Both can have moved on while it waited: the peer may be gone, and their log may
+            // already be being read.
+            if !roster.is_admitted(&peer) || self.inflight.contains_key(&(peer, group)) {
                 continue;
             }
 
@@ -463,9 +461,9 @@ impl FileSync {
         self.now_at = at;
         self.budget.reset();
 
-        // Abandon episodes that can no longer finish, so the group is free to try again:
+        // Abandon episodes that can no longer finish, so the read is free to try again:
         self.inflight
-            .retain(|_, f| now < f.deadline && roster.is_ready(&f.peer));
+            .retain(|(peer, _), f| now < f.deadline && roster.is_ready(peer));
         self.deferred.retain(|(peer, _)| roster.is_admitted(peer));
         Vec::new()
     }
@@ -495,9 +493,7 @@ impl FileSync {
     }
 
     fn finish(&mut self, group: GroupId, peer: PeerId) {
-        if matches!(self.inflight.get(&group), Some(f) if f.peer == peer) {
-            self.inflight.remove(&group);
-        }
+        self.inflight.remove(&(peer, group));
     }
 
     /// A row we hold, for the daemon to check a finished transfer against.
