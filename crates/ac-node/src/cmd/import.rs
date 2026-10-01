@@ -5,10 +5,10 @@ use ac_net::config::{Config, Paths};
 use ac_peers::sync::{Limits, Space};
 use anyhow::{Result, bail};
 
-use crate::blob;
+use ac_net::throttle::{THROTTLE_BURST, Throttle};
+
 use crate::ops::format::{ago, human_size};
 use crate::ops::{self};
-use crate::throttle::Throttle;
 
 /// The one command that needs no node: what this build can import from is a fact about the
 /// binary, not about anything on disk.
@@ -239,7 +239,7 @@ fn work(paths: &Paths, limit: Option<usize>) -> Result<ops::import::Fetched> {
     let capped = Config::load(&paths.config_file())
         .unwrap_or_default()
         .bandwidth_max;
-    let pace = std::sync::Arc::new(Limit(Throttle::from_config(capped, blob::THROTTLE_BURST)));
+    let pace = std::sync::Arc::new(Limit(Throttle::from_config(capped, THROTTLE_BURST)));
 
     let mut pump = ops::import::pump(paths, limit)?.paced(pace);
     let mut fetched = ops::import::Fetched::default();

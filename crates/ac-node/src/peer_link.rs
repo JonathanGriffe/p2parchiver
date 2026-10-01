@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use libp2p::multiaddr::Protocol;
@@ -10,18 +9,15 @@ use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
 use ac_net::proto::{PresenceRequest, PresenceResponse};
 
-use ac_files::content::Content;
 use ac_files::store::Files;
 use ac_groups::store::Groups;
 use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers, Space};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
-use crate::blob::{self, Transfers};
 use crate::daemon::ClientSwarm;
-use crate::file_link::{FileLink, RoundOutcome};
+use crate::file_link::{FileLink, RoundOutcome, TransferOutcome};
 use crate::group_link::GroupLink;
 use crate::status::{Bandwidth, Published};
-use crate::throttle::Throttle;
 
 /// Candidate direct addresses kept per peer
 const MAX_DIRECT_ADDRS: usize = 8;
@@ -42,13 +38,11 @@ fn dialable(addr: &Multiaddr) -> bool {
 
 pub struct PeerLink {
     peers: Peers,
-    transfers: Transfers,
     proposals: HashMap<request_response::OutboundRequestId, PeerId>,
     presence: HashMap<request_response::OutboundRequestId, Vec<PeerId>>,
     server: Option<PeerId>,
     relay: Option<Multiaddr>,
     direct: HashMap<PeerId, Vec<Multiaddr>>,
-    content: Content,
     root: std::path::PathBuf,
     status: Published,
     /// Bytes down, bytes up and the clock, as of the last publish. A rate is the difference
@@ -62,7 +56,6 @@ impl PeerLink {
         identity: &Identity,
         server: Option<PeerId>,
         at: i64,
-        down: Arc<Throttle>,
     ) -> Result<Self> {
         let path = paths.db_file();
         let me = identity.peer_id();
@@ -75,20 +68,17 @@ impl PeerLink {
         let config = Config::load(&paths.config_file())
             .with_context(|| format!("reading the config at {}", paths.config_file().display()))?;
         let root = config.storage_root(paths);
-        let content = Content::new(root.clone());
 
         Ok(Self {
             peers: Peers::new(files, groups, at).with_limits(Limits {
                 storage_max: config.storage_max,
                 ..Limits::default()
             }),
-            transfers: Transfers::new(path.clone(), me, down),
             proposals: HashMap::new(),
             presence: HashMap::new(),
             server,
             relay: config.server.clone(),
             direct: HashMap::new(),
-            content,
             root,
             status: Published::open(&path)
                 .with_context(|| format!("opening the status table at {}", path.display()))?,
@@ -172,23 +162,6 @@ impl PeerLink {
         self.peers.close_was_agreed(peer)
     }
 
-    /// Wait for a transfer to end.
-    pub async fn next_transfer(&mut self) -> Option<PeerEvent> {
-        self.transfers.finished().await
-    }
-
-    pub fn on_transfer(
-        &mut self,
-        swarm: &mut ClientSwarm,
-        files: &mut FileLink,
-        groups: &mut GroupLink,
-        admitted_peers: &AdmittedPeers,
-        event: PeerEvent,
-    ) {
-        let actions = self.peers.on(event);
-        self.dispatch(swarm, files, groups, admitted_peers, actions);
-    }
-
     /// Feed the supervisor everything the other layers have finished.
     pub fn collect(
         &mut self,
@@ -197,8 +170,24 @@ impl PeerLink {
         groups: &mut GroupLink,
         admitted_peers: &AdmittedPeers,
     ) {
-        for outcome in self.transfers.collect() {
-            let actions = self.peers.on(outcome);
+        for TransferOutcome {
+            peer,
+            group,
+            path,
+            result,
+        } in files.drain_transfers()
+        {
+            let event = match result {
+                Ok(()) => PeerEvent::BlobDone { peer, group, path },
+                Err(why) => PeerEvent::BlobFailed {
+                    peer,
+                    group,
+                    path,
+                    terminal: why.is_terminal(),
+                    why: why.to_string(),
+                },
+            };
+            let actions = self.peers.on(event);
             self.dispatch(swarm, files, groups, admitted_peers, actions);
         }
 
@@ -276,8 +265,7 @@ impl PeerLink {
     /// Measured here rather than by whoever displays it: this runs on a fixed tick and never
     /// stops, where a reader can be closed, asleep or looking at another page for an hour.
     fn bandwidth(&mut self, files: &FileLink, at: i64) -> Bandwidth {
-        let down = self.transfers.moved_down();
-        let up = files.moved_up();
+        let (down, up) = files.moved();
 
         let rates = match self.moved_at {
             Some((wasdown, wasup, then)) if at > then => {
@@ -439,7 +427,6 @@ impl PeerLink {
         admitted_peers: &AdmittedPeers,
     ) -> bool {
         admitted_peers.is_ready(peer)
-            && self.transfers.running_with(peer) == 0
             && self.peers.drained(*peer)
             && !files.busy_with(peer)
             && !groups.busy_with(peer)
@@ -509,27 +496,13 @@ impl PeerLink {
                     path,
                     hash,
                 } => {
-                    let Some(dir) = files.dir_of(group) else {
-                        continue;
-                    };
-                    let started = self.transfers.fetch(
-                        swarm.behaviour().app.blobs.new_control(),
-                        self.content.clone(),
-                        blob::Wanted {
-                            peer,
-                            group,
-                            path: path.clone(),
-                            hash,
-                            dir,
-                        },
-                    );
-                    if !started {
+                    if let Err(why) = files.fetch(peer, group, path.clone(), hash) {
                         let actions = self.peers.on(PeerEvent::BlobFailed {
                             peer,
                             group,
                             path,
                             terminal: false,
-                            why: "the transfer pool was full".to_owned(),
+                            why: why.to_string(),
                         });
                         self.dispatch(swarm, files, groups, admitted_peers, actions);
                     }
@@ -588,7 +561,11 @@ impl PeerLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ac_files::blob::FetchError;
     use ac_net::connectivity::Connectivity;
+    use ac_net::throttle::{THROTTLE_BURST, Throttle};
+    use ac_net::transfer::TransferEvent;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use libp2p::Multiaddr;
@@ -618,7 +595,6 @@ mod tests {
         link: FileLink,
         groups: GroupLink,
         peers: PeerLink,
-        blobs: libp2p_stream::IncomingStreams,
         admitted_peers: AdmittedPeers,
         peer: PeerId,
         dir: tempfile::TempDir,
@@ -642,22 +618,15 @@ mod tests {
                 bandwidth_max: None,
             };
 
-            let mut swarm = build(&identity, &config, Role::Client, AcceptAnyPeer, app()).unwrap();
-            let blobs = FileLink::accept_blobs(&mut swarm).unwrap();
+            let swarm = build(&identity, &config, Role::Client, AcceptAnyPeer, app()).unwrap();
+            let down = Arc::new(Throttle::from_config(None, THROTTLE_BURST));
+            let streams = swarm.behaviour().app.blobs.new_control();
 
             Self {
+                link: FileLink::open(&paths, &identity, streams, down).unwrap(),
                 swarm,
-                link: FileLink::open(&paths, &identity).unwrap(),
                 groups: GroupLink::open(&paths, &identity).unwrap(),
-                peers: PeerLink::open(
-                    &paths,
-                    &identity,
-                    None,
-                    AT,
-                    Arc::new(Throttle::from_config(None, blob::THROTTLE_BURST)),
-                )
-                .unwrap(),
-                blobs,
+                peers: PeerLink::open(&paths, &identity, None, AT).unwrap(),
                 admitted_peers: AdmittedPeers::default(),
                 peer: identity.peer_id(),
                 dir,
@@ -723,14 +692,16 @@ mod tests {
             );
         }
 
-        fn on_transfer(&mut self, outcome: PeerEvent) {
-            self.peers.on_transfer(
-                &mut self.swarm,
-                &mut self.link,
-                &mut self.groups,
-                &self.admitted_peers,
-                outcome,
-            );
+        /// The daemon's transfer arm.
+        fn on_transfer(&mut self, event: TransferEvent<FetchError>) {
+            if self.link.on_transfer(event, &self.admitted_peers) {
+                self.peers.collect(
+                    &mut self.swarm,
+                    &mut self.link,
+                    &mut self.groups,
+                    &self.admitted_peers,
+                );
+            }
         }
 
         fn tick(&mut self) {
@@ -793,7 +764,7 @@ mod tests {
         /// Put a file in this node's catalogue, bytes and all.
         fn add(&mut self, group: GroupId, path: &str, bytes: &[u8]) -> RelPath {
             let path = RelPath::parse(path).unwrap();
-            let dir = self.link.dir_of(group).unwrap();
+            let dir = self.link.sync().dir_of(group).unwrap();
 
             let src = self.dir.path().join("incoming");
             std::fs::write(&src, bytes).unwrap();
@@ -825,13 +796,13 @@ mod tests {
         }
 
         fn bytes(&mut self, group: GroupId, path: &RelPath) -> Vec<u8> {
-            let dir = self.link.dir_of(group).unwrap();
+            let dir = self.link.sync().dir_of(group).unwrap();
             std::fs::read(self.link.sync().content().locate(&dir, path)).unwrap()
         }
 
         /// Delete a file's bytes behind the index's back, as a stray `rm` would.
         fn lose_bytes(&mut self, group: GroupId, path: &RelPath) {
-            let dir = self.link.dir_of(group).unwrap();
+            let dir = self.link.sync().dir_of(group).unwrap();
             std::fs::remove_file(self.link.sync().content().locate(&dir, path)).unwrap();
         }
     }
@@ -850,10 +821,8 @@ mod tests {
             tokio::select! {
                 event = a.swarm.select_next_some() => a.step(event),
                 event = b.swarm.select_next_some() => b.step(event),
-                Some((peer, stream)) = a.blobs.next() => a.link.on_inbound_blob(peer, stream),
-                Some((peer, stream)) = b.blobs.next() => b.link.on_inbound_blob(peer, stream),
-                Some(outcome) = a.peers.next_transfer() => done_a = Some(outcome),
-                Some(outcome) = b.peers.next_transfer() => done_b = Some(outcome),
+                event = a.link.next_transfer() => done_a = Some(event),
+                event = b.link.next_transfer() => done_b = Some(event),
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {
                     a.tick();
                     b.tick();
@@ -956,6 +925,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fetch_for_a_group_with_no_directory_does_not_start() {
+        let mut n = Node::new();
+        let unknown = GroupId::from_bytes([9u8; 32]);
+        let path = RelPath::parse("a.jpg").unwrap();
+
+        let started = n
+            .link
+            .fetch(PeerId::random(), unknown, path, "00".repeat(32));
+        assert_eq!(started, Err(crate::file_link::NotStarted::NoDirectory));
+    }
+
+    #[tokio::test]
     async fn a_failed_dial_moves_on_rather_than_retrying_the_same_address() {
         let mut n = Node::new();
         let them = PeerId::random();
@@ -1037,12 +1018,12 @@ mod tests {
         // node has a limit configured, which is the case that would have gone unmeasured had
         // the count lived under the throttle's early return.
         assert_eq!(
-            bob.peers.transfers.moved_down(),
+            bob.link.moved().0,
             content.len() as u64,
             "bob counted every byte he fetched"
         );
         assert_eq!(
-            alice.link.moved_up(),
+            alice.link.moved().1,
             content.len() as u64,
             "and alice counted every byte she served"
         );
@@ -1071,8 +1052,8 @@ mod tests {
             tokio::select! {
                 event = alice.swarm.select_next_some() => alice.step(event),
                 event = bob.swarm.select_next_some() => bob.step(event),
-                Some((p, s)) = alice.blobs.next() => alice.link.on_inbound_blob(p, s),
-                Some((p, s)) = bob.blobs.next() => bob.link.on_inbound_blob(p, s),
+                event = alice.link.next_transfer() => alice.on_transfer(event),
+                event = bob.link.next_transfer() => bob.on_transfer(event),
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {
                     alice.tick();
                     bob.tick();
@@ -1134,8 +1115,8 @@ mod tests {
             tokio::select! {
                 event = alice.swarm.select_next_some() => alice.step(event),
                 event = carol.swarm.select_next_some() => carol.step(event),
-                Some((p, s)) = alice.blobs.next() => alice.link.on_inbound_blob(p, s),
-                Some((p, s)) = carol.blobs.next() => carol.link.on_inbound_blob(p, s),
+                event = alice.link.next_transfer() => alice.on_transfer(event),
+                event = carol.link.next_transfer() => carol.on_transfer(event),
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {
                     alice.tick();
                     carol.tick();

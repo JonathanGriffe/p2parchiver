@@ -8,9 +8,7 @@ Paths below are relative to `crates/ac-node/`.
 
 - **CLI**: the `ac` binary and its commands (`id`, `join`, `run`, `probe`, `peer`, `group`, `file` and `import`) in `src/main.rs` and `src/cmd/`.
 - **Daemon**: the event loop that drives the swarm and every layer in `src/daemon.rs`.
-- **Links**: connect each layer's state machine to the swarm: chains in `src/group_link.rs`, catalogues and inbound file transfers in `src/file_link.rs`, the supervisor in `src/peer_link.rs`, and imports in `src/import_link.rs`.
-- **File transfers**: the `/ac/blob/1.0.0` protocol in `src/blob.rs`.
-- **Bandwidth**: the rate limiter in `src/throttle.rs`.
+- **Links**: connect each layer's state machine to the swarm: chains in `src/group_link.rs`, catalogues and file transfers in `src/file_link.rs`, the supervisor in `src/peer_link.rs`, and imports in `src/import_link.rs`.
 - **Operations**: the actions the CLI and the desktop app share in `src/ops/`: joining a server, groups, files, contacts and status, imports, and the node lock.
 - **Contacts**: peers named by hand in `src/contacts.rs`, merged with fellow group members into one list of names in `src/directory.rs`.
 - **Status**: the supervisor's snapshot, published for the CLI and the desktop app, in `src/status.rs`.
@@ -20,7 +18,7 @@ Paths below are relative to `crates/ac-node/`.
 
 ### Daemon
 
-The daemon is a single task waiting on the 5 s housekeeping tick, swarm events, finished imports, finished file transfers, inbound file streams and Ctrl-C. It owns every link and passes them where they are needed, so nothing needs a lock.
+The daemon is a single task waiting on the 5 s housekeeping tick, swarm events, finished imports, file transfers (a download finished or a stream opened) and Ctrl-C. It owns every link and passes them where they are needed, so nothing needs a lock.
 The daemon is event-driven when possible to avoid unneccesary delays, and the housekeeping tick is only used when no event is available for the feature. 
 
 On each tick it:
@@ -29,7 +27,7 @@ On each tick it:
 - ticks every layer;
 - measures free and held space once, and hands the same numbers to the supervisor and the import scheduler, so downloads and imports share one storage budget.
 
-After every swarm event it feeds the supervisor what the chain and catalogue rounds finished.
+After every swarm event and every finished download it feeds the supervisor what the chain and catalogue rounds and the file transfers finished.
 
 The layers only decide, and the links carry it out. Each link takes the actions its state machine returns, sends the requests they call for, and turns the answers back into events. No layer's state machine touches the swarm.
 
@@ -41,16 +39,13 @@ Only one daemon may run on a home. `ac run` and the desktop app take a lock on `
 
 ### File transfers
 
-A download sends the group, the path, the hash and the offset to resume from, framed as a 4-byte length followed by CBOR. The peer answers with the number of bytes it will send, or refuses, then streams the raw bytes in 64 KiB chunks.
-- **Resuming.** The receiver resumes from what it staged on an earlier attempt, and keeps the partial when a transfer ends early.
-- **Final failures.** More bytes than announced, or bytes that do not hash to what was asked, are final: the supervisor does not ask that peer for that file again. A wrong hash also discards the partial.
-- **Serving.** A node serves a file only to a ready peer the group is shared with, and only if it holds that exact hash. A file its index claims but that is missing on disk is refused, and the index is corrected so it is fetched again.
-- **Limits.** At most 8 downloads and 64 uploads at once. Past 64, a request is refused.
+`FileLink` mounts `ac-net`'s transfer service for `/ac/blob/1.0.0`, built from the rules and limits `ac-files` declares, routes the supervisor's fetches to it, and turns finished downloads into supervisor events.
+- **Readiness.** An inbound stream is served only from a ready peer, and dropped otherwise.
+- **No directory.** A fetch for a group that has no directory, such as one forgotten while the fetch was queued, fails, to be retried, so the supervisor frees its slot.
 - **Imports first.** Before downloading, the node looks in `.unsorted`. If the bytes were imported and not yet sorted, they are moved into the group instead. Any failure there falls back to downloading.
-
-### Bandwidth
-
-`bandwidth_max` in the config caps downloads and uploads separately. The download limit is shared by transfers from peers and by imports. Each limit is a token bucket with a burst of two 64 KiB chunks. A foreground `ac import fetch` has a limit of its own, since it assumes no daemon runs beside it.
+- **Two download caps.** The supervisor runs at most 8 transfers at once (`MAX_TRANSFERS` in `ac-peers`), and the service refuses a download past 8 (`MAX_DOWNLOADS` in `ac-files`) as a backstop. A fetch refused there fails, to be retried.
+- **Hanging up.** A running download counts as work outstanding with its peer. An upload does not.
+- **Bandwidth.** The download limit is shared by transfers from peers and by imports. A foreground `ac import fetch` has a limit of its own, since it assumes no daemon runs beside it.
 
 ### Imports
 

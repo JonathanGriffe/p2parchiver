@@ -72,22 +72,6 @@ pub enum FileEvent {
     },
 }
 
-/// Whether these stores say a peer may have this file's bytes, and how many.
-pub fn may_serve(
-    files: &Files,
-    groups: &Groups,
-    peer: &PeerId,
-    group: GroupId,
-    path: &RelPath,
-) -> Option<u64> {
-    let shared = groups.shared_with(peer).unwrap_or_default();
-    if !shared.iter().any(|h| h.group == group) {
-        return None;
-    }
-    let row = files.get(group, path).ok().flatten()?;
-    (!row.is_removed() && row.have).then_some(row.size)
-}
-
 /// One outstanding catalogue read. Keyed by peer and group, so peers' logs of one group are
 /// read side by side.
 #[derive(Debug, Clone)]

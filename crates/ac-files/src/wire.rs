@@ -8,6 +8,15 @@ pub const MANIFEST_PROTOCOL: &str = "/ac/manifest/3.0.0";
 
 pub const BLOB_PROTOCOL: &str = "/ac/blob/1.0.0";
 
+/// The cap on a blob stream's request and reply frames.
+pub const MAX_BLOB_HEADER_BYTES: usize = 4096;
+
+/// Downloads this node runs at once, across every peer. Backs up the supervisor's own cap.
+pub const MAX_DOWNLOADS: usize = 8;
+
+/// Uploads this node serves at once, across every peer. Past it, a request is refused.
+pub const MAX_UPLOADS: usize = 64;
+
 pub const MAX_HEADS_PER_ANSWER: usize = 128;
 pub const MAX_ENTRIES_PER_RESPONSE: usize = 2048;
 
@@ -345,6 +354,32 @@ mod tests {
         .len();
 
         assert!(size < 128, "a 512-file answer is {size} bytes");
+    }
+
+    #[test]
+    fn a_request_for_the_longest_path_fits_the_blob_header() {
+        let path = ["a".repeat(255), "b".repeat(255), "c".repeat(255)]
+            .into_iter()
+            .chain(["d".repeat(254), "e".to_owned()])
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(RelPath::parse(&path).is_ok(), "the longest path allowed");
+        assert!(
+            RelPath::parse(&format!("{path}x")).is_err(),
+            "and no longer"
+        );
+
+        let size = encoded(&BlobRequest {
+            group: GroupId::from_str(&hex::encode([1u8; 32])).unwrap(),
+            path,
+            hash: [6u8; 32],
+            offset: u64::MAX,
+        })
+        .len();
+        assert!(
+            size <= MAX_BLOB_HEADER_BYTES,
+            "a request is {size} bytes against a {MAX_BLOB_HEADER_BYTES} ceiling"
+        );
     }
 
     #[test]

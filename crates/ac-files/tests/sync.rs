@@ -2,9 +2,10 @@
 
 use std::time::Instant;
 
+use ac_files::blob::may_serve;
 use ac_files::path::RelPath;
 use ac_files::store::{FileRow, Files};
-use ac_files::sync::{FileAction, FileEvent, FileSync, MAX_INFLIGHT, may_serve};
+use ac_files::sync::{FileAction, FileEvent, FileSync, MAX_INFLIGHT};
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_files::{Content, ManifestEntry};
 use ac_groups::chain::Op;
@@ -81,7 +82,7 @@ impl Node {
     /// It takes no `AdmittedPeers`: a blob stream cannot exist without an admitted connection, so
     /// the only question left is whether the stores entitle this peer to these bytes.
     fn sync_may_serve(&mut self, peer: PeerId, group: GroupId, path: &RelPath) -> Option<u64> {
-        may_serve(self.sync.files(), self.sync.groups(), &peer, group, path)
+        may_serve(self.sync.files(), self.sync.groups(), &peer, group, path).map(|row| row.size)
     }
 
     /// A peer that has gone. `AdmittedPeers` forgets them; nothing else needs telling.

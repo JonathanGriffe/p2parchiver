@@ -1,0 +1,358 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use libp2p::futures::StreamExt;
+use libp2p::swarm::SwarmEvent;
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
+use serde::{Deserialize, Serialize};
+
+use ac_net::authz::AcceptAnyPeer;
+use ac_net::config::Config;
+use ac_net::identity::Identity;
+use ac_net::stream::StreamError;
+use ac_net::swarm::{AcBehaviour, Role, build};
+use ac_net::throttle::Throttle;
+use ac_net::transfer::{
+    Answered, Behaviour, Download, Serve, TransferEvent, TransferId, TransferSpec, Transfers,
+};
+
+const TIMEOUT: Duration = Duration::from_secs(20);
+
+type TestSwarm = libp2p::Swarm<AcBehaviour<AcceptAnyPeer, Behaviour>>;
+
+#[derive(Debug, Serialize, Deserialize)]
+enum Reply {
+    Sending(u64),
+    Missing,
+    Busy,
+}
+
+#[derive(Debug)]
+enum ToyError {
+    Missing,
+    Busy,
+    Short,
+    /// The only retryable one.
+    Stream(StreamError),
+}
+
+impl From<StreamError> for ToyError {
+    fn from(e: StreamError) -> Self {
+        ToyError::Stream(e)
+    }
+}
+
+/// Fetches one numbered item into a shared buffer.
+struct Toy {
+    item: u32,
+    nothing_to_do: bool,
+    panics: bool,
+    into: Arc<Mutex<Vec<u8>>>,
+}
+
+struct Receiving {
+    expected: u64,
+    into: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Download for Toy {
+    type Request = u32;
+    type Reply = Reply;
+    type Receiving = Receiving;
+    type Error = ToyError;
+
+    fn start(&mut self) -> Result<Option<u32>, ToyError> {
+        Ok((!self.nothing_to_do).then_some(self.item))
+    }
+
+    fn on_reply(self, reply: Reply) -> Result<Receiving, ToyError> {
+        assert!(!self.panics, "told to panic");
+        match reply {
+            Reply::Sending(expected) => Ok(Receiving {
+                expected,
+                into: self.into,
+            }),
+            Reply::Missing => Err(ToyError::Missing),
+            Reply::Busy => Err(ToyError::Busy),
+        }
+    }
+
+    fn on_chunk(receiving: &mut Receiving, chunk: &[u8]) -> Result<(), ToyError> {
+        receiving.into.lock().unwrap().extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn on_end(receiving: Receiving, ended: Result<(), ToyError>) -> Result<(), ToyError> {
+        ended?;
+        if receiving.into.lock().unwrap().len() as u64 != receiving.expected {
+            return Err(ToyError::Short);
+        }
+        Ok(())
+    }
+}
+
+/// Serves numbered items from memory.
+struct Library(HashMap<u32, Vec<u8>>);
+
+impl Serve for Library {
+    type Request = u32;
+    type Reply = Reply;
+    type Source = Cursor<Vec<u8>>;
+    type Error = StreamError;
+
+    fn answer(&self, _: PeerId, item: u32) -> Result<Answered<Self>, StreamError> {
+        Ok(match self.0.get(&item) {
+            Some(bytes) => (
+                Reply::Sending(bytes.len() as u64),
+                Some(Cursor::new(bytes.clone())),
+            ),
+            None => (Reply::Missing, None),
+        })
+    }
+
+    fn busy(&self) -> Reply {
+        Reply::Busy
+    }
+}
+
+type Side = Transfers<Toy, Library>;
+
+fn item() -> Vec<u8> {
+    (0..200_000).map(|i| (i % 251) as u8).collect()
+}
+
+fn spec(max_downloads: usize, max_uploads: usize) -> TransferSpec {
+    TransferSpec {
+        protocol: "/ac/test-transfer/1.0.0",
+        max_header: 4096,
+        max_downloads,
+        max_uploads,
+    }
+}
+
+fn identity() -> Identity {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Identity::load_or_generate(&dir.path().join("identity.key"))
+        .expect("identity")
+        .0
+}
+
+fn loopback_config() -> Config {
+    Config {
+        listen: vec![
+            "/ip4/127.0.0.1/udp/0/quic-v1"
+                .parse()
+                .expect("valid multiaddr"),
+        ],
+        listen_enroll: Vec::new(),
+        external: Vec::new(),
+        mdns: false,
+        server: None,
+        storage_root: None,
+        storage_max: None,
+        bandwidth_max: None,
+    }
+}
+
+fn side(swarm: &TestSwarm, spec: TransferSpec) -> Side {
+    Transfers::new(
+        swarm.behaviour().app.new_control(),
+        spec,
+        Library(HashMap::from([(1, item())])),
+        Arc::new(Throttle::none()),
+        Arc::new(Throttle::none()),
+    )
+    .unwrap()
+}
+
+/// Two connected swarms, left running in the background, and a service on each: the server
+/// first, then the client, and the server's peer id.
+async fn pair(server: TransferSpec, client: TransferSpec) -> (Side, Side, PeerId) {
+    let (id_a, id_b) = (identity(), identity());
+    let peer_a = id_a.peer_id();
+    let mut a = build(
+        &id_a,
+        &loopback_config(),
+        Role::Client,
+        AcceptAnyPeer,
+        Behaviour::new(),
+    )
+    .unwrap();
+    let mut b = build(
+        &id_b,
+        &loopback_config(),
+        Role::Client,
+        AcceptAnyPeer,
+        Behaviour::new(),
+    )
+    .unwrap();
+    let (serving, fetching) = (side(&a, server), side(&b, client));
+
+    let addr: Multiaddr = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = a.select_next_some().await {
+                return address;
+            }
+        }
+    })
+    .await
+    .expect("a should listen");
+    b.dial(addr.with(Protocol::P2p(peer_a))).unwrap();
+
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            tokio::select! {
+                _ = a.select_next_some() => {}
+                event = b.select_next_some() => {
+                    if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("b should connect");
+
+    for mut swarm in [a, b] {
+        tokio::spawn(async move {
+            loop {
+                swarm.select_next_some().await;
+            }
+        });
+    }
+    (serving, fetching, peer_a)
+}
+
+fn toy(item: u32) -> (Toy, Arc<Mutex<Vec<u8>>>) {
+    let into = Arc::new(Mutex::new(Vec::new()));
+    (
+        Toy {
+            item,
+            nothing_to_do: false,
+            panics: false,
+            into: into.clone(),
+        },
+        into,
+    )
+}
+
+/// Drive both sides until the client's next download finishes. The server serves every
+/// stream unless told to decline them, and says whether it saw any.
+async fn finish(
+    server: &mut Side,
+    client: &mut Side,
+    decline: bool,
+) -> (TransferId, Result<(), ToyError>, bool) {
+    let mut saw_stream = false;
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            tokio::select! {
+                event = server.next() => {
+                    if let TransferEvent::Inbound(inbound) = event {
+                        saw_stream = true;
+                        if !decline {
+                            server.serve(inbound);
+                        }
+                    }
+                }
+                event = client.next() => {
+                    if let TransferEvent::Finished { id, result, .. } = event {
+                        return (id, result, saw_stream);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("the download should finish")
+}
+
+#[tokio::test]
+async fn a_fetch_completes_and_names_its_transfer() {
+    let (mut server, mut client, peer) = pair(spec(8, 64), spec(8, 64)).await;
+    let (download, into) = toy(1);
+
+    let id = client.fetch(peer, download).unwrap();
+    let (finished, result, _) = finish(&mut server, &mut client, false).await;
+
+    assert_eq!(finished, id);
+    result.unwrap();
+    assert_eq!(*into.lock().unwrap(), item(), "byte for byte");
+    assert_eq!(client.moved().0, item().len() as u64);
+    assert_eq!(server.moved().1, item().len() as u64);
+}
+
+#[tokio::test]
+async fn a_download_with_nothing_to_fetch_opens_no_stream() {
+    let (mut server, mut client, peer) = pair(spec(8, 64), spec(8, 64)).await;
+    let (mut download, _) = toy(1);
+    download.nothing_to_do = true;
+
+    client.fetch(peer, download).unwrap();
+    let (_, result, saw_stream) = finish(&mut server, &mut client, false).await;
+
+    result.unwrap();
+    assert!(!saw_stream);
+}
+
+#[tokio::test]
+async fn a_fetch_past_the_download_cap_is_refused() {
+    let (mut server, mut client, peer) = pair(spec(8, 64), spec(1, 64)).await;
+
+    assert!(client.fetch(peer, toy(1).0).is_some());
+    assert!(
+        client.fetch(peer, toy(1).0).is_none(),
+        "the one slot is taken"
+    );
+
+    finish(&mut server, &mut client, false).await.1.unwrap();
+    assert!(
+        client.fetch(peer, toy(1).0).is_some(),
+        "and it frees once the download ends"
+    );
+}
+
+#[tokio::test]
+async fn past_the_upload_cap_the_server_answers_busy() {
+    let (mut server, mut client, peer) = pair(spec(8, 0), spec(8, 64)).await;
+
+    client.fetch(peer, toy(1).0).unwrap();
+    let (_, result, _) = finish(&mut server, &mut client, false).await;
+
+    assert!(matches!(result, Err(ToyError::Busy)), "got {result:?}");
+}
+
+#[tokio::test]
+async fn a_declined_stream_fails_the_fetch_as_retryable() {
+    let (mut server, mut client, peer) = pair(spec(8, 64), spec(8, 64)).await;
+
+    client.fetch(peer, toy(1).0).unwrap();
+    let (_, result, saw_stream) = finish(&mut server, &mut client, true).await;
+
+    assert!(saw_stream);
+    assert!(matches!(result, Err(ToyError::Stream(_))), "got {result:?}");
+}
+
+#[tokio::test]
+async fn a_download_that_panics_fails_and_frees_its_slot() {
+    let (mut server, mut client, peer) = pair(spec(8, 64), spec(1, 64)).await;
+    let (mut download, _) = toy(1);
+    download.panics = true;
+
+    client.fetch(peer, download).unwrap();
+    let (_, result, _) = finish(&mut server, &mut client, false).await;
+
+    assert!(
+        matches!(result, Err(ToyError::Stream(StreamError::Panicked))),
+        "got {result:?}"
+    );
+    assert!(
+        client.fetch(peer, toy(1).0).is_some(),
+        "its one slot is free again"
+    );
+}

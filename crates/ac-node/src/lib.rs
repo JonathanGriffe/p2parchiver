@@ -5,7 +5,6 @@ pub mod daemon;
 pub mod ops;
 
 // puts them in a signature, so they stay in.
-mod blob;
 mod contacts;
 mod directory;
 mod file_link;
@@ -13,6 +12,5 @@ mod group_link;
 mod import_link;
 mod peer_link;
 mod status;
-mod throttle;
 
 pub const DEFAULT_LOG: &str = "ac=info,ac_net=info,libp2p=warn";

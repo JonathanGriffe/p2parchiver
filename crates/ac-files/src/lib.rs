@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod blob;
 pub mod content;
 pub mod dirname;
 pub mod path;

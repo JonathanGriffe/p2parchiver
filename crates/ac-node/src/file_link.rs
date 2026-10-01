@@ -8,20 +8,22 @@ use libp2p::{PeerId, request_response};
 use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
+use ac_net::throttle::{THROTTLE_BURST, Throttle};
+use ac_net::transfer::{Control, TransferEvent, TransferId, TransferSpec, Transfers};
 
+use ac_files::blob::{Blobs, Fetch, FetchError, Local};
 use ac_files::content::Content;
 use ac_files::path::RelPath;
 use ac_files::store::Files;
 use ac_files::sync::{FileAction, FileEvent, FileSync};
-use ac_files::wire::{ManifestRequest, ManifestResponse, holds};
+use ac_files::wire::{
+    BLOB_PROTOCOL, MAX_BLOB_HEADER_BYTES, MAX_DOWNLOADS, MAX_UPLOADS, ManifestRequest,
+    ManifestResponse, holds,
+};
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
 
-use tokio::sync::Semaphore;
-
-use crate::blob;
 use crate::daemon::ClientSwarm;
-use crate::throttle::Throttle;
 
 /// What we asked a peer, kept so a bare reply can be matched back to it.
 enum Outbound {
@@ -55,13 +57,57 @@ pub enum RoundOutcome {
     },
 }
 
+/// How a file transfer ended.
+#[derive(Debug)]
+pub struct TransferOutcome {
+    pub peer: PeerId,
+    pub group: GroupId,
+    pub path: RelPath,
+    pub result: Result<(), FetchError>,
+}
+
+/// Why a fetch did not start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NotStarted {
+    #[error("the transfer pool was full")]
+    PoolFull,
+    #[error("the group has no directory")]
+    NoDirectory,
+}
+
+/// Imported files not yet sorted, where a download looks before asking a peer.
+struct Unsorted {
+    db: std::path::PathBuf,
+    content: Content,
+}
+
+impl Local for Unsorted {
+    fn take(&self, group: GroupId, dir: &str, path: &RelPath, hash: &str) -> bool {
+        crate::ops::import::adopt_unsorted(
+            &self.db,
+            &self.content,
+            &group.to_string(),
+            dir,
+            path,
+            hash,
+        )
+        .unwrap_or_else(|e| {
+            // Never fatal: a peer has the bytes, and fetching them is what would have happened
+            // anyway. Worth a line, because it means the import ledger is unhappy about something.
+            tracing::warn!(%hash, error = %format!("{e:#}"), "could not take the unsorted copy");
+            false
+        })
+    }
+}
+
 pub struct FileLink {
     sync: FileSync,
     outbound: HashMap<request_response::OutboundRequestId, (PeerId, Outbound)>,
     rounds: Vec<RoundOutcome>,
-    db: std::path::PathBuf,
-    up: Arc<Throttle>,
-    serving: Arc<Semaphore>,
+    blobs: Blobs,
+    transfers: Transfers<Fetch, Blobs>,
+    fetching: HashMap<TransferId, (PeerId, GroupId, RelPath)>,
+    fetched: Vec<TransferOutcome>,
 }
 
 /// How long a partial must sit untouched before a sweep will remove it.
@@ -86,7 +132,14 @@ fn sweep_staging(files: &Files, content: &Content) {
 }
 
 impl FileLink {
-    pub fn open(paths: &Paths, identity: &Identity) -> Result<Self> {
+    /// Open the stores, and start accepting file transfers through `streams`. Downloads share
+    /// `down` with imports.
+    pub fn open(
+        paths: &Paths,
+        identity: &Identity,
+        streams: Control,
+        down: Arc<Throttle>,
+    ) -> Result<Self> {
         let path = paths.db_file();
         let me = identity.peer_id();
 
@@ -100,22 +153,99 @@ impl FileLink {
         let content = Content::new(config.storage_root(paths));
         sweep_staging(&files, &content);
 
+        let unsorted = Unsorted {
+            db: path.clone(),
+            content: content.clone(),
+        };
+        let blobs = Blobs::new(path, me, content.clone(), Arc::new(unsorted));
+
+        let transfers = Transfers::new(
+            streams,
+            TransferSpec {
+                protocol: BLOB_PROTOCOL,
+                max_header: MAX_BLOB_HEADER_BYTES,
+                max_downloads: MAX_DOWNLOADS,
+                max_uploads: MAX_UPLOADS,
+            },
+            blobs.clone(),
+            down,
+            Arc::new(Throttle::from_config(config.bandwidth_max, THROTTLE_BURST)),
+        )
+        .context("registering the blob protocol")?;
+
         Ok(Self {
             sync: FileSync::new(files, groups, content),
             outbound: HashMap::new(),
             rounds: Vec::new(),
-            db: path,
-            up: Arc::new(Throttle::from_config(
-                config.bandwidth_max,
-                blob::THROTTLE_BURST,
-            )),
-            serving: Arc::new(Semaphore::new(blob::MAX_SERVING)),
+            blobs,
+            transfers,
+            fetching: HashMap::new(),
+            fetched: Vec::new(),
         })
     }
 
-    /// Bytes of content served since this node started.
-    pub fn moved_up(&self) -> u64 {
-        self.up.moved()
+    /// Bytes of content fetched and served since this node started.
+    pub fn moved(&self) -> (u64, u64) {
+        self.transfers.moved()
+    }
+
+    /// Start fetching a file from `peer`.
+    pub fn fetch(
+        &mut self,
+        peer: PeerId,
+        group: GroupId,
+        path: RelPath,
+        hash: String,
+    ) -> Result<(), NotStarted> {
+        let dir = self.sync.dir_of(group).ok_or(NotStarted::NoDirectory)?;
+        let fetch = self.blobs.fetch(group, dir, path.clone(), hash);
+        let id = self
+            .transfers
+            .fetch(peer, fetch)
+            .ok_or(NotStarted::PoolFull)?;
+        self.fetching.insert(id, (peer, group, path));
+        Ok(())
+    }
+
+    /// Wait for a file transfer to end, or a peer to open one.
+    pub async fn next_transfer(&mut self) -> TransferEvent<FetchError> {
+        self.transfers.next().await
+    }
+
+    /// Serve a stream only from a ready peer, and keep a finished download for the supervisor.
+    /// True if a download finished.
+    pub fn on_transfer(
+        &mut self,
+        event: TransferEvent<FetchError>,
+        admitted_peers: &AdmittedPeers,
+    ) -> bool {
+        match event {
+            TransferEvent::Inbound(inbound) => {
+                let peer = inbound.peer();
+                if admitted_peers.is_ready(&peer) {
+                    self.transfers.serve(inbound);
+                } else {
+                    tracing::debug!(%peer, "declining a blob stream from a peer that is not ready");
+                }
+                false
+            }
+            TransferEvent::Finished { id, result, .. } => {
+                let Some((peer, group, path)) = self.fetching.remove(&id) else {
+                    return false;
+                };
+                self.fetched.push(TransferOutcome {
+                    peer,
+                    group,
+                    path,
+                    result,
+                });
+                true
+            }
+        }
+    }
+
+    pub fn drain_transfers(&mut self) -> Vec<TransferOutcome> {
+        std::mem::take(&mut self.fetched)
     }
 
     #[cfg(test)]
@@ -155,20 +285,18 @@ impl FileLink {
             .insert(id, (peer, Outbound::Holdings { group, paths }));
     }
 
-    /// Whether any question we put to this peer is still outstanding, or a catalogue read
-    /// from them is still waiting to go out.
+    /// Whether any question we put to this peer is still outstanding, a catalogue read from
+    /// them is still waiting to go out, or a download from them is running. Uploads to them
+    /// do not count.
     pub fn busy_with(&self, peer: &PeerId) -> bool {
-        self.outbound.values().any(|(p, _)| p == peer) || self.sync.has_work_with(peer)
+        self.outbound.values().any(|(p, _)| p == peer)
+            || self.sync.has_work_with(peer)
+            || self.fetching.values().any(|(p, ..)| p == peer)
     }
 
     /// Bytes of content this node holds, across every group. Feeds the storage budget.
     pub fn held_bytes(&self) -> Option<u64> {
         self.sync.files().held_bytes().ok()
-    }
-
-    /// The group directory, for a transfer that needs somewhere to put bytes.
-    pub fn dir_of(&mut self, group: GroupId) -> Option<String> {
-        self.sync.dir_of(group)
     }
 
     /// Drive the machine's clock.
@@ -314,30 +442,6 @@ impl FileLink {
         };
 
         self.dispatch(swarm, actions);
-    }
-
-    /// Serve an inbound blob stream from a peer the daemon has already found ready.
-    pub fn on_inbound_blob(&self, peer: PeerId, stream: libp2p::swarm::Stream) {
-        blob::serve(
-            self.db.clone(),
-            self.sync.content().clone(),
-            self.sync.me(),
-            peer,
-            stream,
-            self.up.clone(),
-            self.serving.clone(),
-        );
-    }
-
-    /// A handle for accepting inbound blob streams, taken once at startup.
-    pub fn accept_blobs(swarm: &mut ClientSwarm) -> Result<libp2p_stream::IncomingStreams> {
-        swarm
-            .behaviour()
-            .app
-            .blobs
-            .new_control()
-            .accept(libp2p::StreamProtocol::new(ac_files::wire::BLOB_PROTOCOL))
-            .context("registering the blob protocol")
     }
 
     /// The one place the swarm is driven on the file layer's behalf.
