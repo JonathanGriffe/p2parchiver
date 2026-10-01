@@ -5,7 +5,6 @@ pub mod daemon;
 pub mod ops;
 
 // puts them in a signature, so they stay in.
-mod blob;
 mod contacts;
 mod directory;
 mod file_link;

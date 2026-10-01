@@ -1,6 +1,6 @@
 # ac-net
 
-The networking layer of the projects. It owns a node's identity key and on-disk config, builds the libp2p swarm (transports, NAT traversal, relay and rendezvous) for each of the three process roles, and defines the wire protocols for enrolment, attestation and presence. It also runs the admission layer, which decides which peers count as trusted: every peer must present an attestation signed by the server that both sides enrolled with.
+The networking layer of the projects. It owns a node's identity key and on-disk config, builds the libp2p swarm (transports, NAT traversal, relay and rendezvous) for each of the three process roles, and defines the wire protocols for enrolment, attestation and presence. It also runs the admission layer, which decides which peers count as trusted: every peer must present an attestation signed by the server that both sides enrolled with. For the layers above, it moves bulk bytes and caps the bandwidth they use, without knowing what the bytes are.
 
 Paths below are relative to `crates/ac-net/`.
 
@@ -15,7 +15,7 @@ Paths below are relative to `crates/ac-net/`.
 - **Authorizing connections**: implements policies for the server and node to accept or reject connections in `src/authz.rs`
 - **Limits and Budget**: setting network limits in `src/limits.rs` and a budget of requests to answer in `src/budgets.rs`
 - **Swarm**: building the swarm for each role (node, server and enrollment server) in `src/swarm.rs`.
-- **Streams**: length-prefixed CBOR frames and chunked byte copies over one stream in `src/stream.rs`.
+- **Transfers**: a service that moves bulk bytes for a protocol mounted above it, in `src/transfer.rs`, over the frames and chunk loops in `src/stream.rs`.
 - **Bandwidth**: the rate limiter the layers above share to cap the bytes they move, in `src/throttle.rs`.
 
 ## Design
@@ -40,6 +40,18 @@ A connection is deemed usable once admission has completed successfully and the 
 ### Swarm
 
 The swarm mounts ac-net's protocols and has a slot so that other layers can also mount their own protocols.
+
+### Transfers
+
+`Transfers` is to bulk bytes what `request_response` is to messages, and it never names what the bytes are. A protocol plugs in through two traits that share its request and reply types: a `Download` for each fetch, and one `Serve` shared by every upload. `ac-files` implements both for `/ac/blob/1.0.0`, and `ac-node` mounts the service on the swarm through the `libp2p-stream` behaviour re-exported here.
+- **Frames.** The opener writes a request and the other side a reply, each a 4-byte big-endian length followed by CBOR. A length over the protocol's cap is refused before the body is read, and a value over it is never written. The raw bytes then follow in 64 KiB chunks, until the sender closes the stream.
+- **Caps.** A fetch past the protocol's download cap is refused at once. An inbound stream past its upload cap is answered with the protocol's busy reply and closed.
+- **Spawning.** Each transfer runs in its own tokio task, which calls the protocol's code, including its blocking disk and database I/O. `Transfers::next` yields each finished download, named by the id `fetch` returned, and each inbound stream, which the caller either serves or drops to decline.
+- **Bandwidth.** Every chunk waits on the service's download or upload throttle.
+
+### Bandwidth
+
+`bandwidth_max` in the config caps downloads and uploads separately. Each limit is a `Throttle`, a token bucket with a burst of two 64 KiB chunks, that also counts every byte it lets through, limited or not. The layers above decide what shares one: in `ac-node`, downloads from peers and imports share the download limit.
 
 ### Limits
 

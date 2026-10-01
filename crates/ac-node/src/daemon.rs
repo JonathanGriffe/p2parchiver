@@ -28,7 +28,7 @@ use ac_peers::wire::{SessionRequest, SessionResponse};
 pub struct App {
     pub groups: request_response::cbor::Behaviour<GroupRequest, GroupResponse>,
     pub manifests: request_response::cbor::Behaviour<ManifestRequest, ManifestResponse>,
-    pub blobs: libp2p_stream::Behaviour,
+    pub blobs: ac_net::transfer::Behaviour,
     pub sessions: request_response::cbor::Behaviour<SessionRequest, SessionResponse>,
 }
 
@@ -44,7 +44,7 @@ pub fn app() -> App {
             ac_files::wire::MAX_REQUEST_BYTES,
             ac_files::wire::MAX_RESPONSE_BYTES,
         ),
-        blobs: libp2p_stream::Behaviour::new(),
+        blobs: ac_net::transfer::Behaviour::new(),
         sessions: cbor_behaviour(
             ac_peers::wire::SESSION_PROTOCOL,
             ac_peers::wire::MAX_SESSION_BYTES,
@@ -115,24 +115,21 @@ pub async fn run(
         attest::now(),
     );
 
-    let mut groups = GroupLink::open(paths, identity)?;
-    let mut files = FileLink::open(paths, identity)?;
-
-    // Only the download throttle is created here as only download is done in two places
-    // Upload is only done in peer link
+    // Only the download throttle is created here, as downloads from peers and imports share it.
     let down = Arc::new(Throttle::from_config(config.bandwidth_max, THROTTLE_BURST));
+
+    let mut groups = GroupLink::open(paths, identity)?;
+    let mut files = FileLink::open(paths, identity, &swarm, down.clone())?;
 
     let mut peers = PeerLink::open(
         paths,
         identity,
         link.as_ref().map(|l| l.server),
         attest::now(),
-        down.clone(),
     )?;
 
     let mut imports = ImportLink::open(paths, down.clone())?;
 
-    let mut blobs = FileLink::accept_blobs(&mut swarm)?;
     let mut connectivity = Connectivity::default();
 
     let mut admitted_peers = AdmittedPeers::default();
@@ -291,17 +288,9 @@ pub async fn run(
                 peers.collect(&mut swarm, &mut files, &mut groups, &admitted_peers);
             }
 
-            Some(outcome) = peers.next_transfer() => {
-                peers.on_transfer(&mut swarm, &mut files, &mut groups, &admitted_peers, outcome);
-            }
-
-            Some((peer, stream)) = blobs.next() => {
-                if admitted_peers.is_ready(&peer) {
-                    files.on_inbound_blob(peer, stream);
-                } else {
-                    tracing::debug!(%peer, "declining a blob stream from a peer that is not ready");
-                    drop(stream);
-                }
+            event = files.next_transfer() => {
+                files.on_transfer(event, &admitted_peers);
+                peers.collect(&mut swarm, &mut files, &mut groups, &admitted_peers);
             }
 
             _ = tokio::signal::ctrl_c() => {

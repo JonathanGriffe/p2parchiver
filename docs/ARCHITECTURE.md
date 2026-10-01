@@ -63,7 +63,7 @@ ac-desktop ─► ac-node ─┬─► ac-peers ─► ac-files ─► ac-groups
                                                    ac-server ─────┘
 ```
 
-- `ac-net` is the network layer of the project, which is why it is one of the only crates (with ac-node and ac-server) which depends on libp2p. It implements every network layer service used by both the client and server, such as attestation and presence protocols. It allows layers on top of it to mount protocols.
+- `ac-net` is the network layer of the project, which is why it is one of the only crates (with ac-node and ac-server) which depends on libp2p. It implements every network layer service used by both the client and server, such as attestation and presence protocols. It allows layers on top of it to mount protocols, and also moves bulk bytes and caps bandwidth for them.
 - `ac-server` is the crate implementing the server for this network. As it only participates in the network layer, it only depends on the `ac-net` crate.
 - `ac-groups` adds the group layer, which allows creating groups, inviting and removing users from them. This is the first of the three middle layers, which are separate from the network layer, and therefore depend only on the lower layers and not libp2p.
 - `ac-files` adds file sharing through groups, as well as the per-group file catalogue and syncing method.

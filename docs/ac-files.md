@@ -1,6 +1,6 @@
 # ac-files
 
-The application's content layer. It keeps each group's catalogue, the list of files the group holds, reconciles catalogues between members over `/ac/manifest/3.0.0`, and stores the files' bytes on disk. It decides and records but never moves bytes between peers itself: `ac-node` does the I/O, including the `/ac/blob/1.0.0` transfers whose messages are defined here. It depends on `ac-net` and `ac-groups`, and `ac-peers` and `ac-node` build on it.
+The application's content layer. It keeps each group's catalogue, the list of files the group holds, reconciles catalogues between members over `/ac/manifest/3.0.0`, and stores the files' bytes on disk. It decides and records but never moves bytes between peers itself: `ac-net` does, driven by `ac-node`, including for the `/ac/blob/1.0.0` transfers whose messages and rules are defined here. It depends on `ac-net` and `ac-groups`, and `ac-peers` and `ac-node` build on it.
 
 Paths below are relative to `crates/ac-files/`.
 
