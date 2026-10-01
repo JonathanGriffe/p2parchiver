@@ -982,3 +982,155 @@ fn catalogues_that_waited_are_read_once_there_is_room() {
         "and none is dropped for want of a slot: {seen:?}"
     );
 }
+
+// ---- one read per peer and group ----
+
+/// Admit each other, then ask `from` for its heads and hand them to `to`.
+fn heads_of(to: &mut Node, from: &mut Node) -> Vec<FileAction> {
+    to.verify(from.peer());
+    from.verify(to.peer());
+    let ManifestResponse::Heads(heads) = from.sync_on_request(to.peer(), ManifestRequest::Ask).0
+    else {
+        panic!("expected heads");
+    };
+    to.sync_on(FileEvent::Heads {
+        peer: from.peer(),
+        heads,
+    })
+}
+
+/// Answer the one page `to` asked `from` for in `actions`, and hand it back.
+fn page_of(to: &mut Node, from: &mut Node, actions: &[FileAction]) -> Vec<FileAction> {
+    let (group, after) = actions
+        .iter()
+        .find_map(|a| match a {
+            FileAction::FetchChanges { peer, group, after } if *peer == from.peer() => {
+                Some((*group, *after))
+            }
+            _ => None,
+        })
+        .expect("a read from this peer");
+    let ManifestResponse::Changes {
+        group,
+        entries,
+        next,
+        more,
+        digest,
+    } = from
+        .sync_on_request(to.peer(), ManifestRequest::Changes { group, after })
+        .0
+    else {
+        panic!("expected a page");
+    };
+    to.sync_on(FileEvent::Changes {
+        peer: from.peer(),
+        group,
+        after,
+        entries,
+        next,
+        more,
+        digest,
+    })
+}
+
+/// Keep answering `to`'s reads from `from` until it asks for no more, and return what it did.
+fn read_through(to: &mut Node, from: &mut Node, actions: &[FileAction]) -> Vec<FileAction> {
+    let mut seen = Vec::new();
+    let mut next = page_of(to, from, actions);
+    for _ in 0..10 {
+        let again = next
+            .iter()
+            .any(|a| matches!(a, FileAction::FetchChanges { peer, .. } if *peer == from.peer()));
+        seen.extend(next.iter().cloned());
+        if !again {
+            return seen;
+        }
+        next = page_of(to, from, &next);
+    }
+    panic!("the read never ended");
+}
+
+fn settled_with(actions: &[FileAction], who: PeerId) -> bool {
+    actions
+        .iter()
+        .any(|a| matches!(a, FileAction::Settled { peer, .. } if *peer == who))
+}
+
+#[test]
+fn two_peers_logs_of_one_group_are_read_side_by_side() {
+    let (mut alice, mut bob, mut carol) = (Node::new(), Node::new(), Node::new());
+    let id = share_group(&mut [&mut alice, &mut bob, &mut carol]);
+    bob.add(id, "from-bob.jpg", b"bob's", AT);
+    carol.add(id, "from-carol.jpg", b"carol's", AT);
+
+    let from_bob = heads_of(&mut alice, &mut bob);
+    let from_carol = heads_of(&mut alice, &mut carol);
+    assert_eq!(reads(&from_bob), vec![id]);
+    assert_eq!(
+        reads(&from_carol),
+        vec![id],
+        "carol's read does not wait for bob's: {from_carol:?}"
+    );
+    assert!(
+        !settled_with(&from_carol, carol.peer()),
+        "nor is she settled unread"
+    );
+
+    let bob_done = read_through(&mut alice, &mut bob, &from_bob);
+    assert!(settled_with(&bob_done, bob.peer()));
+    let carol_done = read_through(&mut alice, &mut carol, &from_carol);
+    assert!(settled_with(&carol_done, carol.peer()));
+
+    assert_eq!(alice.paths(id), vec!["from-bob.jpg", "from-carol.jpg"]);
+}
+
+#[test]
+fn heads_from_a_peer_being_read_do_not_settle_them_early() {
+    let (mut alice, mut bob) = (Node::new(), Node::new());
+    let id = share_group(&mut [&mut alice, &mut bob]);
+    bob.add(id, "from-bob.jpg", b"bob's", AT);
+
+    let from_bob = heads_of(&mut alice, &mut bob);
+    assert_eq!(reads(&from_bob), vec![id]);
+    let again = heads_of(&mut alice, &mut bob);
+    assert!(
+        again.is_empty(),
+        "the read under way settles bob, not his heads: {again:?}"
+    );
+
+    let done = read_through(&mut alice, &mut bob, &from_bob);
+    assert!(settled_with(&done, bob.peer()));
+    assert_eq!(alice.paths(id), vec!["from-bob.jpg"]);
+}
+
+#[test]
+fn a_read_waiting_for_a_slot_is_work_outstanding_with_its_peer() {
+    let (mut alice, mut bob, mut carol) = (Node::new(), Node::new(), Node::new());
+    let ids = shared_groups(&mut alice, &mut bob, MAX_INFLIGHT);
+    let other = share_group(&mut [&mut bob, &mut carol]);
+    carol.add(other, "from-carol.jpg", b"carol's", AT);
+
+    let from_alice = heads_of(&mut bob, &mut alice);
+    assert_eq!(reads(&from_alice).len(), MAX_INFLIGHT);
+
+    let from_carol = heads_of(&mut bob, &mut carol);
+    assert!(
+        from_carol.is_empty(),
+        "no slot, so carol's read waits, unsettled: {from_carol:?}"
+    );
+    assert!(bob.sync.has_work_with(&carol.peer()));
+
+    let freed = bob.sync_on(FileEvent::Unavailable {
+        peer: alice.peer(),
+        group: ids[0],
+    });
+    assert_eq!(
+        reads(&freed),
+        vec![other],
+        "carol's read takes the freed slot"
+    );
+
+    let done = read_through(&mut bob, &mut carol, &freed);
+    assert!(settled_with(&done, carol.peer()));
+    assert!(!bob.sync.has_work_with(&carol.peer()));
+}

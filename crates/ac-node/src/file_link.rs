@@ -155,9 +155,10 @@ impl FileLink {
             .insert(id, (peer, Outbound::Holdings { group, paths }));
     }
 
-    /// Whether any question we put to this peer is still outstanding.
+    /// Whether any question we put to this peer is still outstanding, or a catalogue read
+    /// from them is still waiting to go out.
     pub fn busy_with(&self, peer: &PeerId) -> bool {
-        self.outbound.values().any(|(p, _)| p == peer)
+        self.outbound.values().any(|(p, _)| p == peer) || self.sync.has_work_with(peer)
     }
 
     /// Bytes of content this node holds, across every group. Feeds the storage budget.

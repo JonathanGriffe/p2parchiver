@@ -32,7 +32,7 @@ Each catalogue also has a digest: a hash of every row's path, hash, and added an
 2. A group whose digests match is settled. Otherwise the node reads the peer's log from its stored cursor, a page of up to 2048 rows at a time, merging each row and moving the cursor to where the peer said the page ended.
 3. Once the log is drained, the digests are compared again. If they still differ, the cursor is reset and the whole log is read once more: the cursor is an optimisation, the digest is the check.
 
-A group is read from one peer at a time, with at most 8 reads in flight and up to 256 more queued. Reads time out after 30 s, and a page that does not match the outstanding read is dropped. A failed request frees the slot but does not settle the group, since nothing said there was nothing left to read.
+Each peer's log of a group is read on its own, so the logs of several peers who differ from us are read side by side, with at most 8 reads in flight across every peer and group. A read that finds no free slot waits in a queue of up to 2048 reads, one per peer and group, and is not settled while it waits, nor when the queue is full. Heads from a peer whose log of that group is already being read change nothing, since that read settles them. Reads time out after 30 s, and a page that does not match the outstanding read is dropped. A failed request frees the slot but does not settle the group, since nothing said there was nothing left to read. `ac-node` counts a read in flight or queued as work outstanding with its peer, so it does not hang up on them while it waits.
 
 ### Merging
 
