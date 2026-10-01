@@ -26,6 +26,8 @@ pub enum StreamError {
     Source(io::Error),
     #[error(transparent)]
     Io(io::Error),
+    #[error("the transfer panicked")]
+    Panicked,
 }
 
 /// Write `value` as a 4-byte big-endian length followed by its CBOR encoding.

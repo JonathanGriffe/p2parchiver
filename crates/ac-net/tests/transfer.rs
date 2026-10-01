@@ -37,12 +37,12 @@ enum ToyError {
     Busy,
     Short,
     /// The only retryable one.
-    Stream,
+    Stream(StreamError),
 }
 
 impl From<StreamError> for ToyError {
-    fn from(_: StreamError) -> Self {
-        ToyError::Stream
+    fn from(e: StreamError) -> Self {
+        ToyError::Stream(e)
     }
 }
 
@@ -50,11 +50,13 @@ impl From<StreamError> for ToyError {
 struct Toy {
     item: u32,
     nothing_to_do: bool,
+    panics: bool,
     into: Arc<Mutex<Vec<u8>>>,
 }
 
 struct Receiving {
     expected: u64,
+    panics: bool,
     into: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -72,6 +74,7 @@ impl Download for Toy {
         match reply {
             Reply::Sending(expected) => Ok(Receiving {
                 expected,
+                panics: self.panics,
                 into: self.into,
             }),
             Reply::Missing => Err(ToyError::Missing),
@@ -80,6 +83,7 @@ impl Download for Toy {
     }
 
     fn on_chunk(receiving: &mut Receiving, chunk: &[u8]) -> Result<(), ToyError> {
+        assert!(!receiving.panics, "told to panic");
         receiving.into.lock().unwrap().extend_from_slice(chunk);
         Ok(())
     }
@@ -232,6 +236,7 @@ fn toy(item: u32) -> (Toy, Arc<Mutex<Vec<u8>>>) {
         Toy {
             item,
             nothing_to_do: false,
+            panics: false,
             into: into.clone(),
         },
         into,
@@ -332,5 +337,24 @@ async fn a_declined_stream_fails_the_fetch_as_retryable() {
     let (_, result, saw_stream) = finish(&mut server, &mut client, true).await;
 
     assert!(saw_stream);
-    assert!(matches!(result, Err(ToyError::Stream)), "got {result:?}");
+    assert!(matches!(result, Err(ToyError::Stream(_))), "got {result:?}");
+}
+
+#[tokio::test]
+async fn a_download_that_panics_fails_and_frees_its_slot() {
+    let (mut server, mut client, peer) = pair(spec(8, 64), spec(1, 64)).await;
+    let (mut download, _) = toy(1);
+    download.panics = true;
+
+    client.fetch(peer, download).unwrap();
+    let (_, result, _) = finish(&mut server, &mut client, false).await;
+
+    assert!(
+        matches!(result, Err(ToyError::Stream(StreamError::Panicked))),
+        "got {result:?}"
+    );
+    assert!(
+        client.fetch(peer, toy(1).0).is_some(),
+        "its one slot is free again"
+    );
 }

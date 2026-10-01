@@ -6,10 +6,11 @@
 use std::fmt::Display;
 use std::future::poll_fn;
 use std::io::Read;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::task::Poll;
 
-use libp2p::futures::{AsyncWriteExt, StreamExt};
+use libp2p::futures::{AsyncWriteExt, FutureExt, StreamExt};
 use libp2p::{PeerId, Stream, StreamProtocol};
 use libp2p_stream::{AlreadyRegistered, Control, IncomingStreams};
 use serde::Serialize;
@@ -156,7 +157,14 @@ impl<D: Download, S: Serve> Transfers<D, S> {
         let down = self.down.clone();
         let outcomes = self.outcomes.clone();
         tokio::spawn(async move {
-            let result = download_from(control, protocol, limit, peer, download, &down).await;
+            let download = download_from(control, protocol, limit, peer, download, &down);
+            let result = AssertUnwindSafe(download)
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::error!(%peer, "a download panicked");
+                    Err(StreamError::Panicked.into())
+                });
             // Freed before the outcome goes out, so the next fetch can start on it.
             drop(slot);
             let _ = outcomes.send((id, peer, result));
