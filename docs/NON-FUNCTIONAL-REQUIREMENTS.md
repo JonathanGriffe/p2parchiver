@@ -16,6 +16,12 @@ The properties the peer-to-peer system must keep in order to work. A change that
 - P3. The server doesn't learn about groups and files.
 - P4. A peer that isn't enrolled doesn't learn anything about other peers.
 
+## Local security
+
+- S1. Nothing from a peer is written outside its group's directory. Paths and group names that come from peers are checked before anything touches the disk. (`ac-files`)
+- S2. Import sources are only read, with the narrowest access each one offers. (`ac-import`)
+- S3. Secrets never appear in logs, status tables or error messages. The invite token is shown once, to the operator who created it. (`ac-net`, `ac-import`, `ac-server`)
+
 ## Convergence
 
 - C1. Members converge on connection. Any two members who connect end up with the same chain, the same standings and the same catalogue for every group they share, and the same files.
