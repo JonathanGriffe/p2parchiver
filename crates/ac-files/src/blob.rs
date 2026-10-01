@@ -517,11 +517,12 @@ mod tests {
             })
             .unwrap();
         Fetch::on_chunk(&mut receiving, &bytes[..1000]).unwrap();
-        let failed = Fetch::on_end(receiving, Err(TransferError::TimedOut.into())).unwrap_err();
+        let stalled = TransferError::TimedOut(crate::wire::BLOB_STALL_TIMEOUT);
+        let failed = Fetch::on_end(receiving, Err(stalled.into())).unwrap_err();
 
         assert!(matches!(
             failed,
-            FetchError::Transfer(TransferError::TimedOut)
+            FetchError::Transfer(TransferError::TimedOut(_))
         ));
         assert!(!failed.is_terminal());
         assert_eq!(node.staged(), 1000);

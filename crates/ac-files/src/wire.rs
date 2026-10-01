@@ -19,12 +19,19 @@ pub const MAX_DOWNLOADS: usize = 8;
 /// Uploads this node serves at once, across every peer. Past it, a request is refused.
 pub const MAX_UPLOADS: usize = 64;
 
-/// How long a blob stream may take to open, and each request or reply frame to go through.
+/// How long a requester may take to open a blob stream and get its reply, and a server to
+/// read the request or write its reply.
 pub const BLOB_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a blob stream's bytes may go without moving. Above the longest a peer's
 /// bandwidth limit typically holds one chunk back when it is shared by every upload.
 pub const BLOB_STALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+const _: () = assert!(
+    BLOB_STALL_TIMEOUT.as_secs()
+        > (MAX_UPLOADS * ac_net::stream::CHUNK) as u64 / ac_net::config::MIN_BANDWIDTH,
+    "a peer at its bandwidth floor, serving every upload, would stall each one"
+);
 
 pub const MAX_HEADS_PER_ANSWER: usize = 128;
 pub const MAX_ENTRIES_PER_RESPONSE: usize = 2048;

@@ -69,7 +69,8 @@ pub struct TransferSpec {
     pub max_header: usize,
     pub max_downloads: usize,
     pub max_uploads: usize,
-    /// How long opening a stream, each request or reply frame, and closing it may take.
+    /// How long the requester may take to open a stream and get its reply, and the server to
+    /// read the request, write its reply, or close the stream.
     pub header_timeout: Duration,
     /// How long the bytes may go without moving, throttle waits aside.
     pub stall_timeout: Duration,
@@ -210,8 +211,9 @@ impl<D: Download, S: Serve> Transfers<D, S> {
             tracing::warn!(%peer, limit = spec.max_uploads, "already serving all we can; refusing");
             let busy = self.server.busy();
             tokio::spawn(async move {
-                let _ = write_frame(&mut stream, &busy, spec.max_header, spec.header_timeout).await;
-                let _ = close(&mut stream, spec.header_timeout).await;
+                let header = spec.header_timeout;
+                let _ = within(header, write_frame(&mut stream, &busy, spec.max_header)).await;
+                let _ = within(header, stream.close()).await;
             });
             return;
         };
@@ -239,17 +241,13 @@ async fn download_from<D: Download>(
         return Ok(());
     };
 
-    let (limit, header) = (spec.max_header, spec.header_timeout);
-    let mut stream = within(header, async {
-        control
-            .open_stream(peer, protocol)
-            .await
-            .map_err(TransferError::Open)
+    let (mut stream, reply) = within(spec.header_timeout, async {
+        let mut stream = control.open_stream(peer, protocol).await?;
+        write_frame(&mut stream, &request, spec.max_header).await?;
+        let reply = read_frame(&mut stream, spec.max_header).await?;
+        Ok::<_, TransferError>((stream, reply))
     })
     .await?;
-    write_frame(&mut stream, &request, limit, header).await?;
-
-    let reply = read_frame(&mut stream, limit, header).await?;
     let mut receiving = download.on_reply(reply)?;
     let ended = receive(&mut stream, down, spec.stall_timeout, |chunk| {
         D::on_chunk(&mut receiving, chunk)
@@ -265,22 +263,14 @@ async fn upload_to<S: Serve>(
     spec: TransferSpec,
     up: &Throttle,
 ) -> Result<(), S::Error> {
-    let (limit, header) = (spec.max_header, spec.header_timeout);
-    let request = read_frame(stream, limit, header).await?;
+    let header = spec.header_timeout;
+    let request = within(header, read_frame(stream, spec.max_header)).await?;
     let (reply, source) = server.answer(peer, request)?;
 
-    write_frame(stream, &reply, limit, header).await?;
+    within(header, write_frame(stream, &reply, spec.max_header)).await?;
     if let Some(source) = source {
         send(stream, source, up, spec.stall_timeout).await?;
     }
-    close(stream, header).await?;
+    within(header, stream.close()).await?;
     Ok(())
-}
-
-/// Close our side of the stream within `timeout`.
-async fn close(stream: &mut Stream, timeout: Duration) -> Result<(), TransferError> {
-    within(timeout, async {
-        stream.close().await.map_err(TransferError::Io)
-    })
-    .await
 }

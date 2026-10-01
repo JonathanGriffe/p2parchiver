@@ -16,7 +16,7 @@ pub const CHUNK: usize = 64 * 1024;
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
     #[error("could not open the stream: {0}")]
-    Open(OpenStreamError),
+    Open(#[from] OpenStreamError),
     #[error("a {len} byte frame exceeds the {limit} byte limit")]
     TooLarge { len: usize, limit: usize },
     #[error("could not encode a frame: {0}")]
@@ -26,31 +26,26 @@ pub enum TransferError {
     #[error("could not read the bytes to send: {0}")]
     Source(io::Error),
     #[error(transparent)]
-    Io(io::Error),
+    Io(#[from] io::Error),
     #[error("the transfer panicked")]
     Panicked,
-    #[error("the peer went quiet past the deadline")]
-    TimedOut,
+    #[error("timed out after {0:?}")]
+    TimedOut(Duration),
 }
 
 /// Run `io`, failing with [`TransferError::TimedOut`] if it has not finished within `limit`.
-pub(crate) async fn within<T>(
+pub(crate) async fn within<T, E: Into<TransferError>>(
     limit: Duration,
-    io: impl Future<Output = Result<T, TransferError>>,
+    io: impl Future<Output = Result<T, E>>,
 ) -> Result<T, TransferError> {
     tokio::time::timeout(limit, io)
         .await
-        .map_err(|_| TransferError::TimedOut)?
+        .map_err(|_| TransferError::TimedOut(limit))?
+        .map_err(Into::into)
 }
 
-/// Write `value` as a 4-byte big-endian length followed by its CBOR encoding, within
-/// `timeout`.
-pub async fn write_frame<W, T>(
-    stream: &mut W,
-    value: &T,
-    limit: usize,
-    timeout: Duration,
-) -> Result<(), TransferError>
+/// Write `value` as a 4-byte big-endian length followed by its CBOR encoding.
+pub async fn write_frame<W, T>(stream: &mut W, value: &T, limit: usize) -> Result<(), TransferError>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
@@ -68,46 +63,27 @@ where
         len: body.len(),
         limit,
     })?;
-    within(timeout, async {
-        stream
-            .write_all(&len.to_be_bytes())
-            .await
-            .map_err(TransferError::Io)?;
-        stream.write_all(&body).await.map_err(TransferError::Io)
-    })
-    .await
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(&body).await?;
+    Ok(())
 }
 
-/// Read one frame within `timeout`, refusing a length over `limit` before reading the body.
-pub async fn read_frame<R, T>(
-    stream: &mut R,
-    limit: usize,
-    timeout: Duration,
-) -> Result<T, TransferError>
+/// Read one frame, refusing a length over `limit` before reading the body.
+pub async fn read_frame<R, T>(stream: &mut R, limit: usize) -> Result<T, TransferError>
 where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
-    let body = within(timeout, async {
-        let mut len = [0u8; 4];
-        stream
-            .read_exact(&mut len)
-            .await
-            .map_err(TransferError::Io)?;
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).await?;
 
-        let len = u32::from_be_bytes(len) as usize;
-        if len > limit {
-            return Err(TransferError::TooLarge { len, limit });
-        }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > limit {
+        return Err(TransferError::TooLarge { len, limit });
+    }
 
-        let mut body = vec![0u8; len];
-        stream
-            .read_exact(&mut body)
-            .await
-            .map_err(TransferError::Io)?;
-        Ok(body)
-    })
-    .await?;
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).await?;
     ciborium::from_reader(&body[..]).map_err(|e| TransferError::Decode(e.to_string()))
 }
 
@@ -128,10 +104,7 @@ pub async fn send<W: AsyncWrite + Unpin>(
         throttle.consume(n).await;
         let mut left = &buf[..n];
         while !left.is_empty() {
-            let written = within(stall, async {
-                stream.write(left).await.map_err(TransferError::Io)
-            })
-            .await?;
+            let written = within(stall, stream.write(left)).await?;
             if written == 0 {
                 return Err(TransferError::Io(io::ErrorKind::WriteZero.into()));
             }
@@ -155,10 +128,7 @@ where
 {
     let mut buf = vec![0u8; CHUNK];
     loop {
-        let n = within(stall, async {
-            stream.read(&mut buf).await.map_err(TransferError::Io)
-        })
-        .await?;
+        let n = within(stall, stream.read(&mut buf)).await?;
         if n == 0 {
             return Ok(());
         }
@@ -194,12 +164,10 @@ mod tests {
     #[tokio::test]
     async fn a_frame_round_trips() {
         let mut wire = Cursor::new(Vec::new());
-        write_frame(&mut wire, &header(), 4096, DEADLINE)
-            .await
-            .unwrap();
+        write_frame(&mut wire, &header(), 4096).await.unwrap();
 
         wire.set_position(0);
-        let back: Header = read_frame(&mut wire, 4096, DEADLINE).await.unwrap();
+        let back: Header = read_frame(&mut wire, 4096).await.unwrap();
         assert_eq!(back, header());
     }
 
@@ -208,7 +176,7 @@ mod tests {
         // A length that claims far more than the limit, and no body at all: reading one would
         // fail on the missing bytes rather than on the length.
         let mut wire = Cursor::new(u32::MAX.to_be_bytes().to_vec());
-        let refused = read_frame::<_, Header>(&mut wire, 4096, DEADLINE).await;
+        let refused = read_frame::<_, Header>(&mut wire, 4096).await;
 
         assert!(matches!(
             refused,
@@ -220,7 +188,7 @@ mod tests {
     #[tokio::test]
     async fn an_over_limit_value_is_not_written() {
         let mut wire = Cursor::new(Vec::new());
-        let refused = write_frame(&mut wire, &header(), 8, DEADLINE).await;
+        let refused = write_frame(&mut wire, &header(), 8).await;
 
         assert!(matches!(
             refused,
@@ -306,10 +274,6 @@ mod tests {
                 pace: None,
                 sleep: None,
             }
-        }
-
-        fn silent() -> Self {
-            Self::new(Vec::new(), false, 0)
         }
 
         fn paced(mut self, per_op: usize, pace: Duration) -> Self {
@@ -401,28 +365,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reading_a_frame_times_out_on_a_peer_that_never_sends() {
-        let start = Instant::now();
-        let read = read_frame::<_, Header>(&mut Peer::silent(), 4096, DEADLINE).await;
-
-        assert!(matches!(read, Err(TransferError::TimedOut)), "got {read:?}");
-        assert_eq!(start.elapsed(), DEADLINE);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn writing_a_frame_times_out_on_a_peer_that_never_reads() {
-        let written = write_frame(&mut Peer::silent(), &header(), 4096, DEADLINE).await;
-
-        assert!(matches!(written, Err(TransferError::TimedOut)));
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn receiving_times_out_on_a_peer_that_stops_sending_partway() {
         let mut peer = Peer::new(vec![7u8; 100_000], false, 0);
         let (ended, got) = receive_all(&mut peer, &Throttle::none()).await;
 
         assert!(
-            matches!(ended, Err(TransferError::TimedOut)),
+            matches!(ended, Err(TransferError::TimedOut(_))),
             "got {ended:?}"
         );
         assert_eq!(got.len(), 100_000, "what came before the stall was kept");
@@ -434,7 +382,10 @@ mod tests {
         let bytes = vec![7u8; 3 * CHUNK];
         let sent = send(&mut peer, &bytes[..], &Throttle::none(), DEADLINE).await;
 
-        assert!(matches!(sent, Err(TransferError::TimedOut)), "got {sent:?}");
+        assert!(
+            matches!(sent, Err(TransferError::TimedOut(_))),
+            "got {sent:?}"
+        );
         assert_eq!(peer.written, 100_000);
     }
 
