@@ -15,6 +15,7 @@ pub mod limits;
 pub mod link;
 pub mod proto;
 pub mod swarm;
+pub mod throttle;
 
 pub use libp2p::multiaddr::Protocol;
 pub use libp2p::{Multiaddr, PeerId};

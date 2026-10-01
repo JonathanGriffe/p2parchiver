@@ -14,7 +14,7 @@ use ac_peers::sync::{Limits, Space};
 
 use crate::ops::import::{self, Brought, Outcome, Pace, Scanned, UNSORTED};
 use crate::ops::now;
-use crate::throttle::Throttle;
+use ac_net::throttle::Throttle;
 
 /// Downloads in flight, matching what the rest of this node already allows itself.
 const FETCH_CONCURRENCY: usize = 8;

@@ -12,7 +12,7 @@ use ac_groups::store::Groups;
 use ac_peers::sync::PeerEvent;
 use tokio::sync::Semaphore;
 
-use crate::throttle::Throttle;
+use ac_net::throttle::Throttle;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{PeerId, StreamProtocol};
 use std::io::Read as _;
@@ -27,10 +27,6 @@ const MAX_CONCURRENT: usize = 8;
 
 /// Transfers this node will serve at once, across every peer.
 pub const MAX_SERVING: usize = 64;
-
-/// Burst for the transfer rate limits: a second of allowance, floored so a whole chunk is
-/// always spendable.
-pub const THROTTLE_BURST: u64 = (2 * CHUNK) as u64;
 
 pub struct Wanted {
     pub peer: PeerId,

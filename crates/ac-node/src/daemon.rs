@@ -6,12 +6,10 @@ use libp2p::futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, rendezvous, request_response, upnp};
 
-use crate::blob;
 use crate::file_link::FileLink;
 use crate::group_link::GroupLink;
 use crate::import_link::ImportLink;
 use crate::peer_link::PeerLink;
-use crate::throttle::Throttle;
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_groups::wire::{GroupRequest, GroupResponse};
 use ac_net::admission_link::AdmissionLink;
@@ -23,6 +21,7 @@ use ac_net::connectivity::Connectivity;
 use ac_net::identity::Identity;
 use ac_net::link::{HOUSEKEEPING_TICK, ServerLink};
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
+use ac_net::throttle::{THROTTLE_BURST, Throttle};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -121,10 +120,7 @@ pub async fn run(
 
     // Only the download throttle is created here as only download is done in two places
     // Upload is only done in peer link
-    let down = Arc::new(Throttle::from_config(
-        config.bandwidth_max,
-        blob::THROTTLE_BURST,
-    ));
+    let down = Arc::new(Throttle::from_config(config.bandwidth_max, THROTTLE_BURST));
 
     let mut peers = PeerLink::open(
         paths,

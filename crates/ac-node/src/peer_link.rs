@@ -21,7 +21,7 @@ use crate::daemon::ClientSwarm;
 use crate::file_link::{FileLink, RoundOutcome};
 use crate::group_link::GroupLink;
 use crate::status::{Bandwidth, Published};
-use crate::throttle::Throttle;
+use ac_net::throttle::Throttle;
 
 /// Candidate direct addresses kept per peer
 const MAX_DIRECT_ADDRS: usize = 8;
@@ -654,7 +654,10 @@ mod tests {
                     &identity,
                     None,
                     AT,
-                    Arc::new(Throttle::from_config(None, blob::THROTTLE_BURST)),
+                    Arc::new(Throttle::from_config(
+                        None,
+                        ac_net::throttle::THROTTLE_BURST,
+                    )),
                 )
                 .unwrap(),
                 blobs,

@@ -10,7 +10,7 @@ Paths below are relative to `crates/ac-node/`.
 - **Daemon**: the event loop that drives the swarm and every layer in `src/daemon.rs`.
 - **Links**: connect each layer's state machine to the swarm: chains in `src/group_link.rs`, catalogues and inbound file transfers in `src/file_link.rs`, the supervisor in `src/peer_link.rs`, and imports in `src/import_link.rs`.
 - **File transfers**: the `/ac/blob/1.0.0` protocol in `src/blob.rs`.
-- **Bandwidth**: the rate limiter in `src/throttle.rs`.
+- **Bandwidth**: the shared download and upload limits, built on `ac-net`'s rate limiter.
 - **Operations**: the actions the CLI and the desktop app share in `src/ops/`: joining a server, groups, files, contacts and status, imports, and the node lock.
 - **Contacts**: peers named by hand in `src/contacts.rs`, merged with fellow group members into one list of names in `src/directory.rs`.
 - **Status**: the supervisor's snapshot, published for the CLI and the desktop app, in `src/status.rs`.

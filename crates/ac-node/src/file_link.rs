@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 
 use crate::blob;
 use crate::daemon::ClientSwarm;
-use crate::throttle::Throttle;
+use ac_net::throttle::{THROTTLE_BURST, Throttle};
 
 /// What we asked a peer, kept so a bare reply can be matched back to it.
 enum Outbound {
@@ -105,10 +105,7 @@ impl FileLink {
             outbound: HashMap::new(),
             rounds: Vec::new(),
             db: path,
-            up: Arc::new(Throttle::from_config(
-                config.bandwidth_max,
-                blob::THROTTLE_BURST,
-            )),
+            up: Arc::new(Throttle::from_config(config.bandwidth_max, THROTTLE_BURST)),
             serving: Arc::new(Semaphore::new(blob::MAX_SERVING)),
         })
     }

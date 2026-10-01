@@ -15,6 +15,7 @@ Paths below are relative to `crates/ac-net/`.
 - **Authorizing connections**: implements policies for the server and node to accept or reject connections in `src/authz.rs`
 - **Limits and Budget**: setting network limits in `src/limits.rs` and a budget of requests to answer in `src/budgets.rs`
 - **Swarm**: building the swarm for each role (node, server and enrollment server) in `src/swarm.rs`.
+- **Bandwidth**: the rate limiter the layers above share to cap the bytes they move, in `src/throttle.rs`.
 
 ## Design
 
