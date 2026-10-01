@@ -90,10 +90,7 @@ pub enum TransferEvent<E> {
         peer: PeerId,
         result: Result<(), E>,
     },
-    Inbound {
-        peer: PeerId,
-        inbound: Inbound,
-    },
+    Inbound(Inbound),
 }
 
 type Outcome<E> = (TransferId, PeerId, Result<(), E>);
@@ -178,13 +175,10 @@ impl<D: Download, S: Serve> Transfers<D, S> {
             if let Some(incoming) = &mut self.incoming {
                 match incoming.poll_next_unpin(cx) {
                     Poll::Ready(Some((peer, stream))) => {
-                        return Poll::Ready(TransferEvent::Inbound {
+                        return Poll::Ready(TransferEvent::Inbound(Inbound {
                             peer,
-                            inbound: Inbound {
-                                peer,
-                                stream: Box::new(stream),
-                            },
-                        });
+                            stream: Box::new(stream),
+                        }));
                     }
                     Poll::Ready(None) => self.incoming = None,
                     Poll::Pending => {}

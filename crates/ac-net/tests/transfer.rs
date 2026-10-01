@@ -250,7 +250,7 @@ async fn finish(
         loop {
             tokio::select! {
                 event = server.next() => {
-                    if let TransferEvent::Inbound { inbound, .. } = event {
+                    if let TransferEvent::Inbound(inbound) = event {
                         saw_stream = true;
                         if !decline {
                             server.serve(inbound);

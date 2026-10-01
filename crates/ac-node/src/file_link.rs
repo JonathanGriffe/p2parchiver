@@ -218,7 +218,8 @@ impl FileLink {
         admitted_peers: &AdmittedPeers,
     ) {
         match event {
-            TransferEvent::Inbound { peer, inbound } => {
+            TransferEvent::Inbound(inbound) => {
+                let peer = inbound.peer();
                 if admitted_peers.is_ready(&peer) {
                     self.transfers.serve(inbound);
                 } else {
