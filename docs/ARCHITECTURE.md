@@ -67,7 +67,7 @@ ac-desktop ─► ac-node ─┬─► ac-supervisor ─► ac-files ─► ac-g
 - `ac-server` is the crate implementing the server for this network. As it only participates in the network layer, it only depends on the `ac-net` crate.
 - `ac-groups` adds the group layer, which allows creating groups, inviting and removing users from them. This is the first of the three middle layers, which are separate from the network layer, and therefore depend only on the lower layers and not libp2p.
 - `ac-files` adds file sharing through groups, as well as the per-group file catalogue and syncing method.
-- `ac-supervisor` is the supervisor, which decides what actions to take, such as dialing, what files to fetch and when to hang up.
+- `ac-supervisor` decides what actions to take, such as dialing, what files to fetch and when to hang up.
 - `ac-import` is the crate for importing files from sources. It is not part of the peer to peer network, instead it allows connecting sources such as a google drive and pulling media from them automatically, so that they might be shared in the p2p network later. As such, it depends on nothing in the workspace.
 - `ac-node` runs the client's daemon and includes the node CLI, and therefore depends on all lower layers and ac-import, as well as libp2p.
 - `ac-desktop` is the desktop app, and uses `ac-node` to run the daemon and connect to the p2p network.

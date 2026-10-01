@@ -10,7 +10,6 @@ ac-net.workspace = true
 ac-groups.workspace = true
 ac-files.workspace = true
 serde.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

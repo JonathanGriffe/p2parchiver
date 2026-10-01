@@ -4,5 +4,5 @@ pub mod missing;
 pub mod sync;
 pub mod wire;
 
-pub use missing::{SupervisorError, next_missing};
+pub use missing::next_missing;
 pub use sync::{GroupStatus, NoRoom, PeerAction, PeerEvent, PeerStatus, Status, Supervisor};

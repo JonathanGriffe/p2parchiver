@@ -553,12 +553,6 @@ impl SupervisorLink {
                 .with(Protocol::P2p(*peer)),
         )
     }
-
-    /// The supervisor's own view, for `ac peer status` and for tests.
-    #[cfg(test)]
-    pub(crate) fn supervisor(&self) -> &Supervisor {
-        &self.supervisor
-    }
 }
 
 #[cfg(test)]
@@ -839,7 +833,7 @@ mod tests {
             }
         }
         let dump = |n: &mut Node| {
-            let status = n.supervisor.supervisor().status();
+            let status = n.supervisor.supervisor.status();
             format!(
                 "at={} connected={} groups={:?} peers={:?}",
                 n.at,
@@ -1163,7 +1157,7 @@ mod tests {
         .await;
 
         assert!(
-            alice.supervisor.supervisor().drained(bob_peer),
+            alice.supervisor.supervisor.drained(bob_peer),
             "alice hung up because she was drained, not because something went wrong"
         );
     }

@@ -1860,8 +1860,9 @@ fn cramped(storage_max: Option<u64>, free: u64, held: u64) -> (Node, GroupId) {
     (node, id)
 }
 
-fn source_of(node: &Supervisor, group: GroupId) -> Option<PeerId> {
-    node.status()
+fn source_of(node: &Node, group: GroupId) -> Option<PeerId> {
+    node.supervisor
+        .status()
         .groups
         .into_iter()
         .find(|g| g.group == group)
@@ -1888,7 +1889,7 @@ fn a_source_the_budget_shut_out_is_let_go_when_the_last_transfer_ends() {
     let running = fetched_paths(&step(&mut node, AT, true));
     assert_eq!(running.len(), 1, "the budget has room for exactly one");
     assert_eq!(
-        source_of(&node.supervisor, id),
+        source_of(&node, id),
         Some(members[0]),
         "and the group is pulling through the peer that offered them"
     );
@@ -1900,7 +1901,7 @@ fn a_source_the_budget_shut_out_is_let_go_when_the_last_transfer_ends() {
     });
 
     assert_eq!(
-        source_of(&node.supervisor, id),
+        source_of(&node, id),
         None,
         "the rest cannot start and nothing is running, so the peer is let go at once"
     );
