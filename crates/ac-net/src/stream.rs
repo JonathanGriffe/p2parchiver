@@ -13,7 +13,7 @@ use crate::throttle::Throttle;
 pub const CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
-pub enum StreamError {
+pub enum TransferError {
     #[error("could not open the stream: {0}")]
     Open(OpenStreamError),
     #[error("a {len} byte frame exceeds the {limit} byte limit")]
@@ -31,51 +31,54 @@ pub enum StreamError {
 }
 
 /// Write `value` as a 4-byte big-endian length followed by its CBOR encoding.
-pub async fn write_frame<W, T>(stream: &mut W, value: &T, limit: usize) -> Result<(), StreamError>
+pub async fn write_frame<W, T>(stream: &mut W, value: &T, limit: usize) -> Result<(), TransferError>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
     let mut body = Vec::new();
-    ciborium::into_writer(value, &mut body).map_err(|e| StreamError::Encode(e.to_string()))?;
+    ciborium::into_writer(value, &mut body).map_err(|e| TransferError::Encode(e.to_string()))?;
     if body.len() > limit {
-        return Err(StreamError::TooLarge {
+        return Err(TransferError::TooLarge {
             len: body.len(),
             limit,
         });
     }
 
-    let len = u32::try_from(body.len()).map_err(|_| StreamError::TooLarge {
+    let len = u32::try_from(body.len()).map_err(|_| TransferError::TooLarge {
         len: body.len(),
         limit,
     })?;
     stream
         .write_all(&len.to_be_bytes())
         .await
-        .map_err(StreamError::Io)?;
-    stream.write_all(&body).await.map_err(StreamError::Io)
+        .map_err(TransferError::Io)?;
+    stream.write_all(&body).await.map_err(TransferError::Io)
 }
 
 /// Read one frame, refusing a length over `limit` before reading the body.
-pub async fn read_frame<R, T>(stream: &mut R, limit: usize) -> Result<T, StreamError>
+pub async fn read_frame<R, T>(stream: &mut R, limit: usize) -> Result<T, TransferError>
 where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
     let mut len = [0u8; 4];
-    stream.read_exact(&mut len).await.map_err(StreamError::Io)?;
+    stream
+        .read_exact(&mut len)
+        .await
+        .map_err(TransferError::Io)?;
 
     let len = u32::from_be_bytes(len) as usize;
     if len > limit {
-        return Err(StreamError::TooLarge { len, limit });
+        return Err(TransferError::TooLarge { len, limit });
     }
 
     let mut body = vec![0u8; len];
     stream
         .read_exact(&mut body)
         .await
-        .map_err(StreamError::Io)?;
-    ciborium::from_reader(&body[..]).map_err(|e| StreamError::Decode(e.to_string()))
+        .map_err(TransferError::Io)?;
+    ciborium::from_reader(&body[..]).map_err(|e| TransferError::Decode(e.to_string()))
 }
 
 /// Copy `source` to the stream a chunk at a time, waiting on the throttle before each chunk.
@@ -83,15 +86,18 @@ pub async fn send<W: AsyncWrite + Unpin>(
     stream: &mut W,
     mut source: impl Read,
     throttle: &Throttle,
-) -> Result<(), StreamError> {
+) -> Result<(), TransferError> {
     let mut buf = vec![0u8; CHUNK];
     loop {
-        let n = source.read(&mut buf).map_err(StreamError::Source)?;
+        let n = source.read(&mut buf).map_err(TransferError::Source)?;
         if n == 0 {
             return Ok(());
         }
         throttle.consume(n).await;
-        stream.write_all(&buf[..n]).await.map_err(StreamError::Io)?;
+        stream
+            .write_all(&buf[..n])
+            .await
+            .map_err(TransferError::Io)?;
     }
 }
 
@@ -104,14 +110,14 @@ pub async fn receive<R, E>(
 ) -> Result<(), E>
 where
     R: AsyncRead + Unpin,
-    E: From<StreamError>,
+    E: From<TransferError>,
 {
     let mut buf = vec![0u8; CHUNK];
     loop {
         let n = stream
             .read(&mut buf)
             .await
-            .map_err(|e| E::from(StreamError::Io(e)))?;
+            .map_err(|e| E::from(TransferError::Io(e)))?;
         if n == 0 {
             return Ok(());
         }
@@ -157,7 +163,7 @@ mod tests {
 
         assert!(matches!(
             refused,
-            Err(StreamError::TooLarge { limit: 4096, .. })
+            Err(TransferError::TooLarge { limit: 4096, .. })
         ));
         assert_eq!(wire.position(), 4, "only the length was read");
     }
@@ -169,7 +175,7 @@ mod tests {
 
         assert!(matches!(
             refused,
-            Err(StreamError::TooLarge { limit: 8, .. })
+            Err(TransferError::TooLarge { limit: 8, .. })
         ));
         assert!(wire.get_ref().is_empty(), "nothing went out");
     }
@@ -184,7 +190,7 @@ mod tests {
 
         wire.set_position(0);
         let mut got = Vec::new();
-        receive::<_, StreamError>(&mut wire, &down, |chunk| {
+        receive::<_, TransferError>(&mut wire, &down, |chunk| {
             got.extend_from_slice(chunk);
             Ok(())
         })
@@ -203,8 +209,8 @@ mod tests {
             Enough,
             Stream,
         }
-        impl From<StreamError> for Refused {
-            fn from(_: StreamError) -> Self {
+        impl From<TransferError> for Refused {
+            fn from(_: TransferError) -> Self {
                 Refused::Stream
             }
         }

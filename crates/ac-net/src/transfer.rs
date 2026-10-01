@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Semaphore, mpsc};
 
-use crate::stream::{StreamError, read_frame, receive, send, write_frame};
+use crate::stream::{TransferError, read_frame, receive, send, write_frame};
 use crate::throttle::Throttle;
 
 /// The behaviour to mount on the swarm for [`Transfers`], and the handle to it a service is
@@ -29,7 +29,7 @@ pub trait Download: Send + 'static {
     type Request: Serialize + Send + Sync;
     type Reply: DeserializeOwned + Send;
     type Receiving: Send;
-    type Error: From<StreamError> + Send;
+    type Error: From<TransferError> + Send;
 
     /// The request to send, or `None` if there turned out to be nothing to fetch.
     fn start(&mut self) -> Result<Option<Self::Request>, Self::Error>;
@@ -52,7 +52,7 @@ pub trait Serve: Send + Sync + 'static {
     type Request: DeserializeOwned + Send;
     type Reply: Serialize + Send + Sync;
     type Source: Read + Send;
-    type Error: From<StreamError> + Display + Send;
+    type Error: From<TransferError> + Display + Send;
 
     /// The reply to `peer`, and the bytes to send after it, if any.
     fn answer(&self, peer: PeerId, request: Self::Request) -> Result<Answered<Self>, Self::Error>;
@@ -164,7 +164,7 @@ impl<D: Download, S: Serve> Transfers<D, S> {
                 .await
                 .unwrap_or_else(|_| {
                     tracing::error!(%peer, "a download panicked");
-                    Err(StreamError::Panicked.into())
+                    Err(TransferError::Panicked.into())
                 });
             // Freed before the outcome goes out, so the next fetch can start on it.
             drop(slot);
@@ -237,7 +237,7 @@ async fn download_from<D: Download>(
     let mut stream = control
         .open_stream(peer, protocol)
         .await
-        .map_err(StreamError::Open)?;
+        .map_err(TransferError::Open)?;
     write_frame(&mut stream, &request, limit).await?;
 
     let reply = read_frame(&mut stream, limit).await?;
@@ -263,6 +263,6 @@ async fn upload_to<S: Serve>(
     if let Some(source) = source {
         send(stream, source, up).await?;
     }
-    stream.close().await.map_err(StreamError::Io)?;
+    stream.close().await.map_err(TransferError::Io)?;
     Ok(())
 }

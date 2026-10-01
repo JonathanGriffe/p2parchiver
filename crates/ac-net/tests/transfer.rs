@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use ac_net::authz::AcceptAnyPeer;
 use ac_net::config::Config;
 use ac_net::identity::Identity;
-use ac_net::stream::StreamError;
+use ac_net::stream::TransferError;
 use ac_net::swarm::{AcBehaviour, Role, build};
 use ac_net::throttle::Throttle;
 use ac_net::transfer::{
@@ -37,12 +37,12 @@ enum ToyError {
     Busy,
     Short,
     /// The only retryable one.
-    Stream(StreamError),
+    Transfer(TransferError),
 }
 
-impl From<StreamError> for ToyError {
-    fn from(e: StreamError) -> Self {
-        ToyError::Stream(e)
+impl From<TransferError> for ToyError {
+    fn from(e: TransferError) -> Self {
+        ToyError::Transfer(e)
     }
 }
 
@@ -102,9 +102,9 @@ impl Serve for Library {
     type Request = u32;
     type Reply = Reply;
     type Source = Cursor<Vec<u8>>;
-    type Error = StreamError;
+    type Error = TransferError;
 
-    fn answer(&self, _: PeerId, item: u32) -> Result<Answered<Self>, StreamError> {
+    fn answer(&self, _: PeerId, item: u32) -> Result<Answered<Self>, TransferError> {
         Ok(match self.0.get(&item) {
             Some(bytes) => (
                 Reply::Sending(bytes.len() as u64),
@@ -335,7 +335,10 @@ async fn a_declined_stream_fails_the_fetch_as_retryable() {
     let (_, result, saw_stream) = finish(&mut server, &mut client, true).await;
 
     assert!(saw_stream);
-    assert!(matches!(result, Err(ToyError::Stream(_))), "got {result:?}");
+    assert!(
+        matches!(result, Err(ToyError::Transfer(_))),
+        "got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -348,7 +351,7 @@ async fn a_download_that_panics_fails_and_frees_its_slot() {
     let (_, result, _) = finish(&mut server, &mut client, false).await;
 
     assert!(
-        matches!(result, Err(ToyError::Stream(StreamError::Panicked))),
+        matches!(result, Err(ToyError::Transfer(TransferError::Panicked))),
         "got {result:?}"
     );
     assert!(
