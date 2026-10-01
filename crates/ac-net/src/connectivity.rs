@@ -188,8 +188,8 @@ mod tests {
 
     #[test]
     fn only_a_pending_upgrade_is_unsettled() {
-        // What `Roster::promote` asks. The unknown-peer case is load-bearing: it is why a test
-        // holding an empty `Connectivity` promotes everyone, and why a node that somehow
+        // What `AdmittedPeers::promote` asks. The unknown-peer case is load-bearing: it is why a
+        // test holding an empty `Connectivity` promotes everyone, and why a node that somehow
         // admitted a peer it never saw connect is not held for ever.
         let mut c = Connectivity::default();
         let p = peer();

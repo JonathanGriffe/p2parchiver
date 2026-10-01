@@ -11,7 +11,7 @@ Paths below are relative to `crates/ac-net/`.
 - **Config**: Owns the config in `src/config.rs`.
 - **Enrollment**: It creates the protocol for enrollment in `src/proto.rs` and `src/invite.rs`.
 - **Attestation**: It implements attestation and admission, ie issuing an attestation and handling it in the node in `src/attest.rs`, the protocol to ask the server for one and the protocol for admission in in `src/proto.rs`, and the admission state machine in `src/admission.rs`. It connects the admission to the swarm through the `AdmissionLink` in `src/admission_link.rs`
-- **Handling connections** in `src/roster.rs`, `src/connectivity`, keeps the connection to the server alive and using server services in `src/link.rs`.
+- **Handling connections** in `src/admitted_peers.rs`, `src/connectivity`, keeps the connection to the server alive and using server services in `src/link.rs`.
 - **Authorizing connections**: implements policies for the server and node to accept or reject connections in `src/authz.rs`
 - **Limits and Budget**: setting network limits in `src/limits.rs` and a budget of requests to answer in `src/budgets.rs`
 - **Swarm**: building the swarm for each role (node, server and enrollment server) in `src/swarm.rs`.

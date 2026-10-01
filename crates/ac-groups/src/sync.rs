@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use ac_net::PeerId;
+use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::budget::TickBudget;
 use ac_net::identity::Keypair;
-use ac_net::roster::Roster;
 
 use crate::chain::Op;
 use crate::id::GroupId;
@@ -117,9 +117,9 @@ impl GroupSync {
         &mut self,
         peer: PeerId,
         request: GroupRequest,
-        roster: &Roster,
+        admitted_peers: &AdmittedPeers,
     ) -> (GroupResponse, Vec<GroupAction>) {
-        if !roster.is_admitted(&peer) || !self.budget.spend(peer) {
+        if !admitted_peers.is_admitted(&peer) || !self.budget.spend(peer) {
             return (GroupResponse::Unavailable, Vec::new());
         }
 
@@ -149,10 +149,10 @@ impl GroupSync {
         }
     }
 
-    pub fn on(&mut self, event: GroupEvent, roster: &Roster) -> Vec<GroupAction> {
+    pub fn on(&mut self, event: GroupEvent, admitted_peers: &AdmittedPeers) -> Vec<GroupAction> {
         let mut actions = match event {
             GroupEvent::Heads { peer, heads } => {
-                if !roster.is_ready(&peer) {
+                if !admitted_peers.is_ready(&peer) {
                     return Vec::new();
                 }
                 self.on_heads(peer, heads)
@@ -173,10 +173,10 @@ impl GroupSync {
 
             GroupEvent::AskFailed { .. } => Vec::new(),
 
-            GroupEvent::Tick { now, at } => self.tick(now, at, roster),
+            GroupEvent::Tick { now, at } => self.tick(now, at, admitted_peers),
         };
 
-        self.drain_deferred(&mut actions, roster);
+        self.drain_deferred(&mut actions, admitted_peers);
         actions
     }
 
@@ -355,14 +355,15 @@ impl GroupSync {
         }
     }
 
-    fn tick(&mut self, now: Instant, at: i64, roster: &Roster) -> Vec<GroupAction> {
+    fn tick(&mut self, now: Instant, at: i64, admitted_peers: &AdmittedPeers) -> Vec<GroupAction> {
         self.now_at = at;
         self.budget.reset();
 
         // Abandon episodes that can no longer finish, so the group is free to try again
         self.inflight
-            .retain(|_, f| now < f.deadline && roster.is_ready(&f.peer));
-        self.deferred.retain(|(peer, _)| roster.is_admitted(peer));
+            .retain(|_, f| now < f.deadline && admitted_peers.is_ready(&f.peer));
+        self.deferred
+            .retain(|(peer, _)| admitted_peers.is_admitted(peer));
 
         let actions = Vec::new();
 
@@ -423,13 +424,13 @@ impl GroupSync {
     }
 
     /// Start whatever the freed slots have room for.
-    fn drain_deferred(&mut self, actions: &mut Vec<GroupAction>, roster: &Roster) {
+    fn drain_deferred(&mut self, actions: &mut Vec<GroupAction>, admitted_peers: &AdmittedPeers) {
         while self.inflight.len() < MAX_INFLIGHT {
             let Some((peer, group)) = self.deferred.pop_front() else {
                 return;
             };
 
-            if !roster.is_admitted(&peer) || self.inflight.contains_key(&group) {
+            if !admitted_peers.is_admitted(&peer) || self.inflight.contains_key(&group) {
                 continue;
             }
 
