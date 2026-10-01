@@ -19,8 +19,7 @@ pub const MAX_DOWNLOADS: usize = 8;
 /// Uploads this node serves at once, across every peer. Past it, a request is refused.
 pub const MAX_UPLOADS: usize = 64;
 
-/// How long a requester may take to open a blob stream and get its reply, and a server to
-/// read the request or write its reply.
+/// The blob protocol's [`TransferSpec::header_timeout`](ac_net::transfer::TransferSpec::header_timeout).
 pub const BLOB_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a blob stream's bytes may go without moving. Above the longest a peer's

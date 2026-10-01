@@ -107,7 +107,6 @@ type Outcome<E> = (TransferId, PeerId, Result<(), E>);
 pub struct Transfers<D: Download, S: Serve> {
     control: Control,
     incoming: Option<IncomingStreams>,
-    protocol: StreamProtocol,
     spec: TransferSpec,
     server: Arc<S>,
     down: Arc<Throttle>,
@@ -128,13 +127,11 @@ impl<D: Download, S: Serve> Transfers<D, S> {
         down: Arc<Throttle>,
         up: Arc<Throttle>,
     ) -> Result<Self, AlreadyRegistered> {
-        let protocol = StreamProtocol::new(spec.protocol);
-        let incoming = control.accept(protocol.clone())?;
+        let incoming = control.accept(StreamProtocol::new(spec.protocol))?;
         let (outcomes, finished) = mpsc::unbounded_channel();
         Ok(Self {
             control,
             incoming: Some(incoming),
-            protocol,
             spec,
             server: Arc::new(server),
             down,
@@ -159,12 +156,11 @@ impl<D: Download, S: Serve> Transfers<D, S> {
         self.next_id += 1;
 
         let control = self.control.clone();
-        let protocol = self.protocol.clone();
         let spec = self.spec;
         let down = self.down.clone();
         let outcomes = self.outcomes.clone();
         tokio::spawn(async move {
-            let download = download_from(control, protocol, spec, peer, download, &down);
+            let download = download_from(control, spec, peer, download, &down);
             let result = AssertUnwindSafe(download)
                 .catch_unwind()
                 .await
@@ -231,7 +227,6 @@ impl<D: Download, S: Serve> Transfers<D, S> {
 
 async fn download_from<D: Download>(
     mut control: Control,
-    protocol: StreamProtocol,
     spec: TransferSpec,
     peer: PeerId,
     mut download: D,
@@ -242,6 +237,7 @@ async fn download_from<D: Download>(
     };
 
     let (mut stream, reply) = within(spec.header_timeout, async {
+        let protocol = StreamProtocol::new(spec.protocol);
         let mut stream = control.open_stream(peer, protocol).await?;
         write_frame(&mut stream, &request, spec.max_header).await?;
         let reply = read_frame(&mut stream, spec.max_header).await?;

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use ac_net::authz::AcceptAnyPeer;
 use ac_net::config::Config;
 use ac_net::identity::Identity;
-use ac_net::stream::TransferError;
+use ac_net::stream::{CHUNK, TransferError};
 use ac_net::swarm::{AcBehaviour, Role, build};
 use ac_net::throttle::Throttle;
 use ac_net::transfer::{
@@ -166,13 +166,13 @@ fn loopback_config() -> Config {
     }
 }
 
-fn side(swarm: &TestSwarm, spec: TransferSpec) -> Side {
+fn side(swarm: &TestSwarm, spec: TransferSpec, up: Throttle) -> Side {
     Transfers::new(
         swarm.behaviour().app.new_control(),
         spec,
-        Library(HashMap::from([(1, item())])),
+        Library(HashMap::from([(1, item()), (2, vec![7; 2 * CHUNK])])),
         Arc::new(Throttle::none()),
-        Arc::new(Throttle::none()),
+        Arc::new(up),
     )
     .unwrap()
 }
@@ -180,6 +180,15 @@ fn side(swarm: &TestSwarm, spec: TransferSpec) -> Side {
 /// Two connected swarms, left running in the background, and a service on each: the server
 /// first, then the client, the server's peer id, and a control for raw streams from the client.
 async fn pair(server: TransferSpec, client: TransferSpec) -> (Side, Side, PeerId, Control) {
+    paced_pair(server, Throttle::none(), client).await
+}
+
+/// The same, with the server's uploads held to `up`.
+async fn paced_pair(
+    server: TransferSpec,
+    up: Throttle,
+    client: TransferSpec,
+) -> (Side, Side, PeerId, Control) {
     let (id_a, id_b) = (identity(), identity());
     let peer_a = id_a.peer_id();
     let mut a = build(
@@ -198,7 +207,7 @@ async fn pair(server: TransferSpec, client: TransferSpec) -> (Side, Side, PeerId
         Behaviour::new(),
     )
     .unwrap();
-    let (serving, fetching) = (side(&a, server), side(&b, client));
+    let (serving, fetching) = (side(&a, server, up), side(&b, client, Throttle::none()));
     let raw = b.behaviour().app.new_control();
 
     let addr: Multiaddr = tokio::time::timeout(TIMEOUT, async {
@@ -402,6 +411,27 @@ async fn a_peer_that_never_replies_times_out_the_download() {
         ),
         "got {result:?}"
     );
+}
+
+#[tokio::test]
+async fn bytes_held_back_past_the_header_deadline_still_arrive() {
+    let quick = TransferSpec {
+        header_timeout: SHORT_HEADER,
+        ..spec(8, 64)
+    };
+    // A chunk every 1.5 s, so the bytes outlast the client's header deadline.
+    let paced = Throttle::new(CHUNK as u64 * 2 / 3, CHUNK as u64);
+    let (mut server, mut client, peer, _) = paced_pair(spec(8, 64), paced, quick).await;
+    let (download, into) = toy(2);
+
+    client.fetch(peer, download).unwrap();
+    let (_, result, _) = finish(&mut server, &mut client, Streams::Serve).await;
+
+    assert!(
+        result.is_ok(),
+        "only the stall deadline bounds them; got {result:?}"
+    );
+    assert_eq!(into.lock().unwrap().len(), 2 * CHUNK);
 }
 
 #[tokio::test]

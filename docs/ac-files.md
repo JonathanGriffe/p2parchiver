@@ -77,7 +77,7 @@ Bytes are first written to the group's `.staging` directory and fsynced, then re
 
 Requests are capped at 64 KiB and responses at 1 MiB, and tests check that a full page of 2048 rows, 128 heads and a 512-path holdings query all fit. A holdings query asks which of a list of paths a peer holds, and is answered with a bitmap. Hashes travel as raw bytes.
 
-A blob stream's request and reply are capped at 4 KiB, and a test checks that a request for the longest allowed path fits. At most 8 downloads and 64 uploads run at once, and past 64 a request is refused. A requester must open a blob stream and get its reply within 30 s, and a server has 30 s to read the request, then 30 s to write its reply. The bytes may then go 10 minutes without moving. Ten minutes stays above how long a peer's 8 KiB/s bandwidth floor, shared by its 64 uploads, typically holds one 64 KiB chunk back, about 512 s, and a compile-time check keeps it there.
+A blob stream's request and reply are capped at 4 KiB, and a test checks that a request for the longest allowed path fits. At most 8 downloads and 64 uploads run at once, and past 64 a request is refused. Blob streams have a 30 s header deadline and a 10-minute stall deadline; the Transfers section of `ac-net.md` says what each bounds. Ten minutes stays above how long a peer's 8 KiB/s bandwidth floor, shared by its 64 uploads, typically holds one 64 KiB chunk back, about 512 s, and a compile-time check keeps it there.
 
 ## On-disk files
 
