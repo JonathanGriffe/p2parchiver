@@ -177,18 +177,22 @@ fn side(swarm: &TestSwarm, spec: TransferSpec, up: Throttle) -> Side {
     .unwrap()
 }
 
-/// Two connected swarms, left running in the background, and a service on each: the server
-/// first, then the client, the server's peer id, and a control for raw streams from the client.
-async fn pair(server: TransferSpec, client: TransferSpec) -> (Side, Side, PeerId, Control) {
+/// Two connected swarms, left running in the background, with a service on each.
+struct Pair {
+    server: Side,
+    client: Side,
+    /// The server's peer id.
+    peer: PeerId,
+    /// Opens raw streams from the client.
+    raw: Control,
+}
+
+async fn pair(server: TransferSpec, client: TransferSpec) -> Pair {
     paced_pair(server, Throttle::none(), client).await
 }
 
 /// The same, with the server's uploads held to `up`.
-async fn paced_pair(
-    server: TransferSpec,
-    up: Throttle,
-    client: TransferSpec,
-) -> (Side, Side, PeerId, Control) {
+async fn paced_pair(server: TransferSpec, up: Throttle, client: TransferSpec) -> Pair {
     let (id_a, id_b) = (identity(), identity());
     let peer_a = id_a.peer_id();
     let mut a = build(
@@ -243,7 +247,12 @@ async fn paced_pair(
             }
         });
     }
-    (serving, fetching, peer_a, raw)
+    Pair {
+        server: serving,
+        client: fetching,
+        peer: peer_a,
+        raw,
+    }
 }
 
 fn toy(item: u32) -> (Toy, Arc<Mutex<Vec<u8>>>) {
@@ -302,9 +311,27 @@ async fn finish(
     .expect("the download should finish")
 }
 
+/// The next stream a peer opens to `server`.
+async fn next_inbound(server: &mut Side) -> Inbound {
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if let TransferEvent::Inbound(inbound) = server.next().await {
+                return inbound;
+            }
+        }
+    })
+    .await
+    .expect("the server should see the stream")
+}
+
 #[tokio::test]
 async fn a_fetch_completes_and_names_its_transfer() {
-    let (mut server, mut client, peer, _) = pair(spec(8, 64), spec(8, 64)).await;
+    let Pair {
+        mut server,
+        mut client,
+        peer,
+        ..
+    } = pair(spec(8, 64), spec(8, 64)).await;
     let (download, into) = toy(1);
 
     let id = client.fetch(peer, download).unwrap();
@@ -319,7 +346,12 @@ async fn a_fetch_completes_and_names_its_transfer() {
 
 #[tokio::test]
 async fn a_download_with_nothing_to_fetch_opens_no_stream() {
-    let (mut server, mut client, peer, _) = pair(spec(8, 64), spec(8, 64)).await;
+    let Pair {
+        mut server,
+        mut client,
+        peer,
+        ..
+    } = pair(spec(8, 64), spec(8, 64)).await;
     let (mut download, _) = toy(1);
     download.nothing_to_do = true;
 
@@ -332,7 +364,12 @@ async fn a_download_with_nothing_to_fetch_opens_no_stream() {
 
 #[tokio::test]
 async fn a_fetch_past_the_download_cap_is_refused() {
-    let (mut server, mut client, peer, _) = pair(spec(8, 64), spec(1, 64)).await;
+    let Pair {
+        mut server,
+        mut client,
+        peer,
+        ..
+    } = pair(spec(8, 64), spec(1, 64)).await;
 
     assert!(client.fetch(peer, toy(1).0).is_some());
     assert!(
@@ -352,7 +389,12 @@ async fn a_fetch_past_the_download_cap_is_refused() {
 
 #[tokio::test]
 async fn past_the_upload_cap_the_server_answers_busy() {
-    let (mut server, mut client, peer, _) = pair(spec(8, 0), spec(8, 64)).await;
+    let Pair {
+        mut server,
+        mut client,
+        peer,
+        ..
+    } = pair(spec(8, 0), spec(8, 64)).await;
 
     client.fetch(peer, toy(1).0).unwrap();
     let (_, result, _) = finish(&mut server, &mut client, Streams::Serve).await;
@@ -362,7 +404,12 @@ async fn past_the_upload_cap_the_server_answers_busy() {
 
 #[tokio::test]
 async fn a_declined_stream_fails_the_fetch_as_retryable() {
-    let (mut server, mut client, peer, _) = pair(spec(8, 64), spec(8, 64)).await;
+    let Pair {
+        mut server,
+        mut client,
+        peer,
+        ..
+    } = pair(spec(8, 64), spec(8, 64)).await;
 
     client.fetch(peer, toy(1).0).unwrap();
     let (_, result, saw_stream) = finish(&mut server, &mut client, Streams::Decline).await;
@@ -376,7 +423,12 @@ async fn a_declined_stream_fails_the_fetch_as_retryable() {
 
 #[tokio::test]
 async fn a_download_that_panics_fails_and_frees_its_slot() {
-    let (mut server, mut client, peer, _) = pair(spec(8, 64), spec(1, 64)).await;
+    let Pair {
+        mut server,
+        mut client,
+        peer,
+        ..
+    } = pair(spec(8, 64), spec(1, 64)).await;
     let (mut download, _) = toy(1);
     download.panics = true;
 
@@ -399,11 +451,17 @@ async fn a_peer_that_never_replies_times_out_the_download() {
         header_timeout: SHORT_HEADER,
         ..spec(8, 64)
     };
-    let (mut server, mut client, peer, _) = pair(spec(8, 64), quick).await;
+    let Pair {
+        mut server,
+        mut client,
+        peer,
+        ..
+    } = pair(spec(8, 64), quick).await;
 
     client.fetch(peer, toy(1).0).unwrap();
-    let (_, result, _) = finish(&mut server, &mut client, Streams::Hold).await;
+    let (_, result, saw_stream) = finish(&mut server, &mut client, Streams::Hold).await;
 
+    assert!(saw_stream, "the stream reached the server");
     assert!(
         matches!(
             result,
@@ -421,7 +479,12 @@ async fn bytes_held_back_past_the_header_deadline_still_arrive() {
     };
     // A chunk every 1.5 s, so the bytes outlast the client's header deadline.
     let paced = Throttle::new(CHUNK as u64 * 2 / 3, CHUNK as u64);
-    let (mut server, mut client, peer, _) = paced_pair(spec(8, 64), paced, quick).await;
+    let Pair {
+        mut server,
+        mut client,
+        peer,
+        ..
+    } = paced_pair(spec(8, 64), paced, quick).await;
     let (download, into) = toy(2);
 
     client.fetch(peer, download).unwrap();
@@ -440,7 +503,12 @@ async fn a_peer_that_never_asks_holds_an_upload_slot_only_until_the_deadline() {
         header_timeout: SHORT_HEADER,
         ..spec(8, 1)
     };
-    let (mut server, mut client, peer, mut raw) = pair(quick, spec(8, 64)).await;
+    let Pair {
+        mut server,
+        mut client,
+        peer,
+        mut raw,
+    } = pair(quick, spec(8, 64)).await;
 
     // Half a length, so the stream reaches the server but its request never ends.
     let mut silent = raw
@@ -449,18 +517,13 @@ async fn a_peer_that_never_asks_holds_an_upload_slot_only_until_the_deadline() {
         .unwrap();
     silent.write_all(&[0, 0]).await.unwrap();
     silent.flush().await.unwrap();
-    let inbound = tokio::time::timeout(TIMEOUT, async {
-        loop {
-            if let TransferEvent::Inbound(inbound) = server.next().await {
-                return inbound;
-            }
-        }
-    })
-    .await
-    .expect("the server should see the stream");
-    server.serve(inbound);
+    let silent_inbound = next_inbound(&mut server).await;
 
     client.fetch(peer, toy(1).0).unwrap();
+    let fetch_inbound = next_inbound(&mut server).await;
+    // Served back to back, so the silent stream holds the slot however slow the runner.
+    server.serve(silent_inbound);
+    server.serve(fetch_inbound);
     let (_, result, _) = finish(&mut server, &mut client, Streams::Serve).await;
     assert!(
         matches!(result, Err(ToyError::Busy)),
