@@ -15,7 +15,7 @@ use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers, Space};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
 use crate::daemon::ClientSwarm;
-use crate::file_link::{FileLink, NotStarted, RoundOutcome, TransferOutcome};
+use crate::file_link::{FileLink, RoundOutcome, TransferOutcome};
 use crate::group_link::GroupLink;
 use crate::status::{Bandwidth, Published};
 
@@ -496,18 +496,15 @@ impl PeerLink {
                     path,
                     hash,
                 } => {
-                    match files.fetch(peer, group, path.clone(), hash) {
-                        Ok(()) | Err(NotStarted::NoDirectory) => {}
-                        Err(why) => {
-                            let actions = self.peers.on(PeerEvent::BlobFailed {
-                                peer,
-                                group,
-                                path,
-                                terminal: false,
-                                why: why.to_string(),
-                            });
-                            self.dispatch(swarm, files, groups, admitted_peers, actions);
-                        }
+                    if let Err(why) = files.fetch(peer, group, path.clone(), hash) {
+                        let actions = self.peers.on(PeerEvent::BlobFailed {
+                            peer,
+                            group,
+                            path,
+                            terminal: false,
+                            why: why.to_string(),
+                        });
+                        self.dispatch(swarm, files, groups, admitted_peers, actions);
                     }
                 }
 
@@ -923,6 +920,18 @@ mod tests {
         // 172.15 and 172.32 are outside the pool and stay dialable.
         assert!(dialable(&"/ip4/172.15.0.1/tcp/4001".parse().unwrap()));
         assert!(dialable(&"/ip4/172.32.0.1/tcp/4001".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_fetch_for_a_group_with_no_directory_does_not_start() {
+        let mut n = Node::new();
+        let unknown = GroupId::from_bytes([9u8; 32]);
+        let path = RelPath::parse("a.jpg").unwrap();
+
+        let started = n
+            .link
+            .fetch(PeerId::random(), unknown, path, "00".repeat(32));
+        assert_eq!(started, Err(crate::file_link::NotStarted::NoDirectory));
     }
 
     #[tokio::test]

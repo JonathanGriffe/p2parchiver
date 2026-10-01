@@ -41,6 +41,7 @@ Only one daemon may run on a home. `ac run` and the desktop app take a lock on `
 
 `FileLink` mounts `ac-net`'s transfer service for `/ac/blob/1.0.0`, built from the rules and limits `ac-files` declares, routes the supervisor's fetches to it, and turns finished downloads into supervisor events.
 - **Readiness.** An inbound stream is served only from a ready peer, and dropped otherwise.
+- **No directory.** A fetch for a group that has no directory, such as one forgotten while the fetch was queued, fails, to be retried, so the supervisor frees its slot.
 - **Imports first.** Before downloading, the node looks in `.unsorted`. If the bytes were imported and not yet sorted, they are moved into the group instead. Any failure there falls back to downloading.
 - **Two download caps.** The supervisor runs at most 8 transfers at once (`MAX_TRANSFERS` in `ac-peers`), and the service refuses a download past 8 (`MAX_DOWNLOADS` in `ac-files`) as a backstop. A fetch refused there fails, to be retried.
 - **Hanging up.** A running download counts as work outstanding with its peer. An upload does not.
