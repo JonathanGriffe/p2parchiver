@@ -213,11 +213,12 @@ impl FileLink {
     }
 
     /// Serve a stream only from a ready peer, and keep a finished download for the supervisor.
+    /// True if a download finished.
     pub fn on_transfer(
         &mut self,
         event: TransferEvent<FetchError>,
         admitted_peers: &AdmittedPeers,
-    ) {
+    ) -> bool {
         match event {
             TransferEvent::Inbound(inbound) => {
                 let peer = inbound.peer();
@@ -226,16 +227,19 @@ impl FileLink {
                 } else {
                     tracing::debug!(%peer, "declining a blob stream from a peer that is not ready");
                 }
+                false
             }
             TransferEvent::Finished { id, result, .. } => {
-                if let Some((peer, group, path)) = self.fetching.remove(&id) {
-                    self.fetched.push(TransferOutcome {
-                        peer,
-                        group,
-                        path,
-                        result,
-                    });
-                }
+                let Some((peer, group, path)) = self.fetching.remove(&id) else {
+                    return false;
+                };
+                self.fetched.push(TransferOutcome {
+                    peer,
+                    group,
+                    path,
+                    result,
+                });
+                true
             }
         }
     }

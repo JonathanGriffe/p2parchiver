@@ -289,8 +289,9 @@ pub async fn run(
             }
 
             event = files.next_transfer() => {
-                files.on_transfer(event, &admitted_peers);
-                peers.collect(&mut swarm, &mut files, &mut groups, &admitted_peers);
+                if files.on_transfer(event, &admitted_peers) {
+                    peers.collect(&mut swarm, &mut files, &mut groups, &admitted_peers);
+                }
             }
 
             _ = tokio::signal::ctrl_c() => {

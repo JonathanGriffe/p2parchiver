@@ -693,13 +693,14 @@ mod tests {
 
         /// The daemon's transfer arm.
         fn on_transfer(&mut self, event: TransferEvent<FetchError>) {
-            self.link.on_transfer(event, &self.admitted_peers);
-            self.peers.collect(
-                &mut self.swarm,
-                &mut self.link,
-                &mut self.groups,
-                &self.admitted_peers,
-            );
+            if self.link.on_transfer(event, &self.admitted_peers) {
+                self.peers.collect(
+                    &mut self.swarm,
+                    &mut self.link,
+                    &mut self.groups,
+                    &self.admitted_peers,
+                );
+            }
         }
 
         fn tick(&mut self) {
