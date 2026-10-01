@@ -9,7 +9,7 @@ use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
 use ac_net::throttle::{THROTTLE_BURST, Throttle};
-use ac_net::transfer::{TransferEvent, TransferId, TransferSpec, Transfers};
+use ac_net::transfer::{Control, TransferEvent, TransferId, TransferSpec, Transfers};
 
 use ac_files::blob::{Blobs, Fetch, FetchError, Local};
 use ac_files::content::Content;
@@ -132,12 +132,12 @@ fn sweep_staging(files: &Files, content: &Content) {
 }
 
 impl FileLink {
-    /// Open the stores, and start accepting file transfers on `swarm`. Downloads share `down`
-    /// with imports.
+    /// Open the stores, and start accepting file transfers through `streams`. Downloads share
+    /// `down` with imports.
     pub fn open(
         paths: &Paths,
         identity: &Identity,
-        swarm: &ClientSwarm,
+        streams: Control,
         down: Arc<Throttle>,
     ) -> Result<Self> {
         let path = paths.db_file();
@@ -160,7 +160,7 @@ impl FileLink {
         let blobs = Blobs::new(path, me, content.clone(), Arc::new(unsorted));
 
         let transfers = Transfers::new(
-            swarm.behaviour().app.blobs.new_control(),
+            streams,
             TransferSpec {
                 protocol: BLOB_PROTOCOL,
                 max_header: MAX_BLOB_HEADER_BYTES,

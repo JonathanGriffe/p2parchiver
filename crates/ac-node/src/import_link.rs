@@ -620,20 +620,9 @@ mod tests {
         // The number the peer machine is given: unsorted content has no row in `files`, so
         // without this it would be invisible to the budget.
         let identity = crate::ops::identity(&paths).unwrap();
-        let swarm = ac_net::swarm::build(
-            &identity,
-            &Config {
-                listen: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
-                mdns: false,
-                ..Config::default()
-            },
-            ac_net::swarm::Role::Client,
-            ac_net::authz::AcceptAnyPeer,
-            crate::daemon::app(),
-        )
-        .unwrap();
+        let blobs = ac_net::transfer::Behaviour::new().new_control();
         let files =
-            crate::file_link::FileLink::open(&paths, &identity, &swarm, Arc::new(Throttle::none()))
+            crate::file_link::FileLink::open(&paths, &identity, blobs, Arc::new(Throttle::none()))
                 .unwrap();
         let peers = crate::peer_link::PeerLink::open(&paths, &identity, None, now()).unwrap();
 

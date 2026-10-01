@@ -12,7 +12,7 @@ use std::task::Poll;
 
 use libp2p::futures::{AsyncWriteExt, FutureExt, StreamExt};
 use libp2p::{PeerId, Stream, StreamProtocol};
-use libp2p_stream::{AlreadyRegistered, Control, IncomingStreams};
+use libp2p_stream::{AlreadyRegistered, IncomingStreams};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Semaphore, mpsc};
@@ -20,8 +20,9 @@ use tokio::sync::{Semaphore, mpsc};
 use crate::stream::{StreamError, read_frame, receive, send, write_frame};
 use crate::throttle::Throttle;
 
-/// The behaviour to mount on the swarm for [`Transfers`].
-pub use libp2p_stream::Behaviour;
+/// The behaviour to mount on the swarm for [`Transfers`], and the handle to it a service is
+/// built from.
+pub use libp2p_stream::{Behaviour, Control};
 
 /// One download, driven by the service from its own task.
 pub trait Download: Send + 'static {
