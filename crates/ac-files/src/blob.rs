@@ -233,7 +233,9 @@ pub fn answer(
     peer: &PeerId,
     request: &BlobRequest,
 ) -> Result<Answer, FilesError> {
-    let path = RelPath::parse(&request.path)?;
+    let Ok(path) = RelPath::parse(&request.path) else {
+        return Ok(Answer::Unavailable);
+    };
 
     let Some(row) = may_serve(files, groups, peer, request.group, &path) else {
         return Ok(Answer::Unavailable);
@@ -666,6 +668,16 @@ mod tests {
 
         assert!(matches!(node.answer(member, &request), Answer::Unavailable));
         assert!(node.held(), "nothing about our copy is in doubt");
+    }
+
+    #[test]
+    fn a_path_that_does_not_parse_is_refused() {
+        let mut node = Holder::new(&bytes());
+        let mut request = node.request(0);
+        request.path = "../outside.jpg".to_owned();
+        let member = node.member;
+
+        assert!(matches!(node.answer(member, &request), Answer::Unavailable));
     }
 
     #[test]
