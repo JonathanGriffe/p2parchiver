@@ -59,8 +59,8 @@ Only admitted peers get answers, at most 8 per peer per tick, and heads are only
 
 A download sends the group, the path, the hash and the offset to resume from. The peer answers with the number of bytes it will send, or refuses, then sends the raw bytes. `ac-net` moves them, and `src/blob.rs` decides what to do with them, as sync code. `Blobs` holds what every transfer shares, answers every upload, and makes a `Fetch` for each download. Both open the stores they need on each transfer.
 - **Imports first.** Before asking the peer, a download asks a `Local` whether the bytes are already on this node. `ac-node` answers from its imports not yet sorted, moving the bytes into the group. Any failure there falls back to downloading.
-- **Resuming.** A download resumes from what it staged on an earlier attempt. A transfer that stops partway, whether it ended early, broke, or failed to write, parks its partial with an fsync, so the next attempt continues from it even after a crash.
-- **Final failures.** A refusal, more bytes than announced, or bytes that do not hash to what was asked are final: the supervisor does not ask that peer for that file again. A wrong hash also discards the partial. Anything else, such as a broken stream, is retried.
+- **Resuming.** A download resumes from what it staged on an earlier attempt. A transfer that stops partway, whether it ended early, broke, timed out, or failed to write, parks its partial with an fsync, so the next attempt continues from it even after a crash.
+- **Final failures.** A refusal, more bytes than announced, or bytes that do not hash to what was asked are final: the supervisor does not ask that peer for that file again. A wrong hash also discards the partial. Anything else, such as a broken or timed-out stream, is retried.
 - **Serving.** A file is served only to a peer the group is shared with, and only if its row is live, held, and has the hash asked for. A path that does not parse is refused. A file the index claims but that is missing on disk is refused, and the index is corrected so it is fetched again.
 
 ### Paths
@@ -77,7 +77,7 @@ Bytes are first written to the group's `.staging` directory and fsynced, then re
 
 Requests are capped at 64 KiB and responses at 1 MiB, and tests check that a full page of 2048 rows, 128 heads and a 512-path holdings query all fit. A holdings query asks which of a list of paths a peer holds, and is answered with a bitmap. Hashes travel as raw bytes.
 
-A blob stream's request and reply are capped at 4 KiB, and a test checks that a request for the longest allowed path fits. At most 8 downloads and 64 uploads run at once, and past 64 a request is refused.
+A blob stream's request and reply are capped at 4 KiB, and a test checks that a request for the longest allowed path fits. At most 8 downloads and 64 uploads run at once, and past 64 a request is refused. Opening a blob stream and each of its frames must finish within 30 s, and its bytes may go 10 minutes without moving. Ten minutes stays above how long a peer's 8 KiB/s bandwidth floor, shared by its 64 uploads, typically holds one 64 KiB chunk back, about 512 s.
 
 ## On-disk files
 

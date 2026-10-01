@@ -17,8 +17,8 @@ use ac_files::path::RelPath;
 use ac_files::store::Files;
 use ac_files::sync::{FileAction, FileEvent, FileSync};
 use ac_files::wire::{
-    BLOB_PROTOCOL, MAX_BLOB_HEADER_BYTES, MAX_DOWNLOADS, MAX_UPLOADS, ManifestRequest,
-    ManifestResponse, holds,
+    BLOB_HEADER_TIMEOUT, BLOB_PROTOCOL, BLOB_STALL_TIMEOUT, MAX_BLOB_HEADER_BYTES, MAX_DOWNLOADS,
+    MAX_UPLOADS, ManifestRequest, ManifestResponse, holds,
 };
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
@@ -166,6 +166,8 @@ impl FileLink {
                 max_header: MAX_BLOB_HEADER_BYTES,
                 max_downloads: MAX_DOWNLOADS,
                 max_uploads: MAX_UPLOADS,
+                header_timeout: BLOB_HEADER_TIMEOUT,
+                stall_timeout: BLOB_STALL_TIMEOUT,
             },
             blobs.clone(),
             down,

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ac_groups::id::GroupId;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +18,13 @@ pub const MAX_DOWNLOADS: usize = 8;
 
 /// Uploads this node serves at once, across every peer. Past it, a request is refused.
 pub const MAX_UPLOADS: usize = 64;
+
+/// How long a blob stream may take to open, and each request or reply frame to go through.
+pub const BLOB_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a blob stream's bytes may go without moving. Above the longest a peer's
+/// bandwidth limit typically holds one chunk back when it is shared by every upload.
+pub const BLOB_STALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub const MAX_HEADS_PER_ANSWER: usize = 128;
 pub const MAX_ENTRIES_PER_RESPONSE: usize = 2048;

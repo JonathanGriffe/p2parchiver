@@ -9,6 +9,7 @@ use std::io::Read;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Duration;
 
 use libp2p::futures::{AsyncWriteExt, FutureExt, StreamExt};
 use libp2p::{PeerId, Stream, StreamProtocol};
@@ -17,7 +18,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Semaphore, mpsc};
 
-use crate::stream::{TransferError, read_frame, receive, send, write_frame};
+use crate::stream::{TransferError, read_frame, receive, send, within, write_frame};
 use crate::throttle::Throttle;
 
 /// The behaviour to mount on the swarm for [`Transfers`], and the handle to it a service is
@@ -68,6 +69,10 @@ pub struct TransferSpec {
     pub max_header: usize,
     pub max_downloads: usize,
     pub max_uploads: usize,
+    /// How long opening a stream, each request or reply frame, and closing it may take.
+    pub header_timeout: Duration,
+    /// How long the bytes may go without moving, throttle waits aside.
+    pub stall_timeout: Duration,
 }
 
 /// Names one download, the way `OutboundRequestId` names a request.
@@ -154,11 +159,11 @@ impl<D: Download, S: Serve> Transfers<D, S> {
 
         let control = self.control.clone();
         let protocol = self.protocol.clone();
-        let limit = self.spec.max_header;
+        let spec = self.spec;
         let down = self.down.clone();
         let outcomes = self.outcomes.clone();
         tokio::spawn(async move {
-            let download = download_from(control, protocol, limit, peer, download, &down);
+            let download = download_from(control, protocol, spec, peer, download, &down);
             let result = AssertUnwindSafe(download)
                 .catch_unwind()
                 .await
@@ -199,14 +204,14 @@ impl<D: Download, S: Serve> Transfers<D, S> {
     /// Answer an inbound stream, or reply [`Serve::busy`] if every upload slot is taken.
     pub fn serve(&self, inbound: Inbound) {
         let Inbound { peer, mut stream } = inbound;
-        let limit = self.spec.max_header;
+        let spec = self.spec;
 
         let Ok(slot) = self.uploads.clone().try_acquire_owned() else {
-            tracing::warn!(%peer, limit = self.spec.max_uploads, "already serving all we can; refusing");
+            tracing::warn!(%peer, limit = spec.max_uploads, "already serving all we can; refusing");
             let busy = self.server.busy();
             tokio::spawn(async move {
-                let _ = write_frame(&mut stream, &busy, limit).await;
-                let _ = stream.close().await;
+                let _ = write_frame(&mut stream, &busy, spec.max_header, spec.header_timeout).await;
+                let _ = close(&mut stream, spec.header_timeout).await;
             });
             return;
         };
@@ -215,7 +220,7 @@ impl<D: Download, S: Serve> Transfers<D, S> {
         let up = self.up.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) = upload_to(&*server, peer, &mut stream, limit, &up).await {
+            if let Err(e) = upload_to(&*server, peer, &mut stream, spec, &up).await {
                 tracing::debug!(%peer, error = %e, "a transfer request went unanswered");
             }
         });
@@ -225,7 +230,7 @@ impl<D: Download, S: Serve> Transfers<D, S> {
 async fn download_from<D: Download>(
     mut control: Control,
     protocol: StreamProtocol,
-    limit: usize,
+    spec: TransferSpec,
     peer: PeerId,
     mut download: D,
     down: &Throttle,
@@ -234,15 +239,19 @@ async fn download_from<D: Download>(
         return Ok(());
     };
 
-    let mut stream = control
-        .open_stream(peer, protocol)
-        .await
-        .map_err(TransferError::Open)?;
-    write_frame(&mut stream, &request, limit).await?;
+    let (limit, header) = (spec.max_header, spec.header_timeout);
+    let mut stream = within(header, async {
+        control
+            .open_stream(peer, protocol)
+            .await
+            .map_err(TransferError::Open)
+    })
+    .await?;
+    write_frame(&mut stream, &request, limit, header).await?;
 
-    let reply = read_frame(&mut stream, limit).await?;
+    let reply = read_frame(&mut stream, limit, header).await?;
     let mut receiving = download.on_reply(reply)?;
-    let ended = receive(&mut stream, down, |chunk| {
+    let ended = receive(&mut stream, down, spec.stall_timeout, |chunk| {
         D::on_chunk(&mut receiving, chunk)
     })
     .await;
@@ -253,16 +262,25 @@ async fn upload_to<S: Serve>(
     server: &S,
     peer: PeerId,
     stream: &mut Stream,
-    limit: usize,
+    spec: TransferSpec,
     up: &Throttle,
 ) -> Result<(), S::Error> {
-    let request = read_frame(stream, limit).await?;
+    let (limit, header) = (spec.max_header, spec.header_timeout);
+    let request = read_frame(stream, limit, header).await?;
     let (reply, source) = server.answer(peer, request)?;
 
-    write_frame(stream, &reply, limit).await?;
+    write_frame(stream, &reply, limit, header).await?;
     if let Some(source) = source {
-        send(stream, source, up).await?;
+        send(stream, source, up, spec.stall_timeout).await?;
     }
-    stream.close().await.map_err(TransferError::Io)?;
+    close(stream, header).await?;
     Ok(())
+}
+
+/// Close our side of the stream within `timeout`.
+async fn close(stream: &mut Stream, timeout: Duration) -> Result<(), TransferError> {
+    within(timeout, async {
+        stream.close().await.map_err(TransferError::Io)
+    })
+    .await
 }

@@ -505,6 +505,36 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_that_times_out_is_retryable_and_keeps_its_partial() {
+        let bytes = bytes();
+        let node = Fetcher::new(&bytes);
+
+        let mut fetch = node.fetch(&hash_of(&bytes));
+        fetch.start().unwrap();
+        let mut receiving = fetch
+            .on_reply(BlobReply::Sending {
+                size: bytes.len() as u64,
+            })
+            .unwrap();
+        Fetch::on_chunk(&mut receiving, &bytes[..1000]).unwrap();
+        let failed = Fetch::on_end(receiving, Err(TransferError::TimedOut.into())).unwrap_err();
+
+        assert!(matches!(
+            failed,
+            FetchError::Transfer(TransferError::TimedOut)
+        ));
+        assert!(!failed.is_terminal());
+        assert_eq!(node.staged(), 1000);
+
+        let mut again = node.fetch(&hash_of(&bytes));
+        assert_eq!(
+            again.start().unwrap().unwrap().offset,
+            1000,
+            "the next attempt resumes from it"
+        );
+    }
+
+    #[test]
     fn an_unavailable_reply_is_final() {
         let bytes = bytes();
         let node = Fetcher::new(&bytes);

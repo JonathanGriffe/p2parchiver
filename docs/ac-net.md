@@ -48,6 +48,7 @@ The swarm mounts ac-net's protocols and has a slot so that other layers can also
 - **Caps.** A fetch past the protocol's download cap is refused at once. An inbound stream past its upload cap is answered with the protocol's busy reply and closed.
 - **Spawning.** Each transfer runs in its own tokio task, which calls the protocol's code, including its blocking disk and database I/O. `Transfers::next` yields each finished download, named by the id `fetch` returned, and each inbound stream, which the caller either serves or drops to decline. A download whose code panics finishes like any failed one, with `TransferError::Panicked`, so its slot is freed and its outcome still arrives. The protocol's `on_end` does not run, though, so nothing it does on a failure, such as parking a partial, happens.
 - **Bandwidth.** Every chunk waits on the service's download or upload throttle.
+- **Deadlines.** The protocol sets two. The header deadline bounds opening the stream, each request and reply frame, the busy reply, and closing the stream. The stall deadline bounds each read and write of the raw bytes, so it restarts whenever bytes move, and waiting on this node's own throttle never counts towards it. A deadline that passes fails the transfer with `TransferError::TimedOut`, which frees its slot on either side like any other failure. There is no deadline on a whole transfer, which may legitimately take hours.
 
 ### Bandwidth
 

@@ -131,6 +131,8 @@ fn spec(max_downloads: usize, max_uploads: usize) -> TransferSpec {
         max_header: 4096,
         max_downloads,
         max_uploads,
+        header_timeout: Duration::from_secs(30),
+        stall_timeout: Duration::from_secs(600),
     }
 }
 
