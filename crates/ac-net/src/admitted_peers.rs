@@ -11,12 +11,14 @@ enum Standing {
     Ready,
 }
 
+/// Peers connected right now whose attestation checked out, each settling or ready.
 #[derive(Debug, Default)]
 pub struct AdmittedPeers {
     peers: HashMap<PeerId, Standing>,
 }
 
 impl AdmittedPeers {
+    /// Their attestation checked out; they settle before they are ready.
     pub fn admitted(&mut self, peer: PeerId) {
         self.peers.insert(peer, Standing::Settling);
     }

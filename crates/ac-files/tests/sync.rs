@@ -52,7 +52,7 @@ impl Node {
         peer_of(&self.key)
     }
 
-    /// Admit a peer and promote them, as the daemon's admitted peers would.
+    /// Admit a peer and promote them, as the daemon's `AdmittedPeers` would.
     ///
     /// An empty `Connectivity` promotes everyone: `settled` is false only while a hole punch
     /// is still in flight, and these tests have no connections at all.
@@ -62,7 +62,7 @@ impl Node {
         Vec::new()
     }
 
-    /// Every call into the machine carries the admitted peers, so who is admitted is asked rather
+    /// Every call into the machine carries `AdmittedPeers`, so who is admitted is asked rather
     /// than remembered.
     fn sync_on(&mut self, event: FileEvent) -> Vec<FileAction> {
         self.sync.on(event, &self.admitted_peers)
@@ -78,13 +78,13 @@ impl Node {
 
     /// The free function, which is the one the blob path actually calls.
     ///
-    /// It takes no admitted peers: a blob stream cannot exist without an admitted connection, so
+    /// It takes no `AdmittedPeers`: a blob stream cannot exist without an admitted connection, so
     /// the only question left is whether the stores entitle this peer to these bytes.
     fn sync_may_serve(&mut self, peer: PeerId, group: GroupId, path: &RelPath) -> Option<u64> {
         may_serve(self.sync.files(), self.sync.groups(), &peer, group, path)
     }
 
-    /// A peer that has gone. The admitted peers forget them; nothing else needs telling.
+    /// A peer that has gone. `AdmittedPeers` forgets them; nothing else needs telling.
     fn forget(&mut self, other: PeerId) {
         self.admitted_peers.disconnected(&other, false);
     }

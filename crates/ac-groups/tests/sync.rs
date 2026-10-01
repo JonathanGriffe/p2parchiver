@@ -52,7 +52,7 @@ impl Node {
         peer_of(&self.key)
     }
 
-    /// Admit a peer and promote them, as the daemon's admitted peers would.
+    /// Admit a peer and promote them, as the daemon's `AdmittedPeers` would.
     ///
     /// An empty `Connectivity` promotes everyone: `settled` is false only while a hole punch
     /// is still in flight, and these tests have no connections at all.
@@ -62,7 +62,7 @@ impl Node {
         Vec::new()
     }
 
-    /// Every call into the machine carries the admitted peers, so who is admitted is asked rather
+    /// Every call into the machine carries `AdmittedPeers`, so who is admitted is asked rather
     /// than remembered.
     fn sync_on(&mut self, event: GroupEvent) -> Vec<GroupAction> {
         self.sync.on(event, &self.admitted_peers)
@@ -76,7 +76,7 @@ impl Node {
         self.sync.on_request(peer, request, &self.admitted_peers)
     }
 
-    /// A peer that has gone. The admitted peers forget them; nothing else needs telling.
+    /// A peer that has gone. `AdmittedPeers` forgets them; nothing else needs telling.
     fn forget(&mut self, other: PeerId) {
         self.admitted_peers.disconnected(&other, false);
     }
