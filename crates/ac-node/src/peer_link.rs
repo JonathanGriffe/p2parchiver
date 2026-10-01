@@ -620,10 +620,10 @@ mod tests {
 
             let swarm = build(&identity, &config, Role::Client, AcceptAnyPeer, app()).unwrap();
             let down = Arc::new(Throttle::from_config(None, THROTTLE_BURST));
-            let blobs = swarm.behaviour().app.blobs.new_control();
+            let streams = swarm.behaviour().app.blobs.new_control();
 
             Self {
-                link: FileLink::open(&paths, &identity, blobs, down).unwrap(),
+                link: FileLink::open(&paths, &identity, streams, down).unwrap(),
                 swarm,
                 groups: GroupLink::open(&paths, &identity).unwrap(),
                 peers: PeerLink::open(&paths, &identity, None, AT).unwrap(),

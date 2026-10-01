@@ -119,8 +119,8 @@ pub async fn run(
     let down = Arc::new(Throttle::from_config(config.bandwidth_max, THROTTLE_BURST));
 
     let mut groups = GroupLink::open(paths, identity)?;
-    let blobs = swarm.behaviour().app.blobs.new_control();
-    let mut files = FileLink::open(paths, identity, blobs, down.clone())?;
+    let streams = swarm.behaviour().app.blobs.new_control();
+    let mut files = FileLink::open(paths, identity, streams, down.clone())?;
 
     let mut peers = PeerLink::open(
         paths,

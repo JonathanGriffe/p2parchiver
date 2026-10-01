@@ -620,10 +620,14 @@ mod tests {
         // The number the peer machine is given: unsorted content has no row in `files`, so
         // without this it would be invisible to the budget.
         let identity = crate::ops::identity(&paths).unwrap();
-        let blobs = ac_net::transfer::Behaviour::new().new_control();
-        let files =
-            crate::file_link::FileLink::open(&paths, &identity, blobs, Arc::new(Throttle::none()))
-                .unwrap();
+        let streams = ac_net::transfer::Behaviour::new().new_control();
+        let files = crate::file_link::FileLink::open(
+            &paths,
+            &identity,
+            streams,
+            Arc::new(Throttle::none()),
+        )
+        .unwrap();
         let peers = crate::peer_link::PeerLink::open(&paths, &identity, None, now()).unwrap();
 
         let space = peers.space(&files, unsorted).unwrap();

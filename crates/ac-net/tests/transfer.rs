@@ -56,7 +56,6 @@ struct Toy {
 
 struct Receiving {
     expected: u64,
-    panics: bool,
     into: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -71,10 +70,10 @@ impl Download for Toy {
     }
 
     fn on_reply(self, reply: Reply) -> Result<Receiving, ToyError> {
+        assert!(!self.panics, "told to panic");
         match reply {
             Reply::Sending(expected) => Ok(Receiving {
                 expected,
-                panics: self.panics,
                 into: self.into,
             }),
             Reply::Missing => Err(ToyError::Missing),
@@ -83,7 +82,6 @@ impl Download for Toy {
     }
 
     fn on_chunk(receiving: &mut Receiving, chunk: &[u8]) -> Result<(), ToyError> {
-        assert!(!receiving.panics, "told to panic");
         receiving.into.lock().unwrap().extend_from_slice(chunk);
         Ok(())
     }
