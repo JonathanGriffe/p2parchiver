@@ -104,8 +104,8 @@ pub struct Transfers<D: Download, S: Serve> {
     server: Arc<S>,
     down: Arc<Throttle>,
     up: Arc<Throttle>,
+    downloads: Arc<Semaphore>,
     uploads: Arc<Semaphore>,
-    running: usize,
     next_id: u64,
     outcomes: mpsc::UnboundedSender<Outcome<D::Error>>,
     finished: mpsc::UnboundedReceiver<Outcome<D::Error>>,
@@ -131,8 +131,8 @@ impl<D: Download, S: Serve> Transfers<D, S> {
             server: Arc::new(server),
             down,
             up,
+            downloads: Arc::new(Semaphore::new(spec.max_downloads)),
             uploads: Arc::new(Semaphore::new(spec.max_uploads)),
-            running: 0,
             next_id: 0,
             outcomes,
             finished,
@@ -146,10 +146,7 @@ impl<D: Download, S: Serve> Transfers<D, S> {
 
     /// Start a download from `peer`, or `None` if every download slot is taken.
     pub fn fetch(&mut self, peer: PeerId, download: D) -> Option<TransferId> {
-        if self.running >= self.spec.max_downloads {
-            return None;
-        }
-        self.running += 1;
+        let slot = self.downloads.clone().try_acquire_owned().ok()?;
         let id = TransferId(self.next_id);
         self.next_id += 1;
 
@@ -160,6 +157,8 @@ impl<D: Download, S: Serve> Transfers<D, S> {
         let outcomes = self.outcomes.clone();
         tokio::spawn(async move {
             let result = download_from(control, protocol, limit, peer, download, &down).await;
+            // Freed before the outcome goes out, so the next fetch can start on it.
+            drop(slot);
             let _ = outcomes.send((id, peer, result));
         });
         Some(id)
@@ -169,7 +168,6 @@ impl<D: Download, S: Serve> Transfers<D, S> {
     pub async fn next(&mut self) -> TransferEvent<D::Error> {
         poll_fn(|cx| {
             if let Poll::Ready(Some((id, peer, result))) = self.finished.poll_recv(cx) {
-                self.running = self.running.saturating_sub(1);
                 return Poll::Ready(TransferEvent::Finished { id, peer, result });
             }
             if let Some(incoming) = &mut self.incoming {
