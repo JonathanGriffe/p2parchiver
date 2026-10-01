@@ -9,11 +9,12 @@ use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
 
+use ac_files::blob::Server;
 use ac_files::content::Content;
 use ac_files::path::RelPath;
 use ac_files::store::Files;
 use ac_files::sync::{FileAction, FileEvent, FileSync};
-use ac_files::wire::{ManifestRequest, ManifestResponse, holds};
+use ac_files::wire::{MAX_UPLOADS, ManifestRequest, ManifestResponse, holds};
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
 
@@ -59,7 +60,7 @@ pub struct FileLink {
     sync: FileSync,
     outbound: HashMap<request_response::OutboundRequestId, (PeerId, Outbound)>,
     rounds: Vec<RoundOutcome>,
-    db: std::path::PathBuf,
+    server: Arc<Server>,
     up: Arc<Throttle>,
     serving: Arc<Semaphore>,
 }
@@ -101,12 +102,12 @@ impl FileLink {
         sweep_staging(&files, &content);
 
         Ok(Self {
+            server: Arc::new(Server::new(path, me, content.clone())),
             sync: FileSync::new(files, groups, content),
             outbound: HashMap::new(),
             rounds: Vec::new(),
-            db: path,
             up: Arc::new(Throttle::from_config(config.bandwidth_max, THROTTLE_BURST)),
-            serving: Arc::new(Semaphore::new(blob::MAX_SERVING)),
+            serving: Arc::new(Semaphore::new(MAX_UPLOADS)),
         })
     }
 
@@ -316,9 +317,7 @@ impl FileLink {
     /// Serve an inbound blob stream from a peer the daemon has already found ready.
     pub fn on_inbound_blob(&self, peer: PeerId, stream: libp2p::swarm::Stream) {
         blob::serve(
-            self.db.clone(),
-            self.sync.content().clone(),
-            self.sync.me(),
+            self.server.clone(),
             peer,
             stream,
             self.up.clone(),

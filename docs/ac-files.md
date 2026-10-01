@@ -11,7 +11,8 @@ Paths below are relative to `crates/ac-files/`.
 - **Content**: stores, resumes, moves and removes files' bytes on disk in `src/content.rs`.
 - **Catalogue**: records local files and merges rows from peers, resolving collisions and duplicates, in `src/store/mod.rs`, with the rules for picking a winner in `src/store/row.rs`.
 - **Change log**: each group's log, how far each peer has read it, the catalogue digest, and the counters the supervisor reads, in `src/store/log.rs`.
-- **Sync**: the state machine that reconciles catalogues with peers, and the check for whether a peer may download a file, in `src/sync.rs`.
+- **Sync**: the state machine that reconciles catalogues with peers in `src/sync.rs`.
+- **File transfers**: the rules of `/ac/blob/1.0.0` in `src/blob.rs`: what a download asks for and keeps, what this node agrees to serve, and which failures are final.
 - **Wire**: the manifest and blob messages and size limits in `src/wire.rs`.
 
 ## Design
@@ -54,6 +55,14 @@ The store keeps two counters for the supervisor: the changes this node made itse
 
 Only admitted peers get answers, at most 8 per peer per tick, and heads are only acted on from ready peers. A group's catalogue and bytes only go to peers `ac-groups` shares the group's content with: fellow members, while the group is active here. To anyone else the group does not exist. A file's bytes are only served if its row is live and held.
 
+### File transfers
+
+A download sends the group, the path, the hash and the offset to resume from. The peer answers with the number of bytes it will send, or refuses, then sends the raw bytes. `ac-net` moves them, and `src/blob.rs` decides what to do with them, as sync code: `Fetch` for one download and `Server` for every upload. Both open the stores they need on each transfer.
+- **Imports first.** Before asking the peer, a download asks a `Local` whether the bytes are already on this node. `ac-node` answers from its imports not yet sorted, moving the bytes into the group. Any failure there falls back to downloading.
+- **Resuming.** A download resumes from what it staged on an earlier attempt, and keeps the partial when a transfer ends early.
+- **Final failures.** A refusal, more bytes than announced, or bytes that do not hash to what was asked are final: the supervisor does not ask that peer for that file again. A wrong hash also discards the partial. Anything else, such as a broken stream, is retried.
+- **Serving.** A file is served only to a peer the group is shared with, and only if its row is live, held, and has the hash asked for. A file the index claims but that is missing on disk is refused, and the index is corrected so it is fetched again.
+
 ### Paths
 
 A path must be relative, `/`-separated, at most 1024 bytes with components of at most 255, and free of empty, `.` or `..` components, backslashes and control characters. Paths from peers are checked as their rows arrive, so a hostile path is rejected.
@@ -67,6 +76,8 @@ Bytes are first written to the group's `.staging` directory and fsynced, then re
 ### Wire
 
 Requests are capped at 64 KiB and responses at 1 MiB, and tests check that a full page of 2048 rows, 128 heads and a 512-path holdings query all fit. A holdings query asks which of a list of paths a peer holds, and is answered with a bitmap. Hashes travel as raw bytes.
+
+A blob stream's request and reply are capped at 4 KiB, and a test checks that a request for the longest allowed path fits. At most 8 downloads and 64 uploads run at once, and past 64 a request is refused.
 
 ## On-disk files
 

@@ -2,29 +2,20 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ac_files::blob::{Fetch, FetchError, Local, Server};
 use ac_files::content::Content;
 use ac_files::path::RelPath;
-use ac_files::store::Files;
-use ac_files::sync::may_serve;
-use ac_files::wire::{BLOB_PROTOCOL, BlobReply, BlobRequest};
+use ac_files::wire::{BLOB_PROTOCOL, BlobRequest, MAX_BLOB_HEADER_BYTES, MAX_DOWNLOADS};
 use ac_groups::id::GroupId;
-use ac_groups::store::Groups;
 use ac_peers::sync::PeerEvent;
 use tokio::sync::Semaphore;
 
-use ac_net::stream::{read_frame, receive, send, write_frame};
+use ac_net::stream::{StreamError, read_frame, receive, send, write_frame};
 use ac_net::throttle::Throttle;
+use ac_net::transfer::{Download, Serve};
 use futures::AsyncWriteExt;
 use libp2p::{PeerId, StreamProtocol};
 use tokio::sync::mpsc;
-
-const MAX_HEADER_BYTES: usize = 4096;
-
-/// Transfers this node will pull at once, across every peer.
-const MAX_CONCURRENT: usize = 8;
-
-/// Transfers this node will serve at once, across every peer.
-pub const MAX_SERVING: usize = 64;
 
 pub struct Wanted {
     pub peer: PeerId,
@@ -34,34 +25,29 @@ pub struct Wanted {
     pub dir: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
-    Unavailable,
-    WrongContent,
-    Overlong,
+/// Imported files not yet sorted, where a download looks before asking a peer.
+pub struct Unsorted {
+    pub db: PathBuf,
+    pub content: Content,
 }
 
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Refusal::Unavailable => write!(f, "the peer would not serve it"),
-            Refusal::WrongContent => {
-                write!(f, "the content did not match the hash it was asked for")
-            }
-            Refusal::Overlong => write!(f, "the peer sent more than the size it announced"),
-        }
+impl Local for Unsorted {
+    fn take(&self, group: GroupId, dir: &str, path: &RelPath, hash: &str) -> bool {
+        crate::ops::import::adopt_unsorted(
+            &self.db,
+            &self.content,
+            &group.to_string(),
+            dir,
+            path,
+            hash,
+        )
+        .unwrap_or_else(|e| {
+            // Never fatal: a peer has the bytes, and fetching them is what would have happened
+            // anyway. Worth a line, because it means the import ledger is unhappy about something.
+            tracing::warn!(%hash, error = %format!("{e:#}"), "could not take the unsorted copy");
+            false
+        })
     }
-}
-
-impl std::error::Error for Refusal {}
-
-/// Whether taking `n` more bytes would carry the transfer past what the sender announced.
-fn overruns(got: u64, n: usize, expected: u64) -> bool {
-    got.saturating_add(n as u64) > expected
-}
-
-fn terminal(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<Refusal>().is_some()
 }
 
 /// Blob transfers in flight, and the channel their outcomes come back on.
@@ -142,26 +128,37 @@ impl Transfers {
         content: Content,
         want: Wanted,
     ) -> bool {
-        if self.total() >= MAX_CONCURRENT {
+        if self.total() >= MAX_DOWNLOADS {
             return false;
         }
         *self.running.entry(want.peer).or_default() += 1;
 
+        let unsorted = Arc::new(Unsorted {
+            db: self.db.clone(),
+            content: content.clone(),
+        });
+        let fetch = Fetch::new(
+            self.db.clone(),
+            self.me,
+            content,
+            want.group,
+            want.dir,
+            want.path.clone(),
+            want.hash,
+        )
+        .with_local(unsorted);
+
         let outcomes = self.outcomes.clone();
-        let db = self.db.clone();
-        let me = self.me;
         let down = self.down.clone();
+        let (peer, group, path) = (want.peer, want.group, want.path);
         tokio::spawn(async move {
-            let peer = want.peer;
-            let group = want.group;
-            let path = want.path.clone();
-            let event = match bring_in(control, &content, &want, &db, me, &down).await {
+            let event = match download(control, peer, fetch, &down).await {
                 Ok(()) => PeerEvent::BlobDone { peer, group, path },
                 Err(why) => PeerEvent::BlobFailed {
                     peer,
                     group,
                     path,
-                    terminal: terminal(&why),
+                    terminal: why.is_terminal(),
                     why: why.to_string(),
                 },
             };
@@ -171,128 +168,45 @@ impl Transfers {
     }
 }
 
-/// Get one file into the group, from wherever it is cheapest.
-///
-/// Almost always that means asking the peer. The exception is a file this node imported and
-/// has not sorted yet: the bytes are already here, so they are moved into the group and
-/// nothing is transferred. Either way the caller sees one outcome and the row ends up held.
-async fn bring_in(
-    control: libp2p_stream::Control,
-    content: &Content,
-    want: &Wanted,
-    db: &std::path::Path,
-    me: PeerId,
-    down: &Throttle,
-) -> anyhow::Result<()> {
-    // Asked before the stream is opened, because the point is not to open one.
-    let taken = crate::ops::import::adopt_unsorted(
-        db,
-        content,
-        &want.group.to_string(),
-        &want.dir,
-        &want.path,
-        &want.hash,
-    )
-    .unwrap_or_else(|e| {
-        // Never fatal: a peer has the bytes, and fetching them is what would have happened
-        // anyway. Worth a line, because it means the import ledger is unhappy about something.
-        tracing::warn!(hash = %want.hash, error = %format!("{e:#}"), "could not take the unsorted copy");
-        false
-    });
-
-    if taken {
-        tracing::info!(%want.path, "already here unsorted; filed rather than fetched");
-        let mut files = Files::open(db, me)?;
-        files.mark_have(want.group, &want.path, true)?;
-        return Ok(());
-    }
-
-    download(control, content, want, db, me, down).await
-}
-
-/// Ask one peer for one file and write it to disk.
+/// Ask one peer for one file, unless it turns out to be here already.
 async fn download(
     mut control: libp2p_stream::Control,
-    content: &Content,
-    want: &Wanted,
-    db: &std::path::Path,
-    me: PeerId,
+    peer: PeerId,
+    mut fetch: Fetch,
     down: &Throttle,
-) -> anyhow::Result<()> {
-    let mut hash = [0u8; 32];
-    hex::decode_to_slice(&want.hash, &mut hash)?;
-
-    let resume = content.staged_len(&want.dir, &want.path);
+) -> Result<(), FetchError> {
+    let Some(request) = fetch.start()? else {
+        return Ok(());
+    };
 
     let mut stream = control
-        .open_stream(want.peer, StreamProtocol::new(BLOB_PROTOCOL))
-        .await?;
+        .open_stream(peer, StreamProtocol::new(BLOB_PROTOCOL))
+        .await
+        .map_err(|e| StreamError::Io(std::io::Error::other(e)))?;
+    write_frame(&mut stream, &request, MAX_BLOB_HEADER_BYTES).await?;
 
-    let header = BlobRequest {
-        group: want.group,
-        path: want.path.to_string(),
-        hash,
-        offset: resume,
-    };
-    write_frame(&mut stream, &header, MAX_HEADER_BYTES).await?;
-
-    let reply: BlobReply = read_frame(&mut stream, MAX_HEADER_BYTES).await?;
-    let expected = match reply {
-        BlobReply::Sending { size } => size,
-        BlobReply::Unavailable => anyhow::bail!(Refusal::Unavailable),
-    };
-
-    let mut sink = content.resume(&want.dir, &want.path, resume)?;
-    let mut got = 0u64;
-
-    let received = receive(&mut stream, down, |chunk| -> anyhow::Result<()> {
-        if overruns(got, chunk.len(), expected) {
-            anyhow::bail!(Refusal::Overlong);
-        }
-        sink.write(chunk)?;
-        got += chunk.len() as u64;
-        Ok(())
+    let reply = read_frame(&mut stream, MAX_BLOB_HEADER_BYTES).await?;
+    let mut receiving = fetch.on_reply(reply)?;
+    let ended = receive(&mut stream, down, |chunk| {
+        Fetch::on_chunk(&mut receiving, chunk)
     })
     .await;
-    if let Err(e) = received {
-        if e.downcast_ref::<Refusal>() == Some(&Refusal::Overlong) {
-            sink.park()?;
-        }
-        return Err(e);
-    }
-
-    if got != expected {
-        sink.park()?;
-        anyhow::bail!("transfer ended early after {got} of {expected} bytes");
-    }
-
-    let staged = sink.finish()?;
-    if staged.hash != want.hash {
-        content.discard(staged).ok();
-        anyhow::bail!(Refusal::WrongContent);
-    }
-    content.commit(staged)?;
-
-    let mut files = Files::open(db, me)?;
-    files.mark_have(want.group, &want.path, true)?;
-    Ok(())
+    Fetch::on_end(receiving, ended)
 }
 
 /// Answer an inbound blob stream.
 pub fn serve(
-    db: PathBuf,
-    content: Content,
-    me: PeerId,
+    server: Arc<Server>,
     peer: PeerId,
     stream: libp2p::swarm::Stream,
     up: Arc<Throttle>,
     slots: Arc<Semaphore>,
 ) {
     let Ok(slot) = slots.try_acquire_owned() else {
-        tracing::warn!(%peer, limit = MAX_SERVING, "already serving all we can; refusing");
+        tracing::warn!(%peer, "already serving all we can; refusing");
         tokio::spawn(async move {
             let mut stream = stream;
-            let _ = write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await;
+            let _ = write_frame(&mut stream, &server.busy(), MAX_BLOB_HEADER_BYTES).await;
             let _ = stream.close().await;
         });
         return;
@@ -300,116 +214,25 @@ pub fn serve(
 
     tokio::spawn(async move {
         let _slot = slot;
-        if let Err(e) = answer(db, content, me, peer, stream, &up).await {
+        if let Err(e) = answer(&server, peer, stream, &up).await {
             tracing::debug!(%peer, error = %e, "a blob request went unanswered");
         }
     });
 }
 
 async fn answer(
-    db: PathBuf,
-    content: Content,
-    me: PeerId,
+    server: &Server,
     peer: PeerId,
     mut stream: libp2p::swarm::Stream,
     up: &Throttle,
 ) -> anyhow::Result<()> {
-    let request: BlobRequest = read_frame(&mut stream, MAX_HEADER_BYTES).await?;
-    let path = RelPath::parse(&request.path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let request: BlobRequest = read_frame(&mut stream, MAX_BLOB_HEADER_BYTES).await?;
+    let (reply, source) = server.answer(peer, request)?;
 
-    let files = Files::open(&db, me)?;
-    let groups = Groups::open(&db, me)?;
-
-    let Some(size) = may_serve(&files, &groups, &peer, request.group, &path) else {
-        write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await?;
-        stream.close().await?;
-        return Ok(());
-    };
-
-    let row = files.get(request.group, &path)?;
-    if row.is_none_or(|r| r.hash != hex::encode(request.hash)) {
-        write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await?;
-        stream.close().await?;
-        return Ok(());
+    write_frame(&mut stream, &reply, MAX_BLOB_HEADER_BYTES).await?;
+    if let Some(file) = source {
+        send(&mut stream, file, up).await?;
     }
-
-    let Some(dir) = files.dir_of(request.group)? else {
-        write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await?;
-        stream.close().await?;
-        return Ok(());
-    };
-
-    let file = match content.open_at(&dir, &path, request.offset) {
-        Ok(file) => file,
-        Err(e) => {
-            tracing::warn!(%path, error = %e, "indexed as held, but not on disk; correcting");
-            let mut files = files;
-            let _ = files.mark_have(request.group, &path, false);
-
-            write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await?;
-            stream.close().await?;
-            return Ok(());
-        }
-    };
-
-    let remaining = size.saturating_sub(request.offset);
-    write_frame(
-        &mut stream,
-        &BlobReply::Sending { size: remaining },
-        MAX_HEADER_BYTES,
-    )
-    .await?;
-
-    send(&mut stream, file, up).await?;
     stream.close().await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_transfer_may_take_exactly_what_was_announced_and_not_a_byte_more() {
-        // Exactly the announced size is the ordinary end of every honest transfer.
-        assert!(!overruns(0, 1000, 1000));
-        assert!(!overruns(936, 64, 1000));
-
-        // One byte past it is not, however small the overrun.
-        assert!(overruns(936, 65, 1000));
-        assert!(overruns(1000, 1, 1000));
-
-        // A sender that keeps going cannot wrap the counter into looking acceptable.
-        assert!(overruns(u64::MAX - 1, usize::MAX, 1000));
-    }
-
-    #[test]
-    fn nothing_is_announced_means_nothing_may_arrive() {
-        assert!(!overruns(0, 0, 0));
-        assert!(overruns(0, 1, 0));
-    }
-
-    #[test]
-    fn a_severed_transfer_is_retryable_and_a_refusal_is_not() {
-        let severed = anyhow::anyhow!("transfer ended early after 12 of 4096 bytes");
-        assert!(!terminal(&severed), "a cut circuit is the ordinary case");
-
-        for refusal in [
-            Refusal::Unavailable,
-            Refusal::WrongContent,
-            Refusal::Overlong,
-        ] {
-            assert!(
-                terminal(&anyhow::Error::new(refusal)),
-                "{refusal:?} cannot be fixed by asking again"
-            );
-        }
-    }
-
-    #[test]
-    fn a_refusal_survives_the_context_a_caller_adds() {
-        let wrapped =
-            anyhow::Error::new(Refusal::WrongContent).context("fetching photos/beach.jpg");
-        assert!(terminal(&wrapped));
-    }
 }
