@@ -49,7 +49,7 @@ Each node records its own consent to each group: `Pending` when invited, `Active
 A group is only named to a peer if both are members, so a non-member does not learn it exists.
 - Content is shared only in `Active` groups.
 - Chains are offered in `Active` and `Pending` groups, because staying silent while pending would look like a refusal.
-- Current members get the whole chain. Former members get it up to their removal, so they learn they were removed and nothing after. Strangers get nothing, so a guessed group id reveals nothing.
+- Current members get the whole chain and every standing. Former members get the chain up to their removal and no standings, so they learn they were removed and nothing else. Strangers get nothing, so a guessed group id reveals nothing.
 
 A node that is pending or has left still answers fetches, since it holds the only copy of its own standing. A node the chain does not name serves nothing.
 

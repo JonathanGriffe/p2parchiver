@@ -136,12 +136,24 @@ impl GroupSync {
             }
             GroupRequest::Fetch { group, from } => {
                 let response = match self.store.entries_for(group, &peer, from) {
-                    Ok(Some(entries)) => GroupResponse::Entries {
-                        group,
-                        from,
-                        entries,
-                        standings: self.store.standings(group).unwrap_or_default(),
-                    },
+                    Ok(Some(entries)) => {
+                        // A former member gets the chain up to its removal, and no standings.
+                        let is_member = self
+                            .store
+                            .members(group)
+                            .is_ok_and(|members| members.contains(&peer));
+                        let standings = if is_member {
+                            self.store.standings(group).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        GroupResponse::Entries {
+                            group,
+                            from,
+                            entries,
+                            standings,
+                        }
+                    }
                     _ => GroupResponse::Unavailable,
                 };
                 (response, Vec::new())

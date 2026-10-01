@@ -492,6 +492,71 @@ fn a_removed_member_finds_out_by_asking() {
 }
 
 #[test]
+fn a_removed_member_is_sent_no_standings() {
+    let (mut admin, mut member, id) = admin_and_member();
+    join(&mut admin, &mut member, id);
+
+    admin
+        .sync
+        .store_mut()
+        .author(
+            &admin.key,
+            id,
+            Op::Remove {
+                peer: member.peer().to_base58(),
+            },
+            AT,
+        )
+        .unwrap();
+    let mut carol = Node::new();
+    add(&mut admin, id, carol.peer(), "carol");
+    join(&mut admin, &mut carol, id);
+    connect(&mut admin, &mut carol);
+    assert!(
+        admin
+            .sync
+            .store()
+            .standings(id)
+            .unwrap()
+            .iter()
+            .any(|s| s.subject().unwrap() == carol.peer()),
+        "the admin holds Carol's answer"
+    );
+
+    // Asserted on the response: the former member's store would drop the rows anyway.
+    admin.verify(member.peer());
+    let (response, _) =
+        admin.sync_on_request(member.peer(), GroupRequest::Fetch { group: id, from: 0 });
+    let GroupResponse::Entries {
+        entries, standings, ..
+    } = response
+    else {
+        panic!("a former member must still learn of its removal, got {response:?}");
+    };
+    assert_eq!(entries.len(), 3, "up to and including the removal");
+    let last = entries.last().unwrap().body().unwrap();
+    assert_eq!(
+        last.op,
+        Op::Remove {
+            peer: member.peer().to_base58()
+        },
+        "ending on the removal itself"
+    );
+    assert!(standings.is_empty(), "and no standings");
+
+    let (response, _) =
+        admin.sync_on_request(carol.peer(), GroupRequest::Fetch { group: id, from: 0 });
+    let GroupResponse::Entries { standings, .. } = response else {
+        panic!("a member must be answered, got {response:?}");
+    };
+    assert_eq!(
+        standings.len(),
+        admin.sync.store().standings(id).unwrap().len(),
+        "a current member gets every standing"
+    );
+}
+
+#[test]
 fn the_admin_ratifies_a_departure_exactly_once() {
     let (mut admin, mut member, id) = admin_and_member();
     join(&mut admin, &mut member, id);
