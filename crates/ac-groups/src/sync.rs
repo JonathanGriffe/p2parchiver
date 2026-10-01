@@ -9,7 +9,7 @@ use ac_net::identity::Keypair;
 use crate::chain::Op;
 use crate::id::GroupId;
 use crate::standing::Position;
-use crate::store::{Applied, GroupRow, Groups, State, StoreError};
+use crate::store::{Applied, GroupRow, Groups, Served, State, StoreError};
 use crate::wire::{GroupHead, GroupRequest, GroupResponse, MAX_HEADS_PER_ANSWER};
 
 /// How long a fetch may be outstanding before the episode is abandoned.
@@ -135,25 +135,13 @@ impl GroupSync {
                 (GroupResponse::Heads(ours), Vec::new())
             }
             GroupRequest::Fetch { group, from } => {
-                let response = match self.store.entries_for(group, &peer, from) {
-                    Ok(Some(entries)) => {
-                        // A former member gets the chain up to its removal, and no standings.
-                        let is_member = self
-                            .store
-                            .members(group)
-                            .is_ok_and(|members| members.contains(&peer));
-                        let standings = if is_member {
-                            self.store.standings(group).unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-                        GroupResponse::Entries {
-                            group,
-                            from,
-                            entries,
-                            standings,
-                        }
-                    }
+                let response = match self.store.serve(group, &peer, from) {
+                    Ok(Some(Served { entries, standings })) => GroupResponse::Entries {
+                        group,
+                        from,
+                        entries,
+                        standings,
+                    },
                     _ => GroupResponse::Unavailable,
                 };
                 (response, Vec::new())

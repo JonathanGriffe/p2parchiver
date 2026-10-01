@@ -77,6 +77,19 @@ pub struct Applied {
     pub departed: Vec<PeerId>,
 }
 
+/// The answer to a `Fetch`.
+#[derive(Debug)]
+pub struct Served {
+    pub entries: Vec<Entry>,
+    pub standings: Vec<Standing>,
+}
+
+/// What a peer may be served of a group: all of it, or the chain up to their removal.
+enum Access {
+    Member { head: u64 },
+    Former { until: u64 },
+}
+
 pub struct Groups {
     db: Connection,
     me: PeerId,
@@ -276,9 +289,8 @@ impl Groups {
         Ok(out)
     }
 
-    /// How much of a group we may serve `peer`, if any. `Some(limit)` means entries
-    /// `0..limit`.
-    pub fn serve_up_to(&self, group: GroupId, peer: &PeerId) -> Result<Option<u64>, StoreError> {
+    /// What `peer` may be served of a group, if anything.
+    fn access(&self, group: GroupId, peer: &PeerId) -> Result<Option<Access>, StoreError> {
         let Some(row) = self.get(group)? else {
             return Ok(None);
         };
@@ -288,37 +300,53 @@ impl Groups {
             return Ok(None);
         }
         if members.contains(peer) {
-            return Ok(Some(row.head_seq));
+            return Ok(Some(Access::Member { head: row.head_seq }));
         }
 
         // Not a member now. Were they ever? The chain is only loaded on this rarer path.
         Ok(self
             .chain(group)?
             .departure_seq(peer)
-            .map(|removed_at| removed_at + 1))
+            .map(|removed_at| Access::Former {
+                until: removed_at + 1,
+            }))
+    }
+
+    /// How much of a group we may serve `peer`, if any. `Some(limit)` means entries
+    /// `0..limit`.
+    pub fn serve_up_to(&self, group: GroupId, peer: &PeerId) -> Result<Option<u64>, StoreError> {
+        Ok(self.access(group, peer)?.map(|access| match access {
+            Access::Member { head } => head,
+            Access::Former { until } => until,
+        }))
     }
 
     /// Whether we may answer this peer's `Fetch` at all.
     pub fn serves(&self, group: GroupId, peer: &PeerId) -> Result<bool, StoreError> {
-        Ok(self.serve_up_to(group, peer)?.is_some())
+        Ok(self.access(group, peer)?.is_some())
     }
 
-    /// The entries to send in answer to `Fetch { group, from }`, or `None` to refuse.
-    pub fn entries_for(
+    /// The entries and standings to send in answer to `Fetch { group, from }`, or `None` to
+    /// refuse. A former member gets the chain up to its removal, and no standings.
+    pub fn serve(
         &self,
         group: GroupId,
         peer: &PeerId,
         from: u64,
-    ) -> Result<Option<Vec<Entry>>, StoreError> {
-        let Some(limit) = self.serve_up_to(group, peer)? else {
+    ) -> Result<Option<Served>, StoreError> {
+        let Some(access) = self.access(group, peer)? else {
             return Ok(None);
         };
-        Ok(Some(
-            self.chain(group)?
-                .entries_between(from, limit)
-                .cloned()
-                .collect(),
-        ))
+        let (limit, standings) = match access {
+            Access::Member { head } => (head, self.standings(group)?),
+            Access::Former { until } => (until, Vec::new()),
+        };
+        let entries = self
+            .chain(group)?
+            .entries_between(from, limit)
+            .cloned()
+            .collect();
+        Ok(Some(Served { entries, standings }))
     }
 
     /// Resolve a full id, a unique hex prefix, or an exact name.
@@ -1203,7 +1231,8 @@ mod tests {
             )
             .unwrap();
         // One more entry, which Bob must never see.
-        add(&mut store, &admin, id, peer_of(&key()), "carol");
+        let carol = peer_of(&key());
+        add(&mut store, &admin, id, carol, "carol");
 
         assert!(
             store.shared_with(&peer_of(&bob)).unwrap().is_empty(),
@@ -1216,13 +1245,20 @@ mod tests {
         );
 
         let served = store
-            .entries_for(id, &peer_of(&bob), 0)
+            .serve(id, &peer_of(&bob), 0)
             .unwrap()
             .expect("a removed member may still ask");
-        assert_eq!(served.len(), 3, "genesis, their add, their removal");
+        assert_eq!(served.entries.len(), 3, "genesis, their add, their removal");
+        assert!(served.standings.is_empty(), "nor who is in the group now");
+
+        assert_eq!(
+            store.serve(id, &carol, 0).unwrap().unwrap().standings,
+            store.standings(id).unwrap(),
+            "a member gets every standing"
+        );
 
         // What Bob makes of it: he is out, and knows it.
-        let bobs_view = Chain::load(served).unwrap();
+        let bobs_view = Chain::load(served.entries).unwrap();
         assert!(!bobs_view.fold().contains(&peer_of(&bob)));
         assert_eq!(bobs_view.len(), 3, "nothing after the removal");
     }
@@ -1281,7 +1317,7 @@ mod tests {
         let stranger = peer_of(&key());
 
         assert_eq!(store.serve_up_to(id, &stranger).unwrap(), None);
-        assert!(store.entries_for(id, &stranger, 0).unwrap().is_none());
+        assert!(store.serve(id, &stranger, 0).unwrap().is_none());
     }
 
     #[test]
