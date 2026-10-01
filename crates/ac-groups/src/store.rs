@@ -77,6 +77,13 @@ pub struct Applied {
     pub departed: Vec<PeerId>,
 }
 
+/// The answer to a `Fetch`.
+#[derive(Debug)]
+pub struct Served {
+    pub entries: Vec<Entry>,
+    pub standings: Vec<Standing>,
+}
+
 pub struct Groups {
     db: Connection,
     me: PeerId,
@@ -276,49 +283,30 @@ impl Groups {
         Ok(out)
     }
 
-    /// How much of a group we may serve `peer`, if any. `Some(limit)` means entries
-    /// `0..limit`.
-    pub fn serve_up_to(&self, group: GroupId, peer: &PeerId) -> Result<Option<u64>, StoreError> {
-        let Some(row) = self.get(group)? else {
-            return Ok(None);
-        };
-        // A group we are not in ourselves is not ours to serve.
-        let members = self.members(group)?;
-        if !members.contains(&self.me) {
-            return Ok(None);
-        }
-        if members.contains(peer) {
-            return Ok(Some(row.head_seq));
-        }
-
-        // Not a member now. Were they ever? The chain is only loaded on this rarer path.
-        Ok(self
-            .chain(group)?
-            .departure_seq(peer)
-            .map(|removed_at| removed_at + 1))
-    }
-
-    /// Whether we may answer this peer's `Fetch` at all.
-    pub fn serves(&self, group: GroupId, peer: &PeerId) -> Result<bool, StoreError> {
-        Ok(self.serve_up_to(group, peer)?.is_some())
-    }
-
-    /// The entries to send in answer to `Fetch { group, from }`, or `None` to refuse.
-    pub fn entries_for(
+    /// The entries and standings to send in answer to `Fetch { group, from }`, or `None` to
+    /// refuse. A member gets the whole chain and every standing, a former member the chain up
+    /// to its removal and no standings.
+    pub fn serve(
         &self,
         group: GroupId,
         peer: &PeerId,
         from: u64,
-    ) -> Result<Option<Vec<Entry>>, StoreError> {
-        let Some(limit) = self.serve_up_to(group, peer)? else {
+    ) -> Result<Option<Served>, StoreError> {
+        // A group we are not in ourselves, or do not know, is not ours to serve.
+        let members = self.members(group)?;
+        if !members.contains(&self.me) {
+            return Ok(None);
+        }
+        let chain = self.chain(group)?;
+        let (limit, standings) = if members.contains(peer) {
+            (chain.len(), self.standings(group)?)
+        } else if let Some(removed_at) = chain.departure_seq(peer) {
+            (removed_at + 1, Vec::new())
+        } else {
             return Ok(None);
         };
-        Ok(Some(
-            self.chain(group)?
-                .entries_between(from, limit)
-                .cloned()
-                .collect(),
-        ))
+        let entries = chain.entries_between(from, limit).cloned().collect();
+        Ok(Some(Served { entries, standings }))
     }
 
     /// Resolve a full id, a unique hex prefix, or an exact name.
@@ -1184,7 +1172,7 @@ mod tests {
             store.shared_with(&peer_of(&stranger)).unwrap().is_empty(),
             "a non-member must learn nothing, not even that the group exists"
         );
-        assert!(!store.serves(id, &peer_of(&stranger)).unwrap());
+        assert!(store.serve(id, &peer_of(&stranger), 0).unwrap().is_none());
     }
 
     #[test]
@@ -1203,26 +1191,33 @@ mod tests {
             )
             .unwrap();
         // One more entry, which Bob must never see.
-        add(&mut store, &admin, id, peer_of(&key()), "carol");
+        let carol = peer_of(&key());
+        add(&mut store, &admin, id, carol, "carol");
 
         assert!(
             store.shared_with(&peer_of(&bob)).unwrap().is_empty(),
             "we do not chase someone we removed"
         );
-        assert_eq!(
-            store.serve_up_to(id, &peer_of(&bob)).unwrap(),
-            Some(3),
-            "everything up to and including the entry that removed them"
-        );
 
         let served = store
-            .entries_for(id, &peer_of(&bob), 0)
+            .serve(id, &peer_of(&bob), 0)
             .unwrap()
             .expect("a removed member may still ask");
-        assert_eq!(served.len(), 3, "genesis, their add, their removal");
+        assert_eq!(
+            served.entries.len(),
+            3,
+            "everything up to and including their removal: genesis, their add, their removal"
+        );
+        assert!(served.standings.is_empty(), "nor who is in the group now");
+
+        assert_eq!(
+            store.serve(id, &carol, 0).unwrap().unwrap().standings,
+            store.standings(id).unwrap(),
+            "a member gets every standing"
+        );
 
         // What Bob makes of it: he is out, and knows it.
-        let bobs_view = Chain::load(served).unwrap();
+        let bobs_view = Chain::load(served.entries).unwrap();
         assert!(!bobs_view.fold().contains(&peer_of(&bob)));
         assert_eq!(bobs_view.len(), 3, "nothing after the removal");
     }
@@ -1248,7 +1243,8 @@ mod tests {
         add(&mut store, &admin, id, peer_of(&bob), "bob"); // 3
         remove(&mut store); // 4
 
-        assert_eq!(store.serve_up_to(id, &peer_of(&bob)).unwrap(), Some(5));
+        let served = store.serve(id, &peer_of(&bob), 0).unwrap().unwrap();
+        assert_eq!(served.entries.len(), 5);
     }
 
     #[test]
@@ -1269,7 +1265,8 @@ mod tests {
         add(&mut store, &admin, id, peer_of(&bob), "bob");
 
         let head = store.get(id).unwrap().unwrap().head_seq;
-        assert_eq!(store.serve_up_to(id, &peer_of(&bob)).unwrap(), Some(head));
+        let served = store.serve(id, &peer_of(&bob), 0).unwrap().unwrap();
+        assert_eq!(served.entries.len() as u64, head);
         assert_eq!(store.shared_with(&peer_of(&bob)).unwrap().len(), 1);
     }
 
@@ -1280,8 +1277,7 @@ mod tests {
         add(&mut store, &admin, id, peer_of(&key()), "bob");
         let stranger = peer_of(&key());
 
-        assert_eq!(store.serve_up_to(id, &stranger).unwrap(), None);
-        assert!(store.entries_for(id, &stranger, 0).unwrap().is_none());
+        assert!(store.serve(id, &stranger, 0).unwrap().is_none());
     }
 
     #[test]
@@ -1308,7 +1304,7 @@ mod tests {
             "but we do name its log, or our silence reads as a refusal forever"
         );
         assert!(
-            mine.serves(id, &peer_of(&admin)).unwrap(),
+            mine.serve(id, &peer_of(&admin), 0).unwrap().is_some(),
             "and we still answer a member asking for the log, which is not data"
         );
 
@@ -1381,7 +1377,7 @@ mod tests {
         );
         assert!(mine.shared_with(&peer_of(&admin)).unwrap().is_empty());
         assert!(
-            mine.serves(id, &peer_of(&admin)).unwrap(),
+            mine.serve(id, &peer_of(&admin), 0).unwrap().is_some(),
             "a node that has left still answers, or its own departure could never reach the \
              admin and leaving would be invisible to everyone but the leaver"
         );

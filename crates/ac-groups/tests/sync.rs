@@ -242,6 +242,22 @@ fn add(admin: &mut Node, id: GroupId, peer: PeerId, _name: &str) {
         .unwrap();
 }
 
+/// Remove `peer` from `id` as the admin.
+fn remove(admin: &mut Node, id: GroupId, peer: PeerId) {
+    admin
+        .sync
+        .store_mut()
+        .author(
+            &admin.key,
+            id,
+            Op::Remove {
+                peer: peer.to_base58(),
+            },
+            AT,
+        )
+        .unwrap();
+}
+
 fn join(admin: &mut Node, member: &mut Node, id: GroupId) {
     connect(admin, member);
     member
@@ -450,18 +466,7 @@ fn a_removed_member_finds_out_by_asking() {
     join(&mut admin, &mut member, id);
 
     // The admin removes them, then adds someone else the member must never see.
-    admin
-        .sync
-        .store_mut()
-        .author(
-            &admin.key,
-            id,
-            Op::Remove {
-                peer: member.peer().to_base58(),
-            },
-            AT,
-        )
-        .unwrap();
+    remove(&mut admin, id, member.peer());
     add(&mut admin, id, Node::new().peer(), "carol");
 
     connect(&mut admin, &mut member);
@@ -488,6 +493,59 @@ fn a_removed_member_finds_out_by_asking() {
             .unwrap()
             .contains(&member.peer()),
         "and their own copy of the chain no longer lists them"
+    );
+}
+
+#[test]
+fn a_removed_member_is_sent_no_standings() {
+    let (mut admin, mut member, id) = admin_and_member();
+    join(&mut admin, &mut member, id);
+
+    remove(&mut admin, id, member.peer());
+    let mut carol = Node::new();
+    add(&mut admin, id, carol.peer(), "carol");
+    join(&mut admin, &mut carol, id);
+    connect(&mut admin, &mut carol);
+    assert!(
+        admin
+            .sync
+            .store()
+            .standings(id)
+            .unwrap()
+            .iter()
+            .any(|s| s.subject().unwrap() == carol.peer()),
+        "the admin holds Carol's answer"
+    );
+
+    // Asserted on the response: the former member's store would drop the rows anyway.
+    let (response, _) =
+        admin.sync_on_request(member.peer(), GroupRequest::Fetch { group: id, from: 0 });
+    let GroupResponse::Entries {
+        entries, standings, ..
+    } = response
+    else {
+        panic!("a former member must still learn of its removal, got {response:?}");
+    };
+    assert_eq!(entries.len(), 3, "up to and including the removal");
+    let last = entries.last().unwrap().body().unwrap();
+    assert_eq!(
+        last.op,
+        Op::Remove {
+            peer: member.peer().to_base58()
+        },
+        "ending on the removal itself"
+    );
+    assert!(standings.is_empty(), "and no standings");
+
+    let (response, _) =
+        admin.sync_on_request(carol.peer(), GroupRequest::Fetch { group: id, from: 0 });
+    let GroupResponse::Entries { standings, .. } = response else {
+        panic!("a member must be answered, got {response:?}");
+    };
+    assert_eq!(
+        standings,
+        admin.sync.store().standings(id).unwrap(),
+        "a current member gets every standing"
     );
 }
 
