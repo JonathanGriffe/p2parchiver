@@ -126,7 +126,7 @@ dependencies = [
  "ac-groups",
  "ac-import",
  "ac-net",
- "ac-peers",
+ "ac-supervisor",
  "anyhow",
  "clap",
  "fs4",
@@ -140,21 +140,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "ac-peers"
-version = "0.0.0"
-dependencies = [
- "ac-files",
- "ac-groups",
- "ac-net",
- "ciborium",
- "hex",
- "serde",
- "tempfile",
- "thiserror 2.0.19",
- "tracing",
 ]
 
 [[package]]
@@ -175,6 +160,20 @@ dependencies = [
  "toml 1.1.4+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ac-supervisor"
+version = "0.0.0"
+dependencies = [
+ "ac-files",
+ "ac-groups",
+ "ac-net",
+ "ciborium",
+ "hex",
+ "serde",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

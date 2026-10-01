@@ -11,8 +11,8 @@ use ac_net::proto::{PresenceRequest, PresenceResponse};
 
 use ac_files::store::Files;
 use ac_groups::store::Groups;
-use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers, Space};
-use ac_peers::wire::{SessionRequest, SessionResponse};
+use ac_supervisor::sync::{Limits, Offering, PeerAction, PeerEvent, Space, Supervisor};
+use ac_supervisor::wire::{SessionRequest, SessionResponse};
 
 use crate::daemon::ClientSwarm;
 use crate::file_link::{FileLink, RoundOutcome, TransferOutcome};
@@ -36,8 +36,8 @@ fn dialable(addr: &Multiaddr) -> bool {
     })
 }
 
-pub struct PeerLink {
-    peers: Peers,
+pub struct SupervisorLink {
+    supervisor: Supervisor,
     proposals: HashMap<request_response::OutboundRequestId, PeerId>,
     presence: HashMap<request_response::OutboundRequestId, Vec<PeerId>>,
     server: Option<PeerId>,
@@ -50,7 +50,7 @@ pub struct PeerLink {
     moved_at: Option<(u64, u64, i64)>,
 }
 
-impl PeerLink {
+impl SupervisorLink {
     pub fn open(
         paths: &Paths,
         identity: &Identity,
@@ -70,7 +70,7 @@ impl PeerLink {
         let root = config.storage_root(paths);
 
         Ok(Self {
-            peers: Peers::new(files, groups, at).with_limits(Limits {
+            supervisor: Supervisor::new(files, groups, at).with_limits(Limits {
                 storage_max: config.storage_max,
                 ..Limits::default()
             }),
@@ -95,7 +95,7 @@ impl PeerLink {
         admitted_peers: &AdmittedPeers,
         peer: PeerId,
     ) {
-        let actions = self.peers.on(PeerEvent::Verified { peer });
+        let actions = self.supervisor.on(PeerEvent::Verified { peer });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
     }
 
@@ -119,7 +119,7 @@ impl PeerLink {
             }
         }
 
-        let actions = self.peers.on(PeerEvent::Discovered { peer });
+        let actions = self.supervisor.on(PeerEvent::Discovered { peer });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
     }
 
@@ -131,7 +131,7 @@ impl PeerLink {
         admitted_peers: &AdmittedPeers,
         peer: PeerId,
     ) {
-        let actions = self.peers.on(PeerEvent::Gone { peer });
+        let actions = self.supervisor.on(PeerEvent::Gone { peer });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
     }
 
@@ -144,7 +144,7 @@ impl PeerLink {
         peer: PeerId,
     ) {
         self.demote(&peer);
-        let actions = self.peers.on(PeerEvent::DialFailed { peer });
+        let actions = self.supervisor.on(PeerEvent::DialFailed { peer });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
     }
 
@@ -159,7 +159,7 @@ impl PeerLink {
 
     /// Whether this peer's connection is ending by agreement rather than by accident.
     pub fn close_was_agreed(&self, peer: &PeerId) -> bool {
-        self.peers.close_was_agreed(peer)
+        self.supervisor.close_was_agreed(peer)
     }
 
     /// Feed the supervisor everything the other layers have finished.
@@ -187,7 +187,7 @@ impl PeerLink {
                     why: why.to_string(),
                 },
             };
-            let actions = self.peers.on(event);
+            let actions = self.supervisor.on(event);
             self.dispatch(swarm, files, groups, admitted_peers, actions);
         }
 
@@ -227,7 +227,7 @@ impl PeerLink {
                     PeerEvent::HoldingsRefused { peer, group }
                 }
             };
-            let actions = self.peers.on(event);
+            let actions = self.supervisor.on(event);
             self.dispatch(swarm, files, groups, admitted_peers, actions);
         }
     }
@@ -245,17 +245,20 @@ impl PeerLink {
         self.collect(swarm, files, groups, admitted_peers);
 
         if let Some(space) = space {
-            self.peers.on(PeerEvent::Space {
+            self.supervisor.on(PeerEvent::Space {
                 free: space.free,
                 held: space.held,
             });
         }
 
-        let actions = self.peers.on(PeerEvent::Tick { at });
+        let actions = self.supervisor.on(PeerEvent::Tick { at });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
 
         let bandwidth = self.bandwidth(files, at);
-        if let Err(e) = self.status.publish(&self.peers.status(), at, &bandwidth) {
+        if let Err(e) = self
+            .status
+            .publish(&self.supervisor.status(), at, &bandwidth)
+        {
             tracing::debug!(error = %e, "could not publish supervisor status");
         }
     }
@@ -341,7 +344,7 @@ impl PeerLink {
                         SessionResponse::Busy
                     },
                 );
-                self.peers.on(PeerEvent::CloseProposed { peer, ready })
+                self.supervisor.on(PeerEvent::CloseProposed { peer, ready })
             }
 
             Event::Message {
@@ -356,7 +359,7 @@ impl PeerLink {
                 if self.proposals.remove(&request_id) != Some(peer) {
                     return;
                 }
-                self.peers.on(PeerEvent::CloseAnswered {
+                self.supervisor.on(PeerEvent::CloseAnswered {
                     peer,
                     ready: matches!(response, SessionResponse::Ready),
                 })
@@ -366,7 +369,7 @@ impl PeerLink {
                 peer, request_id, ..
             } => {
                 self.proposals.remove(&request_id);
-                self.peers
+                self.supervisor
                     .on(PeerEvent::CloseAnswered { peer, ready: false })
             }
 
@@ -414,7 +417,7 @@ impl PeerLink {
             online = online.len(),
             "who is online, answered"
         );
-        let actions = self.peers.on(PeerEvent::Presence { asked, online });
+        let actions = self.supervisor.on(PeerEvent::Presence { asked, online });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
     }
 
@@ -427,7 +430,7 @@ impl PeerLink {
         admitted_peers: &AdmittedPeers,
     ) -> bool {
         admitted_peers.is_ready(peer)
-            && self.peers.drained(*peer)
+            && self.supervisor.drained(*peer)
             && !files.busy_with(peer)
             && !groups.busy_with(peer)
     }
@@ -451,7 +454,7 @@ impl PeerLink {
                     tracing::debug!(%peer, %addr, "dialling a member");
                     if let Err(e) = swarm.dial(addr) {
                         tracing::debug!(%peer, error = %e, "dial refused before it started");
-                        let actions = self.peers.on(PeerEvent::DialFailed { peer });
+                        let actions = self.supervisor.on(PeerEvent::DialFailed { peer });
                         self.dispatch(swarm, files, groups, admitted_peers, actions);
                     }
                 }
@@ -476,7 +479,7 @@ impl PeerLink {
                 PeerAction::Ask { peer, offering } => {
                     if groups.busy_with(&peer) {
                         tracing::debug!(%peer, ?offering, "ask deferred; a chain exchange is still outstanding");
-                        let actions = self.peers.on(PeerEvent::AskDeferred { peer });
+                        let actions = self.supervisor.on(PeerEvent::AskDeferred { peer });
                         self.dispatch(swarm, files, groups, admitted_peers, actions);
                         continue;
                     }
@@ -497,7 +500,7 @@ impl PeerLink {
                     hash,
                 } => {
                     if let Err(why) = files.fetch(peer, group, path.clone(), hash) {
-                        let actions = self.peers.on(PeerEvent::BlobFailed {
+                        let actions = self.supervisor.on(PeerEvent::BlobFailed {
                             peer,
                             group,
                             path,
@@ -514,7 +517,7 @@ impl PeerLink {
                     }
                     if !self.drained(&peer, files, groups, admitted_peers) {
                         let actions = self
-                            .peers
+                            .supervisor
                             .on(PeerEvent::CloseAnswered { peer, ready: false });
                         self.dispatch(swarm, files, groups, admitted_peers, actions);
                         continue;
@@ -549,12 +552,6 @@ impl PeerLink {
                 .with(Protocol::P2pCircuit)
                 .with(Protocol::P2p(*peer)),
         )
-    }
-
-    /// The supervisor's own view, for `ac peer status` and for tests.
-    #[cfg(test)]
-    pub(crate) fn peers(&self) -> &Peers {
-        &self.peers
     }
 }
 
@@ -594,7 +591,7 @@ mod tests {
         swarm: ClientSwarm,
         link: FileLink,
         groups: GroupLink,
-        peers: PeerLink,
+        supervisor: SupervisorLink,
         admitted_peers: AdmittedPeers,
         peer: PeerId,
         dir: tempfile::TempDir,
@@ -626,7 +623,7 @@ mod tests {
                 link: FileLink::open(&paths, &identity, streams, down).unwrap(),
                 swarm,
                 groups: GroupLink::open(&paths, &identity).unwrap(),
-                peers: PeerLink::open(&paths, &identity, None, AT).unwrap(),
+                supervisor: SupervisorLink::open(&paths, &identity, None, AT).unwrap(),
                 admitted_peers: AdmittedPeers::default(),
                 peer: identity.peer_id(),
                 dir,
@@ -651,7 +648,7 @@ mod tests {
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     let still = self.swarm.is_connected(peer_id);
                     if self.admitted_peers.disconnected(peer_id, still) {
-                        self.peers.on_disconnected(
+                        self.supervisor.on_disconnected(
                             &mut self.swarm,
                             &mut self.link,
                             &mut self.groups,
@@ -673,7 +670,7 @@ mod tests {
                         .on_event(&mut self.swarm, &self.admitted_peers, event);
                 }
                 SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Sessions(event))) => {
-                    self.peers.on_session(
+                    self.supervisor.on_session(
                         &mut self.swarm,
                         &mut self.link,
                         &mut self.groups,
@@ -684,7 +681,7 @@ mod tests {
                 _ => {}
             }
 
-            self.peers.collect(
+            self.supervisor.collect(
                 &mut self.swarm,
                 &mut self.link,
                 &mut self.groups,
@@ -695,7 +692,7 @@ mod tests {
         /// The daemon's transfer arm.
         fn on_transfer(&mut self, event: TransferEvent<FetchError>) {
             if self.link.on_transfer(event, &self.admitted_peers) {
-                self.peers.collect(
+                self.supervisor.collect(
                     &mut self.swarm,
                     &mut self.link,
                     &mut self.groups,
@@ -708,7 +705,7 @@ mod tests {
             self.at += PER_TICK;
 
             for peer in self.admitted_peers.promote(&Connectivity::default()) {
-                self.peers.peer_ready(
+                self.supervisor.peer_ready(
                     &mut self.swarm,
                     &mut self.link,
                     &mut self.groups,
@@ -728,8 +725,8 @@ mod tests {
                 Instant::now(),
                 self.at,
             );
-            let space = self.peers.space(&self.link, 0);
-            self.peers.housekeeping(
+            let space = self.supervisor.space(&self.link, 0);
+            self.supervisor.housekeeping(
                 &mut self.swarm,
                 &mut self.link,
                 &mut self.groups,
@@ -741,7 +738,7 @@ mod tests {
 
         /// Hand the supervisor an address for a peer, as mDNS or the rendezvous sweep would.
         fn discover(&mut self, peer: PeerId, addr: Multiaddr) {
-            self.peers.discovered(
+            self.supervisor.discovered(
                 peer,
                 std::slice::from_ref(&addr),
                 &mut self.link,
@@ -836,7 +833,7 @@ mod tests {
             }
         }
         let dump = |n: &mut Node| {
-            let status = n.peers.peers().status();
+            let status = n.supervisor.supervisor.status();
             format!(
                 "at={} connected={} groups={:?} peers={:?}",
                 n.at,
@@ -946,7 +943,7 @@ mod tests {
         // Discovery hands them over one at a time, which is how the last one heard used to
         // become the only one tried.
         for addr in [&first, &second] {
-            n.peers.discovered(
+            n.supervisor.discovered(
                 them,
                 std::slice::from_ref(addr),
                 &mut n.link,
@@ -956,16 +953,16 @@ mod tests {
             );
         }
 
-        assert_eq!(n.peers.address_of(&them), Some(first.clone()));
-        n.peers.demote(&them);
+        assert_eq!(n.supervisor.address_of(&them), Some(first.clone()));
+        n.supervisor.demote(&them);
         assert_eq!(
-            n.peers.address_of(&them),
+            n.supervisor.address_of(&them),
             Some(second),
             "a dial that failed gives the next candidate a turn"
         );
-        n.peers.demote(&them);
+        n.supervisor.demote(&them);
         assert_eq!(
-            n.peers.address_of(&them),
+            n.supervisor.address_of(&them),
             Some(first),
             "and they come round again rather than running out"
         );
@@ -1160,7 +1157,7 @@ mod tests {
         .await;
 
         assert!(
-            alice.peers.peers().drained(bob_peer),
+            alice.supervisor.supervisor.drained(bob_peer),
             "alice hung up because she was drained, not because something went wrong"
         );
     }
@@ -1221,18 +1218,21 @@ mod tests {
         }
 
         assert!(
-            n.peers
+            n.supervisor
                 .drained(&dave, &n.link, &n.groups, &n.admitted_peers),
             "a peer with nothing outstanding may be hung up on"
         );
-        assert!(!n.peers.drained(&bob, &n.link, &n.groups, &n.admitted_peers));
         assert!(
-            !n.peers
+            !n.supervisor
+                .drained(&bob, &n.link, &n.groups, &n.admitted_peers)
+        );
+        assert!(
+            !n.supervisor
                 .drained(&carol, &n.link, &n.groups, &n.admitted_peers),
             "a read still waiting to go out is work outstanding with carol"
         );
 
-        n.peers.dispatch(
+        n.supervisor.dispatch(
             &mut n.swarm,
             &mut n.link,
             &mut n.groups,
@@ -1240,7 +1240,7 @@ mod tests {
             vec![PeerAction::ProposeClose { peer: carol }],
         );
         assert!(
-            n.peers.proposals.is_empty(),
+            n.supervisor.proposals.is_empty(),
             "carol is not asked to hang up"
         );
     }

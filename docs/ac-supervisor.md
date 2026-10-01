@@ -1,8 +1,8 @@
-# ac-peers
+# ac-supervisor
 
 The application's supervisor. It decides which peers to call and when, what to reconcile with them, which files to download from whom, and when to hang up. Like the sync machines, it does no IO: it takes events and returns the actions for `ac-node` to carry out. It depends on `ac-net`, `ac-groups` and `ac-files`, since deciding who to call needs to see membership and content at once, and only `ac-node` builds on it.
 
-Paths below are relative to `crates/ac-peers/`.
+Paths below are relative to `crates/ac-supervisor/`.
 
 ## Features
 

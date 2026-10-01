@@ -316,7 +316,7 @@ struct Retry {
     left: u8,
 }
 
-pub struct Peers {
+pub struct Supervisor {
     files: Files,
     groups: Groups,
     me: PeerId,
@@ -340,7 +340,7 @@ pub struct Peers {
     cramped: bool,
 }
 
-impl Peers {
+impl Supervisor {
     pub fn new(files: Files, groups: Groups, at: i64) -> Self {
         let me = files.me();
         Self {

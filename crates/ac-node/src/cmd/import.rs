@@ -2,7 +2,7 @@ use std::path::Path;
 
 use ac_import::config::{Field, FieldKind, Fields};
 use ac_net::config::{Config, Paths};
-use ac_peers::sync::{Limits, Space};
+use ac_supervisor::sync::{Limits, Space};
 use anyhow::{Result, bail};
 
 use ac_net::throttle::{THROTTLE_BURST, Throttle};
@@ -524,7 +524,7 @@ mod tests {
     /// The daemon holds imports to `Limits` and the sync side refuses transfers on the same
     /// ones; a fetch typed at a terminal answers to them too. What is asserted here is the
     /// half a mistake would break silently: an empty node must not refuse. Whether a spent
-    /// budget says no is `Limits::room`'s own question, and `ac-peers` tests it.
+    /// budget says no is `Limits::room`'s own question, and `ac-supervisor` tests it.
     #[test]
     fn a_fetch_on_an_empty_node_is_not_refused_for_want_of_room() {
         let home = tempfile::tempdir().unwrap();

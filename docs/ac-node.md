@@ -1,6 +1,6 @@
 # ac-node
 
-The client node, built as the `ac` binary. It runs the daemon, which puts every layer onto one libp2p swarm and carries out what their state machines decide, and it holds the operations, the actions on a node's home that the CLI and the desktop app both call. It depends on every other client crate (`ac-net`, `ac-groups`, `ac-files`, `ac-import` and `ac-peers`), and only `ac-desktop` builds on it.
+The client node, built as the `ac` binary. It runs the daemon, which puts every layer onto one libp2p swarm and carries out what their state machines decide, and it holds the operations, the actions on a node's home that the CLI and the desktop app both call. It depends on every other client crate (`ac-net`, `ac-groups`, `ac-files`, `ac-import` and `ac-supervisor`), and only `ac-desktop` builds on it.
 
 Paths below are relative to `crates/ac-node/`.
 
@@ -8,7 +8,7 @@ Paths below are relative to `crates/ac-node/`.
 
 - **CLI**: the `ac` binary and its commands (`id`, `join`, `run`, `probe`, `peer`, `group`, `file` and `import`) in `src/main.rs` and `src/cmd/`.
 - **Daemon**: the event loop that drives the swarm and every layer in `src/daemon.rs`.
-- **Links**: connect each layer's state machine to the swarm: chains in `src/group_link.rs`, catalogues and file transfers in `src/file_link.rs`, the supervisor in `src/peer_link.rs`, and imports in `src/import_link.rs`.
+- **Links**: connect each layer's state machine to the swarm: chains in `src/group_link.rs`, catalogues and file transfers in `src/file_link.rs`, the supervisor in `src/supervisor_link.rs`, and imports in `src/import_link.rs`.
 - **Operations**: the actions the CLI and the desktop app share in `src/ops/`: joining a server, groups, files, contacts and status, imports, and the node lock.
 - **Contacts**: peers named by hand in `src/contacts.rs`, merged with fellow group members into one list of names in `src/directory.rs`.
 - **Status**: the supervisor's snapshot, published for the CLI and the desktop app, in `src/status.rs`.
@@ -43,7 +43,7 @@ Only one daemon may run on a home. `ac run` and the desktop app take a lock on `
 - **Readiness.** An inbound stream is served only from a ready peer, and dropped otherwise.
 - **No directory.** A fetch for a group that has no directory, such as one forgotten while the fetch was queued, fails, to be retried, so the supervisor frees its slot.
 - **Imports first.** Before downloading, the node looks in `.unsorted`. If the bytes were imported and not yet sorted, they are moved into the group instead. Any failure there falls back to downloading.
-- **Two download caps.** The supervisor runs at most 8 transfers at once (`MAX_TRANSFERS` in `ac-peers`), and the service refuses a download past 8 (`MAX_DOWNLOADS` in `ac-files`) as a backstop. A fetch refused there fails, to be retried.
+- **Two download caps.** The supervisor runs at most 8 transfers at once (`MAX_TRANSFERS` in `ac-supervisor`), and the service refuses a download past 8 (`MAX_DOWNLOADS` in `ac-files`) as a backstop. A fetch refused there fails, to be retried.
 - **Hanging up.** A running download counts as work outstanding with its peer. An upload does not.
 - **Bandwidth.** The download limit is shared by transfers from peers and by imports. A foreground `ac import fetch` has a limit of its own, since it assumes no daemon runs beside it.
 

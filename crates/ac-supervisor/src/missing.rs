@@ -1,27 +1,18 @@
 use ac_files::path::RelPath;
 use ac_files::store::{Files, FilesError};
 use ac_groups::id::GroupId;
-use ac_groups::store::StoreError;
 
 pub fn next_missing(
     files: &Files,
     group: GroupId,
     after: Option<&RelPath>,
     limit: usize,
-) -> Result<Vec<(RelPath, String)>, PeersError> {
+) -> Result<Vec<(RelPath, String)>, FilesError> {
     Ok(files
         .missing(group, after, limit)?
         .into_iter()
         .map(|row| (row.path, row.hash))
         .collect())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PeersError {
-    #[error(transparent)]
-    Files(#[from] FilesError),
-    #[error(transparent)]
-    Groups(#[from] StoreError),
 }
 
 #[cfg(test)]
