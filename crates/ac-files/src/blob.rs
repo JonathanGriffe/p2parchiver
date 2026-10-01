@@ -194,13 +194,9 @@ impl Download for Fetch {
             expected,
         } = receiving;
 
-        match ended {
-            Err(FetchError::Overlong) => {
-                sink.park().map_err(FetchError::Disk)?;
-                return Err(FetchError::Overlong);
-            }
-            Err(e) => return Err(e),
-            Ok(()) => {}
+        if let Err(e) = ended {
+            sink.park().map_err(FetchError::Disk)?;
+            return Err(e);
         }
 
         if got != expected {

@@ -59,7 +59,7 @@ Only admitted peers get answers, at most 8 per peer per tick, and heads are only
 
 A download sends the group, the path, the hash and the offset to resume from. The peer answers with the number of bytes it will send, or refuses, then sends the raw bytes. `ac-net` moves them, and `src/blob.rs` decides what to do with them, as sync code: `Fetch` for one download and `Server` for every upload. Both open the stores they need on each transfer.
 - **Imports first.** Before asking the peer, a download asks a `Local` whether the bytes are already on this node. `ac-node` answers from its imports not yet sorted, moving the bytes into the group. Any failure there falls back to downloading.
-- **Resuming.** A download resumes from what it staged on an earlier attempt, and keeps the partial when a transfer ends early.
+- **Resuming.** A download resumes from what it staged on an earlier attempt. A transfer that stops partway, whether it ended early, broke, or failed to write, parks its partial with an fsync, so the next attempt continues from it even after a crash.
 - **Final failures.** A refusal, more bytes than announced, or bytes that do not hash to what was asked are final: the supervisor does not ask that peer for that file again. A wrong hash also discards the partial. Anything else, such as a broken stream, is retried.
 - **Serving.** A file is served only to a peer the group is shared with, and only if its row is live, held, and has the hash asked for. A path that does not parse is refused. A file the index claims but that is missing on disk is refused, and the index is corrected so it is fetched again.
 
