@@ -15,7 +15,7 @@ use ac_peers::sync::{Limits, Offering, PeerAction, PeerEvent, Peers, Space};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
 use crate::daemon::ClientSwarm;
-use crate::file_link::{FileLink, RoundOutcome, TransferOutcome};
+use crate::file_link::{FileLink, NotStarted, RoundOutcome, TransferOutcome};
 use crate::group_link::GroupLink;
 use crate::status::{Bandwidth, Published};
 
@@ -496,18 +496,18 @@ impl PeerLink {
                     path,
                     hash,
                 } => {
-                    let Some(dir) = files.dir_of(group) else {
-                        continue;
-                    };
-                    if !files.fetch(peer, group, path.clone(), hash, dir) {
-                        let actions = self.peers.on(PeerEvent::BlobFailed {
-                            peer,
-                            group,
-                            path,
-                            terminal: false,
-                            why: "the transfer pool was full".to_owned(),
-                        });
-                        self.dispatch(swarm, files, groups, admitted_peers, actions);
+                    match files.fetch(peer, group, path.clone(), hash) {
+                        Ok(()) | Err(NotStarted::NoDirectory) => {}
+                        Err(why) => {
+                            let actions = self.peers.on(PeerEvent::BlobFailed {
+                                peer,
+                                group,
+                                path,
+                                terminal: false,
+                                why: why.to_string(),
+                            });
+                            self.dispatch(swarm, files, groups, admitted_peers, actions);
+                        }
                     }
                 }
 
@@ -765,7 +765,7 @@ mod tests {
         /// Put a file in this node's catalogue, bytes and all.
         fn add(&mut self, group: GroupId, path: &str, bytes: &[u8]) -> RelPath {
             let path = RelPath::parse(path).unwrap();
-            let dir = self.link.dir_of(group).unwrap();
+            let dir = self.link.sync().dir_of(group).unwrap();
 
             let src = self.dir.path().join("incoming");
             std::fs::write(&src, bytes).unwrap();
@@ -797,13 +797,13 @@ mod tests {
         }
 
         fn bytes(&mut self, group: GroupId, path: &RelPath) -> Vec<u8> {
-            let dir = self.link.dir_of(group).unwrap();
+            let dir = self.link.sync().dir_of(group).unwrap();
             std::fs::read(self.link.sync().content().locate(&dir, path)).unwrap()
         }
 
         /// Delete a file's bytes behind the index's back, as a stray `rm` would.
         fn lose_bytes(&mut self, group: GroupId, path: &RelPath) {
-            let dir = self.link.dir_of(group).unwrap();
+            let dir = self.link.sync().dir_of(group).unwrap();
             std::fs::remove_file(self.link.sync().content().locate(&dir, path)).unwrap();
         }
     }

@@ -66,6 +66,15 @@ pub struct TransferOutcome {
     pub result: Result<(), FetchError>,
 }
 
+/// Why a fetch did not start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NotStarted {
+    #[error("the transfer pool was full")]
+    PoolFull,
+    #[error("the group has no directory")]
+    NoDirectory,
+}
+
 /// Imported files not yet sorted, where a download looks before asking a peer.
 struct Unsorted {
     db: std::path::PathBuf,
@@ -180,21 +189,22 @@ impl FileLink {
         self.transfers.moved()
     }
 
-    /// Start fetching a file from `peer`. False if every download slot is taken.
+    /// Start fetching a file from `peer`.
     pub fn fetch(
         &mut self,
         peer: PeerId,
         group: GroupId,
         path: RelPath,
         hash: String,
-        dir: String,
-    ) -> bool {
+    ) -> Result<(), NotStarted> {
+        let dir = self.sync.dir_of(group).ok_or(NotStarted::NoDirectory)?;
         let fetch = self.blobs.fetch(group, dir, path.clone(), hash);
-        let Some(id) = self.transfers.fetch(peer, fetch) else {
-            return false;
-        };
+        let id = self
+            .transfers
+            .fetch(peer, fetch)
+            .ok_or(NotStarted::PoolFull)?;
         self.fetching.insert(id, (peer, group, path));
-        true
+        Ok(())
     }
 
     /// Wait for a file transfer to end, or a peer to open one.
@@ -283,11 +293,6 @@ impl FileLink {
     /// Bytes of content this node holds, across every group. Feeds the storage budget.
     pub fn held_bytes(&self) -> Option<u64> {
         self.sync.files().held_bytes().ok()
-    }
-
-    /// The group directory, for a transfer that needs somewhere to put bytes.
-    pub fn dir_of(&mut self, group: GroupId) -> Option<String> {
-        self.sync.dir_of(group)
     }
 
     /// Drive the machine's clock.
