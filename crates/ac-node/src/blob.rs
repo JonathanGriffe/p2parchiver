@@ -12,13 +12,11 @@ use ac_groups::store::Groups;
 use ac_peers::sync::PeerEvent;
 use tokio::sync::Semaphore;
 
+use ac_net::stream::{read_frame, receive, send, write_frame};
 use ac_net::throttle::Throttle;
-use futures::{AsyncReadExt, AsyncWriteExt};
+use futures::AsyncWriteExt;
 use libp2p::{PeerId, StreamProtocol};
-use std::io::Read as _;
 use tokio::sync::mpsc;
-
-const CHUNK: usize = 64 * 1024;
 
 const MAX_HEADER_BYTES: usize = 4096;
 
@@ -236,7 +234,7 @@ async fn download(
         hash,
         offset: resume,
     };
-    write_frame(&mut stream, &header).await?;
+    write_frame(&mut stream, &header, MAX_HEADER_BYTES).await?;
 
     let reply: BlobReply = read_frame(&mut stream, MAX_HEADER_BYTES).await?;
     let expected = match reply {
@@ -245,24 +243,22 @@ async fn download(
     };
 
     let mut sink = content.resume(&want.dir, &want.path, resume)?;
-    let mut buf = vec![0u8; CHUNK];
     let mut got = 0u64;
 
-    loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-
-        if overruns(got, n, expected) {
-            sink.park()?;
+    let received = receive(&mut stream, down, |chunk| -> anyhow::Result<()> {
+        if overruns(got, chunk.len(), expected) {
             anyhow::bail!(Refusal::Overlong);
         }
-
-        down.consume(n).await;
-
-        sink.write(&buf[..n])?;
-        got += n as u64;
+        sink.write(chunk)?;
+        got += chunk.len() as u64;
+        Ok(())
+    })
+    .await;
+    if let Err(e) = received {
+        if e.downcast_ref::<Refusal>() == Some(&Refusal::Overlong) {
+            sink.park()?;
+        }
+        return Err(e);
     }
 
     if got != expected {
@@ -296,7 +292,7 @@ pub fn serve(
         tracing::warn!(%peer, limit = MAX_SERVING, "already serving all we can; refusing");
         tokio::spawn(async move {
             let mut stream = stream;
-            let _ = write_frame(&mut stream, &BlobReply::Unavailable).await;
+            let _ = write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await;
             let _ = stream.close().await;
         });
         return;
@@ -325,20 +321,20 @@ async fn answer(
     let groups = Groups::open(&db, me)?;
 
     let Some(size) = may_serve(&files, &groups, &peer, request.group, &path) else {
-        write_frame(&mut stream, &BlobReply::Unavailable).await?;
+        write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await?;
         stream.close().await?;
         return Ok(());
     };
 
     let row = files.get(request.group, &path)?;
     if row.is_none_or(|r| r.hash != hex::encode(request.hash)) {
-        write_frame(&mut stream, &BlobReply::Unavailable).await?;
+        write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await?;
         stream.close().await?;
         return Ok(());
     }
 
     let Some(dir) = files.dir_of(request.group)? else {
-        write_frame(&mut stream, &BlobReply::Unavailable).await?;
+        write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await?;
         stream.close().await?;
         return Ok(());
     };
@@ -350,59 +346,23 @@ async fn answer(
             let mut files = files;
             let _ = files.mark_have(request.group, &path, false);
 
-            write_frame(&mut stream, &BlobReply::Unavailable).await?;
+            write_frame(&mut stream, &BlobReply::Unavailable, MAX_HEADER_BYTES).await?;
             stream.close().await?;
             return Ok(());
         }
     };
 
     let remaining = size.saturating_sub(request.offset);
-    write_frame(&mut stream, &BlobReply::Sending { size: remaining }).await?;
+    write_frame(
+        &mut stream,
+        &BlobReply::Sending { size: remaining },
+        MAX_HEADER_BYTES,
+    )
+    .await?;
 
-    let mut file = file;
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        up.consume(n).await;
-        stream.write_all(&buf[..n]).await?;
-    }
+    send(&mut stream, file, up).await?;
     stream.close().await?;
     Ok(())
-}
-
-/// Write a length-prefixed CBOR value.
-async fn write_frame<T: serde::Serialize>(
-    stream: &mut libp2p::swarm::Stream,
-    value: &T,
-) -> anyhow::Result<()> {
-    let mut body = Vec::new();
-    ciborium::into_writer(value, &mut body)?;
-    anyhow::ensure!(body.len() <= MAX_HEADER_BYTES, "header too large");
-
-    stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
-    stream.write_all(&body).await?;
-    Ok(())
-}
-
-async fn read_frame<T: serde::de::DeserializeOwned>(
-    stream: &mut libp2p::swarm::Stream,
-    limit: usize,
-) -> anyhow::Result<T> {
-    let mut len = [0u8; 4];
-    stream.read_exact(&mut len).await?;
-
-    let len = u32::from_be_bytes(len) as usize;
-    anyhow::ensure!(
-        len <= limit,
-        "a {len} byte header exceeds the {limit} limit"
-    );
-
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body).await?;
-    Ok(ciborium::from_reader(&body[..])?)
 }
 
 #[cfg(test)]

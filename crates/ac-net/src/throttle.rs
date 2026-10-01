@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-/// Burst for the transfer rate limits: a second of allowance, floored so two 64 KiB chunks
-/// are always spendable.
-pub const THROTTLE_BURST: u64 = 2 * 64 * 1024;
+/// Burst for the transfer rate limits: a second of allowance, floored so a whole chunk is
+/// always spendable.
+pub const THROTTLE_BURST: u64 = (2 * crate::stream::CHUNK) as u64;
 
 /// A rate limit on bytes, shared by everything moving them in one direction.
 #[derive(Debug)]

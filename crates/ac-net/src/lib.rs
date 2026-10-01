@@ -14,6 +14,7 @@ pub mod keepalive;
 pub mod limits;
 pub mod link;
 pub mod proto;
+pub mod stream;
 pub mod swarm;
 pub mod throttle;
 
