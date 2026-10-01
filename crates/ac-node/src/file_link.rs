@@ -5,9 +5,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use libp2p::{PeerId, request_response};
 
+use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
-use ac_net::roster::Roster;
 
 use ac_files::content::Content;
 use ac_files::path::RelPath;
@@ -175,18 +175,18 @@ impl FileLink {
     pub fn housekeeping(
         &mut self,
         swarm: &mut ClientSwarm,
-        roster: &Roster,
+        admitted_peers: &AdmittedPeers,
         now: Instant,
         at: i64,
     ) {
-        let actions = self.sync.on(FileEvent::Tick { now, at }, roster);
+        let actions = self.sync.on(FileEvent::Tick { now, at }, admitted_peers);
         self.dispatch(swarm, actions);
     }
 
     pub fn on_event(
         &mut self,
         swarm: &mut ClientSwarm,
-        roster: &Roster,
+        admitted_peers: &AdmittedPeers,
         event: request_response::Event<ManifestRequest, ManifestResponse>,
     ) {
         use request_response::{Event, Message};
@@ -200,7 +200,7 @@ impl FileLink {
                     },
                 ..
             } => {
-                let (response, actions) = self.sync.on_request(peer, request, roster);
+                let (response, actions) = self.sync.on_request(peer, request, admitted_peers);
                 let _ = swarm
                     .behaviour_mut()
                     .app
@@ -228,7 +228,8 @@ impl FileLink {
                 match (what, response) {
                     (Outbound::Ask, ManifestResponse::Heads(heads)) => {
                         self.rounds.push(RoundOutcome::Asked { peer });
-                        self.sync.on(FileEvent::Heads { peer, heads }, roster)
+                        self.sync
+                            .on(FileEvent::Heads { peer, heads }, admitted_peers)
                     }
                     (Outbound::Ask, _) => {
                         self.rounds.push(RoundOutcome::Failed { peer });
@@ -253,11 +254,11 @@ impl FileLink {
                             more,
                             digest,
                         },
-                        roster,
+                        admitted_peers,
                     ),
-                    (Outbound::Changes { group, .. }, ManifestResponse::Unavailable) => {
-                        self.sync.on(FileEvent::Unavailable { peer, group }, roster)
-                    }
+                    (Outbound::Changes { group, .. }, ManifestResponse::Unavailable) => self
+                        .sync
+                        .on(FileEvent::Unavailable { peer, group }, admitted_peers),
                     (
                         Outbound::Holdings { group, paths },
                         ManifestResponse::Holdings {
@@ -306,7 +307,7 @@ impl FileLink {
                     _ => None,
                 };
                 self.sync
-                    .on(FileEvent::RequestFailed { peer, group }, roster)
+                    .on(FileEvent::RequestFailed { peer, group }, admitted_peers)
             }
 
             _ => return,

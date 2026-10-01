@@ -9,9 +9,9 @@ use ac_groups::store::{Groups, State};
 use ac_groups::sync::{GroupAction, GroupEvent, GroupSync, MAX_INFLIGHT};
 use ac_groups::wire::{GroupHead, GroupRequest, GroupResponse};
 use ac_net::PeerId;
+use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::connectivity::Connectivity;
 use ac_net::identity::Keypair;
-use ac_net::roster::Roster;
 
 const AT: i64 = 1_000_000;
 
@@ -34,7 +34,7 @@ fn sync_for(k: &Keypair) -> GroupSync {
 /// Everything one side needs to be driven: its machine and its own key.
 struct Node {
     key: Keypair,
-    roster: Roster,
+    admitted_peers: AdmittedPeers,
     sync: GroupSync,
 }
 
@@ -43,7 +43,7 @@ impl Node {
         let key = key();
         Self {
             sync: sync_for(&key),
-            roster: Roster::default(),
+            admitted_peers: AdmittedPeers::default(),
             key,
         }
     }
@@ -52,20 +52,20 @@ impl Node {
         peer_of(&self.key)
     }
 
-    /// Admit a peer and promote them, as the daemon's roster would.
+    /// Admit a peer and promote them, as the daemon's admitted peers would.
     ///
     /// An empty `Connectivity` promotes everyone: `settled` is false only while a hole punch
     /// is still in flight, and these tests have no connections at all.
     fn verify(&mut self, other: PeerId) -> Vec<GroupAction> {
-        self.roster.admitted(other);
-        self.roster.promote(&Connectivity::default());
+        self.admitted_peers.admitted(other);
+        self.admitted_peers.promote(&Connectivity::default());
         Vec::new()
     }
 
-    /// Every call into the machine carries the roster, so who is admitted is asked rather
+    /// Every call into the machine carries the admitted peers, so who is admitted is asked rather
     /// than remembered.
     fn sync_on(&mut self, event: GroupEvent) -> Vec<GroupAction> {
-        self.sync.on(event, &self.roster)
+        self.sync.on(event, &self.admitted_peers)
     }
 
     fn sync_on_request(
@@ -73,12 +73,12 @@ impl Node {
         peer: PeerId,
         request: GroupRequest,
     ) -> (GroupResponse, Vec<GroupAction>) {
-        self.sync.on_request(peer, request, &self.roster)
+        self.sync.on_request(peer, request, &self.admitted_peers)
     }
 
-    /// A peer that has gone. The roster forgets them; nothing else needs telling.
+    /// A peer that has gone. The admitted peers forget them; nothing else needs telling.
     fn forget(&mut self, other: PeerId) {
-        self.roster.disconnected(&other, false);
+        self.admitted_peers.disconnected(&other, false);
     }
 
     fn tick(&mut self) -> Vec<GroupAction> {

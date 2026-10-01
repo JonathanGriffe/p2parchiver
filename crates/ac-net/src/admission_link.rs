@@ -4,9 +4,9 @@ use std::time::Instant;
 use libp2p::{PeerId, Swarm, request_response};
 
 use crate::admission::{Admission, AdmissionAction, AdmissionEvent, Renewal, renewal_of};
+use crate::admitted_peers::AdmittedPeers;
 use crate::authz::PeerAuthorizer;
 use crate::proto::{AttestRequest, AttestResponse, PeerAttestRequest, PeerAttestResponse};
-use crate::roster::Roster;
 use crate::swarm::AcBehaviour;
 
 /// The mutual attestation check, wired to a swarm.
@@ -28,21 +28,21 @@ impl AdmissionLink {
     pub fn connected<A: PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
         swarm: &mut AcSwarm<A, X>,
-        roster: &mut Roster,
+        admitted_peers: &mut AdmittedPeers,
         peer: PeerId,
     ) {
         let actions = self.admission.on(AdmissionEvent::Connected {
             peer,
             now: Instant::now(),
         });
-        self.dispatch(swarm, roster, actions)
+        self.dispatch(swarm, admitted_peers, actions)
     }
 
     /// A connection closed.
     pub fn disconnected<A: PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
         swarm: &mut AcSwarm<A, X>,
-        roster: &mut Roster,
+        admitted_peers: &mut AdmittedPeers,
         peer: PeerId,
         still_connected: bool,
     ) {
@@ -50,14 +50,14 @@ impl AdmissionLink {
             peer,
             still_connected,
         });
-        self.dispatch(swarm, roster, actions)
+        self.dispatch(swarm, admitted_peers, actions)
     }
 
     /// Renew when due, re-send to anyone still waiting, and close whatever has timed out.
     pub fn housekeeping<A: PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
         swarm: &mut AcSwarm<A, X>,
-        roster: &mut Roster,
+        admitted_peers: &mut AdmittedPeers,
         at: i64,
     ) {
         let server_connected = self
@@ -70,14 +70,14 @@ impl AdmissionLink {
             at,
             server_connected,
         });
-        self.dispatch(swarm, roster, actions)
+        self.dispatch(swarm, admitted_peers, actions)
     }
 
     /// A peer's half of the exchange: their attestation to us, or their verdict on ours.
     pub fn on_peer_attest<A: PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
         swarm: &mut AcSwarm<A, X>,
-        roster: &mut Roster,
+        admitted_peers: &mut AdmittedPeers,
         at: i64,
         event: request_response::Event<PeerAttestRequest, PeerAttestResponse>,
     ) {
@@ -120,14 +120,14 @@ impl AdmissionLink {
             request_response::Event::ResponseSent { .. } => Vec::new(),
         };
 
-        self.dispatch(swarm, roster, actions)
+        self.dispatch(swarm, admitted_peers, actions)
     }
 
     /// The server's answer to a renewal we asked for.
     pub fn on_renewal<A: PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
         swarm: &mut AcSwarm<A, X>,
-        roster: &mut Roster,
+        admitted_peers: &mut AdmittedPeers,
         event: request_response::Event<AttestRequest, AttestResponse>,
     ) {
         let actions = match event {
@@ -150,14 +150,14 @@ impl AdmissionLink {
             }
         };
 
-        self.dispatch(swarm, roster, actions)
+        self.dispatch(swarm, admitted_peers, actions)
     }
 
     /// Carry out what [`Admission`] asked for.
     fn dispatch<A: PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
         swarm: &mut AcSwarm<A, X>,
-        roster: &mut Roster,
+        admitted_peers: &mut AdmittedPeers,
         actions: Vec<AdmissionAction>,
     ) {
         for action in actions {
@@ -195,7 +195,7 @@ impl AdmissionLink {
                 }
 
                 AdmissionAction::Admitted { peer, username } => {
-                    roster.admitted(peer);
+                    admitted_peers.admitted(peer);
                     tracing::info!(%peer, %username, "verified");
                 }
             }

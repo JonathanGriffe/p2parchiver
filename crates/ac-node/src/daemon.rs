@@ -15,13 +15,13 @@ use crate::throttle::Throttle;
 use ac_files::wire::{ManifestRequest, ManifestResponse};
 use ac_groups::wire::{GroupRequest, GroupResponse};
 use ac_net::admission_link::AdmissionLink;
+use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::attest;
 use ac_net::authz::AcceptAnyPeer;
 use ac_net::config::{Config, Paths};
 use ac_net::connectivity::Connectivity;
 use ac_net::identity::Identity;
 use ac_net::link::{HOUSEKEEPING_TICK, ServerLink};
-use ac_net::roster::Roster;
 use ac_net::swarm::{AcBehaviourEvent, Role, build};
 use ac_peers::wire::{SessionRequest, SessionResponse};
 
@@ -139,7 +139,7 @@ pub async fn run(
     let mut blobs = FileLink::accept_blobs(&mut swarm)?;
     let mut connectivity = Connectivity::default();
 
-    let mut roster = Roster::default();
+    let mut admitted_peers = AdmittedPeers::default();
 
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -150,17 +150,17 @@ pub async fn run(
                 if let Some(link) = &mut link {
                     link.housekeeping(&mut swarm);
                 }
-                admission.housekeeping(&mut swarm, &mut roster, attest::now());
+                admission.housekeeping(&mut swarm, &mut admitted_peers, attest::now());
 
                 connectivity.expire_upgrades();
-                promote_ready(&mut swarm, &mut roster, &connectivity, &mut peers, &mut files, &mut groups);
+                promote_ready(&mut swarm, &mut admitted_peers, &connectivity, &mut peers, &mut files, &mut groups);
 
-                groups.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
-                files.housekeeping(&mut swarm, &roster, Instant::now(), attest::now());
+                groups.housekeeping(&mut swarm, &admitted_peers, Instant::now(), attest::now());
+                files.housekeeping(&mut swarm, &admitted_peers, Instant::now(), attest::now());
 
                 // Measured once and given to both, which is what makes them one budget.
                 let space = peers.space(&files, imports.unsorted_bytes());
-                peers.housekeeping(&mut swarm, &mut files, &mut groups, &roster, attest::now(), space);
+                peers.housekeeping(&mut swarm, &mut files, &mut groups, &admitted_peers, attest::now(), space);
                 imports.housekeeping(attest::now(), space);
             }
 
@@ -173,7 +173,7 @@ pub async fn run(
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         connectivity.connected(peer_id, endpoint.is_relayed());
 
-                        admission.connected(&mut swarm, &mut roster, peer_id);
+                        admission.connected(&mut swarm, &mut admitted_peers, peer_id);
 
                         if let Some(link) = &mut link {
                             link.reserve(&mut swarm, peer_id);
@@ -186,10 +186,10 @@ pub async fn run(
                         let agreed = peers.close_was_agreed(&peer_id);
                         connectivity.disconnected(peer_id, still_connected);
 
-                        admission.disconnected(&mut swarm, &mut roster, peer_id, still_connected);
+                        admission.disconnected(&mut swarm, &mut admitted_peers, peer_id, still_connected);
 
-                        if roster.disconnected(&peer_id, still_connected) {
-                            peers.on_disconnected(&mut swarm, &mut files, &mut groups, &roster, peer_id);
+                        if admitted_peers.disconnected(&peer_id, still_connected) {
+                            peers.on_disconnected(&mut swarm, &mut files, &mut groups, &admitted_peers, peer_id);
                         }
                         if let Some(link) = &mut link {
                             link.on_disconnected(peer_id, still_connected);
@@ -203,7 +203,7 @@ pub async fn run(
 
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                         if let Some(peer) = peer_id {
-                            peers.dial_failed(&mut swarm, &mut files, &mut groups, &roster, peer);
+                            peers.dial_failed(&mut swarm, &mut files, &mut groups, &admitted_peers, peer);
                         }
                         tracing::warn!(peer = ?peer_id, %error, "outgoing connection failed");
                     }
@@ -224,7 +224,7 @@ pub async fn run(
                                 &mut files,
                                 &mut groups,
                                 &mut swarm,
-                                &roster,
+                                &admitted_peers,
                             );
                         }
                     }
@@ -242,7 +242,7 @@ pub async fn run(
                                     &mut files,
                                     &mut groups,
                                     &mut swarm,
-                                    &roster,
+                                    &admitted_peers,
                                 );
                             }
                         }
@@ -266,41 +266,41 @@ pub async fn run(
                             }
                         }
 
-                        promote_ready(&mut swarm, &mut roster, &connectivity, &mut peers, &mut files, &mut groups);
+                        promote_ready(&mut swarm, &mut admitted_peers, &connectivity, &mut peers, &mut files, &mut groups);
                     }
 
                     SwarmEvent::Behaviour(AcBehaviourEvent::PeerAttest(event)) => {
-                        admission.on_peer_attest(&mut swarm, &mut roster, attest::now(), event);
-                        promote_ready(&mut swarm, &mut roster, &connectivity, &mut peers, &mut files, &mut groups);
+                        admission.on_peer_attest(&mut swarm, &mut admitted_peers, attest::now(), event);
+                        promote_ready(&mut swarm, &mut admitted_peers, &connectivity, &mut peers, &mut files, &mut groups);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::Attest(event)) => {
-                        admission.on_renewal(&mut swarm, &mut roster, event);
+                        admission.on_renewal(&mut swarm, &mut admitted_peers, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Groups(event))) => {
-                        groups.on_event(&mut swarm, &roster, event);
+                        groups.on_event(&mut swarm, &admitted_peers, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Manifests(event))) => {
-                        files.on_event(&mut swarm, &roster, event);
+                        files.on_event(&mut swarm, &admitted_peers, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Blobs(()))) => {}
                     SwarmEvent::Behaviour(AcBehaviourEvent::App(AppEvent::Sessions(event))) => {
-                        peers.on_session(&mut swarm, &mut files, &mut groups, &roster, event);
+                        peers.on_session(&mut swarm, &mut files, &mut groups, &admitted_peers, event);
                     }
                     SwarmEvent::Behaviour(AcBehaviourEvent::Presence(event)) => {
-                        peers.on_presence(&mut swarm, &mut files, &mut groups, &roster, event);
+                        peers.on_presence(&mut swarm, &mut files, &mut groups, &admitted_peers, event);
                     }
                     other => on_event(other),
                 }
 
-                peers.collect(&mut swarm, &mut files, &mut groups, &roster);
+                peers.collect(&mut swarm, &mut files, &mut groups, &admitted_peers);
             }
 
             Some(outcome) = peers.next_transfer() => {
-                peers.on_transfer(&mut swarm, &mut files, &mut groups, &roster, outcome);
+                peers.on_transfer(&mut swarm, &mut files, &mut groups, &admitted_peers, outcome);
             }
 
             Some((peer, stream)) = blobs.next() => {
-                if roster.is_ready(&peer) {
+                if admitted_peers.is_ready(&peer) {
                     files.on_inbound_blob(peer, stream);
                 } else {
                     tracing::debug!(%peer, "declining a blob stream from a peer that is not ready");
@@ -318,14 +318,14 @@ pub async fn run(
 
 fn promote_ready(
     swarm: &mut ClientSwarm,
-    roster: &mut Roster,
+    admitted_peers: &mut AdmittedPeers,
     connectivity: &Connectivity,
     peers: &mut PeerLink,
     files: &mut FileLink,
     groups: &mut GroupLink,
 ) {
-    for peer in roster.promote(connectivity) {
-        peers.peer_ready(swarm, files, groups, roster, peer);
+    for peer in admitted_peers.promote(connectivity) {
+        peers.peer_ready(swarm, files, groups, admitted_peers, peer);
     }
 }
 

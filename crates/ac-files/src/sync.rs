@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
 use ac_net::PeerId;
+use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::budget::TickBudget;
-use ac_net::roster::Roster;
 
 use crate::content::Content;
 use crate::path::RelPath;
@@ -164,9 +164,9 @@ impl FileSync {
         &mut self,
         peer: PeerId,
         request: ManifestRequest,
-        roster: &Roster,
+        admitted_peers: &AdmittedPeers,
     ) -> (ManifestResponse, Vec<FileAction>) {
-        if !roster.is_admitted(&peer) || !self.budget.spend(peer) {
+        if !admitted_peers.is_admitted(&peer) || !self.budget.spend(peer) {
             return (ManifestResponse::Unavailable, Vec::new());
         }
 
@@ -203,19 +203,19 @@ impl FileSync {
         }
     }
 
-    pub fn on(&mut self, event: FileEvent, roster: &Roster) -> Vec<FileAction> {
-        let mut actions = self.dispatch(event, roster);
+    pub fn on(&mut self, event: FileEvent, admitted_peers: &AdmittedPeers) -> Vec<FileAction> {
+        let mut actions = self.dispatch(event, admitted_peers);
 
         // Any of those can end an episode and free a slot, and the tick expires the ones
         // nobody ended. Draining in one place keeps the queue moving whatever made room.
-        self.drain_deferred(&mut actions, roster);
+        self.drain_deferred(&mut actions, admitted_peers);
         actions
     }
 
-    fn dispatch(&mut self, event: FileEvent, roster: &Roster) -> Vec<FileAction> {
+    fn dispatch(&mut self, event: FileEvent, admitted_peers: &AdmittedPeers) -> Vec<FileAction> {
         match event {
             FileEvent::Heads { peer, heads } => {
-                if !roster.is_ready(&peer) {
+                if !admitted_peers.is_ready(&peer) {
                     return Vec::new();
                 }
                 self.on_heads(peer, heads)
@@ -248,7 +248,7 @@ impl FileSync {
                 Vec::new()
             }
 
-            FileEvent::Tick { now, at } => self.tick(now, at, roster),
+            FileEvent::Tick { now, at } => self.tick(now, at, admitted_peers),
         }
     }
 
@@ -426,14 +426,14 @@ impl FileSync {
     }
 
     /// Start whatever the freed slots have room for.
-    fn drain_deferred(&mut self, actions: &mut Vec<FileAction>, roster: &Roster) {
+    fn drain_deferred(&mut self, actions: &mut Vec<FileAction>, admitted_peers: &AdmittedPeers) {
         while self.has_slot() {
             let Some((peer, group)) = self.deferred.pop_front() else {
                 return;
             };
 
             // The peer may have gone while it waited.
-            if !roster.is_admitted(&peer) {
+            if !admitted_peers.is_admitted(&peer) {
                 continue;
             }
 
@@ -452,14 +452,15 @@ impl FileSync {
         self.inflight.keys().any(|(p, _)| p == peer) || self.deferred.iter().any(|(p, _)| p == peer)
     }
 
-    fn tick(&mut self, now: Instant, at: i64, roster: &Roster) -> Vec<FileAction> {
+    fn tick(&mut self, now: Instant, at: i64, admitted_peers: &AdmittedPeers) -> Vec<FileAction> {
         self.now_at = at;
         self.budget.reset();
 
         // Abandon episodes that can no longer finish, so the read is free to try again:
         self.inflight
-            .retain(|(peer, _), f| now < f.deadline && roster.is_ready(peer));
-        self.deferred.retain(|(peer, _)| roster.is_admitted(peer));
+            .retain(|(peer, _), f| now < f.deadline && admitted_peers.is_ready(peer));
+        self.deferred
+            .retain(|(peer, _)| admitted_peers.is_admitted(peer));
         Vec::new()
     }
 

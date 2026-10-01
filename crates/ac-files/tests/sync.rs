@@ -12,9 +12,9 @@ use ac_groups::id::GroupId;
 use ac_groups::standing::Position;
 use ac_groups::store::Groups;
 use ac_net::PeerId;
+use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::connectivity::Connectivity;
 use ac_net::identity::Keypair;
-use ac_net::roster::Roster;
 
 const AT: i64 = 1_000_000;
 
@@ -25,7 +25,7 @@ fn peer_of(k: &Keypair) -> PeerId {
 /// Everything one side needs to be driven, plus the temp directory its content lives in.
 struct Node {
     key: Keypair,
-    roster: Roster,
+    admitted_peers: AdmittedPeers,
     sync: FileSync,
     _dir: tempfile::TempDir,
 }
@@ -42,7 +42,7 @@ impl Node {
         );
         Self {
             key,
-            roster: Roster::default(),
+            admitted_peers: AdmittedPeers::default(),
             sync,
             _dir: dir,
         }
@@ -52,20 +52,20 @@ impl Node {
         peer_of(&self.key)
     }
 
-    /// Admit a peer and promote them, as the daemon's roster would.
+    /// Admit a peer and promote them, as the daemon's admitted peers would.
     ///
     /// An empty `Connectivity` promotes everyone: `settled` is false only while a hole punch
     /// is still in flight, and these tests have no connections at all.
     fn verify(&mut self, other: PeerId) -> Vec<FileAction> {
-        self.roster.admitted(other);
-        self.roster.promote(&Connectivity::default());
+        self.admitted_peers.admitted(other);
+        self.admitted_peers.promote(&Connectivity::default());
         Vec::new()
     }
 
-    /// Every call into the machine carries the roster, so who is admitted is asked rather
+    /// Every call into the machine carries the admitted peers, so who is admitted is asked rather
     /// than remembered.
     fn sync_on(&mut self, event: FileEvent) -> Vec<FileAction> {
-        self.sync.on(event, &self.roster)
+        self.sync.on(event, &self.admitted_peers)
     }
 
     fn sync_on_request(
@@ -73,20 +73,20 @@ impl Node {
         peer: PeerId,
         request: ManifestRequest,
     ) -> (ManifestResponse, Vec<FileAction>) {
-        self.sync.on_request(peer, request, &self.roster)
+        self.sync.on_request(peer, request, &self.admitted_peers)
     }
 
     /// The free function, which is the one the blob path actually calls.
     ///
-    /// It takes no roster: a blob stream cannot exist without an admitted connection, so the
-    /// only question left is whether the stores entitle this peer to these bytes.
+    /// It takes no admitted peers: a blob stream cannot exist without an admitted connection, so
+    /// the only question left is whether the stores entitle this peer to these bytes.
     fn sync_may_serve(&mut self, peer: PeerId, group: GroupId, path: &RelPath) -> Option<u64> {
         may_serve(self.sync.files(), self.sync.groups(), &peer, group, path)
     }
 
-    /// A peer that has gone. The roster forgets them; nothing else needs telling.
+    /// A peer that has gone. The admitted peers forget them; nothing else needs telling.
     fn forget(&mut self, other: PeerId) {
-        self.roster.disconnected(&other, false);
+        self.admitted_peers.disconnected(&other, false);
     }
 
     fn tick(&mut self) -> Vec<FileAction> {

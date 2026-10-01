@@ -55,7 +55,7 @@ A node that is pending or has left still answers fetches, since it holds the onl
 
 ### Sync
 
-The sync machine does no IO: it takes events and returns the fetches to send, and reads the roster on every call to know who is admitted. It never asks for heads itself, as the supervisor in `ac-peers` decides who to ask.
+The sync machine does no IO: it takes events and returns the fetches to send, and reads the admitted peers on every call to know who is admitted. It never asks for heads itself, as the supervisor in `ac-peers` decides who to ask.
 - Requests are answered only for admitted peers, at most 8 per peer per tick.
 - From a peer's heads, it fetches groups it has never seen from the start, and known groups where the peer is ahead or the digests differ.
 - A group it holds that names the peer, but that the peer did not offer, gets one fetch too. That is how a removal is learned, since nobody offers a group to someone they no longer count as a member.

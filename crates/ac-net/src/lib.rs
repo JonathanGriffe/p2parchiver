@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod admission_link;
+pub mod admitted_peers;
 pub mod attest;
 pub mod authz;
 pub mod budget;
@@ -13,7 +14,6 @@ pub mod keepalive;
 pub mod limits;
 pub mod link;
 pub mod proto;
-pub mod roster;
 pub mod swarm;
 
 pub use libp2p::multiaddr::Protocol;

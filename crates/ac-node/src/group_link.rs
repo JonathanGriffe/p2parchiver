@@ -4,9 +4,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use libp2p::{PeerId, request_response};
 
+use ac_net::admitted_peers::AdmittedPeers;
 use ac_net::config::Paths;
 use ac_net::identity::Identity;
-use ac_net::roster::Roster;
 
 use ac_groups::id::GroupId;
 use ac_groups::store::Groups;
@@ -75,11 +75,11 @@ impl GroupLink {
     pub fn housekeeping(
         &mut self,
         swarm: &mut ClientSwarm,
-        roster: &Roster,
+        admitted_peers: &AdmittedPeers,
         now: Instant,
         at: i64,
     ) {
-        let actions = self.sync.on(GroupEvent::Tick { now, at }, roster);
+        let actions = self.sync.on(GroupEvent::Tick { now, at }, admitted_peers);
         self.dispatch(swarm, actions);
         self.settle_rounds();
     }
@@ -87,7 +87,7 @@ impl GroupLink {
     pub fn on_event(
         &mut self,
         swarm: &mut ClientSwarm,
-        roster: &Roster,
+        admitted_peers: &AdmittedPeers,
         event: request_response::Event<GroupRequest, GroupResponse>,
     ) {
         use request_response::{Event, Message};
@@ -101,7 +101,7 @@ impl GroupLink {
                     },
                 ..
             } => {
-                let (response, actions) = self.sync.on_request(peer, request, roster);
+                let (response, actions) = self.sync.on_request(peer, request, admitted_peers);
                 let _ = swarm
                     .behaviour_mut()
                     .app
@@ -121,7 +121,8 @@ impl GroupLink {
             } => match (self.outbound.remove(&request_id), response) {
                 (Some(Outbound::Ask { .. }), GroupResponse::Heads(heads)) => {
                     self.awaiting.insert(peer);
-                    self.sync.on(GroupEvent::Heads { peer, heads }, roster)
+                    self.sync
+                        .on(GroupEvent::Heads { peer, heads }, admitted_peers)
                 }
                 (Some(Outbound::Ask { .. }), other) => {
                     tracing::debug!(%peer, response = ?other, "a group round was refused");
@@ -144,11 +145,11 @@ impl GroupLink {
                         entries,
                         standings,
                     },
-                    roster,
+                    admitted_peers,
                 ),
                 (Some(Outbound::Fetch { group, .. }), GroupResponse::Unavailable) => self
                     .sync
-                    .on(GroupEvent::Unavailable { peer, group }, roster),
+                    .on(GroupEvent::Unavailable { peer, group }, admitted_peers),
                 _ => Vec::new(),
             },
 
@@ -163,12 +164,12 @@ impl GroupLink {
                     self.awaiting.remove(&peer);
                     self.rounds.push(RoundOutcome::Failed { peer });
                     self.sync
-                        .on(GroupEvent::FetchFailed { peer, group }, roster)
+                        .on(GroupEvent::FetchFailed { peer, group }, admitted_peers)
                 }
                 Some(Outbound::Ask { peer }) => {
                     tracing::debug!(%peer, %error, "a group round went unanswered");
                     self.rounds.push(RoundOutcome::Failed { peer });
-                    self.sync.on(GroupEvent::AskFailed { peer }, roster)
+                    self.sync.on(GroupEvent::AskFailed { peer }, admitted_peers)
                 }
                 None => return,
             },
@@ -234,9 +235,9 @@ mod tests {
     use ac_groups::id::GroupId;
     use ac_groups::standing::Position;
     use ac_groups::wire::{GroupRequest, GroupResponse};
+    use ac_net::admitted_peers::AdmittedPeers;
     use ac_net::config::Config;
     use ac_net::connectivity::Connectivity;
-    use ac_net::roster::Roster;
     use libp2p::futures::StreamExt;
 
     const WIRE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -246,7 +247,7 @@ mod tests {
     struct Node {
         swarm: ClientSwarm,
         link: GroupLink,
-        roster: Roster,
+        admitted_peers: AdmittedPeers,
         peer: PeerId,
         /// Replies observed on the wire, for assertions the adapter would otherwise swallow.
         seen: Vec<GroupResponse>,
@@ -273,7 +274,7 @@ mod tests {
             Self {
                 swarm: build(&identity, &config, Role::Client, AcceptAnyPeer, app()).unwrap(),
                 link: GroupLink::open(&paths, &identity).unwrap(),
-                roster: Roster::default(),
+                admitted_peers: AdmittedPeers::default(),
                 peer: identity.peer_id(),
                 seen: Vec::new(),
                 _dir: dir,
@@ -284,13 +285,13 @@ mod tests {
         fn step(&mut self, event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
             match &event {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    self.roster.admitted(*peer_id);
+                    self.admitted_peers.admitted(*peer_id);
                 }
                 // A peer legitimately holds two connections while an upgrade settles, so
                 // one closing is not the peer leaving.
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     let still = self.swarm.is_connected(peer_id);
-                    self.roster.disconnected(peer_id, still);
+                    self.admitted_peers.disconnected(peer_id, still);
                 }
                 _ => {}
             }
@@ -306,15 +307,16 @@ mod tests {
                 {
                     self.seen.push(response.clone());
                 }
-                self.link.on_event(&mut self.swarm, &self.roster, event);
+                self.link
+                    .on_event(&mut self.swarm, &self.admitted_peers, event);
             }
         }
 
         /// Housekeeping, then offer to whoever is connected
         fn tick(&mut self) {
-            self.roster.promote(&Connectivity::default());
+            self.admitted_peers.promote(&Connectivity::default());
             self.link
-                .housekeeping(&mut self.swarm, &self.roster, Instant::now(), AT);
+                .housekeeping(&mut self.swarm, &self.admitted_peers, Instant::now(), AT);
 
             let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
             for peer in peers {
@@ -589,7 +591,7 @@ mod tests {
 
         let carol_peer = carol.peer;
         run_until(&mut alice, &mut carol, move |a, c| {
-            a.roster.is_ready(&carol_peer) && c.roster.is_ready(&alice_peer)
+            a.admitted_peers.is_ready(&carol_peer) && c.admitted_peers.is_ready(&alice_peer)
         })
         .await;
 
