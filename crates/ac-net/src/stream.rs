@@ -3,6 +3,7 @@
 use std::io::{self, Read};
 
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use libp2p_stream::OpenStreamError;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -13,6 +14,8 @@ pub const CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
+    #[error("could not open the stream: {0}")]
+    Open(OpenStreamError),
     #[error("a {len} byte frame exceeds the {limit} byte limit")]
     TooLarge { len: usize, limit: usize },
     #[error("could not encode a frame: {0}")]

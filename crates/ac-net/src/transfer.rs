@@ -5,7 +5,7 @@
 
 use std::fmt::{self, Display};
 use std::future::poll_fn;
-use std::io::{self, Read};
+use std::io::Read;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -230,7 +230,7 @@ async fn download_from<D: Download>(
     let mut stream = control
         .open_stream(peer, protocol)
         .await
-        .map_err(|e| StreamError::Io(io::Error::other(e)))?;
+        .map_err(StreamError::Open)?;
     write_frame(&mut stream, &request, limit).await?;
 
     let reply = read_frame(&mut stream, limit).await?;
