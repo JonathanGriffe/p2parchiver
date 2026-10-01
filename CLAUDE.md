@@ -14,7 +14,7 @@ Then read the code. The docs say what the code does and why. Where they disagree
 ## Respect the design
 
 A change must fit the design those docs describe. If a task cannot be done without breaking it, stop and say so rather than working around it. Breaking the design includes:
-- a dependency against the layering: `ac-net` ← `ac-groups` ← `ac-files` ← `ac-peers` ← `ac-node` ← `ac-desktop`, with `ac-import` depending on nothing and `ac-server` only on `ac-net`;
+- a dependency against the layering: `ac-net` ← `ac-groups` ← `ac-files` ← `ac-supervisor` ← `ac-node` ← `ac-desktop`, with `ac-import` depending on nothing and `ac-server` only on `ac-net`;
 - libp2p used outside `ac-net`, `ac-node` and `ac-server`;
 - IO inside a sync machine or the supervisor: they take events and return actions, and `ac-node`'s links do the networking;
 - group or file logic in the server, which stays at the network layer;

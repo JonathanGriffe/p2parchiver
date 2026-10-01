@@ -11,10 +11,10 @@ use ac_groups::standing::{Position, Standing};
 use ac_groups::store::Groups;
 use ac_net::PeerId;
 use ac_net::identity::Keypair;
-use ac_peers::sync::{
+use ac_supervisor::sync::{
     CLOSE_TIMEOUT, DIAL_ATTEMPTS, DIAL_WINDOW, DIALS_PER_ROUND, DIALS_PER_WINDOW, HEARTBEAT,
     Limits, MAX_TRANSFERS, MIN_BACKOFF, NoRoom, Offering, PRESENCE_INTERVAL, PeerAction, PeerEvent,
-    Peers, RETRY_AFTER, RETRY_ATTEMPTS, ROUND_TIMEOUT, SHARE_AFTER_IDLE, Space,
+    RETRY_AFTER, RETRY_ATTEMPTS, ROUND_TIMEOUT, SHARE_AFTER_IDLE, Space, Supervisor,
 };
 use tempfile::TempDir;
 
@@ -22,7 +22,7 @@ const AT: i64 = 1_000_000;
 
 /// One node's supervisor, plus the keys of everyone it shares a group with.
 struct Node {
-    peers: Peers,
+    supervisor: Supervisor,
     key: Keypair,
     me: PeerId,
     /// Where `merge` would put bytes. Nothing in these tests transfers any, but a row that
@@ -41,7 +41,7 @@ impl Node {
         let root = tempfile::tempdir().unwrap();
         Self {
             root,
-            peers: Peers::new(
+            supervisor: Supervisor::new(
                 Files::in_memory(me).unwrap(),
                 Groups::in_memory(me).unwrap(),
                 AT,
@@ -56,13 +56,13 @@ impl Node {
     fn group_with(&mut self, members: &[PeerId]) -> GroupId {
         let key = self.key.clone();
         let id = self
-            .peers
+            .supervisor
             .groups_mut()
             .create(&key, "holiday", "alice", AT)
             .unwrap();
 
         for peer in members.iter() {
-            self.peers
+            self.supervisor
                 .groups_mut()
                 .author(
                     &key,
@@ -83,9 +83,13 @@ impl Node {
 
     fn learn_file(&mut self, group: GroupId, path: &str) {
         let row = self.row(path, false);
-        let dir = self.peers.files_mut().dir_for(group, "holiday").unwrap();
+        let dir = self
+            .supervisor
+            .files_mut()
+            .dir_for(group, "holiday")
+            .unwrap();
         let content = Content::new(self.root.path().to_path_buf());
-        self.peers
+        self.supervisor
             .files_mut()
             .merge(group, &row, &content, &dir)
             .unwrap();
@@ -93,7 +97,10 @@ impl Node {
 
     fn record(&mut self, group: GroupId, path: &str, have: bool) {
         let row = self.row(path, have);
-        self.peers.files_mut().record(group, &row, true).unwrap();
+        self.supervisor
+            .files_mut()
+            .record(group, &row, true)
+            .unwrap();
     }
 
     fn row(&self, path: &str, have: bool) -> FileRow {
@@ -116,12 +123,12 @@ impl Node {
     }
 
     fn tick(&mut self, at: i64) -> Vec<PeerAction> {
-        self.peers.on(PeerEvent::Tick { at })
+        self.supervisor.on(PeerEvent::Tick { at })
     }
 
     /// Every group this node holds, which is what an offer to any member names.
     fn shared_groups(&mut self) -> Vec<GroupId> {
-        self.peers
+        self.supervisor
             .groups_mut()
             .list()
             .unwrap_or_default()
@@ -133,7 +140,7 @@ impl Node {
     /// `ac group add`, after the group exists.
     fn add_member(&mut self, group: GroupId, peer: PeerId) {
         let key = self.key.clone();
-        self.peers
+        self.supervisor
             .groups_mut()
             .author(
                 &key,
@@ -149,14 +156,14 @@ impl Node {
     fn accept_invite(&mut self, group: GroupId, key: &Keypair) {
         let standing = Standing::author(key, group, 1, Position::In, "someone", AT).unwrap();
         let entries: Vec<_> = self
-            .peers
+            .supervisor
             .groups_mut()
             .chain(group)
             .unwrap()
             .entries()
             .cloned()
             .collect();
-        self.peers
+        self.supervisor
             .groups_mut()
             .adopt(&entries, &[standing], AT)
             .unwrap();
@@ -180,19 +187,19 @@ impl Node {
         for action in &actions {
             match action {
                 PeerAction::Dial { peer } => {
-                    out.extend(self.peers.on(PeerEvent::Verified { peer: *peer }));
+                    out.extend(self.supervisor.on(PeerEvent::Verified { peer: *peer }));
                 }
                 // The other half of the lifecycle, and it matters now: a member is told nothing
                 // while we hold a connection to them, so the hang-up is what lets the next call
                 // deliver. A test that never closes never gets a second round.
                 PeerAction::ProposeClose { peer } => {
-                    out.extend(self.peers.on(PeerEvent::CloseAnswered {
+                    out.extend(self.supervisor.on(PeerEvent::CloseAnswered {
                         peer: *peer,
                         ready: true,
                     }));
                 }
                 PeerAction::Disconnect { peer } => {
-                    out.extend(self.peers.on(PeerEvent::Gone { peer: *peer }));
+                    out.extend(self.supervisor.on(PeerEvent::Gone { peer: *peer }));
                 }
                 _ => {}
             }
@@ -201,7 +208,7 @@ impl Node {
         let follow: Vec<PeerAction> = out.clone();
         for action in &follow {
             if let PeerAction::Disconnect { peer } = action {
-                self.peers.on(PeerEvent::Gone { peer: *peer });
+                self.supervisor.on(PeerEvent::Gone { peer: *peer });
             }
         }
         out.extend(actions);
@@ -214,13 +221,13 @@ impl Node {
     /// change delivered has to let the call end first.
     fn hang_up(&mut self, members: &[PeerId]) {
         for peer in members {
-            self.peers.on(PeerEvent::Gone { peer: *peer });
+            self.supervisor.on(PeerEvent::Gone { peer: *peer });
         }
     }
 
     /// Everyone reachable and nobody connected, which is the ordinary state here.
     fn all_online(&mut self, members: &[PeerId]) {
-        self.peers.on(PeerEvent::Presence {
+        self.supervisor.on(PeerEvent::Presence {
             asked: members.to_vec(),
             online: members.to_vec(),
         });
@@ -228,13 +235,13 @@ impl Node {
 
     /// Everyone online and connected, as a settled network would be.
     fn all_up(&mut self, members: &[PeerId]) -> Vec<PeerAction> {
-        self.peers.on(PeerEvent::Presence {
+        self.supervisor.on(PeerEvent::Presence {
             asked: members.to_vec(),
             online: members.to_vec(),
         });
         let mut seen = Vec::new();
         for peer in members {
-            let actions = self.peers.on(PeerEvent::Verified { peer: *peer });
+            let actions = self.supervisor.on(PeerEvent::Verified { peer: *peer });
             seen.extend(self.settle_all(&actions));
         }
         seen
@@ -248,13 +255,13 @@ impl Node {
         while let Some(action) = queue.pop() {
             if let PeerAction::Ask { peer, offering } = action {
                 for group in &groups {
-                    queue.extend(self.peers.on(PeerEvent::Synced {
+                    queue.extend(self.supervisor.on(PeerEvent::Synced {
                         peer,
                         group: *group,
                         offering,
                     }));
                 }
-                queue.extend(self.peers.on(PeerEvent::Asked { peer, offering }));
+                queue.extend(self.supervisor.on(PeerEvent::Asked { peer, offering }));
             }
             seen.push(action);
         }
@@ -277,20 +284,20 @@ fn step_holding(node: &mut Node, at: i64, held: &[RelPath]) -> Vec<PeerAction> {
         match &action {
             PeerAction::Ask { peer, offering } => {
                 for group in node.shared_groups() {
-                    queue.extend(node.peers.on(PeerEvent::Synced {
+                    queue.extend(node.supervisor.on(PeerEvent::Synced {
                         peer: *peer,
                         group,
                         offering: *offering,
                     }));
                 }
-                queue.extend(node.peers.on(PeerEvent::Asked {
+                queue.extend(node.supervisor.on(PeerEvent::Asked {
                     peer: *peer,
                     offering: *offering,
                 }));
             }
             PeerAction::AskHoldings { peer, group, paths } => {
                 let answer: Vec<bool> = paths.iter().map(|p| held.contains(p)).collect();
-                queue.extend(node.peers.on(PeerEvent::Holdings {
+                queue.extend(node.supervisor.on(PeerEvent::Holdings {
                     peer: *peer,
                     group: *group,
                     held: answer,
@@ -330,12 +337,12 @@ fn settle_offers(node: &mut Node, actions: &[PeerAction], group: GroupId) -> Vec
 
     while let Some(action) = queue.pop() {
         if let PeerAction::Ask { peer, offering } = action {
-            node.peers.on(PeerEvent::Synced {
+            node.supervisor.on(PeerEvent::Synced {
                 peer,
                 group,
                 offering,
             });
-            queue.extend(node.peers.on(PeerEvent::Asked { peer, offering }));
+            queue.extend(node.supervisor.on(PeerEvent::Asked { peer, offering }));
             asked.push(peer);
         }
     }
@@ -388,7 +395,7 @@ fn step(node: &mut Node, at: i64, holds: bool) -> Vec<PeerAction> {
         match &action {
             PeerAction::Ask { peer, offering } => {
                 for group in node.shared_groups() {
-                    queue.extend(node.peers.on(PeerEvent::Synced {
+                    queue.extend(node.supervisor.on(PeerEvent::Synced {
                         peer: *peer,
                         group,
                         offering: *offering,
@@ -396,7 +403,7 @@ fn step(node: &mut Node, at: i64, holds: bool) -> Vec<PeerAction> {
                 }
                 // The question is answered, whatever the answer was. Without this the exchange
                 // stays open, is swept as a failure, and the node never goes quiet.
-                queue.extend(node.peers.on(PeerEvent::Asked {
+                queue.extend(node.supervisor.on(PeerEvent::Asked {
                     peer: *peer,
                     offering: *offering,
                 }));
@@ -404,11 +411,11 @@ fn step(node: &mut Node, at: i64, holds: bool) -> Vec<PeerAction> {
             // A dial that is answered, which is what makes the question that follows it happen:
             // the supervisor asks on `Verified`, not on the tick that opened the circuit.
             PeerAction::Dial { peer } => {
-                queue.extend(node.peers.on(PeerEvent::Verified { peer: *peer }));
+                queue.extend(node.supervisor.on(PeerEvent::Verified { peer: *peer }));
             }
 
             PeerAction::AskHoldings { peer, group, paths } => {
-                queue.extend(node.peers.on(PeerEvent::Holdings {
+                queue.extend(node.supervisor.on(PeerEvent::Holdings {
                     peer: *peer,
                     group: *group,
                     held: vec![holds; paths.len()],
@@ -466,11 +473,11 @@ fn a_node_that_knows_no_groups_still_asks_whoever_it_meets() {
     let stranger = peers(1)[0];
 
     assert!(
-        node.peers.groups_mut().list().unwrap().is_empty(),
+        node.supervisor.groups_mut().list().unwrap().is_empty(),
         "this node is in no groups and so has nothing of its own to say"
     );
 
-    let met = node.peers.on(PeerEvent::Verified { peer: stranger });
+    let met = node.supervisor.on(PeerEvent::Verified { peer: stranger });
     assert_eq!(
         rounds(&met),
         vec![stranger],
@@ -483,7 +490,7 @@ fn one_change_in_a_fifty_member_group_is_not_fifty_dials() {
     let mut node = Node::new();
     let members = peers(49);
     let id = node.group_with(&members);
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: members.clone(),
     });
@@ -519,7 +526,7 @@ fn adding_a_member_provokes_a_round_although_no_file_changed() {
 
     let key = node.key.clone();
     let newcomer = peers(1)[0];
-    node.peers
+    node.supervisor
         .groups_mut()
         .author(
             &key,
@@ -530,7 +537,7 @@ fn adding_a_member_provokes_a_round_although_no_file_changed() {
             AT,
         )
         .unwrap();
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: vec![members[0], newcomer],
         online: vec![members[0], newcomer],
     });
@@ -547,7 +554,7 @@ fn no_more_circuits_are_opened_than_the_relay_allows() {
     let members = peers(DIALS_PER_WINDOW * 2);
     let id = node.group_with(&members);
     node.learn_file(id, "wanted.jpg");
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: members.clone(),
     });
@@ -566,7 +573,7 @@ fn no_more_circuits_are_opened_than_the_relay_allows() {
     // otherwise the second window would be bounded by `MAX_PEER_CONNECTIONS` and prove nothing
     // about the allowance renewing.
     for peer in spent {
-        node.peers.on(PeerEvent::DialFailed { peer });
+        node.supervisor.on(PeerEvent::DialFailed { peer });
     }
 
     let later: usize = (0..DIAL_WINDOW)
@@ -725,7 +732,7 @@ fn a_big_offer_is_fetched_eight_at_a_time_until_none_are_left() {
     };
     assert_eq!(paths.len(), OFFERED, "one page covers this many");
 
-    let mut running: Vec<RelPath> = fetched_paths(&node.peers.on(PeerEvent::Holdings {
+    let mut running: Vec<RelPath> = fetched_paths(&node.supervisor.on(PeerEvent::Holdings {
         peer,
         group,
         held: vec![true; paths.len()],
@@ -740,7 +747,7 @@ fn a_big_offer_is_fetched_eight_at_a_time_until_none_are_left() {
     // Each completion starts exactly one more, until the offer runs out.
     let mut done: Vec<RelPath> = Vec::new();
     while let Some(path) = running.pop() {
-        let actions = node.peers.on(PeerEvent::BlobDone {
+        let actions = node.supervisor.on(PeerEvent::BlobDone {
             peer,
             group,
             path: path.clone(),
@@ -795,7 +802,7 @@ fn a_queue_the_slots_shut_out_is_not_abandoned_there() {
             .find(|(_, g, _)| *g == group)
             .cloned()
             .expect("both groups asked");
-        node.peers.on(PeerEvent::Holdings {
+        node.supervisor.on(PeerEvent::Holdings {
             peer,
             group,
             held: vec![true; paths.len()],
@@ -818,7 +825,9 @@ fn a_queue_the_slots_shut_out_is_not_abandoned_there() {
         .cloned()
         .expect("the first group asked");
     for path in running {
-        let actions = node.peers.on(PeerEvent::BlobDone { peer, group, path });
+        let actions = node
+            .supervisor
+            .on(PeerEvent::BlobDone { peer, group, path });
         assert_eq!(
             fetches(&actions),
             0,
@@ -853,7 +862,7 @@ fn a_new_file_is_fetched_although_the_group_had_given_up_before() {
         step(&mut node, AT + k, false);
         // Giving up *is* the content backoff, which `status` reports.
         if node
-            .peers
+            .supervisor
             .status()
             .groups
             .iter()
@@ -885,13 +894,13 @@ fn a_member_already_connected_is_asked_before_one_that_needs_a_circuit() {
     node.learn_file(id, "wanted.jpg");
 
     // Everyone is reachable; only one is on the other end of a connection.
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: members.clone(),
     });
     let held = members[2];
 
-    let mut actions = node.peers.on(PeerEvent::Verified { peer: held });
+    let mut actions = node.supervisor.on(PeerEvent::Verified { peer: held });
     actions.extend(node.tick(AT));
     assert!(
         actions.iter().any(|a| matches!(
@@ -950,13 +959,13 @@ fn membership_is_offered_before_the_catalogue() {
     );
 
     for group in node.shared_groups() {
-        node.peers.on(PeerEvent::Synced {
+        node.supervisor.on(PeerEvent::Synced {
             peer: members[0],
             group,
             offering: Offering::Chain,
         });
     }
-    let second = node.peers.on(PeerEvent::Asked {
+    let second = node.supervisor.on(PeerEvent::Asked {
         peer: members[0],
         offering: Offering::Chain,
     });
@@ -988,12 +997,12 @@ fn a_settled_membership_round_does_not_write_off_the_catalogue() {
     // Answer only the chain half, exactly as a chain exchange would.
     let mut followed = Vec::new();
     for peer in rounds(&first) {
-        node.peers.on(PeerEvent::Synced {
+        node.supervisor.on(PeerEvent::Synced {
             peer,
             group: id,
             offering: Offering::Chain,
         });
-        followed.extend(node.peers.on(PeerEvent::Asked {
+        followed.extend(node.supervisor.on(PeerEvent::Asked {
             peer,
             offering: Offering::Chain,
         }));
@@ -1097,7 +1106,7 @@ fn what_we_learn_from_a_peer_is_not_re_told_to_the_group() {
 
     // They call us, we learn a file from them, and their exchange settles on our side too.
     node.learn_file(id, "theirs.jpg");
-    node.peers.on(PeerEvent::Synced {
+    node.supervisor.on(PeerEvent::Synced {
         peer: members[0],
         group: id,
         offering: Offering::Catalogue,
@@ -1131,7 +1140,7 @@ fn a_member_added_a_moment_ago_is_called_once_the_server_says_they_are_up() {
     node.add_file(id, "a.jpg");
     node.all_up(&members);
     let (settled, _) = settle(&mut node, AT);
-    node.peers
+    node.supervisor
         .files_mut()
         .set_cursor(id, &members[0], 1)
         .unwrap();
@@ -1145,14 +1154,14 @@ fn a_member_added_a_moment_ago_is_called_once_the_server_says_they_are_up() {
         "adding them is not by itself a reason to call"
     );
 
-    node.peers.on(PeerEvent::Discovered { peer: newcomer });
+    node.supervisor.on(PeerEvent::Discovered { peer: newcomer });
     assert!(
         !dials(&answered(&mut node, settled + 2, id)).contains(&newcomer),
         "being listed in the registry is a claim, not a pulse"
     );
 
     // The server saying it has them connected is.
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: vec![newcomer],
         online: vec![newcomer],
     });
@@ -1182,23 +1191,23 @@ fn a_member_who_has_never_answered_the_invitation_is_told_again_when_the_server_
     for k in 0..=(DIAL_ATTEMPTS as i64) {
         let at = AT + k * (MIN_BACKOFF * 4);
         for peer in dials(&node.tick(at)) {
-            node.peers.on(PeerEvent::DialFailed { peer });
+            node.supervisor.on(PeerEvent::DialFailed { peer });
         }
     }
     assert_eq!(
-        node.peers.status().groups[0].owed,
+        node.supervisor.status().groups[0].owed,
         0,
         "after {DIAL_ATTEMPTS} attempts the group stops counting them as owed"
     );
 
     // The server says they are up. They have never signed a standing, so the invitation is still
     // unanswered and they go back on the list.
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: members.clone(),
     });
     assert_eq!(
-        node.peers.status().groups[0].owed,
+        node.supervisor.status().groups[0].owed,
         1,
         "somebody who never answered the invitation goes back on the list"
     );
@@ -1212,7 +1221,7 @@ fn the_content_pull_still_waits_for_the_registry() {
     let members = peers(1);
     let id = node.group_with(&members);
     node.learn_file(id, "a.jpg");
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: Vec::new(),
     });
@@ -1350,7 +1359,7 @@ fn a_heartbeat_with_nobody_online_waits_for_somebody() {
     let mut node = Node::new();
     let members = node.familiar_group(3);
 
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: Vec::new(),
     });
@@ -1360,7 +1369,7 @@ fn a_heartbeat_with_nobody_online_waits_for_somebody() {
         "nobody is up, so nobody is called: {actions:?}"
     );
 
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: vec![members[1]],
     });
@@ -1387,9 +1396,9 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
     while at < AT + 4 * MIN_BACKOFF {
         for peer in dials(&node.tick(at)) {
             attempts += 1;
-            node.peers.on(PeerEvent::DialFailed { peer });
+            node.supervisor.on(PeerEvent::DialFailed { peer });
         }
-        if node.peers.status().groups[0].owed == 0 {
+        if node.supervisor.status().groups[0].owed == 0 {
             break;
         }
         at += 1;
@@ -1400,7 +1409,7 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
         "three tries, not one and not for ever"
     );
     assert_eq!(
-        node.peers.status().groups[0].owed,
+        node.supervisor.status().groups[0].owed,
         0,
         "and then the group stops counting them as owed"
     );
@@ -1412,7 +1421,7 @@ fn a_member_who_never_answers_is_dropped_after_three_attempts_not_the_first() {
 
     node.tick(at + 2 * HEARTBEAT);
     assert!(
-        node.peers.status().groups[0].owed > 0,
+        node.supervisor.status().groups[0].owed > 0,
         "but the interval does: giving up is the end of one attempt, not a memory"
     );
 }
@@ -1423,9 +1432,9 @@ fn the_heartbeat_passes_over_an_offline_member_for_an_online_one() {
     let members = peers(2);
     node.group_with(&members);
 
-    let offline = node.peers.status().groups[0].next.unwrap();
+    let offline = node.supervisor.status().groups[0].next.unwrap();
     let online = *members.iter().find(|p| **p != offline).unwrap();
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: vec![online],
     });
@@ -1436,7 +1445,7 @@ fn the_heartbeat_passes_over_an_offline_member_for_an_online_one() {
         "nothing of ours left to say"
     );
     assert_eq!(
-        node.peers.status().groups[0].next,
+        node.supervisor.status().groups[0].next,
         Some(offline),
         "the offline member is still first in rotation"
     );
@@ -1467,9 +1476,9 @@ fn successive_heartbeats_reach_different_members_when_nobody_answers() {
         while at < start + 4 * MIN_BACKOFF {
             for peer in dials(&node.tick(at)) {
                 first.get_or_insert(peer);
-                node.peers.on(PeerEvent::DialFailed { peer });
+                node.supervisor.on(PeerEvent::DialFailed { peer });
             }
-            if first.is_some() && node.peers.status().groups[0].owed == 0 {
+            if first.is_some() && node.supervisor.status().groups[0].owed == 0 {
                 break;
             }
             at += 1;
@@ -1493,8 +1502,8 @@ fn the_rotation_moves_past_the_member_called_when_more_come_online() {
 
     // The membership news goes to nobody, then only the first in rotation comes up.
     node.tick(AT);
-    let first = node.peers.status().groups[0].next.unwrap();
-    node.peers.on(PeerEvent::Presence {
+    let first = node.supervisor.status().groups[0].next.unwrap();
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: vec![first],
     });
@@ -1504,9 +1513,9 @@ fn the_rotation_moves_past_the_member_called_when_more_come_online() {
     while at < AT + 4 * MIN_BACKOFF {
         for peer in dials(&node.tick(at)) {
             called.push(peer);
-            node.peers.on(PeerEvent::DialFailed { peer });
+            node.supervisor.on(PeerEvent::DialFailed { peer });
         }
-        if !called.is_empty() && node.peers.status().groups[0].owed == 0 {
+        if !called.is_empty() && node.supervisor.status().groups[0].owed == 0 {
             break;
         }
         at += 1;
@@ -1533,7 +1542,7 @@ fn backoff_advances_on_the_attempt_and_resets_on_verified() {
     let members = peers(1);
     let id = node.group_with(&members);
     node.add_file(id, "a.jpg");
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: members.clone(),
     });
@@ -1543,8 +1552,9 @@ fn backoff_advances_on_the_attempt_and_resets_on_verified() {
         dials(&node.tick(AT + 1)).is_empty(),
         "second attempt is inside the backoff"
     );
-    node.peers.on(PeerEvent::DialFailed { peer: members[0] });
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor
+        .on(PeerEvent::DialFailed { peer: members[0] });
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: members.clone(),
     });
@@ -1558,9 +1568,9 @@ fn backoff_advances_on_the_attempt_and_resets_on_verified() {
         "and it retries once the backoff expires"
     );
 
-    node.peers.on(PeerEvent::Verified { peer: members[0] });
-    node.peers.on(PeerEvent::Gone { peer: members[0] });
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Verified { peer: members[0] });
+    node.supervisor.on(PeerEvent::Gone { peer: members[0] });
+    node.supervisor.on(PeerEvent::Presence {
         asked: members.clone(),
         online: members.clone(),
     });
@@ -1589,7 +1599,7 @@ fn a_stranger_is_called_before_a_familiar_member() {
 
     // And the cursors say the opposite, so this can only come out right for the right reason:
     // the one who never answered is the only one we *have* swapped a catalogue with.
-    node.peers
+    node.supervisor
         .files_mut()
         .set_cursor(id, &members[4], 7)
         .unwrap();
@@ -1662,7 +1672,7 @@ fn work_arriving_before_the_answer_cancels_the_close() {
 
     // A transfer starts before they answer.
     node.learn_file(id, "urgent.bin");
-    node.peers.on(PeerEvent::Holdings {
+    node.supervisor.on(PeerEvent::Holdings {
         peer: members[0],
         group: id,
         paths: vec![RelPath::parse("urgent.bin").unwrap()],
@@ -1670,7 +1680,7 @@ fn work_arriving_before_the_answer_cancels_the_close() {
     });
 
     let closed = node
-        .peers
+        .supervisor
         .on(PeerEvent::CloseAnswered {
             peer: members[0],
             ready: true,
@@ -1689,7 +1699,7 @@ fn a_busy_answer_leaves_the_connection_alone() {
     node.all_up(&members);
     settle(&mut node, AT);
 
-    let actions = node.peers.on(PeerEvent::CloseAnswered {
+    let actions = node.supervisor.on(PeerEvent::CloseAnswered {
         peer: members[0],
         ready: false,
     });
@@ -1709,7 +1719,7 @@ fn a_busy_answer_is_not_re_proposed_to_on_the_next_tick() {
     let (at, seen) = settle(&mut node, AT);
     assert!(proposed_close(&seen), "drained, so a close goes out");
 
-    node.peers.on(PeerEvent::CloseAnswered {
+    node.supervisor.on(PeerEvent::CloseAnswered {
         peer: members[0],
         ready: false,
     });
@@ -1737,7 +1747,7 @@ fn both_ready_closes_once() {
     let (_, seen) = settle(&mut node, AT);
     assert!(proposed_close(&seen), "drained, so a close goes out");
 
-    let actions = node.peers.on(PeerEvent::CloseAnswered {
+    let actions = node.supervisor.on(PeerEvent::CloseAnswered {
         peer: members[0],
         ready: true,
     });
@@ -1846,11 +1856,11 @@ fn cramped(storage_max: Option<u64>, free: u64, held: u64) -> (Node, GroupId) {
     let members = peers(2);
     let id = node.group_with(&members);
     node.all_up(&members);
-    node.peers.on(PeerEvent::Space { free, held });
+    node.supervisor.on(PeerEvent::Space { free, held });
     (node, id)
 }
 
-fn source_of(node: &Peers, group: GroupId) -> Option<PeerId> {
+fn source_of(node: &Supervisor, group: GroupId) -> Option<PeerId> {
     node.status()
         .groups
         .into_iter()
@@ -1870,7 +1880,7 @@ fn a_source_the_budget_shut_out_is_let_go_when_the_last_transfer_ends() {
         node.learn_file(id, &format!("f{i}.bin"));
     }
     node.all_up(&members);
-    node.peers.on(PeerEvent::Space {
+    node.supervisor.on(PeerEvent::Space {
         free: 1_000_000,
         held: 0,
     });
@@ -1878,19 +1888,19 @@ fn a_source_the_budget_shut_out_is_let_go_when_the_last_transfer_ends() {
     let running = fetched_paths(&step(&mut node, AT, true));
     assert_eq!(running.len(), 1, "the budget has room for exactly one");
     assert_eq!(
-        source_of(&node.peers, id),
+        source_of(&node.supervisor, id),
         Some(members[0]),
         "and the group is pulling through the peer that offered them"
     );
 
-    node.peers.on(PeerEvent::BlobDone {
+    node.supervisor.on(PeerEvent::BlobDone {
         peer: members[0],
         group: id,
         path: running[0].clone(),
     });
 
     assert_eq!(
-        source_of(&node.peers, id),
+        source_of(&node.supervisor, id),
         None,
         "the rest cannot start and nothing is running, so the peer is let go at once"
     );
@@ -1911,7 +1921,7 @@ fn the_free_space_floor_stops_fetching_and_says_so_once() {
     let first = step(&mut node, AT, true);
     assert_eq!(fetches(&first), 0, "no room, so nothing is asked for");
     assert!(
-        matches!(node.peers.room(), Some(NoRoom::Floor { .. })),
+        matches!(node.supervisor.room(), Some(NoRoom::Floor { .. })),
         "and it is the floor that stopped it"
     );
 
@@ -1929,7 +1939,7 @@ fn a_budget_stops_fetching_short_of_the_disk_filling() {
     let actions = step(&mut node, AT, true);
     assert_eq!(fetches(&actions), 0);
     assert!(
-        matches!(node.peers.room(), Some(NoRoom::Budget { .. })),
+        matches!(node.supervisor.room(), Some(NoRoom::Budget { .. })),
         "the budget stopped it, not the floor: {actions:?}"
     );
 }
@@ -1942,7 +1952,7 @@ fn space_appearing_resumes_the_mirror() {
     assert_eq!(fetches(&step(&mut node, AT, true)), 0);
 
     // The user raised the limit, or removed something.
-    node.peers.on(PeerEvent::Space {
+    node.supervisor.on(PeerEvent::Space {
         free: 1_000_000,
         held: 0,
     });
@@ -1966,7 +1976,7 @@ fn a_file_larger_than_the_headroom_is_not_started() {
     node.learn_file(id, "big.bin");
 
     // Exactly at the floor: room() passes, room_for(1) does not.
-    node.peers.on(PeerEvent::Space {
+    node.supervisor.on(PeerEvent::Space {
         free: 1_000,
         held: 0,
     });
@@ -1988,8 +1998,9 @@ fn a_presence_answer_says_nothing_about_peers_it_was_not_asked_about() {
     node.learn_file(id, "wanted.bin");
 
     // One connected, one merely known to be up.
-    node.peers.on(PeerEvent::Verified { peer: members[0] });
-    node.peers.on(PeerEvent::Discovered { peer: members[1] });
+    node.supervisor.on(PeerEvent::Verified { peer: members[0] });
+    node.supervisor
+        .on(PeerEvent::Discovered { peer: members[1] });
 
     // A tick asks about whoever is not connected, so only about the second. Answered as it goes,
     // because a peer may have only one offer outstanding and an unanswered one would make the
@@ -2002,12 +2013,12 @@ fn a_presence_answer_says_nothing_about_peers_it_was_not_asked_about() {
     );
 
     // The server says that one is gone. It has said nothing whatever about the first.
-    node.peers.on(PeerEvent::Presence {
+    node.supervisor.on(PeerEvent::Presence {
         asked: vec![members[1]],
         online: Vec::new(),
     });
 
-    let status = node.peers.status();
+    let status = node.supervisor.status();
     let online = |peer: &PeerId| {
         status
             .peers
@@ -2049,7 +2060,7 @@ fn nobody_reachable_is_not_the_same_as_nobody_having_it() {
 
     node.tick(AT);
     assert!(
-        node.peers
+        node.supervisor
             .status()
             .groups
             .iter()
@@ -2093,8 +2104,9 @@ fn a_round_that_did_not_come_off_is_put_again() {
     let _ = node.group_with(&members);
 
     // Verified opens a chain round; the link then reports it never landed.
-    node.peers.on(PeerEvent::Verified { peer: members[0] });
-    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+    node.supervisor.on(PeerEvent::Verified { peer: members[0] });
+    node.supervisor
+        .on(PeerEvent::AskFailed { peer: members[0] });
 
     assert!(
         asks_of(&node.tick(AT + RETRY_AFTER - 1), members[0]).is_empty(),
@@ -2113,8 +2125,9 @@ fn a_retried_round_holds_the_connection_open_for_itself() {
     let members = peers(1);
     let _ = node.group_with(&members);
 
-    node.peers.on(PeerEvent::Verified { peer: members[0] });
-    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+    node.supervisor.on(PeerEvent::Verified { peer: members[0] });
+    node.supervisor
+        .on(PeerEvent::AskFailed { peer: members[0] });
 
     let actions = node.tick(AT + RETRY_AFTER);
     assert_eq!(asks_of(&actions, members[0]), vec![Offering::Chain]);
@@ -2132,11 +2145,12 @@ fn a_round_is_put_again_only_so_many_times() {
     let members = peers(1);
     let _ = node.group_with(&members);
 
-    node.peers.on(PeerEvent::Verified { peer: members[0] });
+    node.supervisor.on(PeerEvent::Verified { peer: members[0] });
 
     let mut asked = 0;
     for k in 1..=(u32::from(RETRY_ATTEMPTS) + 2) {
-        node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+        node.supervisor
+            .on(PeerEvent::AskFailed { peer: members[0] });
         let at = AT + RETRY_AFTER * i64::from(k);
         asked += asks_of(&node.tick(at), members[0]).len();
     }
@@ -2155,12 +2169,13 @@ fn a_catalogue_that_failed_is_put_again_as_a_catalogue() {
     let _ = node.group_with(&members);
 
     // Chain first, answered, which is what opens the catalogue round.
-    node.peers.on(PeerEvent::Verified { peer: members[0] });
-    node.peers.on(PeerEvent::Asked {
+    node.supervisor.on(PeerEvent::Verified { peer: members[0] });
+    node.supervisor.on(PeerEvent::Asked {
         peer: members[0],
         offering: Offering::Chain,
     });
-    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+    node.supervisor
+        .on(PeerEvent::AskFailed { peer: members[0] });
 
     assert_eq!(
         asks_of(&node.tick(AT + RETRY_AFTER), members[0]),
@@ -2178,15 +2193,16 @@ fn a_round_owed_when_the_line_drops_goes_back_on_the_dial_list() {
 
     // Connected, asked, refused: the retry takes them off the dial list because it means to
     // see to them on this connection.
-    node.peers.on(PeerEvent::Verified { peer: members[0] });
-    node.peers.on(PeerEvent::AskFailed { peer: members[0] });
+    node.supervisor.on(PeerEvent::Verified { peer: members[0] });
+    node.supervisor
+        .on(PeerEvent::AskFailed { peer: members[0] });
     assert!(
         dials(&node.tick(AT + 1)).is_empty(),
         "no call while the retry still has a connection to do it on"
     );
 
     // The connection goes before the retry comes round. Now a call is the only way back.
-    node.peers.on(PeerEvent::Gone { peer: members[0] });
+    node.supervisor.on(PeerEvent::Gone { peer: members[0] });
     assert_eq!(
         dials(&node.tick(AT + 2)),
         vec![members[0]],
@@ -2201,19 +2217,19 @@ fn both_sides_of_an_agreed_hang_up_know_it_was_agreed() {
     let mut them = Node::new();
     let caller = peers(1)[0];
     let _ = them.group_with(&[caller]);
-    them.peers.on(PeerEvent::Verified { peer: caller });
+    them.supervisor.on(PeerEvent::Verified { peer: caller });
 
     assert!(
-        !them.peers.close_was_agreed(&caller),
+        !them.supervisor.close_was_agreed(&caller),
         "nothing has been agreed yet"
     );
 
-    them.peers.on(PeerEvent::CloseProposed {
+    them.supervisor.on(PeerEvent::CloseProposed {
         peer: caller,
         ready: true,
     });
     assert!(
-        them.peers.close_was_agreed(&caller),
+        them.supervisor.close_was_agreed(&caller),
         "having said yes, the disconnect that follows is the ordinary end of a call"
     );
 }
@@ -2223,14 +2239,14 @@ fn refusing_to_hang_up_agrees_to_nothing() {
     let mut them = Node::new();
     let caller = peers(1)[0];
     let _ = them.group_with(&[caller]);
-    them.peers.on(PeerEvent::Verified { peer: caller });
+    them.supervisor.on(PeerEvent::Verified { peer: caller });
 
-    them.peers.on(PeerEvent::CloseProposed {
+    them.supervisor.on(PeerEvent::CloseProposed {
         peer: caller,
         ready: false,
     });
     assert!(
-        !them.peers.close_was_agreed(&caller),
+        !them.supervisor.close_was_agreed(&caller),
         "a refusal is not an agreement, and a close after one is worth the cause"
     );
 }
@@ -2240,11 +2256,11 @@ fn the_caller_records_the_agreement_it_asked_for() {
     let mut node = Node::new();
     let member = peers(1)[0];
     let _ = node.group_with(&[member]);
-    node.peers.on(PeerEvent::Verified { peer: member });
+    node.supervisor.on(PeerEvent::Verified { peer: member });
 
     // Let the rounds `Verified` opened finish, so there is nothing outstanding left.
     for offering in [Offering::Chain, Offering::Catalogue] {
-        node.peers.on(PeerEvent::Asked {
+        node.supervisor.on(PeerEvent::Asked {
             peer: member,
             offering,
         });
@@ -2259,7 +2275,7 @@ fn the_caller_records_the_agreement_it_asked_for() {
         "a peer with nothing outstanding is asked to hang up: {proposed:?}"
     );
 
-    let answered = node.peers.on(PeerEvent::CloseAnswered {
+    let answered = node.supervisor.on(PeerEvent::CloseAnswered {
         peer: member,
         ready: true,
     });
@@ -2270,7 +2286,7 @@ fn the_caller_records_the_agreement_it_asked_for() {
         "and hung up on once they agree"
     );
     assert!(
-        node.peers.close_was_agreed(&member),
+        node.supervisor.close_was_agreed(&member),
         "the side that asked knows it too, so neither log calls this a failure"
     );
 }
@@ -2280,19 +2296,19 @@ fn an_agreement_that_led_to_no_close_goes_stale() {
     let mut them = Node::new();
     let caller = peers(1)[0];
     let _ = them.group_with(&[caller]);
-    them.peers.on(PeerEvent::Verified { peer: caller });
+    them.supervisor.on(PeerEvent::Verified { peer: caller });
 
-    them.peers.on(PeerEvent::CloseProposed {
+    them.supervisor.on(PeerEvent::CloseProposed {
         peer: caller,
         ready: true,
     });
-    assert!(them.peers.close_was_agreed(&caller));
+    assert!(them.supervisor.close_was_agreed(&caller));
 
     // They asked, we agreed, and then they never hung up. Whatever ends the connection
     // after that is not the hang-up we agreed to, and the cause is worth printing.
     them.tick(AT + CLOSE_TIMEOUT);
     assert!(
-        !them.peers.close_was_agreed(&caller),
+        !them.supervisor.close_was_agreed(&caller),
         "an agreement nobody acted on stops speaking for later failures"
     );
 }

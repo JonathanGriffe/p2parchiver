@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "crates/ac-files",
     "crates/ac-import",
-    "crates/ac-peers",
+    "crates/ac-supervisor",
     "crates/ac-groups",
     "crates/ac-net",
     "crates/ac-node",
@@ -30,7 +30,7 @@ ac-files = { path = "crates/ac-files" }
 ac-import = { path = "crates/ac-import" }
 # The supervisor. Depends on everything below it and nothing depends on it but the binary:
 # deciding who to call needs to see membership and content at once.
-ac-peers = { path = "crates/ac-peers" }
+ac-supervisor = { path = "crates/ac-supervisor" }
 # The binary with a window. Depends on `ac-node` for both halves of a node: the daemon loop
 # it runs on a thread, and the `ops` layer the CLI dispatches through.
 ac-node = { path = "crates/ac-node" }

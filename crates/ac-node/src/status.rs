@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use ac_groups::id::GroupId;
 use ac_net::PeerId;
-use ac_peers::sync::{GroupStatus, PeerStatus, Status};
+use ac_supervisor::sync::{GroupStatus, PeerStatus, Status};
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub struct Snapshot {

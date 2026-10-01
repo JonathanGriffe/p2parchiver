@@ -10,7 +10,7 @@ mod directory;
 mod file_link;
 mod group_link;
 mod import_link;
-mod peer_link;
 mod status;
+mod supervisor_link;
 
 pub const DEFAULT_LOG: &str = "ac=info,ac_net=info,libp2p=warn";

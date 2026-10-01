@@ -10,7 +10,7 @@ use ac_files::Content;
 use ac_import::ledger::{Ledger, SCAN_INTERVAL, due};
 use ac_import::source::SourceType;
 use ac_net::config::{Config, Paths};
-use ac_peers::sync::{Limits, Space};
+use ac_supervisor::sync::{Limits, Space};
 
 use crate::ops::import::{self, Brought, Outcome, Pace, Scanned, UNSORTED};
 use crate::ops::now;
@@ -628,9 +628,10 @@ mod tests {
             Arc::new(Throttle::none()),
         )
         .unwrap();
-        let peers = crate::peer_link::PeerLink::open(&paths, &identity, None, now()).unwrap();
+        let supervisor =
+            crate::supervisor_link::SupervisorLink::open(&paths, &identity, None, now()).unwrap();
 
-        let space = peers.space(&files, unsorted).unwrap();
+        let space = supervisor.space(&files, unsorted).unwrap();
         assert_eq!(
             space.held, unsorted,
             "no group holds anything, so this is all of it"

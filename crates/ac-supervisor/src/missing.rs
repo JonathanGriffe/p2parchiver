@@ -8,7 +8,7 @@ pub fn next_missing(
     group: GroupId,
     after: Option<&RelPath>,
     limit: usize,
-) -> Result<Vec<(RelPath, String)>, PeersError> {
+) -> Result<Vec<(RelPath, String)>, SupervisorError> {
     Ok(files
         .missing(group, after, limit)?
         .into_iter()
@@ -17,7 +17,7 @@ pub fn next_missing(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum PeersError {
+pub enum SupervisorError {
     #[error(transparent)]
     Files(#[from] FilesError),
     #[error(transparent)]

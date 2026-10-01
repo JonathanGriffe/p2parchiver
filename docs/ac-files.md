@@ -1,6 +1,6 @@
 # ac-files
 
-The application's content layer. It keeps each group's catalogue, the list of files the group holds, reconciles catalogues between members over `/ac/manifest/3.0.0`, and stores the files' bytes on disk. It decides and records but never moves bytes between peers itself: `ac-net` does, driven by `ac-node`, including for the `/ac/blob/1.0.0` transfers whose messages and rules are defined here. It depends on `ac-net` and `ac-groups`, and `ac-peers` and `ac-node` build on it.
+The application's content layer. It keeps each group's catalogue, the list of files the group holds, reconciles catalogues between members over `/ac/manifest/3.0.0`, and stores the files' bytes on disk. It decides and records but never moves bytes between peers itself: `ac-net` does, driven by `ac-node`, including for the `/ac/blob/1.0.0` transfers whose messages and rules are defined here. It depends on `ac-net` and `ac-groups`, and `ac-supervisor` and `ac-node` build on it.
 
 Paths below are relative to `crates/ac-files/`.
 
@@ -29,7 +29,7 @@ Each catalogue also has a digest: a hash of every row's path, hash, and added an
 
 ### Reconciliation
 
-1. A node asks a peer for its heads: the digest and row count of each group they share, at most 128. The sync machine never asks itself, as the supervisor in `ac-peers` decides who to ask.
+1. A node asks a peer for its heads: the digest and row count of each group they share, at most 128. The sync machine never asks itself, as the supervisor in `ac-supervisor` decides who to ask.
 2. A group whose digests match is settled. Otherwise the node reads the peer's log from its stored cursor, a page of up to 2048 rows at a time, merging each row and moving the cursor to where the peer said the page ended.
 3. Once the log is drained, the digests are compared again. If they still differ, the cursor is reset and the whole log is read once more: the cursor is an optimisation, the digest is the check.
 
