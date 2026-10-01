@@ -11,7 +11,7 @@ use ac_net::identity::Identity;
 use ac_net::throttle::{THROTTLE_BURST, Throttle};
 use ac_net::transfer::{TransferEvent, TransferId, TransferSpec, Transfers};
 
-use ac_files::blob::{Fetch, FetchError, Local, Server};
+use ac_files::blob::{Blobs, Fetch, FetchError, Local};
 use ac_files::content::Content;
 use ac_files::path::RelPath;
 use ac_files::store::Files;
@@ -95,11 +95,10 @@ pub struct FileLink {
     sync: FileSync,
     outbound: HashMap<request_response::OutboundRequestId, (PeerId, Outbound)>,
     rounds: Vec<RoundOutcome>,
-    db: std::path::PathBuf,
-    transfers: Transfers<Fetch, Server>,
+    blobs: Blobs,
+    transfers: Transfers<Fetch, Blobs>,
     fetching: HashMap<TransferId, (PeerId, GroupId, RelPath)>,
     fetched: Vec<TransferOutcome>,
-    unsorted: Arc<Unsorted>,
 }
 
 /// How long a partial must sit untouched before a sweep will remove it.
@@ -145,6 +144,12 @@ impl FileLink {
         let content = Content::new(config.storage_root(paths));
         sweep_staging(&files, &content);
 
+        let unsorted = Unsorted {
+            db: path.clone(),
+            content: content.clone(),
+        };
+        let blobs = Blobs::new(path, me, content.clone(), Arc::new(unsorted));
+
         let transfers = Transfers::new(
             swarm.behaviour().app.blobs.new_control(),
             TransferSpec {
@@ -153,21 +158,17 @@ impl FileLink {
                 max_downloads: MAX_DOWNLOADS,
                 max_uploads: MAX_UPLOADS,
             },
-            Server::new(path.clone(), me, content.clone()),
+            blobs.clone(),
             down,
             Arc::new(Throttle::from_config(config.bandwidth_max, THROTTLE_BURST)),
         )
         .context("registering the blob protocol")?;
 
         Ok(Self {
-            unsorted: Arc::new(Unsorted {
-                db: path.clone(),
-                content: content.clone(),
-            }),
             sync: FileSync::new(files, groups, content),
             outbound: HashMap::new(),
             rounds: Vec::new(),
-            db: path,
+            blobs,
             transfers,
             fetching: HashMap::new(),
             fetched: Vec::new(),
@@ -188,17 +189,7 @@ impl FileLink {
         hash: String,
         dir: String,
     ) -> bool {
-        let fetch = Fetch::new(
-            self.db.clone(),
-            self.sync.me(),
-            self.sync.content().clone(),
-            group,
-            dir,
-            path.clone(),
-            hash,
-        )
-        .with_local(self.unsorted.clone());
-
+        let fetch = self.blobs.fetch(group, dir, path.clone(), hash);
         let Some(id) = self.transfers.fetch(peer, fetch) else {
             return false;
         };

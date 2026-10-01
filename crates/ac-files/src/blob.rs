@@ -75,16 +75,46 @@ pub fn may_serve(
     (!row.is_removed() && row.have).then_some(row)
 }
 
-/// One file to fetch from one peer.
-pub struct Fetch {
+/// This node's side of `/ac/blob/1.0.0`: what every download and upload shares.
+#[derive(Clone)]
+pub struct Blobs {
     db: PathBuf,
     me: PeerId,
     content: Content,
+    local: Arc<dyn Local>,
+}
+
+impl Blobs {
+    /// Downloads look in `local` before asking a peer.
+    pub fn new(db: PathBuf, me: PeerId, content: Content, local: Arc<dyn Local>) -> Self {
+        Self {
+            db,
+            me,
+            content,
+            local,
+        }
+    }
+
+    /// A download of `path` in `group`, which must hash to `hash`.
+    pub fn fetch(&self, group: GroupId, dir: String, path: RelPath, hash: String) -> Fetch {
+        Fetch {
+            blobs: self.clone(),
+            group,
+            dir,
+            path,
+            hash,
+            resume: 0,
+        }
+    }
+}
+
+/// One file to fetch from one peer.
+pub struct Fetch {
+    blobs: Blobs,
     group: GroupId,
     dir: String,
     path: RelPath,
     hash: String,
-    local: Option<Arc<dyn Local>>,
     resume: u64,
 }
 
@@ -97,36 +127,8 @@ pub struct Receiving {
 }
 
 impl Fetch {
-    pub fn new(
-        db: PathBuf,
-        me: PeerId,
-        content: Content,
-        group: GroupId,
-        dir: String,
-        path: RelPath,
-        hash: String,
-    ) -> Self {
-        Self {
-            db,
-            me,
-            content,
-            group,
-            dir,
-            path,
-            hash,
-            local: None,
-            resume: 0,
-        }
-    }
-
-    /// Look in `local` before asking the peer.
-    pub fn with_local(mut self, local: Arc<dyn Local>) -> Self {
-        self.local = Some(local);
-        self
-    }
-
     fn mark_held(&self) -> Result<(), FetchError> {
-        Files::open(&self.db, self.me)?.mark_have(self.group, &self.path, true)?;
+        Files::open(&self.blobs.db, self.blobs.me)?.mark_have(self.group, &self.path, true)?;
         Ok(())
     }
 }
@@ -139,9 +141,9 @@ impl Download for Fetch {
 
     fn start(&mut self) -> Result<Option<BlobRequest>, FetchError> {
         if self
+            .blobs
             .local
-            .as_ref()
-            .is_some_and(|l| l.take(self.group, &self.dir, &self.path, &self.hash))
+            .take(self.group, &self.dir, &self.path, &self.hash)
         {
             tracing::info!(path = %self.path, "already on this node; filed rather than fetched");
             self.mark_held()?;
@@ -150,7 +152,7 @@ impl Download for Fetch {
 
         let mut hash = [0u8; 32];
         hex::decode_to_slice(&self.hash, &mut hash).map_err(|_| FetchError::BadHash)?;
-        self.resume = self.content.staged_len(&self.dir, &self.path);
+        self.resume = self.blobs.content.staged_len(&self.dir, &self.path);
 
         Ok(Some(BlobRequest {
             group: self.group,
@@ -166,6 +168,7 @@ impl Download for Fetch {
             BlobReply::Unavailable => return Err(FetchError::Unavailable),
         };
         let sink = self
+            .blobs
             .content
             .resume(&self.dir, &self.path, self.resume)
             .map_err(FetchError::Disk)?;
@@ -205,11 +208,12 @@ impl Download for Fetch {
         }
 
         let staged = sink.finish().map_err(FetchError::Disk)?;
+        let content = &fetch.blobs.content;
         if staged.hash != fetch.hash {
-            fetch.content.discard(staged).ok();
+            content.discard(staged).ok();
             return Err(FetchError::WrongContent);
         }
-        fetch.content.commit(staged).map_err(FetchError::Disk)?;
+        content.commit(staged).map_err(FetchError::Disk)?;
         fetch.mark_held()
     }
 }
@@ -266,20 +270,7 @@ pub enum ServeError {
     Stream(#[from] StreamError),
 }
 
-/// This node's side of `/ac/blob/1.0.0`, shared by every upload.
-pub struct Server {
-    db: PathBuf,
-    me: PeerId,
-    content: Content,
-}
-
-impl Server {
-    pub fn new(db: PathBuf, me: PeerId, content: Content) -> Self {
-        Self { db, me, content }
-    }
-}
-
-impl Serve for Server {
+impl Serve for Blobs {
     type Request = BlobRequest;
     type Reply = BlobReply;
     type Source = File;
@@ -363,10 +354,18 @@ mod tests {
         }
 
         fn fetch(&self, hash: &str) -> Fetch {
-            Fetch::new(
+            self.fetch_finding(hash, false)
+        }
+
+        /// A fetch whose look elsewhere finds the bytes, or not.
+        fn fetch_finding(&self, hash: &str, found: bool) -> Fetch {
+            let blobs = Blobs::new(
                 self.dir.path().join("state.sqlite"),
                 self.me,
                 self.content(),
+                Arc::new(Found(found)),
+            );
+            blobs.fetch(
                 self.group,
                 self.group_dir.clone(),
                 self.path.clone(),
@@ -524,9 +523,7 @@ mod tests {
         let bytes = bytes();
         let node = Fetcher::new(&bytes);
 
-        let mut fetch = node
-            .fetch(&hash_of(&bytes))
-            .with_local(Arc::new(Found(true)));
+        let mut fetch = node.fetch_finding(&hash_of(&bytes), true);
         assert!(fetch.start().unwrap().is_none(), "no request goes out");
         assert!(node.held(), "and the row is held");
     }
@@ -536,9 +533,7 @@ mod tests {
         let bytes = bytes();
         let node = Fetcher::new(&bytes);
 
-        let mut fetch = node
-            .fetch(&hash_of(&bytes))
-            .with_local(Arc::new(Found(false)));
+        let mut fetch = node.fetch_finding(&hash_of(&bytes), false);
         let request = fetch.start().unwrap().unwrap();
 
         assert_eq!(hex::encode(request.hash), hash_of(&bytes));
