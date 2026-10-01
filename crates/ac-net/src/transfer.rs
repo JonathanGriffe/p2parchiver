@@ -3,7 +3,7 @@
 //! The protocol plugs in through [`Download`] and [`Serve`], the way `request_response` is
 //! generic over its request and response. Nothing here knows what the bytes are.
 
-use std::fmt::{self, Display};
+use std::fmt::Display;
 use std::future::poll_fn;
 use std::io::Read;
 use std::sync::Arc;
@@ -50,7 +50,7 @@ pub trait Serve: Send + Sync + 'static {
     type Request: DeserializeOwned + Send;
     type Reply: Serialize + Send + Sync;
     type Source: Read + Send;
-    type Error: Display + Send;
+    type Error: From<StreamError> + Display + Send;
 
     /// The reply to `peer`, and the bytes to send after it, if any.
     fn answer(&self, peer: PeerId, request: Self::Request) -> Result<Answered<Self>, Self::Error>;
@@ -242,43 +242,20 @@ async fn download_from<D: Download>(
     D::on_end(receiving, ended)
 }
 
-/// Why an inbound stream got no answer.
-enum Unanswered<E> {
-    Stream(StreamError),
-    Refused(E),
-}
-
-impl<E> From<StreamError> for Unanswered<E> {
-    fn from(e: StreamError) -> Self {
-        Unanswered::Stream(e)
-    }
-}
-
-impl<E: Display> Display for Unanswered<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Unanswered::Stream(e) => e.fmt(f),
-            Unanswered::Refused(e) => e.fmt(f),
-        }
-    }
-}
-
 async fn upload_to<S: Serve>(
     server: &S,
     peer: PeerId,
     stream: &mut Stream,
     limit: usize,
     up: &Throttle,
-) -> Result<(), Unanswered<S::Error>> {
+) -> Result<(), S::Error> {
     let request = read_frame(stream, limit).await?;
-    let (reply, source) = server.answer(peer, request).map_err(Unanswered::Refused)?;
+    let (reply, source) = server.answer(peer, request)?;
 
     write_frame(stream, &reply, limit).await?;
     if let Some(source) = source {
         send(stream, source, up).await?;
     }
-    stream
-        .close()
-        .await
-        .map_err(|e| Unanswered::Stream(StreamError::Io(e)))
+    stream.close().await.map_err(StreamError::Io)?;
+    Ok(())
 }

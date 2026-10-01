@@ -100,9 +100,9 @@ impl Serve for Library {
     type Request = u32;
     type Reply = Reply;
     type Source = Cursor<Vec<u8>>;
-    type Error = String;
+    type Error = StreamError;
 
-    fn answer(&self, _: PeerId, item: u32) -> Result<Answered<Self>, String> {
+    fn answer(&self, _: PeerId, item: u32) -> Result<Answered<Self>, StreamError> {
         Ok(match self.0.get(&item) {
             Some(bytes) => (
                 Reply::Sending(bytes.len() as u64),

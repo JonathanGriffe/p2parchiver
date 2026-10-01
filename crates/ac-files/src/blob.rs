@@ -262,6 +262,8 @@ pub enum ServeError {
     Index(#[from] FilesError),
     #[error(transparent)]
     Groups(#[from] StoreError),
+    #[error(transparent)]
+    Stream(#[from] StreamError),
 }
 
 /// This node's side of `/ac/blob/1.0.0`, shared by every upload.
