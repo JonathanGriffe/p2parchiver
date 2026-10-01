@@ -9,7 +9,7 @@ use std::sync::Arc;
 use ac_groups::id::GroupId;
 use ac_groups::store::{Groups, StoreError};
 use ac_net::PeerId;
-use ac_net::stream::StreamError;
+use ac_net::stream::TransferError;
 use ac_net::transfer::{Download, Serve};
 
 use crate::content::{Content, Sink};
@@ -31,7 +31,7 @@ pub enum FetchError {
     #[error("the hash asked for is not a SHA-256 in hex")]
     BadHash,
     #[error(transparent)]
-    Stream(#[from] StreamError),
+    Transfer(#[from] TransferError),
     #[error("could not write the download: {0}")]
     Disk(io::Error),
     #[error(transparent)]
@@ -267,7 +267,7 @@ pub enum ServeError {
     #[error(transparent)]
     Groups(#[from] StoreError),
     #[error(transparent)]
-    Stream(#[from] StreamError),
+    Transfer(#[from] TransferError),
 }
 
 impl Serve for Blobs {
@@ -496,12 +496,43 @@ mod tests {
             })
             .unwrap();
         Fetch::on_chunk(&mut receiving, &bytes[..1000]).unwrap();
-        let severed = StreamError::Io(io::Error::from(io::ErrorKind::ConnectionReset));
+        let severed = TransferError::Io(io::Error::from(io::ErrorKind::ConnectionReset));
         let failed = Fetch::on_end(receiving, Err(severed.into())).unwrap_err();
 
-        assert!(matches!(failed, FetchError::Stream(_)));
+        assert!(matches!(failed, FetchError::Transfer(_)));
         assert!(!failed.is_terminal());
         assert_eq!(node.staged(), 1000);
+    }
+
+    #[test]
+    fn a_stream_that_times_out_is_retryable_and_keeps_its_partial() {
+        let bytes = bytes();
+        let node = Fetcher::new(&bytes);
+
+        let mut fetch = node.fetch(&hash_of(&bytes));
+        fetch.start().unwrap();
+        let mut receiving = fetch
+            .on_reply(BlobReply::Sending {
+                size: bytes.len() as u64,
+            })
+            .unwrap();
+        Fetch::on_chunk(&mut receiving, &bytes[..1000]).unwrap();
+        let stalled = TransferError::TimedOut(crate::wire::BLOB_STALL_TIMEOUT);
+        let failed = Fetch::on_end(receiving, Err(stalled.into())).unwrap_err();
+
+        assert!(matches!(
+            failed,
+            FetchError::Transfer(TransferError::TimedOut(_))
+        ));
+        assert!(!failed.is_terminal());
+        assert_eq!(node.staged(), 1000);
+
+        let mut again = node.fetch(&hash_of(&bytes));
+        assert_eq!(
+            again.start().unwrap().unwrap().offset,
+            1000,
+            "the next attempt resumes from it"
+        );
     }
 
     #[test]
