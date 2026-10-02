@@ -4,7 +4,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::swarm::DialError;
 use libp2p::{Multiaddr, PeerId};
 
-/// Candidate direct addresses kept per peer
+/// Candidate direct addresses kept per peer, as many as libp2p dials at once
 const MAX_DIRECT_ADDRS: usize = 8;
 
 /// Whether an address is worth ever dialling.
@@ -21,12 +21,12 @@ fn dialable(addr: &Multiaddr) -> bool {
     })
 }
 
-/// The address with `/p2p/<peer>` appended, so a failed dial names the peer.
+/// The address as libp2p dials it and reports it failing, with `/p2p/<peer>` appended.
 fn named(peer: PeerId, addr: &Multiaddr) -> Option<Multiaddr> {
     addr.clone().with_p2p(peer).ok()
 }
 
-/// Where to dial each peer: its mDNS address while it announces one, else the relay.
+/// Where to dial each peer: its mDNS addresses while it announces any, else the relay.
 pub struct DialPolicy {
     relay: Option<Multiaddr>,
     lan: HashMap<PeerId, Lan>,
@@ -36,7 +36,7 @@ pub struct DialPolicy {
 struct Lan {
     /// Each ending in `/p2p/<peer>`.
     addrs: Vec<Multiaddr>,
-    /// The last dial to one of `addrs` failed, so the next goes through the relay.
+    /// The last dial to `addrs` failed, so the next goes through the relay.
     relay_next: bool,
 }
 
@@ -85,20 +85,21 @@ impl DialPolicy {
         lan.relay_next |= failed;
     }
 
-    /// Where to dial the peer now, taking the one relayed attempt owed after a failed
-    /// direct dial. None when it has no LAN address and there is no server to relay through.
-    pub fn next(&mut self, peer: PeerId) -> Option<Multiaddr> {
+    /// The addresses to dial the peer at now, all in one attempt: its LAN addresses, or the
+    /// circuit through the relay, which also takes the one attempt owed after a failed LAN
+    /// dial. Empty when it has no LAN address and there is no server to relay through.
+    pub fn next(&mut self, peer: PeerId) -> Vec<Multiaddr> {
         let relay = self
             .relay
             .clone()
             .map(|relay| relay.with(Protocol::P2pCircuit).with(Protocol::P2p(peer)));
         let Some(lan) = self.lan.get_mut(&peer) else {
-            return relay;
+            return relay.into_iter().collect();
         };
         if std::mem::take(&mut lan.relay_next) && relay.is_some() {
-            return relay;
+            return relay.into_iter().collect();
         }
-        lan.addrs.first().cloned().or(relay)
+        lan.addrs.clone()
     }
 }
 
@@ -131,11 +132,17 @@ mod tests {
         (policy, them, lan, relayed)
     }
 
-    fn transport_failure(addr: &Multiaddr) -> DialError {
-        DialError::Transport(vec![(
-            addr.clone(),
-            libp2p::TransportError::Other(std::io::Error::other("connection refused")),
-        )])
+    /// A dial that failed at each of these addresses.
+    fn transport_failure(addrs: &[Multiaddr]) -> DialError {
+        DialError::Transport(
+            addrs
+                .iter()
+                .map(|addr| {
+                    let refused = std::io::Error::other("connection refused");
+                    (addr.clone(), libp2p::TransportError::Other(refused))
+                })
+                .collect(),
+        )
     }
 
     #[test]
@@ -166,16 +173,18 @@ mod tests {
     fn a_peer_with_no_lan_address_is_dialed_through_the_relay() {
         let them = PeerId::random();
         let (mut policy, relayed) = with_relay(them);
-        assert_eq!(policy.next(them), Some(relayed));
+        assert_eq!(policy.next(them), vec![relayed]);
     }
 
     #[test]
-    fn a_lan_address_is_dialed_with_the_peer_named() {
+    fn every_lan_address_is_dialed_at_once_with_the_peer_named() {
         let (mut policy, them, lan, _) = with_lan_peer();
+        let other: Multiaddr = "/ip4/192.168.1.5/udp/4002/quic-v1".parse().unwrap();
+        policy.announced(them, &other);
+
         assert_eq!(
             policy.next(them),
-            Some(lan),
-            "without /p2p a failure would not name the peer"
+            vec![lan, other.with(Protocol::P2p(them))]
         );
     }
 
@@ -183,17 +192,33 @@ mod tests {
     fn a_failed_lan_dial_goes_through_the_relay_once_then_tries_the_address_again() {
         let (mut policy, them, lan, relayed) = with_lan_peer();
 
-        assert_eq!(policy.next(them), Some(lan.clone()));
-        policy.failed(them, &transport_failure(&lan));
+        let tried = policy.next(them);
+        assert_eq!(tried, vec![lan.clone()]);
+        policy.failed(them, &transport_failure(&tried));
         assert_eq!(
             policy.next(them),
-            Some(relayed),
+            vec![relayed],
             "the next attempt is relayed"
         );
         assert_eq!(
             policy.next(them),
-            Some(lan),
+            vec![lan],
             "and the address is tried again after that"
+        );
+    }
+
+    #[test]
+    fn a_dial_failing_at_every_lan_address_sends_the_next_through_the_relay() {
+        let (mut policy, them, lan, relayed) = with_lan_peer();
+        let other: Multiaddr = "/ip4/192.168.1.5/udp/4002/quic-v1".parse().unwrap();
+        policy.announced(them, &other);
+
+        let tried = policy.next(them);
+        policy.failed(them, &transport_failure(&tried));
+        assert_eq!(policy.next(them), vec![relayed]);
+        assert_eq!(
+            policy.next(them),
+            vec![lan, other.with(Protocol::P2p(them))]
         );
     }
 
@@ -201,23 +226,24 @@ mod tests {
     fn a_dial_refused_locally_does_not_send_the_next_attempt_through_the_relay() {
         let (mut policy, them, lan, _) = with_lan_peer();
 
-        assert_eq!(policy.next(them), Some(lan.clone()));
+        assert_eq!(policy.next(them), vec![lan.clone()]);
         let denied = DialError::Denied {
             cause: libp2p::swarm::ConnectionDenied::new(std::io::Error::other("too many")),
         };
         policy.failed(them, &denied);
-        assert_eq!(policy.next(them), Some(lan));
+        assert_eq!(policy.next(them), vec![lan]);
     }
 
     #[test]
     fn a_failed_relayed_dial_leaves_the_lan_address_alone() {
         let (mut policy, them, lan, relayed) = with_lan_peer();
 
-        policy.next(them);
-        policy.failed(them, &transport_failure(&lan));
-        assert_eq!(policy.next(them), Some(relayed.clone()));
-        policy.failed(them, &transport_failure(&relayed));
-        assert_eq!(policy.next(them), Some(lan));
+        let tried = policy.next(them);
+        policy.failed(them, &transport_failure(&tried));
+        let tried = policy.next(them);
+        assert_eq!(tried, vec![relayed]);
+        policy.failed(them, &transport_failure(&tried));
+        assert_eq!(policy.next(them), vec![lan]);
     }
 
     #[test]
@@ -229,11 +255,11 @@ mod tests {
         policy.expired(them, &lan);
         assert_eq!(
             policy.next(them),
-            Some(other.clone().with(Protocol::P2p(them))),
-            "the address still announced takes over"
+            vec![other.clone().with(Protocol::P2p(them))],
+            "the address still announced is dialed alone"
         );
 
         policy.expired(them, &other);
-        assert_eq!(policy.next(them), Some(relayed));
+        assert_eq!(policy.next(them), vec![relayed]);
     }
 }

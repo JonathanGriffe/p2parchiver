@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use libp2p::swarm::DialError;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::{Multiaddr, PeerId, request_response};
 
 use ac_net::admitted_peers::AdmittedPeers;
@@ -417,12 +418,19 @@ impl SupervisorLink {
         for action in actions {
             match action {
                 PeerAction::Dial { peer } => {
-                    let Some(addr) = self.dial.next(peer) else {
+                    let addrs = self.dial.next(peer);
+                    if addrs.is_empty() {
                         tracing::debug!(%peer, "wanted to dial, but there is no server to relay through");
                         continue;
-                    };
-                    tracing::debug!(%peer, %addr, "dialling a member");
-                    if let Err(e) = swarm.dial(addr) {
+                    }
+                    tracing::debug!(%peer, ?addrs, "dialling a member");
+                    // Always: the supervisor decides when to dial, and a dead connection can
+                    // outlive the peer's restart.
+                    let opts = DialOpts::peer_id(peer)
+                        .addresses(addrs)
+                        .condition(PeerCondition::Always)
+                        .build();
+                    if let Err(e) = swarm.dial(opts) {
                         tracing::debug!(%peer, error = %e, "dial refused before it started");
                         let actions = self.supervisor.on(PeerEvent::DialFailed { peer });
                         self.dispatch(swarm, files, groups, admitted_peers, actions);
@@ -706,6 +714,7 @@ mod tests {
         }
 
         /// Give this node a server to relay through, and return the circuit to `peer`.
+        /// Call it before `discover`: it starts a fresh policy, dropping known addresses.
         fn relay_through_server(&mut self, peer: PeerId) -> Multiaddr {
             let server: Multiaddr =
                 format!("/ip4/203.0.113.1/udp/4001/quic-v1/p2p/{}", PeerId::random())
@@ -924,19 +933,22 @@ mod tests {
             .expect("the dial failed")
     }
 
-    #[tokio::test]
-    async fn a_lan_address_that_refuses_reports_the_peer_and_the_next_attempt_is_relayed() {
-        let mut n = Node::new();
-        let them = PeerId::random();
-        let relayed = n.relay_through_server(them);
-
-        // A port nothing listens on, so the connection is refused at once.
+    /// A TCP address nothing listens on, so a dial there is refused at once.
+    fn refused_addr() -> Multiaddr {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        n.discover(them, format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap());
+        format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_lan_address_that_refuses_reports_the_peer_and_the_next_attempt_is_relayed() {
+        let mut n = Node::new();
+        let them = PeerId::random();
+        let relayed = n.relay_through_server(them);
+        n.discover(them, refused_addr());
 
         n.dial(them);
         let (peer, error) = next_dial_failure(&mut n, None).await;
@@ -944,7 +956,35 @@ mod tests {
         assert!(matches!(error, DialError::Transport(_)), "{error:?}");
 
         n.dial_failed(them, &error);
-        assert_eq!(n.supervisor.dial.next(them), Some(relayed));
+        assert_eq!(n.supervisor.dial.next(them), vec![relayed]);
+    }
+
+    #[tokio::test]
+    async fn a_dead_lan_address_announced_first_does_not_keep_the_peer_from_its_live_one() {
+        let (mut n, mut them) = (Node::new(), Node::new());
+        let peer = them.peer;
+
+        // Like a v6-only socket's port, once mDNS has moved it onto the peer's IPv4 address.
+        n.discover(peer, refused_addr());
+        let live = them.listen_addr().await;
+        n.discover(peer, live);
+
+        n.dial(peer);
+        let reached = async {
+            while !n.swarm.is_connected(&peer) {
+                tokio::select! {
+                    event = n.swarm.select_next_some() => {
+                        if let SwarmEvent::OutgoingConnectionError { error, .. } = event {
+                            panic!("the dial failed: {error}");
+                        }
+                    }
+                    _ = them.swarm.select_next_some() => {}
+                }
+            }
+        };
+        tokio::time::timeout(WIRE_TIMEOUT, reached)
+            .await
+            .expect("the live address was reached");
     }
 
     #[tokio::test]
@@ -962,7 +1002,7 @@ mod tests {
         assert!(matches!(error, DialError::WrongPeerId { .. }), "{error:?}");
 
         n.dial_failed(them, &error);
-        assert_eq!(n.supervisor.dial.next(them), Some(relayed));
+        assert_eq!(n.supervisor.dial.next(them), vec![relayed]);
     }
 
     #[tokio::test]

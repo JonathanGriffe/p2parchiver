@@ -34,10 +34,10 @@ The layers only decide, and the links carry it out. Each link takes the actions 
 
 ### Dialing
 
-When the supervisor asks to dial a member, the supervisor link takes the address from the dial policy, which does no IO. The daemon feeds it mDNS announcements, mDNS expiries and failed dials.
-- **LAN first.** A member is dialed at the first address mDNS announces for them, with `/p2p/<peer>` appended so a failure names them. Up to 8 addresses are kept per member. Relay circuits, Docker's bridge range (172.16.0.0/12) and IPv6 link-local addresses are never kept.
+When the supervisor asks to dial a member, the supervisor link takes the addresses from the dial policy, which does no IO. The daemon feeds it mDNS announcements, mDNS expiries and failed dials.
+- **LAN first.** A member is dialed at every address mDNS announces for them, all in one attempt, and the first to connect is kept. Some are always dead: mDNS announces every socket a peer listens on at the IPv4 address it announced from, so the ports of its IPv6-only sockets lead nowhere. Up to 8 addresses are kept per member, as many as libp2p dials at once. Relay circuits, Docker's bridge range (172.16.0.0/12) and IPv6 link-local addresses are never kept.
 - **Else the relay.** A member with no LAN address is dialed through a circuit on the server's relay. With no server either, the dial is skipped.
-- **A failed LAN dial.** When a dial to a LAN address fails at the transport level, or reaches a different peer, the next attempt goes through the relay and the one after tries the address again. A dial refused locally, such as by the connection limits, and a failed relayed dial change nothing.
+- **A failed LAN dial.** When a dial to the LAN addresses fails at the transport level, or reaches a different peer, the next attempt goes through the relay and the one after tries the addresses again. A dial refused locally, such as by the connection limits, and a failed relayed dial change nothing.
 - **Expiry.** An address stays a candidate until mDNS reports it expired.
 
 ### CLI and desktop app
