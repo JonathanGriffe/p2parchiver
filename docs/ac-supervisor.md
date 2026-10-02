@@ -44,7 +44,7 @@ call list ─► dial ─► connect ─► chain round ─► catalogue round �
                                          └─► failed ─► off the list after 3 attempts
    ```
 
-   The limits: the member is neither connected nor already being dialed, the node holds fewer than 16 connections and opened fewer than 16 in the last minute, and the member's backoff has run out. Otherwise the dial waits for a later tick. Every attempt doubles the member's backoff, from 15 s up to 30 minutes, whether or not its failure is ever reported. `ac-node` picks the address: the first address mDNS announces for the member on the LAN, with `/p2p/<peer>` appended so a failure names them, or else a circuit through the server's relay. When a dial to an mDNS address fails at the transport level, the next attempt goes through the relay, and the one after tries the address again. A dial refused locally, such as by the connection limits, or a failed relayed dial, changes nothing. An address stays a candidate until mDNS reports it expired.
+   The limits: the member is neither connected nor already being dialed, the node holds fewer than 16 connections and opened fewer than 16 in the last minute, and the member's backoff has run out. Otherwise the dial waits for a later tick. Every attempt doubles the member's backoff, from 15 s up to 30 minutes, whether or not its failure is ever reported. `ac-node` picks the address: the member's LAN address while mDNS announces one, else a circuit through the server's relay, with the attempt after a failed LAN dial going through the relay.
 
 2. **Connect**
 

@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use libp2p::multiaddr::Protocol;
 use libp2p::swarm::DialError;
 use libp2p::{Multiaddr, PeerId, request_response};
 
@@ -16,37 +15,17 @@ use ac_supervisor::sync::{Limits, Offering, PeerAction, PeerEvent, Space, Superv
 use ac_supervisor::wire::{SessionRequest, SessionResponse};
 
 use crate::daemon::ClientSwarm;
+use crate::dial_policy::DialPolicy;
 use crate::file_link::{FileLink, RoundOutcome, TransferOutcome};
 use crate::group_link::GroupLink;
 use crate::status::{Bandwidth, Published};
-
-/// Candidate direct addresses kept per peer
-const MAX_DIRECT_ADDRS: usize = 8;
-
-/// Whether an address is worth ever dialling.
-fn dialable(addr: &Multiaddr) -> bool {
-    if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
-        // The relay path is the fallback, never a "direct" candidate.
-        return false;
-    }
-
-    !addr.iter().any(|p| match p {
-        Protocol::Ip4(ip) => ip.octets()[0] == 172 && (16..32).contains(&ip.octets()[1]),
-        Protocol::Ip6(ip) => (ip.segments()[0] & 0xffc0) == 0xfe80,
-        _ => false,
-    })
-}
 
 pub struct SupervisorLink {
     supervisor: Supervisor,
     proposals: HashMap<request_response::OutboundRequestId, PeerId>,
     presence: HashMap<request_response::OutboundRequestId, Vec<PeerId>>,
     server: Option<PeerId>,
-    relay: Option<Multiaddr>,
-    /// Addresses mDNS announces for each peer, each ending in `/p2p/<peer>`.
-    direct: HashMap<PeerId, Vec<Multiaddr>>,
-    /// Peers whose last direct dial failed, so the next attempt goes through the relay.
-    relay_next: HashSet<PeerId>,
+    dial: DialPolicy,
     root: std::path::PathBuf,
     status: Published,
     /// Bytes down, bytes up and the clock, as of the last publish. A rate is the difference
@@ -81,9 +60,7 @@ impl SupervisorLink {
             proposals: HashMap::new(),
             presence: HashMap::new(),
             server,
-            relay: config.server.clone(),
-            direct: HashMap::new(),
-            relay_next: HashSet::new(),
+            dial: DialPolicy::new(config.server.clone()),
             root,
             status: Published::open(&path)
                 .with_context(|| format!("opening the status table at {}", path.display()))?,
@@ -108,40 +85,20 @@ impl SupervisorLink {
     pub fn discovered(
         &mut self,
         peer: PeerId,
-        addresses: &[Multiaddr],
+        addr: &Multiaddr,
         files: &mut FileLink,
         groups: &mut GroupLink,
         swarm: &mut ClientSwarm,
         admitted_peers: &AdmittedPeers,
     ) {
-        let known = self.direct.entry(peer).or_default();
-        for addr in addresses.iter().filter(|a| dialable(a)) {
-            // Named, so a failed dial reports the peer and reaches `dial_failed`.
-            let Ok(addr) = addr.clone().with_p2p(peer) else {
-                continue;
-            };
-            if !known.contains(&addr) && known.len() < MAX_DIRECT_ADDRS {
-                known.push(addr);
-            }
-        }
-
+        self.dial.announced(peer, addr);
         let actions = self.supervisor.on(PeerEvent::Discovered { peer });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
     }
 
     /// mDNS stopped announcing this address, so it is no longer dialed.
     pub fn expired(&mut self, peer: PeerId, addr: &Multiaddr) {
-        let Ok(addr) = addr.clone().with_p2p(peer) else {
-            return;
-        };
-        let Some(known) = self.direct.get_mut(&peer) else {
-            return;
-        };
-        known.retain(|a| a != &addr);
-        if known.is_empty() {
-            self.direct.remove(&peer);
-            self.relay_next.remove(&peer);
-        }
+        self.dial.expired(peer, addr);
     }
 
     pub fn on_disconnected(
@@ -165,29 +122,9 @@ impl SupervisorLink {
         peer: PeerId,
         error: &DialError,
     ) {
-        if self.failed_direct(&peer, error) {
-            self.relay_next.insert(peer);
-        }
+        self.dial.failed(peer, error);
         let actions = self.supervisor.on(PeerEvent::DialFailed { peer });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
-    }
-
-    /// Whether a dial to one of this peer's direct addresses failed at the transport level.
-    /// A local refusal, such as `Denied`, says nothing about the address.
-    fn failed_direct(&self, peer: &PeerId, error: &DialError) -> bool {
-        let Some(known) = self.direct.get(peer) else {
-            return false;
-        };
-        let is_known = |addr: &Multiaddr| {
-            addr.clone()
-                .with_p2p(*peer)
-                .is_ok_and(|addr| known.contains(&addr))
-        };
-        match error {
-            DialError::Transport(tried) => tried.iter().any(|(addr, _)| is_known(addr)),
-            DialError::WrongPeerId { address, .. } => is_known(address),
-            _ => false,
-        }
     }
 
     /// Whether this peer's connection is ending by agreement rather than by accident.
@@ -480,12 +417,10 @@ impl SupervisorLink {
         for action in actions {
             match action {
                 PeerAction::Dial { peer } => {
-                    let Some(addr) = self.address_of(&peer) else {
+                    let Some(addr) = self.dial.next(peer) else {
                         tracing::debug!(%peer, "wanted to dial, but there is no server to relay through");
                         continue;
                     };
-                    // One relayed attempt after a failed direct one, then the direct address again.
-                    self.relay_next.remove(&peer);
                     tracing::debug!(%peer, %addr, "dialling a member");
                     if let Err(e) = swarm.dial(addr) {
                         tracing::debug!(%peer, error = %e, "dial refused before it started");
@@ -573,21 +508,6 @@ impl SupervisorLink {
                     let _ = swarm.disconnect_peer_id(peer);
                 }
             }
-        }
-    }
-
-    /// Where to dial this peer: its mDNS address, unless the last direct dial failed, else
-    /// a circuit through the server's relay.
-    fn address_of(&self, peer: &PeerId) -> Option<Multiaddr> {
-        let relay = self
-            .relay
-            .clone()
-            .map(|relay| relay.with(Protocol::P2pCircuit).with(Protocol::P2p(*peer)));
-        let direct = self.direct.get(peer).and_then(|known| known.first());
-
-        match direct {
-            Some(addr) if relay.is_none() || !self.relay_next.contains(peer) => Some(addr.clone()),
-            _ => relay,
         }
     }
 }
@@ -777,7 +697,7 @@ mod tests {
         fn discover(&mut self, peer: PeerId, addr: Multiaddr) {
             self.supervisor.discovered(
                 peer,
-                std::slice::from_ref(&addr),
+                &addr,
                 &mut self.link,
                 &mut self.groups,
                 &mut self.swarm,
@@ -791,13 +711,12 @@ mod tests {
                 format!("/ip4/203.0.113.1/udp/4001/quic-v1/p2p/{}", PeerId::random())
                     .parse()
                     .unwrap();
-            self.supervisor.relay = Some(server.clone());
+            self.supervisor.dial = DialPolicy::new(Some(server.clone()));
             server.with(Protocol::P2pCircuit).with(Protocol::P2p(peer))
         }
 
-        /// Carry out the supervisor's decision to dial `peer`, and return where it went.
-        fn dial(&mut self, peer: PeerId) -> Option<Multiaddr> {
-            let addr = self.supervisor.address_of(&peer);
+        /// Carry out the supervisor's decision to dial `peer`.
+        fn dial(&mut self, peer: PeerId) {
             self.supervisor.dispatch(
                 &mut self.swarm,
                 &mut self.link,
@@ -805,7 +724,6 @@ mod tests {
                 &self.admitted_peers,
                 vec![PeerAction::Dial { peer }],
             );
-            addr
         }
 
         /// The daemon's `OutgoingConnectionError` arm.
@@ -969,30 +887,6 @@ mod tests {
         id
     }
 
-    #[test]
-    fn an_address_nobody_else_can_route_to_is_not_a_candidate() {
-        let yes: Multiaddr = "/ip4/192.168.1.140/tcp/4001".parse().unwrap();
-        let lan: Multiaddr = "/ip4/10.0.0.9/udp/4001/quic-v1".parse().unwrap();
-        assert!(dialable(&yes));
-        assert!(dialable(&lan));
-
-        for junk in [
-            "/ip4/172.17.0.1/tcp/4001", // docker0
-            "/ip4/172.19.0.1/tcp/4001", // a user-defined bridge
-            "/ip4/172.31.0.1/tcp/4001", // the top of the pool
-            "/ip6/fe80::1/tcp/4001",    // link-local, no zone survives a multiaddr
-        ] {
-            assert!(
-                !dialable(&junk.parse().unwrap()),
-                "{junk} should be refused"
-            );
-        }
-
-        // 172.15 and 172.32 are outside the pool and stay dialable.
-        assert!(dialable(&"/ip4/172.15.0.1/tcp/4001".parse().unwrap()));
-        assert!(dialable(&"/ip4/172.32.0.1/tcp/4001".parse().unwrap()));
-    }
-
     #[tokio::test]
     async fn a_fetch_for_a_group_with_no_directory_does_not_start() {
         let mut n = Node::new();
@@ -1003,98 +897,6 @@ mod tests {
             .link
             .fetch(PeerId::random(), unknown, path, "00".repeat(32));
         assert_eq!(started, Err(crate::file_link::NotStarted::NoDirectory));
-    }
-
-    fn transport_failure(addr: &Multiaddr) -> DialError {
-        DialError::Transport(vec![(
-            addr.clone(),
-            libp2p::TransportError::Other(std::io::Error::other("connection refused")),
-        )])
-    }
-
-    /// A node with a server to relay through and one peer announcing a LAN address.
-    /// Returns the node, the peer, its LAN address as dialed, and the circuit to it.
-    fn with_lan_peer() -> (Node, PeerId, Multiaddr, Multiaddr) {
-        let mut n = Node::new();
-        let them = PeerId::random();
-        let relayed = n.relay_through_server(them);
-        n.discover(them, "/ip4/192.168.1.5/tcp/4001".parse().unwrap());
-        let lan: Multiaddr = format!("/ip4/192.168.1.5/tcp/4001/p2p/{them}")
-            .parse()
-            .unwrap();
-        (n, them, lan, relayed)
-    }
-
-    #[tokio::test]
-    async fn a_peer_with_no_lan_address_is_dialed_through_the_relay() {
-        let mut n = Node::new();
-        let them = PeerId::random();
-        let relayed = n.relay_through_server(them);
-        assert_eq!(n.dial(them), Some(relayed));
-    }
-
-    #[tokio::test]
-    async fn a_lan_address_is_dialed_with_the_peer_named() {
-        let (mut n, them, lan, _) = with_lan_peer();
-        assert_eq!(
-            n.dial(them),
-            Some(lan),
-            "without /p2p a failure would not name the peer"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_lan_dial_goes_through_the_relay_once_then_tries_the_address_again() {
-        let (mut n, them, lan, relayed) = with_lan_peer();
-
-        assert_eq!(n.dial(them), Some(lan.clone()));
-        n.dial_failed(them, &transport_failure(&lan));
-        assert_eq!(n.dial(them), Some(relayed), "the next attempt is relayed");
-        assert_eq!(
-            n.dial(them),
-            Some(lan),
-            "and the address is tried again after that"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_dial_refused_locally_does_not_send_the_next_attempt_through_the_relay() {
-        let (mut n, them, lan, _) = with_lan_peer();
-
-        assert_eq!(n.dial(them), Some(lan.clone()));
-        let denied = DialError::Denied {
-            cause: libp2p::swarm::ConnectionDenied::new(std::io::Error::other("too many")),
-        };
-        n.dial_failed(them, &denied);
-        assert_eq!(n.dial(them), Some(lan));
-    }
-
-    #[tokio::test]
-    async fn a_failed_relayed_dial_leaves_the_lan_address_alone() {
-        let (mut n, them, lan, relayed) = with_lan_peer();
-
-        n.dial(them);
-        n.dial_failed(them, &transport_failure(&lan));
-        assert_eq!(n.dial(them), Some(relayed.clone()));
-        n.dial_failed(them, &transport_failure(&relayed));
-        assert_eq!(n.dial(them), Some(lan));
-    }
-
-    #[tokio::test]
-    async fn an_address_mdns_reports_expired_is_no_longer_dialed() {
-        let (mut n, them, lan, relayed) = with_lan_peer();
-        let other: Multiaddr = "/ip4/192.168.1.5/udp/4001/quic-v1".parse().unwrap();
-        n.discover(them, other.clone());
-
-        n.supervisor.expired(them, &lan);
-        assert_eq!(
-            n.dial(them),
-            Some(other.clone().with(Protocol::P2p(them))),
-            "the address still announced takes over"
-        );
-
-        n.supervisor.expired(them, &other);
-        assert_eq!(n.dial(them), Some(relayed));
     }
 
     /// Poll the swarm until a dial fails, and return what it reported.
@@ -1142,7 +944,7 @@ mod tests {
         assert!(matches!(error, DialError::Transport(_)), "{error:?}");
 
         n.dial_failed(them, &error);
-        assert_eq!(n.dial(them), Some(relayed));
+        assert_eq!(n.supervisor.dial.next(them), Some(relayed));
     }
 
     #[tokio::test]
@@ -1160,7 +962,7 @@ mod tests {
         assert!(matches!(error, DialError::WrongPeerId { .. }), "{error:?}");
 
         n.dial_failed(them, &error);
-        assert_eq!(n.dial(them), Some(relayed));
+        assert_eq!(n.supervisor.dial.next(them), Some(relayed));
     }
 
     #[tokio::test]

@@ -211,7 +211,7 @@ pub async fn run(
                             tracing::info!(%peer, %addr, "discovered a peer on the local network");
                             supervisor.discovered(
                                 *peer,
-                                std::slice::from_ref(addr),
+                                addr,
                                 &mut files,
                                 &mut groups,
                                 &mut swarm,
