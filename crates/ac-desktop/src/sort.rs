@@ -99,7 +99,7 @@ pub fn read(paths: &Paths, looking_at: &Sorting) -> Page {
     let found = opened.as_ref().and_then(|it| current_in(it, looking_at));
     let (Some(inbox), Some((file, here))) = (opened, found) else {
         page.position = match backlog.total {
-            0 => String::new(),
+            0 => "Nothing to sort".to_owned(),
             total => format!("{total} waiting"),
         };
         return page;
@@ -698,7 +698,7 @@ mod tests {
 
         assert!(!page.have);
         assert!(page.name.is_empty());
-        assert_eq!(page.position, "", "and says nothing about a backlog");
+        assert_eq!(page.position, "Nothing to sort");
     }
 
     #[test]
