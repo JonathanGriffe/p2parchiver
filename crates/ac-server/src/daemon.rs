@@ -8,7 +8,7 @@ use libp2p::futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response;
 use libp2p::swarm::{ConnectionId, Swarm, SwarmEvent};
-use libp2p::{PeerId, identify, ping, relay, rendezvous};
+use libp2p::{PeerId, identify, ping, relay};
 
 use ac_net::attest::{self, Attestation, normalise_username};
 use ac_net::config::Config;
@@ -28,7 +28,7 @@ type NoApp = libp2p::swarm::dummy::Behaviour;
 /// The value form of [`NoApp`]; a type alias cannot be used as a constructor.
 const NO_APP: NoApp = libp2p::swarm::dummy::Behaviour;
 
-/// The service listener's swarm: relay, rendezvous, AutoNAT, attestation renewal, presence.
+/// The service listener's swarm: relay, AutoNAT, attestation renewal, presence.
 type ServiceSwarm = Swarm<AcBehaviour<Enrolled, NoApp>>;
 
 /// The enrolment listener's swarm: `/ac/enroll/3.0.0` and nothing else.
@@ -565,31 +565,6 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<Enrolled, NoApp>>) {
         })) => {
             tracing::debug!(peer = %peer, rtt_ms = rtt.as_millis(), "ping");
         }
-
-        SwarmEvent::Behaviour(AcBehaviourEvent::Rendezvous(event)) => match event {
-            rendezvous::server::Event::PeerRegistered { peer, registration } => {
-                tracing::info!(
-                    %peer,
-                    namespace = %registration.namespace,
-                    ttl = registration.ttl,
-                    "registered"
-                );
-            }
-            rendezvous::server::Event::DiscoverServed {
-                enquirer,
-                registrations,
-            } => {
-                tracing::info!(%enquirer, found = registrations.len(), "served a discovery");
-            }
-            rendezvous::server::Event::PeerNotRegistered {
-                peer,
-                namespace,
-                error,
-            } => {
-                tracing::warn!(%peer, %namespace, ?error, "refused a registration");
-            }
-            other => tracing::debug!(?other, "rendezvous event"),
-        },
 
         SwarmEvent::Behaviour(AcBehaviourEvent::Autonat(event)) => {
             tracing::info!(?event, "autonat dial-back");

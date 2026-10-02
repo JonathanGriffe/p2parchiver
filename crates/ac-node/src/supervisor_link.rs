@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use libp2p::multiaddr::Protocol;
+use libp2p::swarm::DialError;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::{Multiaddr, PeerId, request_response};
 
 use ac_net::admitted_peers::AdmittedPeers;
@@ -15,34 +16,17 @@ use ac_supervisor::sync::{Limits, Offering, PeerAction, PeerEvent, Space, Superv
 use ac_supervisor::wire::{SessionRequest, SessionResponse};
 
 use crate::daemon::ClientSwarm;
+use crate::dial_policy::DialPolicy;
 use crate::file_link::{FileLink, RoundOutcome, TransferOutcome};
 use crate::group_link::GroupLink;
 use crate::status::{Bandwidth, Published};
-
-/// Candidate direct addresses kept per peer
-const MAX_DIRECT_ADDRS: usize = 8;
-
-/// Whether an address is worth ever dialling.
-fn dialable(addr: &Multiaddr) -> bool {
-    if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
-        // The relay path is the fallback, never a "direct" candidate.
-        return false;
-    }
-
-    !addr.iter().any(|p| match p {
-        Protocol::Ip4(ip) => ip.octets()[0] == 172 && (16..32).contains(&ip.octets()[1]),
-        Protocol::Ip6(ip) => (ip.segments()[0] & 0xffc0) == 0xfe80,
-        _ => false,
-    })
-}
 
 pub struct SupervisorLink {
     supervisor: Supervisor,
     proposals: HashMap<request_response::OutboundRequestId, PeerId>,
     presence: HashMap<request_response::OutboundRequestId, Vec<PeerId>>,
     server: Option<PeerId>,
-    relay: Option<Multiaddr>,
-    direct: HashMap<PeerId, Vec<Multiaddr>>,
+    dial: DialPolicy,
     root: std::path::PathBuf,
     status: Published,
     /// Bytes down, bytes up and the clock, as of the last publish. A rate is the difference
@@ -77,8 +61,7 @@ impl SupervisorLink {
             proposals: HashMap::new(),
             presence: HashMap::new(),
             server,
-            relay: config.server.clone(),
-            direct: HashMap::new(),
+            dial: DialPolicy::new(config.server.clone()),
             root,
             status: Published::open(&path)
                 .with_context(|| format!("opening the status table at {}", path.display()))?,
@@ -99,28 +82,24 @@ impl SupervisorLink {
         self.dispatch(swarm, files, groups, admitted_peers, actions);
     }
 
-    /// Discovery saw this peer. A liveness hint, and possibly an address worth preferring.
+    /// mDNS saw this peer on the local network. A liveness hint, and an address to dial.
     pub fn discovered(
         &mut self,
         peer: PeerId,
-        addresses: &[Multiaddr],
+        addr: &Multiaddr,
         files: &mut FileLink,
         groups: &mut GroupLink,
         swarm: &mut ClientSwarm,
         admitted_peers: &AdmittedPeers,
     ) {
-        let known = self.direct.entry(peer).or_default();
-        for addr in addresses.iter().filter(|a| dialable(a)) {
-            // Appended, not promoted: the head is whatever last worked, and letting a newly
-            // heard address take its place is how one dead record used to displace a live
-            // one for good.
-            if !known.contains(addr) && known.len() < MAX_DIRECT_ADDRS {
-                known.push(addr.clone());
-            }
-        }
-
+        self.dial.announced(peer, addr);
         let actions = self.supervisor.on(PeerEvent::Discovered { peer });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
+    }
+
+    /// mDNS stopped announcing this address, so it is no longer dialed.
+    pub fn expired(&mut self, peer: PeerId, addr: &Multiaddr) {
+        self.dial.expired(peer, addr);
     }
 
     pub fn on_disconnected(
@@ -142,19 +121,11 @@ impl SupervisorLink {
         groups: &mut GroupLink,
         admitted_peers: &AdmittedPeers,
         peer: PeerId,
+        error: &DialError,
     ) {
-        self.demote(&peer);
+        self.dial.failed(peer, error);
         let actions = self.supervisor.on(PeerEvent::DialFailed { peer });
         self.dispatch(swarm, files, groups, admitted_peers, actions);
-    }
-
-    /// The address we just tried did not work, so try a different one next time.
-    fn demote(&mut self, peer: &PeerId) {
-        if let Some(known) = self.direct.get_mut(peer)
-            && known.len() > 1
-        {
-            known.rotate_left(1);
-        }
     }
 
     /// Whether this peer's connection is ending by agreement rather than by accident.
@@ -447,12 +418,19 @@ impl SupervisorLink {
         for action in actions {
             match action {
                 PeerAction::Dial { peer } => {
-                    let Some(addr) = self.address_of(&peer) else {
+                    let addrs = self.dial.next(peer);
+                    if addrs.is_empty() {
                         tracing::debug!(%peer, "wanted to dial, but there is no server to relay through");
                         continue;
-                    };
-                    tracing::debug!(%peer, %addr, "dialling a member");
-                    if let Err(e) = swarm.dial(addr) {
+                    }
+                    tracing::debug!(%peer, ?addrs, "dialling a member");
+                    // Always: the supervisor decides when to dial, and a dead connection can
+                    // outlive the peer's restart.
+                    let opts = DialOpts::peer_id(peer)
+                        .addresses(addrs)
+                        .condition(PeerCondition::Always)
+                        .build();
+                    if let Err(e) = swarm.dial(opts) {
                         tracing::debug!(%peer, error = %e, "dial refused before it started");
                         let actions = self.supervisor.on(PeerEvent::DialFailed { peer });
                         self.dispatch(swarm, files, groups, admitted_peers, actions);
@@ -539,19 +517,6 @@ impl SupervisorLink {
                 }
             }
         }
-    }
-
-    /// Where to dial this peer.
-    fn address_of(&self, peer: &PeerId) -> Option<Multiaddr> {
-        if let Some(addr) = self.direct.get(peer).and_then(|known| known.first()) {
-            return Some(addr.clone());
-        }
-        Some(
-            self.relay
-                .clone()?
-                .with(Protocol::P2pCircuit)
-                .with(Protocol::P2p(*peer)),
-        )
     }
 }
 
@@ -736,15 +701,49 @@ mod tests {
             );
         }
 
-        /// Hand the supervisor an address for a peer, as mDNS or the rendezvous sweep would.
+        /// Hand the supervisor an address for a peer, as mDNS would.
         fn discover(&mut self, peer: PeerId, addr: Multiaddr) {
             self.supervisor.discovered(
                 peer,
-                std::slice::from_ref(&addr),
+                &addr,
                 &mut self.link,
                 &mut self.groups,
                 &mut self.swarm,
                 &self.admitted_peers,
+            );
+        }
+
+        /// Give this node a server to relay through, and return the circuit to `peer`.
+        /// Call it before `discover`: it starts a fresh policy, dropping known addresses.
+        fn relay_through_server(&mut self, peer: PeerId) -> Multiaddr {
+            let server: Multiaddr =
+                format!("/ip4/203.0.113.1/udp/4001/quic-v1/p2p/{}", PeerId::random())
+                    .parse()
+                    .unwrap();
+            self.supervisor.dial = DialPolicy::new(Some(server.clone()));
+            server.with(Protocol::P2pCircuit).with(Protocol::P2p(peer))
+        }
+
+        /// Carry out the supervisor's decision to dial `peer`.
+        fn dial(&mut self, peer: PeerId) {
+            self.supervisor.dispatch(
+                &mut self.swarm,
+                &mut self.link,
+                &mut self.groups,
+                &self.admitted_peers,
+                vec![PeerAction::Dial { peer }],
+            );
+        }
+
+        /// The daemon's `OutgoingConnectionError` arm.
+        fn dial_failed(&mut self, peer: PeerId, error: &DialError) {
+            self.supervisor.dial_failed(
+                &mut self.swarm,
+                &mut self.link,
+                &mut self.groups,
+                &self.admitted_peers,
+                peer,
+                error,
             );
         }
 
@@ -897,30 +896,6 @@ mod tests {
         id
     }
 
-    #[test]
-    fn an_address_nobody_else_can_route_to_is_not_a_candidate() {
-        let yes: Multiaddr = "/ip4/192.168.1.140/tcp/4001".parse().unwrap();
-        let lan: Multiaddr = "/ip4/10.0.0.9/udp/4001/quic-v1".parse().unwrap();
-        assert!(dialable(&yes));
-        assert!(dialable(&lan));
-
-        for junk in [
-            "/ip4/172.17.0.1/tcp/4001", // docker0
-            "/ip4/172.19.0.1/tcp/4001", // a user-defined bridge
-            "/ip4/172.31.0.1/tcp/4001", // the top of the pool
-            "/ip6/fe80::1/tcp/4001",    // link-local, no zone survives a multiaddr
-        ] {
-            assert!(
-                !dialable(&junk.parse().unwrap()),
-                "{junk} should be refused"
-            );
-        }
-
-        // 172.15 and 172.32 are outside the pool and stay dialable.
-        assert!(dialable(&"/ip4/172.15.0.1/tcp/4001".parse().unwrap()));
-        assert!(dialable(&"/ip4/172.32.0.1/tcp/4001".parse().unwrap()));
-    }
-
     #[tokio::test]
     async fn a_fetch_for_a_group_with_no_directory_does_not_start() {
         let mut n = Node::new();
@@ -933,39 +908,101 @@ mod tests {
         assert_eq!(started, Err(crate::file_link::NotStarted::NoDirectory));
     }
 
+    /// Poll the swarm until a dial fails, and return what it reported.
+    async fn next_dial_failure(
+        n: &mut Node,
+        other: Option<&mut Node>,
+    ) -> (Option<PeerId>, DialError) {
+        let wait = async {
+            let mut other = other;
+            loop {
+                let event = match other.as_mut() {
+                    Some(o) => tokio::select! {
+                        event = n.swarm.select_next_some() => event,
+                        _ = o.swarm.select_next_some() => continue,
+                    },
+                    None => n.swarm.select_next_some().await,
+                };
+                if let SwarmEvent::OutgoingConnectionError { peer_id, error, .. } = event {
+                    return (peer_id, error);
+                }
+            }
+        };
+        tokio::time::timeout(WIRE_TIMEOUT, wait)
+            .await
+            .expect("the dial failed")
+    }
+
+    /// A TCP address nothing listens on, so a dial there is refused at once.
+    fn refused_addr() -> Multiaddr {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap()
+    }
+
     #[tokio::test]
-    async fn a_failed_dial_moves_on_rather_than_retrying_the_same_address() {
+    async fn a_lan_address_that_refuses_reports_the_peer_and_the_next_attempt_is_relayed() {
         let mut n = Node::new();
         let them = PeerId::random();
-        let first: Multiaddr = "/ip4/192.168.1.5/tcp/4001".parse().unwrap();
-        let second: Multiaddr = "/ip4/10.0.0.9/tcp/4001".parse().unwrap();
+        let relayed = n.relay_through_server(them);
+        n.discover(them, refused_addr());
 
-        // Discovery hands them over one at a time, which is how the last one heard used to
-        // become the only one tried.
-        for addr in [&first, &second] {
-            n.supervisor.discovered(
-                them,
-                std::slice::from_ref(addr),
-                &mut n.link,
-                &mut n.groups,
-                &mut n.swarm,
-                &n.admitted_peers,
-            );
-        }
+        n.dial(them);
+        let (peer, error) = next_dial_failure(&mut n, None).await;
+        assert_eq!(peer, Some(them), "the failure names the peer");
+        assert!(matches!(error, DialError::Transport(_)), "{error:?}");
 
-        assert_eq!(n.supervisor.address_of(&them), Some(first.clone()));
-        n.supervisor.demote(&them);
-        assert_eq!(
-            n.supervisor.address_of(&them),
-            Some(second),
-            "a dial that failed gives the next candidate a turn"
-        );
-        n.supervisor.demote(&them);
-        assert_eq!(
-            n.supervisor.address_of(&them),
-            Some(first),
-            "and they come round again rather than running out"
-        );
+        n.dial_failed(them, &error);
+        assert_eq!(n.supervisor.dial.next(them), vec![relayed]);
+    }
+
+    #[tokio::test]
+    async fn a_dead_lan_address_announced_first_does_not_keep_the_peer_from_its_live_one() {
+        let (mut n, mut them) = (Node::new(), Node::new());
+        let peer = them.peer;
+
+        // Like a v6-only socket's port, once mDNS has moved it onto the peer's IPv4 address.
+        n.discover(peer, refused_addr());
+        let live = them.listen_addr().await;
+        n.discover(peer, live);
+
+        n.dial(peer);
+        let reached = async {
+            while !n.swarm.is_connected(&peer) {
+                tokio::select! {
+                    event = n.swarm.select_next_some() => {
+                        if let SwarmEvent::OutgoingConnectionError { error, .. } = event {
+                            panic!("the dial failed: {error}");
+                        }
+                    }
+                    _ = them.swarm.select_next_some() => {}
+                }
+            }
+        };
+        tokio::time::timeout(WIRE_TIMEOUT, reached)
+            .await
+            .expect("the live address was reached");
+    }
+
+    #[tokio::test]
+    async fn a_lan_address_now_held_by_someone_else_sends_the_next_attempt_through_the_relay() {
+        let (mut n, mut stranger) = (Node::new(), Node::new());
+        let them = PeerId::random();
+        let relayed = n.relay_through_server(them);
+
+        let addr = stranger.listen_addr().await;
+        n.discover(them, addr);
+
+        n.dial(them);
+        let (peer, error) = next_dial_failure(&mut n, Some(&mut stranger)).await;
+        assert_eq!(peer, Some(them));
+        assert!(matches!(error, DialError::WrongPeerId { .. }), "{error:?}");
+
+        n.dial_failed(them, &error);
+        assert_eq!(n.supervisor.dial.next(them), vec![relayed]);
     }
 
     #[tokio::test]

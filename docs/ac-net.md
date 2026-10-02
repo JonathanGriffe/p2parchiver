@@ -1,6 +1,6 @@
 # ac-net
 
-The networking layer of the projects. It owns a node's identity key and on-disk config, builds the libp2p swarm (transports, NAT traversal, relay and rendezvous) for each of the three process roles, and defines the wire protocols for enrolment, attestation and presence. It also runs the admission layer, which decides which peers count as trusted: every peer must present an attestation signed by the server that both sides enrolled with. For the layers above, it moves bulk bytes and caps the bandwidth they use, without knowing what the bytes are.
+The networking layer of the projects. It owns a node's identity key and on-disk config, builds the libp2p swarm (transports, NAT traversal, relay and mDNS) for each of the three process roles, and defines the wire protocols for enrolment, attestation and presence. It also runs the admission layer, which decides which peers count as trusted: every peer must present an attestation signed by the server that both sides enrolled with. For the layers above, it moves bulk bytes and caps the bandwidth they use, without knowing what the bytes are.
 
 Paths below are relative to `crates/ac-net/`.
 
@@ -23,7 +23,7 @@ Paths below are relative to `crates/ac-net/`.
 ### Enrollment, attestation and admission
 
 To enter the p2p network, a peer must be enrolled with the server, who stores which users are enrolled.
-Only enrolled peers can use the server's services such as rendezvous, discovery and presence.
+Only enrolled peers can use the server's services such as the relay and presence.
 Enrolled peers can also get an attestation (ie certificate of enrollment) from the server. This attestation has an expiry, so peers can be eventually revoked.
 
 When connecting to other peers, first libp2p will ensure peers really own the peer id they claim, then they will admit each other by requesting the other's certificate and verifying it. They will only answer other protocols once the peers are admitted, else they will disconnect.
@@ -31,10 +31,10 @@ The certificates are verified using the server's public key, which is recovered 
 
 ### Connections
 
-When the server connection comes up, the client asks for a relay reservation by listening on `<server>/p2p-circuit`. It then registers under the rendezvous namespace `"ac"` and runs discovery. Registration is refreshed and discovery re-run every 300 s.
+When the server connection comes up, the client asks for a relay reservation by listening on `<server>/p2p-circuit`, so any peer that knows its peer id can reach it at `<server>/p2p-circuit/p2p/<peer>`. The server publishes no addresses and lists no peers.
 Only the server connection is pinged, every 25 s, to keep the client's NAT mapping open.
 
-When peers connect, they do so through the server, then try to upgrade the connection to a direct connection by attempting hole punching. If they fail, the connection stays relayed and the communication proceeds.
+A client also runs mDNS when `mdns` is on in its config, which announces it to peers on the same local network and reports theirs. Peers on the same LAN connect directly at those addresses. Others connect through the server, then try to upgrade the connection to a direct connection by attempting hole punching. If they fail, the connection stays relayed and the communication proceeds.
 A connection is deemed usable once admission has completed successfully and the connection is settled, ie either upgraded to direct or attempting to upgrade has timed out.
 
 ### Swarm

@@ -5,7 +5,7 @@
 This project builds to two apps :
 - **The node** (ie the `ac-desktop` crate), runs the peer and the desktop app.
 - **The server** (ie the `ac-server` crate) enrols nodes, grants attestation, and helps them connect:
-  rendezvous for discovery, a relay and AutoNAT for NAT traversal, and answer presence queries.
+  a relay and AutoNAT for NAT traversal, and answer presence queries.
 
 
 ## Assumptions
@@ -24,13 +24,15 @@ In this project, we assume the following about the context of use.
 **Environment**
 - One node per machine.
 - Nodes are online intermittently, and we accept that sync is eventual.
+- Most peers are on a simple home Wi-Fi, behind NAT, with no public address or open port. A
+  peer off the LAN is first reached through the relay, then upgraded by hole punching.
 
 ## High-level network design
 
 In this project, the server is only involved in a couple aspects:
 - Enrollment: registering users with an invite code, and only letting enrolled users use the following features
 - Attestation: giving attestations (ie certificates) to enrolled users so they can verify they only communicate with enrolled users
-- Discovery and presence: seeing which peer ids are online.
+- Presence: answering which of the peer ids a node asks about are online. The server never lists who is connected.
 - Relay and AutoNAT: helping peers do NAT traversal and relaying connections if it doesn't work
 
 Notably, the server is not involved in the following:
@@ -99,7 +101,6 @@ These are deliberate for now:
   `a_chain_transfers_at_a_size_that_leaves_room_for_real_history` pins the per-entry cost.
 - **One permanent admin per group**, with no transfer, removal or key rotation.
 - **Revocation reaches other nodes only through expiry**, up to 24 h later.
-- **One rendezvous namespace per server**, so every enrolled client can discover every other.
 - **Platform gaps.** The tray, start at login and "show in folder" work only on Linux and Windows, and ffmpeg
   is vendored only for x86_64 Linux and Windows.
 - **Import backoff lives in memory**, so a restart scans again.
@@ -109,8 +110,8 @@ These are deliberate for now:
 - Unit tests sit next to the code.
 - Integration tests in `crates/*/tests/`
 - `scripts/mirror-lab.sh` runs release builds end to end on loopback: a server, several
-  nodes, and the desktop app with `--headless`. It checks 11 behaviours, from "they find
-  each other, unprompted" to "one daemon per home". Loopback cannot exercise NAT traversal,
+  nodes, and the desktop app with `--headless`. It checks 11 behaviours, from "every node
+  can be reached through the relay" to "one daemon per home". Loopback cannot exercise NAT traversal,
   and no automated test does.
 
 ## Build, CI and release

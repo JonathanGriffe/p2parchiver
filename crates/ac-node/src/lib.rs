@@ -6,6 +6,7 @@ pub mod ops;
 
 // puts them in a signature, so they stay in.
 mod contacts;
+mod dial_policy;
 mod directory;
 mod file_link;
 mod group_link;

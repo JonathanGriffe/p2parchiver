@@ -40,7 +40,7 @@ libp2p = { version = "0.56", features = [
     "quic", "tcp", "noise", "yamux", "dns",
     "identify", "ping",
     "request-response", "cbor",
-    "relay", "rendezvous", "autonat",
+    "relay", "autonat",
     "upnp",
     "dcutr",
     "mdns",

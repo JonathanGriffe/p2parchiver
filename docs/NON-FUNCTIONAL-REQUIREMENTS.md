@@ -15,6 +15,7 @@ The properties the peer-to-peer system must keep in order to work. A change that
 - P2. A former member learns only of its own removal.
 - P3. The server doesn't learn about groups and files.
 - P4. A peer that isn't enrolled doesn't learn anything about other peers.
+- P5. Outside its local network, a peer can only learn about another peer if they share a group, or it already knows their peer id. Sharing a group covers everyone who ever appeared in the same chain, since each member gets the whole chain, former members' peer ids included. (`ac-net`, `ac-groups`)
 
 ## Local security
 

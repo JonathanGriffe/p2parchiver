@@ -13,7 +13,7 @@ use libp2p::{Multiaddr, PeerId};
 
 use ac_net::config::Paths;
 
-/// The service listener's port: relay, rendezvous, AutoNAT, enrolled peers only.
+/// The service listener's port: relay, AutoNAT, presence, enrolled peers only.
 pub const SERVICE_PORT: u16 = 4001;
 
 /// The enrolment listener's port: `/ac/enroll/3.0.0` only, open to anyone.
@@ -27,7 +27,7 @@ const HOME_ENV: &str = "AC_SERVER_HOME";
 #[command(
     name = "ac-server",
     version,
-    about = "archiverclient rendezvous and relay server"
+    about = "archiverclient enrolment, presence and relay server"
 )]
 struct Cli {
     /// Use this directory for config and data instead of the per-OS defaults.

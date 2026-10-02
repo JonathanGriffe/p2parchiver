@@ -1,17 +1,13 @@
 use std::time::{Duration, Instant};
 
-use libp2p::{Multiaddr, PeerId, multiaddr::Protocol, rendezvous};
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 
 use crate::authz::PeerAuthorizer;
-use crate::proto::RENDEZVOUS_NAMESPACE;
 use crate::swarm::AcBehaviour;
 
 /// First reconnect delay, doubling up to [`MAX_BACKOFF`].
 pub const MIN_BACKOFF: Duration = Duration::from_secs(1);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-/// How often the registry is re-read and our own registration refreshed.
-pub const DISCOVERY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How often the supervisor checks whether anything is due.
 pub const HOUSEKEEPING_TICK: Duration = Duration::from_secs(5);
@@ -22,10 +18,8 @@ pub struct ServerLink {
     address: Multiaddr,
     circuit: Multiaddr,
     reserved: bool,
-    published: bool,
     retry_at: Option<Instant>,
     backoff: Duration,
-    next_discovery: Instant,
 }
 
 impl ServerLink {
@@ -40,10 +34,8 @@ impl ServerLink {
             address: server.clone(),
             circuit: server.clone().with(Protocol::P2pCircuit),
             reserved: false,
-            published: false,
             retry_at: None,
             backoff: MIN_BACKOFF,
-            next_discovery: Instant::now() + DISCOVERY_INTERVAL,
         })
     }
 
@@ -54,7 +46,6 @@ impl ServerLink {
         }
 
         self.reserved = false;
-        self.published = false;
         self.retry_at = Some(Instant::now() + self.backoff);
         tracing::warn!(
             server = %self.server,
@@ -63,7 +54,7 @@ impl ServerLink {
         );
     }
 
-    /// Redial if it is due, and re-read the registry if that is due.
+    /// Redial if it is due.
     pub fn housekeeping<A: PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
         &mut self,
         swarm: &mut libp2p::Swarm<AcBehaviour<A, X>>,
@@ -81,34 +72,6 @@ impl ServerLink {
                 tracing::debug!(server = %self.server, error = %e, "reconnect dial not started");
             }
         }
-
-        if now >= self.next_discovery {
-            self.next_discovery = now + DISCOVERY_INTERVAL;
-            self.discover(swarm);
-        }
-    }
-
-    /// Re-read the registry.
-    pub fn discover<A: PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
-        &self,
-        swarm: &mut libp2p::Swarm<AcBehaviour<A, X>>,
-    ) {
-        if !self.published {
-            // Not registered yet, so there is nothing to refresh and the server may not
-            // even know us. The initial `publish` will do the first query.
-            return;
-        }
-        let Ok(namespace) = rendezvous::Namespace::new(RENDEZVOUS_NAMESPACE.to_owned()) else {
-            return;
-        };
-        let Some(client) = swarm.behaviour_mut().rendezvous_client.as_mut() else {
-            return;
-        };
-
-        if let Err(e) = client.register(namespace.clone(), self.server, None) {
-            tracing::debug!(error = %e, "could not refresh the registration");
-        }
-        client.discover(Some(namespace), None, None, self.server);
     }
 
     /// Ask for the reservation, if this is the connection we were waiting for.
@@ -129,37 +92,5 @@ impl ServerLink {
             Ok(_) => tracing::info!(relay = %self.server, "requesting a relay reservation"),
             Err(e) => tracing::warn!(relay = %self.server, error = %e, "could not reserve"),
         }
-    }
-
-    /// Publish our addresses and ask who else is here.
-    pub fn publish<A: PeerAuthorizer, X: libp2p::swarm::NetworkBehaviour>(
-        &mut self,
-        swarm: &mut libp2p::Swarm<AcBehaviour<A, X>>,
-    ) {
-        if self.published {
-            return;
-        }
-
-        let namespace = match rendezvous::Namespace::new(RENDEZVOUS_NAMESPACE.to_owned()) {
-            Ok(ns) => ns,
-            Err(e) => {
-                tracing::error!(error = %e, "the rendezvous namespace is not valid");
-                return;
-            }
-        };
-
-        let Some(client) = swarm.behaviour_mut().rendezvous_client.as_mut() else {
-            return;
-        };
-
-        if let Err(e) = client.register(namespace.clone(), self.server, None) {
-            // Most likely still no external address; a later confirmation retries.
-            tracing::debug!(error = %e, "not ready to register yet");
-            return;
-        }
-        self.published = true;
-
-        client.discover(Some(namespace), None, None, self.server);
-        tracing::info!(server = %self.server, "registered and discovering");
     }
 }

@@ -9,6 +9,7 @@ Paths below are relative to `crates/ac-node/`.
 - **CLI**: the `ac` binary and its commands (`id`, `join`, `run`, `probe`, `peer`, `group`, `file` and `import`) in `src/main.rs` and `src/cmd/`.
 - **Daemon**: the event loop that drives the swarm and every layer in `src/daemon.rs`.
 - **Links**: connect each layer's state machine to the swarm: chains in `src/group_link.rs`, catalogues and file transfers in `src/file_link.rs`, the supervisor in `src/supervisor_link.rs`, and imports in `src/import_link.rs`.
+- **Dialing**: where to dial each member, its LAN address or the server's relay, in `src/dial_policy.rs`.
 - **Operations**: the actions the CLI and the desktop app share in `src/ops/`: joining a server, groups, files, contacts and status, imports, and the node lock.
 - **Contacts**: peers named by hand in `src/contacts.rs`, merged with fellow group members into one list of names in `src/directory.rs`.
 - **Status**: the supervisor's snapshot, published for the CLI and the desktop app, in `src/status.rs`.
@@ -30,6 +31,14 @@ On each tick it:
 After every swarm event and every finished download it feeds the supervisor what the chain and catalogue rounds and the file transfers finished.
 
 The layers only decide, and the links carry it out. Each link takes the actions its state machine returns, sends the requests they call for, and turns the answers back into events. No layer's state machine touches the swarm.
+
+### Dialing
+
+When the supervisor asks to dial a member, the supervisor link takes the addresses from the dial policy, which does no IO. The daemon feeds it mDNS announcements, mDNS expiries and failed dials.
+- **LAN first.** A member is dialed at every address mDNS announces for them, all in one attempt, and the first to connect is kept. Some are always dead: mDNS announces every socket a peer listens on at the IPv4 address it announced from, so the ports of its IPv6-only sockets lead nowhere. Up to 8 addresses are kept per member, as many as libp2p dials at once. Relay circuits, Docker's bridge range (172.16.0.0/12) and IPv6 link-local addresses are never kept.
+- **Else the relay.** A member with no LAN address is dialed through a circuit on the server's relay. With no server either, the dial is skipped.
+- **A failed LAN dial.** When a dial to the LAN addresses fails at the transport level, or reaches a different peer, the next attempt goes through the relay and the one after tries the addresses again. A dial refused locally, such as by the connection limits, and a failed relayed dial change nothing.
+- **Expiry.** An address stays a candidate until mDNS reports it expired.
 
 ### CLI and desktop app
 
