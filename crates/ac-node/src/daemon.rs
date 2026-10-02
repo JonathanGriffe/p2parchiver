@@ -4,7 +4,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use libp2p::futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, rendezvous, request_response, upnp};
+use libp2p::{Multiaddr, autonat, identify, mdns, ping, relay, request_response, upnp};
 
 use crate::file_link::FileLink;
 use crate::group_link::GroupLink;
@@ -197,15 +197,12 @@ pub async fn run(
 
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                         if let Some(peer) = peer_id {
-                            supervisor.dial_failed(&mut swarm, &mut files, &mut groups, &admitted_peers, peer);
+                            supervisor.dial_failed(&mut swarm, &mut files, &mut groups, &admitted_peers, peer, &error);
                         }
                         tracing::warn!(peer = ?peer_id, %error, "outgoing connection failed");
                     }
 
                     SwarmEvent::ExternalAddrConfirmed { address } => {
-                        if let Some(link) = &mut link {
-                            link.publish(&mut swarm);
-                        }
                         println!("external {address}");
                     }
 
@@ -223,24 +220,11 @@ pub async fn run(
                         }
                     }
 
-                    SwarmEvent::Behaviour(AcBehaviourEvent::RendezvousClient(
-                        rendezvous::client::Event::Discovered { registrations, .. },
-                    )) => {
-                        report_discovered(&registrations, identity.peer_id());
-                        for registration in &registrations {
-                            let peer = registration.record.peer_id();
-                            if peer != identity.peer_id() {
-                                supervisor.discovered(
-                                    peer,
-                                    registration.record.addresses(),
-                                    &mut files,
-                                    &mut groups,
-                                    &mut swarm,
-                                    &admitted_peers,
-                                );
-                            }
+                    SwarmEvent::Behaviour(AcBehaviourEvent::Mdns(mdns::Event::Expired(gone))) => {
+                        for (peer, addr) in &gone {
+                            tracing::debug!(%peer, %addr, "local peer stopped announcing");
+                            supervisor.expired(*peer, addr);
                         }
-                        println!("discovered {} peer(s)", registrations.len());
                     }
 
                     SwarmEvent::Behaviour(AcBehaviourEvent::Dcutr(event)) => {
@@ -325,22 +309,6 @@ fn report_connected(peer: libp2p::PeerId, endpoint: &libp2p::core::ConnectedPoin
     );
 }
 
-/// Report everything the server returned, and connect to none of it.
-fn report_discovered(registrations: &[rendezvous::Registration], me: libp2p::PeerId) {
-    for registration in registrations {
-        let peer = registration.record.peer_id();
-        if peer == me {
-            continue;
-        }
-
-        tracing::info!(
-            %peer,
-            addresses = ?registration.record.addresses(),
-            "discovered a peer"
-        );
-    }
-}
-
 /// Swarm events this node only reports on.
 fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
     match event {
@@ -418,25 +386,6 @@ fn on_event(event: SwarmEvent<AcBehaviourEvent<AcceptAnyPeer, App>>) {
         SwarmEvent::Behaviour(AcBehaviourEvent::RelayClient(event)) => {
             tracing::info!(?event, "relay client event");
         }
-
-        SwarmEvent::Behaviour(AcBehaviourEvent::Mdns(mdns::Event::Expired(gone))) => {
-            for (peer, addr) in gone {
-                tracing::debug!(%peer, %addr, "local peer stopped announcing");
-            }
-        }
-
-        SwarmEvent::Behaviour(AcBehaviourEvent::RendezvousClient(event)) => match event {
-            rendezvous::client::Event::Registered { ttl, namespace, .. } => {
-                println!("registered {namespace} (ttl {ttl}s)");
-            }
-            rendezvous::client::Event::RegisterFailed { error, .. } => {
-                tracing::warn!(?error, "the server refused our registration");
-            }
-            rendezvous::client::Event::DiscoverFailed { error, .. } => {
-                tracing::warn!(?error, "the server refused our discovery request");
-            }
-            other => tracing::debug!(?other, "rendezvous client event"),
-        },
 
         SwarmEvent::Behaviour(AcBehaviourEvent::Ping(ping::Event {
             peer,

@@ -39,12 +39,12 @@ call list ─► dial ─► connect ─► chain round ─► catalogue round �
 1. **Dial**
 
    ```
-   limits ─► backoff ─┬─► known direct address ─┬─► connected
-                      └─► relay circuit ────────┤
-                                                └─► failed ─► off the list after 3 attempts
+   limits ─► backoff ─┬─► mDNS address ──┬─► connected
+                      └─► relay circuit ─┤
+                                         └─► failed ─► off the list after 3 attempts
    ```
 
-   The limits: the member is neither connected nor already being dialed, the node holds fewer than 16 connections and opened fewer than 16 in the last minute, and the member's backoff has run out. Otherwise the dial waits for a later tick. Every attempt doubles the member's backoff, from 15 s up to 30 minutes, whether or not its failure is ever reported. The address is the first direct address discovery reported for the member, or else a circuit through the server's relay. A direct address that fails moves to the back of the member's list, so the next attempt tries another.
+   The limits: the member is neither connected nor already being dialed, the node holds fewer than 16 connections and opened fewer than 16 in the last minute, and the member's backoff has run out. Otherwise the dial waits for a later tick. Every attempt doubles the member's backoff, from 15 s up to 30 minutes, whether or not its failure is ever reported. `ac-node` picks the address: the first address mDNS announces for the member on the LAN, with `/p2p/<peer>` appended so a failure names them, or else a circuit through the server's relay. When a dial to an mDNS address fails at the transport level, the next attempt goes through the relay, and the one after tries the address again. A dial refused locally, such as by the connection limits, or a failed relayed dial, changes nothing. An address stays a candidate until mDNS reports it expired.
 
 2. **Connect**
 

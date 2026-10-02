@@ -1,6 +1,6 @@
 # ac-server
 
-The server binary, run by the network's operator. It hands out single-use invites, enrols clients that redeem one, issues and renews the attestations clients show each other, and serves enrolled clients as a relay, rendezvous point, AutoNAT server and presence oracle. It depends on `ac-net` only: it holds no files and mounts no application protocol, so groups, files and imports are never compiled into it.
+The server binary, run by the network's operator. It hands out single-use invites, enrols clients that redeem one, issues and renews the attestations clients show each other, and serves enrolled clients as a relay, AutoNAT server and presence oracle. It depends on `ac-net` only: it holds no files and mounts no application protocol, so groups, files and imports are never compiled into it.
 
 Paths below are relative to `crates/ac-server/`.
 
@@ -12,7 +12,7 @@ Paths below are relative to `crates/ac-server/`.
 - **Enrollment**: redeems an invite in `src/store.rs` and answers enrollment requests in `src/daemon.rs`.
 - **Attestation**: signs attestations at enrollment and renews them in `src/daemon.rs`.
 - **Presence**: answers which of a list of peers are connected in `src/daemon.rs`.
-- **Relay, rendezvous and AutoNAT**: mounted by `ac-net`'s swarm builder. The server only logs their events and counts relay circuits in `src/daemon.rs`.
+- **Relay and AutoNAT**: mounted by `ac-net`'s swarm builder. The server only logs their events and counts relay circuits in `src/daemon.rs`.
 - **Authorizing connections**: the policy for each listener in `src/store.rs`.
 - **Revocation**: revoking and restoring clients in `src/cmd/client.rs`, and disconnecting revoked clients in `src/daemon.rs`.
 - **Event loop**: drives both swarms in `src/daemon.rs`.
@@ -22,7 +22,7 @@ Paths below are relative to `crates/ac-server/`.
 ### Two listeners
 
 One listener cannot both admit strangers so they can enrol and require enrollment so the services are protected. The server therefore runs two swarms from the same identity, each with its own port and policy:
-- The service listener, port 4001 over QUIC and TCP, serves relay, rendezvous, AutoNAT, attestation renewal and presence. It accepts enrolled clients that are not revoked.
+- The service listener, port 4001 over QUIC and TCP, serves relay, AutoNAT, attestation renewal and presence. It accepts enrolled clients that are not revoked.
 - The enrollment listener, port 4002 over QUIC only, serves enrollment and nothing else. It accepts anyone except revoked clients.
 
 Policies are checked while the connection is being established, so a refused peer cannot negotiate a single protocol.

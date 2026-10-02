@@ -5,7 +5,7 @@ use libp2p::swarm::NetworkBehaviour;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{
     StreamProtocol, Swarm, SwarmBuilder, autonat, connection_limits, identify, noise, ping, relay,
-    rendezvous, tcp, yamux,
+    tcp, yamux,
 };
 
 use crate::authz::{self, PeerAuthorizer};
@@ -74,11 +74,9 @@ pub struct AcBehaviour<A: PeerAuthorizer, X: NetworkBehaviour> {
     pub peer_attest:
         Toggle<request_response::cbor::Behaviour<PeerAttestRequest, PeerAttestResponse>>,
     pub relay: Toggle<relay::Behaviour>,
-    pub rendezvous: Toggle<rendezvous::server::Behaviour>,
     pub autonat: Toggle<autonat::v2::server::Behaviour>,
     pub upnp: Toggle<libp2p::upnp::tokio::Behaviour>,
     pub autonat_client: Toggle<autonat::v2::client::Behaviour>,
-    pub rendezvous_client: Toggle<rendezvous::client::Behaviour>,
     pub mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
     pub dcutr: Toggle<libp2p::dcutr::Behaviour>,
     pub relay_client: Toggle<relay::client::Behaviour>,
@@ -128,7 +126,7 @@ impl<A: PeerAuthorizer, X: NetworkBehaviour> AcBehaviour<A, X> {
             .then(|| libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), peer_id))
             .transpose()
             .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "mDNS unavailable; LAN peers will be found via the server");
+                tracing::warn!(error = %e, "mDNS unavailable; LAN peers will be reached through the relay");
                 None
             });
 
@@ -176,15 +174,9 @@ impl<A: PeerAuthorizer, X: NetworkBehaviour> AcBehaviour<A, X> {
             relay: Toggle::from(
                 is_server.then(|| relay::Behaviour::new(peer_id, limits::relay_config())),
             ),
-            rendezvous: Toggle::from(is_server.then(|| {
-                rendezvous::server::Behaviour::new(rendezvous::server::Config::default())
-            })),
             autonat: Toggle::from(is_server.then(autonat::v2::server::Behaviour::default)),
             upnp: Toggle::from(is_client.then(libp2p::upnp::tokio::Behaviour::default)),
             autonat_client: Toggle::from(is_client.then(autonat::v2::client::Behaviour::default)),
-            rendezvous_client: Toggle::from(
-                is_client.then(|| rendezvous::client::Behaviour::new(keypair.clone())),
-            ),
             dcutr: Toggle::from(is_client.then(|| libp2p::dcutr::Behaviour::new(peer_id))),
             relay_client: Toggle::from(is_client.then_some(relay_client)),
             app,

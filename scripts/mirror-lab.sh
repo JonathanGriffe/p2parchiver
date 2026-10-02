@@ -11,7 +11,7 @@ LAB="${LAB_DIR:-/tmp/ac-mirror-lab}"
 NODE_LOG="${RUST_LOG:-ac=debug,ac_net=info,libp2p=warn}"
 
 # Generous, because CI machines are slow and the point of a failure here is to be legible
-# rather than fast. Discovery runs on a 300s interval, but a node also asks at startup.
+# rather than fast. Presence is asked every 5 minutes, and at once after a membership change.
 SETTLE=90
 
 EDIT_PAUSE=120
@@ -151,12 +151,17 @@ main() {
     DAVE=$(ac dave id)
     ERIN=$(ac erin id)
 
-    say "1. they find each other, unprompted"
+    say "1. every node can be reached through the relay"
     run_node alice; run_node bob; run_node carol
 
-    wait_for 30 "alice to see the others in the registry" \
-        bash -c "[ \$(grep -ac 'discovered a peer' '$LAB/alice.log' 2>/dev/null || echo 0) -ge 2 ]" \
-        || true
+    # mdns is off here, so members are dialed only through their relay reservations.
+    for who in alice bob carol; do
+        if wait_for 30 "$who to reserve a relay slot" grep -q "^reserved via" "$LAB/$who.log"; then
+            ok "$who holds a relay reservation"
+        else
+            bad "$who never got a relay reservation, so nobody off its LAN can reach it"
+        fi
+    done
 
     say "one group, two members"
     ac alice group create --name holiday >/dev/null

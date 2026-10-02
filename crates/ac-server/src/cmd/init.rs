@@ -12,7 +12,7 @@ fn starter_config() -> String {
     format!(
         r#"# archiverclient server configuration.
 
-# The service listener: relay, rendezvous, AutoNAT. Only enrolled clients may connect.
+# The service listener: relay, AutoNAT, presence. Only enrolled clients may connect.
 #
 # The port is FIXED on purpose. Clients learn this address once, at enrolment, and store
 # it permanently, an ephemeral port would orphan every one of them on the next restart.
