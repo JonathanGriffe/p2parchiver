@@ -692,6 +692,10 @@ pub mod tests {
         let window = MainWindow::new().unwrap();
         let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
 
+        // Wide enough that Leave, at the row's far end, is not clipped out of the query.
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(1600., 800.));
         window.set_tab(1);
         window.set_selected_group("holiday-id".into());
         window.set_group_membership(MEMBER);
