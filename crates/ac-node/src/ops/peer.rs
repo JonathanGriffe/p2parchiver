@@ -139,8 +139,8 @@ pub fn status(paths: &Paths) -> Result<StatusReport> {
                 .unwrap_or_else(|| group.group.short()),
             missing: group.missing,
             owed: group.owed,
-            source: group.source.as_ref().map(&name),
-            next: group.next.as_ref().map(&name),
+            source: group.source.as_ref().map(name),
+            next: group.next.as_ref().map(name),
             content_until: group.content_until,
             heartbeat_at: group.heartbeat_at,
         })
