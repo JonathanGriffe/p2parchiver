@@ -273,7 +273,7 @@ impl Pump {
             self.put_back.push((owed.source_dir, owed.source_ref));
         }
         for (dir, source_ref) in &self.put_back {
-            self.ledger.offer_again(dir, &[source_ref.as_str()])?;
+            self.ledger.give_back(dir, source_ref)?;
         }
         Ok(())
     }
@@ -288,6 +288,7 @@ fn fetch_one(
     source: &dyn Source,
     owed: &Owed,
 ) -> Result<Brought> {
+    // The promise as claimed: a scan refreshing it meanwhile only applies from the next claim.
     let item = owed.item();
     let brought = |outcome| {
         Ok(Brought {
@@ -443,7 +444,18 @@ mod tests {
         row: &SourceRow,
         source: &dyn Source,
     ) -> Fetched {
-        let taken = ledger.claim(now(), BATCH).unwrap();
+        pump_at(now(), ledger, files, content, row, source)
+    }
+
+    fn pump_at(
+        at: i64,
+        ledger: &mut Ledger,
+        files: &Files,
+        content: &Content,
+        row: &SourceRow,
+        source: &dyn Source,
+    ) -> Fetched {
+        let taken = ledger.claim(at, BATCH).unwrap();
         let mut out = Fetched::default();
         for owed in &taken {
             let brought =
@@ -612,10 +624,7 @@ mod tests {
         assert_eq!(ledger.waiting().unwrap(), 0);
         // Still owed, with one attempt spent: a source having a bad day is not a deletion.
         assert_eq!(ledger.owed(&row.dir).unwrap(), 1);
-        assert_eq!(
-            ledger.known_refs(&row.dir, &["a.jpg"]).unwrap(),
-            vec![("a.jpg".to_owned(), 1)]
-        );
+        assert_eq!(attempts(&ledger, &row.dir, "a.jpg"), Some(1));
     }
 
     #[test]
@@ -642,10 +651,7 @@ mod tests {
         assert_eq!(ledger.waiting().unwrap(), 1);
         // Still owed, one attempt spent, exactly as a dropped connection would leave it.
         assert_eq!(ledger.owed(&row.dir).unwrap(), 1);
-        assert_eq!(
-            ledger.known_refs(&row.dir, &["a.jpg"]).unwrap(),
-            vec![("a.jpg".to_owned(), 1)]
-        );
+        assert_eq!(attempts(&ledger, &row.dir, "a.jpg"), Some(1));
     }
 
     #[test]
@@ -674,6 +680,109 @@ mod tests {
             assert_eq!(unsorted(&content), ["drive/a.jpg"], "{algo}");
             assert_eq!(ledger.owed(&row.dir).unwrap(), 0, "{algo}");
         }
+    }
+
+    const DELAY: i64 = ac_import::ledger::FETCH_RETRY_DELAY + 1;
+
+    #[test]
+    fn a_file_changed_at_the_source_comes_in_after_the_next_scan() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let (files, content) = store(&paths);
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+
+        // Listed before an edit: the promise no longer matches what the source serves.
+        let stale = fake(SourceType::Remote, &["a.jpg"]).claims_size("a.jpg", 4096);
+        scan_with(&ledger, &row, &stale).unwrap();
+        assert_eq!(
+            pump(&mut ledger, &files, &content, &row, &stale)
+                .failed
+                .len(),
+            1
+        );
+
+        let fresh = fake(SourceType::Remote, &["a.jpg"]).promises(
+            "a.jpg",
+            Digest::Md5,
+            "394659692a460258b45a99f1424ea357",
+        );
+        assert_eq!(scan_with(&ledger, &row, &fresh).unwrap().refreshed, 1);
+
+        let fetched = pump_at(now() + DELAY, &mut ledger, &files, &content, &row, &fresh);
+        assert_eq!(fetched.kept, 1, "{:?}", fetched.failed);
+        assert_eq!(ledger.owed(&row.dir).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_exhausted_reference_gets_three_fresh_attempts_at_its_new_promise() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let (files, content) = store(&paths);
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+
+        let stale = fake(SourceType::Remote, &["a.jpg"]).claims_size("a.jpg", 4096);
+        scan_with(&ledger, &row, &stale).unwrap();
+        let start = now() - 4 * DELAY;
+        for n in 0..ac_import::ledger::MAX_FETCH_ATTEMPTS {
+            let fetched = pump_at(
+                start + n * DELAY,
+                &mut ledger,
+                &files,
+                &content,
+                &row,
+                &stale,
+            );
+            assert!(
+                fetched.failed[0].contains("4096 bytes"),
+                "{:?}",
+                fetched.failed
+            );
+        }
+
+        let edited = fake(SourceType::Remote, &["a.jpg"]).claims_size("a.jpg", 2048);
+        let scanned = scan_with(&ledger, &row, &edited).unwrap();
+        assert_eq!((scanned.refreshed, scanned.again), (1, 1));
+
+        let start = now();
+        for n in 0..ac_import::ledger::MAX_FETCH_ATTEMPTS {
+            let fetched = pump_at(
+                start + n * DELAY,
+                &mut ledger,
+                &files,
+                &content,
+                &row,
+                &edited,
+            );
+            assert!(
+                fetched.failed[0].contains("2048 bytes"),
+                "{:?}",
+                fetched.failed
+            );
+        }
+        let after = start + ac_import::ledger::MAX_FETCH_ATTEMPTS * DELAY;
+        assert_eq!(
+            pump_at(after, &mut ledger, &files, &content, &row, &edited).tried,
+            0,
+            "three attempts per scan, no more"
+        );
+    }
+
+    #[test]
+    fn a_file_moved_at_the_source_is_fetched_under_its_new_name() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let (files, content) = store(&paths);
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+
+        scan_with(&ledger, &row, &fake(SourceType::Remote, &["a.jpg"])).unwrap();
+        let moved = fake(SourceType::Remote, &["a.jpg"]).moves("a.jpg", "Trips", "beach.jpg");
+        scan_with(&ledger, &row, &moved).unwrap();
+
+        assert_eq!(pump(&mut ledger, &files, &content, &row, &moved).kept, 1);
+        assert_eq!(unsorted(&content), ["drive/Trips/beach.jpg"]);
     }
 
     #[test]
@@ -782,10 +891,7 @@ mod tests {
         assert!(fetched.failed[0].contains("Broken"), "{:?}", fetched.failed);
 
         // The reference keeps its attempts: nothing that happened is its fault.
-        assert_eq!(
-            ledger.known_refs("broken", &["a.jpg"]).unwrap(),
-            vec![("a.jpg".to_owned(), 0)]
-        );
+        assert_eq!(attempts(&ledger, "broken", "a.jpg"), Some(0));
         assert_eq!(ledger.owed("broken").unwrap(), 1);
         // And the source itself says what is wrong with it.
         let back = ledger.source("broken").unwrap().unwrap();

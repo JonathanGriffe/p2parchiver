@@ -256,6 +256,7 @@ impl ImportLink {
                     source = %name,
                     found = scanned.found,
                     owed = scanned.owed,
+                    refreshed = scanned.refreshed,
                     retired = scanned.retired,
                     "scanned"
                 ),

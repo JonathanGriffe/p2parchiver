@@ -87,6 +87,34 @@ impl Owed {
     }
 }
 
+/// What the ledger holds for one reference a scan offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Known {
+    pub source_ref: String,
+    pub fails: i64,
+    /// The file is in, so the row is history and no scan changes it.
+    pub settled: bool,
+    folder: String,
+    name: String,
+    size: Option<i64>,
+    algo: Option<String>,
+    checksum: Option<String>,
+}
+
+impl Known {
+    /// Whether refreshing the row from `item` would change it. A value the listing leaves
+    /// out keeps the stored one, so it changes nothing.
+    pub fn differs(&self, item: &Item) -> bool {
+        self.folder != item.folder
+            || self.name != item.name
+            || item.size.is_some_and(|size| self.size != Some(size as i64))
+            || item.checksum.as_ref().is_some_and(|sum| {
+                self.algo.as_deref() != Some(sum.algo.as_str())
+                    || self.checksum.as_deref() != Some(sum.value.as_str())
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Imported {
     pub hash: String,
@@ -361,25 +389,31 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn known_refs(
-        &self,
-        source_dir: &str,
-        refs: &[&str],
-    ) -> Result<Vec<(String, i64)>, LedgerError> {
+    pub fn known_refs(&self, source_dir: &str, refs: &[&str]) -> Result<Vec<Known>, LedgerError> {
         let mut out = Vec::new();
         for chunk in refs.chunks(REFS_PER_QUERY) {
             let holes = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let mut stmt = self.db.prepare(&format!(
-                "SELECT source_ref, fails FROM import_refs
+                "SELECT source_ref, fails, hash IS NOT NULL, folder, name, size, algo, checksum
+                   FROM import_refs
                   WHERE source_dir = ?1 AND source_ref IN ({holes})"
             ))?;
 
             let args = std::iter::once(Value::from(source_dir.to_owned()))
                 .chain(chunk.iter().map(|r| Value::from((*r).to_owned())));
             let rows = stmt.query_map(params_from_iter(args), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok(Known {
+                    source_ref: row.get(0)?,
+                    fails: row.get(1)?,
+                    settled: row.get(2)?,
+                    folder: row.get(3)?,
+                    name: row.get(4)?,
+                    size: row.get(5)?,
+                    algo: row.get(6)?,
+                    checksum: row.get(7)?,
+                })
             })?;
             for row in rows {
                 out.push(row?);
@@ -408,16 +442,67 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn offer_again(&self, source_dir: &str, refs: &[&str]) -> Result<usize, LedgerError> {
+    /// Refresh an owed reference's promise from a scan at `at`. A value the listing leaves
+    /// out keeps the stored one. A changed size or checksum resets the attempts, and makes
+    /// the row claimable at once unless it is leased. True when the row changed.
+    pub fn refresh(&self, source_dir: &str, item: &Item, at: i64) -> Result<bool, LedgerError> {
+        // Every expression reads the row as it was before this update.
+        let promise_changed = "(size IS NOT COALESCE(?5, size)
+                                OR algo IS NOT COALESCE(?6, algo)
+                                OR checksum IS NOT COALESCE(?7, checksum))";
+        let changed = self.db.execute(
+            &format!(
+                "UPDATE import_refs
+                    SET fails = CASE WHEN {promise_changed} THEN 0 ELSE fails END,
+                        tried_at = CASE WHEN {promise_changed} AND tried_at < ?8
+                                        THEN 0 ELSE tried_at END,
+                        folder = ?3, name = ?4, size = COALESCE(?5, size),
+                        algo = COALESCE(?6, algo), checksum = COALESCE(?7, checksum)
+                  WHERE source_dir = ?1 AND source_ref = ?2 AND hash IS NULL
+                    AND (folder IS NOT ?3 OR name IS NOT ?4 OR {promise_changed})"
+            ),
+            params![
+                source_dir,
+                item.reference,
+                item.folder,
+                item.name,
+                item.size.map(|size| size as i64),
+                item.checksum.as_ref().map(|sum| sum.algo.as_str()),
+                item.checksum.as_ref().map(|sum| sum.value.as_str()),
+                at.saturating_sub(FETCH_RETRY_DELAY),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Give exhausted references fresh attempts, for a scan at `at` that still offers them.
+    /// A leased row keeps its lease, so no second worker can claim it.
+    pub fn offer_again(
+        &self,
+        source_dir: &str,
+        refs: &[&str],
+        at: i64,
+    ) -> Result<usize, LedgerError> {
         let mut reset = 0;
         for source_ref in refs {
             reset += self.db.execute(
-                "UPDATE import_refs SET fails = 0, tried_at = 0
+                "UPDATE import_refs
+                    SET fails = 0, tried_at = CASE WHEN tried_at < ?3 THEN 0 ELSE tried_at END
                   WHERE source_dir = ?1 AND source_ref = ?2 AND hash IS NULL",
-                params![source_dir, source_ref],
+                params![source_dir, source_ref, at.saturating_sub(FETCH_RETRY_DELAY)],
             )?;
         }
         Ok(reset)
+    }
+
+    /// Hand back claims the caller holds and never fetched, with their attempts.
+    pub fn give_back(&self, source_dir: &str, source_ref: &str) -> Result<bool, LedgerError> {
+        let reset = self.db.execute(
+            "UPDATE import_refs SET fails = 0, tried_at = 0
+              WHERE source_dir = ?1 AND source_ref = ?2 AND hash IS NULL",
+            params![source_dir, source_ref],
+        )?;
+        Ok(reset > 0)
     }
 
     pub fn retire_gone(&self, source_dir: &str) -> Result<usize, LedgerError> {
@@ -925,7 +1010,7 @@ mod tests {
         let known = ledger
             .known_refs("pictures", &["a.jpg", "b.jpg", "c.jpg", "d.jpg"])
             .unwrap();
-        let mut names: Vec<&str> = known.iter().map(|(r, _)| r.as_str()).collect();
+        let mut names: Vec<&str> = known.iter().map(|k| k.source_ref.as_str()).collect();
         names.sort_unstable();
 
         assert_eq!(
@@ -933,7 +1018,7 @@ mod tests {
             ["a.jpg", "b.jpg"],
             "another source's rows are not ours"
         );
-        assert!(known.iter().all(|(_, fails)| *fails == 0));
+        assert!(known.iter().all(|k| k.fails == 0 && !k.settled));
     }
 
     #[test]
@@ -1011,8 +1096,174 @@ mod tests {
             "an unreadable file must not spin the pump"
         );
 
-        assert_eq!(ledger.offer_again("pictures", &["a.jpg"]).unwrap(), 1);
+        assert_eq!(ledger.offer_again("pictures", &["a.jpg"], at).unwrap(), 1);
         assert_eq!(ledger.claim(at, 8).unwrap().len(), 1, "a scan resets it");
+    }
+
+    #[test]
+    fn a_scan_does_not_hand_out_a_third_attempt_still_in_flight() {
+        let mut ledger = ledger();
+        ledger.owe("pictures", &item("a.jpg")).unwrap();
+
+        let mut at = AT;
+        for _ in 0..MAX_FETCH_ATTEMPTS - 1 {
+            ledger.claim(at, 8).unwrap();
+            at += FETCH_RETRY_DELAY + 1;
+        }
+        assert_eq!(ledger.claim(at, 8).unwrap().len(), 1, "the third, held");
+
+        assert_eq!(ledger.offer_again("pictures", &["a.jpg"], at).unwrap(), 1);
+        assert!(
+            ledger.claim(at, 8).unwrap().is_empty(),
+            "still leased to whoever holds it"
+        );
+        assert_eq!(
+            ledger.claim(at + FETCH_RETRY_DELAY + 1, 8).unwrap().len(),
+            1,
+            "and fresh once the lease runs out"
+        );
+    }
+
+    #[test]
+    fn giving_back_a_claim_makes_it_claimable_at_once() {
+        let mut ledger = ledger();
+        ledger.owe("pictures", &item("a.jpg")).unwrap();
+        ledger.claim(AT, 8).unwrap();
+
+        assert!(ledger.give_back("pictures", "a.jpg").unwrap());
+        assert_eq!(ledger.claim(AT, 8).unwrap().len(), 1);
+    }
+
+    fn promised(reference: &str, size: Option<u64>, md5: Option<&str>) -> Item {
+        let mut item = item(reference);
+        item.size = size;
+        item.checksum = md5.map(|value| Checksum {
+            algo: Digest::Md5,
+            value: value.to_owned(),
+        });
+        item
+    }
+
+    fn known(ledger: &Ledger, reference: &str) -> Known {
+        ledger
+            .known_refs("pictures", &[reference])
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_changed_promise_replaces_the_stored_one_and_its_attempts() {
+        let mut ledger = ledger();
+        ledger
+            .owe("pictures", &promised("a.jpg", Some(10), Some("old")))
+            .unwrap();
+        let mut at = AT;
+        for _ in 0..MAX_FETCH_ATTEMPTS {
+            ledger.claim(at, 8).unwrap();
+            at += FETCH_RETRY_DELAY + 1;
+        }
+
+        let edited = promised("a.jpg", Some(20), Some("new"));
+        assert!(known(&ledger, "a.jpg").differs(&edited));
+        assert!(ledger.refresh("pictures", &edited, at).unwrap());
+
+        let taken = ledger.claim(at, 8).unwrap();
+        assert_eq!(taken.len(), 1, "fresh attempts, at once");
+        assert_eq!(taken[0].item(), edited);
+        assert!(!known(&ledger, "a.jpg").differs(&edited));
+    }
+
+    #[test]
+    fn a_value_the_listing_leaves_out_keeps_the_stored_one() {
+        let mut ledger = ledger();
+        ledger
+            .owe("pictures", &promised("a.jpg", Some(10), Some("sum")))
+            .unwrap();
+        ledger.claim(AT, 8).unwrap();
+
+        let silent = promised("a.jpg", None, None);
+        assert!(!known(&ledger, "a.jpg").differs(&silent));
+        assert!(!ledger.refresh("pictures", &silent, AT).unwrap());
+
+        let row = known(&ledger, "a.jpg");
+        assert_eq!(row.size, Some(10));
+        assert_eq!(row.checksum.as_deref(), Some("sum"));
+        assert_eq!(row.fails, 1, "and the attempt spent still counts");
+    }
+
+    #[test]
+    fn an_unchanged_promise_leaves_the_row_alone() {
+        let mut ledger = ledger();
+        let same = promised("a.jpg", Some(10), Some("sum"));
+        ledger.owe("pictures", &same).unwrap();
+        ledger.claim(AT, 8).unwrap();
+        let before = known(&ledger, "a.jpg");
+
+        assert!(!before.differs(&same));
+        assert!(!ledger.refresh("pictures", &same, AT).unwrap());
+        assert_eq!(known(&ledger, "a.jpg"), before);
+    }
+
+    #[test]
+    fn a_changed_promise_does_not_break_a_lease() {
+        let mut ledger = ledger();
+        ledger
+            .owe("pictures", &promised("a.jpg", Some(10), None))
+            .unwrap();
+        assert_eq!(ledger.claim(AT, 8).unwrap().len(), 1);
+
+        assert!(
+            ledger
+                .refresh("pictures", &promised("a.jpg", Some(20), None), AT)
+                .unwrap()
+        );
+        assert_eq!(
+            known(&ledger, "a.jpg").fails,
+            0,
+            "the old failures are void"
+        );
+        assert!(
+            ledger.claim(AT, 8).unwrap().is_empty(),
+            "but whoever holds it still does"
+        );
+        let taken = ledger.claim(AT + FETCH_RETRY_DELAY + 1, 8).unwrap();
+        assert_eq!(taken[0].size, Some(20));
+    }
+
+    #[test]
+    fn a_move_is_written_down_without_touching_the_attempts() {
+        let mut ledger = ledger();
+        ledger.owe("pictures", &item("DCIM/a.jpg")).unwrap();
+        ledger.claim(AT, 8).unwrap();
+
+        let mut moved = item("DCIM/a.jpg");
+        moved.folder = "Trips".to_owned();
+        moved.name = "beach.jpg".to_owned();
+        assert!(ledger.refresh("pictures", &moved, AT).unwrap());
+
+        let row = known(&ledger, "DCIM/a.jpg");
+        assert_eq!(
+            (row.folder.as_str(), row.name.as_str()),
+            ("Trips", "beach.jpg")
+        );
+        assert_eq!(row.fails, 1);
+        assert!(ledger.claim(AT, 8).unwrap().is_empty(), "still leased");
+    }
+
+    #[test]
+    fn a_settled_reference_is_never_refreshed() {
+        let ledger = ledger();
+        ledger
+            .owe("pictures", &promised("a.jpg", Some(10), Some("sum")))
+            .unwrap();
+        ledger.settled("pictures", "a.jpg", "aa").unwrap();
+        let before = known(&ledger, "a.jpg");
+        assert!(before.settled);
+
+        let edited = promised("a.jpg", Some(20), Some("new"));
+        assert!(!ledger.refresh("pictures", &edited, AT).unwrap());
+        assert_eq!(known(&ledger, "a.jpg"), before);
     }
 
     #[test]
@@ -1132,7 +1383,8 @@ mod tests {
                 .is_empty()
         );
         // Re-offering it in a later scan changes nothing: the fetch already happened.
-        assert_eq!(ledger.offer_again("pictures", &["a.jpg"]).unwrap(), 0);
+        assert_eq!(ledger.offer_again("pictures", &["a.jpg"], AT).unwrap(), 0);
+        assert!(!ledger.give_back("pictures", "a.jpg").unwrap());
     }
 
     #[test]
