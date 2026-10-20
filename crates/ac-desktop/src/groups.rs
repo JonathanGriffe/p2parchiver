@@ -120,8 +120,8 @@ pub fn read(paths: &Paths, known: &[ops::Known], directory: &peers::Page, select
         }
     };
 
-    // A selected group that has just been forgotten is not an error worth showing: the list
-    // beside it has already stopped mentioning it.
+    // A selected group that has just gone is not an error worth showing: the list beside it
+    // has already stopped mentioning it.
     let detail = (!selected.is_empty())
         .then(|| ops::group::show(paths, selected, false).ok())
         .flatten()
@@ -275,33 +275,13 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         let inner = run(&weak, paths, nudge, |paths, id: &str, _| {
             Ok(match ops::group::leave(paths, id)? {
                 ops::group::Departed::Already(name) => format!("already left {name}"),
-                ops::group::Departed::Left(name) => {
+                ops::group::Departed::Left { name, .. } => {
                     format!("left {name}. The others are told when they next connect.")
                 }
             })
         });
         move |id| {
             // The list is about to stop offering it, so nothing should still be pointing at it.
-            selection.set_group("");
-            inner(id);
-        }
-    });
-
-    window.on_forget_group({
-        let selection = selection.clone();
-        let inner = run(&weak, paths, nudge, |paths, id: &str, _| {
-            let forgotten = ops::group::forget(paths, id)?;
-            let mut said = format!("left {} on this node only, nobody was told", forgotten.name);
-            if forgotten.held > 0 {
-                said += &format!(
-                    ", {} file(s) left on disk and no longer indexed",
-                    forgotten.held
-                );
-            }
-            Ok(said)
-        });
-        move |id| {
-            // The group is about to stop existing, so nothing should still be pointing at it.
             selection.set_group("");
             inner(id);
         }
@@ -685,23 +665,44 @@ pub mod tests {
     }
 
     #[test]
-    fn a_groups_own_admin_is_not_offered_a_leave_that_would_be_refused() {
+    fn a_groups_own_admin_is_offered_a_leave_that_leaves() {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
         let id = created.id.to_string();
 
         let detail = page(&paths, &id).detail.unwrap();
-        assert_eq!(detail.membership, MEMBER);
-        assert!(detail.admin, "this is the case the branch turns on");
+        assert_eq!(detail.membership, MEMBER, "so Leave is offered");
+        assert!(detail.admin);
 
-        // What the Leave button would have called, had it been offered.
-        let Err(refused) = ops::group::leave(&paths, &id) else {
-            panic!("leaving must be refused for a group's only admin");
-        };
-        assert!(
-            format!("{refused:#}").contains("forget"),
-            "and it points at the action that does apply: {refused:#}"
-        );
+        // What the Leave button calls.
+        assert!(matches!(
+            ops::group::leave(&paths, &id).unwrap(),
+            ops::group::Departed::Left { admin: true, .. }
+        ));
+        let left = ops::group::show(&paths, &id, false).unwrap();
+        assert_eq!(left.row.state, State::Left);
+    }
+
+    /// Leave sits with the member's buttons, for the admin too, and a left group has none.
+    #[test]
+    fn leave_is_offered_to_a_member_admin_or_not_and_never_to_a_left_group() {
+        use i_slint_backend_testing::ElementHandle;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+
+        window.set_tab(1);
+        window.set_selected_group("holiday-id".into());
+        window.set_group_membership(MEMBER);
+
+        for admin in [false, true] {
+            window.set_group_admin(admin);
+            assert_eq!(showing("Leave"), 1, "admin: {admin}");
+        }
+
+        window.set_group_membership(GONE);
+        assert_eq!(showing("Leave"), 0);
     }
 
     #[test]
@@ -828,10 +829,10 @@ pub mod tests {
     }
 
     #[test]
-    fn a_forgotten_group_stops_being_listed() {
+    fn a_group_its_admin_has_left_stops_being_listed() {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
-        ops::group::forget(&paths, &created.id.to_string()).unwrap();
+        ops::group::leave(&paths, &created.id.to_string()).unwrap();
 
         let page = page(&paths, &created.id.to_string());
 

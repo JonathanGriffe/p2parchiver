@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use ac_groups::chain::Op;
 use ac_groups::id::GroupId;
 use ac_groups::standing::Position;
@@ -10,7 +8,7 @@ use ac_net::config::Paths;
 use ac_net::identity::Identity;
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::{now, open, open_files, resolve};
+use super::{now, open, resolve};
 
 /// One group, as a list wants it.
 pub struct GroupSummary {
@@ -67,16 +65,12 @@ pub enum Accepted {
 }
 
 pub enum Departed {
-    Left(String),
+    /// `admin` is set when this node is the group's admin, so nobody can be added any more.
+    Left {
+        name: String,
+        admin: bool,
+    },
     Already(String),
-}
-
-pub struct Forgotten {
-    pub name: String,
-    pub was_admin: bool,
-    /// Files left on disk, no longer indexed.
-    pub held: usize,
-    pub dir: Option<PathBuf>,
 }
 
 pub fn list(paths: &Paths) -> Result<Vec<GroupSummary>> {
@@ -182,6 +176,9 @@ pub fn add(paths: &Paths, needle: &str, peer: &PeerId) -> Result<Added> {
     let (identity, mut groups) = open(paths)?;
     let (id, row) = resolve(&groups, needle)?;
     require_admin(&row, &identity, "add members")?;
+    if row.state == State::Left {
+        bail!("you left {}, so nobody can be added to it", row.name);
+    }
 
     groups
         .author(
@@ -232,6 +229,18 @@ pub fn accept(paths: &Paths, needle: &str) -> Result<Accepted> {
     if row.state == State::Active {
         return Ok(Accepted::Already(row.name));
     }
+    let left_as_admin = row.admin == identity.peer_id()
+        && groups
+            .positions(id)
+            .context("reading positions")?
+            .get(&identity.peer_id())
+            == Some(&Position::Out);
+    if left_as_admin {
+        bail!(
+            "you left {} as its admin, and an admin cannot come back",
+            row.name
+        );
+    }
 
     groups
         .author_standing(
@@ -250,13 +259,6 @@ pub fn leave(paths: &Paths, needle: &str) -> Result<Departed> {
     let (identity, mut groups) = open(paths)?;
     let (id, row) = resolve(&groups, needle)?;
 
-    if row.admin == identity.peer_id() {
-        bail!(
-            "you created {}, and a group cannot outlive its only admin. To stop holding it \
-             on this node, use `ac group forget {needle}`, which tells nobody.",
-            row.name
-        );
-    }
     if row.state == State::Left {
         return Ok(Departed::Already(row.name));
     }
@@ -271,35 +273,9 @@ pub fn leave(paths: &Paths, needle: &str) -> Result<Departed> {
         )
         .with_context(|| format!("leaving {needle}"))?;
 
-    Ok(Departed::Left(row.name))
-}
-
-pub fn forget(paths: &Paths, needle: &str) -> Result<Forgotten> {
-    let (identity, mut groups) = open(paths)?;
-    let (id, row) = resolve(&groups, needle)?;
-    let was_admin = row.admin == identity.peer_id();
-
-    let (mut files, content) = open_files(paths, &identity)?;
-    let held = files.list(id, None, false).unwrap_or_default().len();
-    let dir = files.dir_of(id).ok().flatten();
-
-    if let Some(dir) = &dir {
-        let _ = content.sweep_staging(dir, &[], std::time::Duration::ZERO);
-    }
-
-    files
-        .forget_group(id)
-        .with_context(|| format!("forgetting the files of {needle}"))?;
-
-    groups
-        .forget(id)
-        .with_context(|| format!("forgetting {needle}"))?;
-
-    Ok(Forgotten {
+    Ok(Departed::Left {
         name: row.name,
-        was_admin,
-        held,
-        dir: dir.map(|d| content.group_dir(&d)),
+        admin: row.admin == identity.peer_id(),
     })
 }
 
@@ -312,4 +288,91 @@ fn require_admin(row: &GroupRow, identity: &Identity, what: &str) -> Result<()> 
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A home that has enrolled, with an attestation written straight to disk.
+    fn home() -> (tempfile::TempDir, Paths) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted_at(tmp.path());
+        std::fs::create_dir_all(&paths.root).unwrap();
+
+        let me = super::super::identity(&paths).unwrap();
+        let server = ac_net::identity::Keypair::generate_ed25519();
+        let attestation = attest::Attestation::issue(
+            &server,
+            &me.peer_id(),
+            "alice",
+            attest::now(),
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        attest::save(&paths.attestation_file(), &attestation).unwrap();
+        (tmp, paths)
+    }
+
+    fn somebody_else() -> PeerId {
+        ac_net::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    /// A group this node created and has left.
+    fn left_as_admin(paths: &Paths) -> String {
+        let id = create(paths, "holiday").unwrap().id.to_string();
+        leave(paths, &id).unwrap();
+        id
+    }
+
+    #[test]
+    fn an_admin_leaves_with_an_out_standing_and_only_once() {
+        let (_tmp, paths) = home();
+        let id = create(&paths, "holiday").unwrap().id.to_string();
+
+        let Departed::Left { name, admin } = leave(&paths, &id).unwrap() else {
+            panic!("the admin's leave is not refused");
+        };
+        assert_eq!(name, "holiday");
+        assert!(admin);
+
+        let (identity, groups) = open(&paths).unwrap();
+        let (gid, row) = resolve(&groups, &id).unwrap();
+        assert_eq!(row.state, State::Left);
+        assert_eq!(
+            groups.positions(gid).unwrap().get(&identity.peer_id()),
+            Some(&Position::Out)
+        );
+
+        assert!(matches!(
+            leave(&paths, &id).unwrap(),
+            Departed::Already(name) if name == "holiday"
+        ));
+    }
+
+    #[test]
+    fn an_admin_that_has_left_cannot_accept_again() {
+        let (_tmp, paths) = home();
+        let id = left_as_admin(&paths);
+
+        assert!(accept(&paths, &id).is_err());
+
+        let (_, groups) = open(&paths).unwrap();
+        assert_eq!(resolve(&groups, &id).unwrap().1.state, State::Left);
+    }
+
+    #[test]
+    fn an_admin_that_has_left_cannot_add_members() {
+        let (_tmp, paths) = home();
+        let id = left_as_admin(&paths);
+        let them = somebody_else();
+
+        assert!(add(&paths, &id, &them).is_err());
+
+        let (_, groups) = open(&paths).unwrap();
+        let (gid, _) = resolve(&groups, &id).unwrap();
+        assert!(!groups.members(gid).unwrap().contains(&them));
+    }
 }

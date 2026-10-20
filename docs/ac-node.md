@@ -50,7 +50,7 @@ Only one daemon may run on a home. `ac run` and the desktop app take a lock on `
 
 `FileLink` mounts `ac-net`'s transfer service for `/ac/blob/1.0.0`, built from the rules and limits `ac-files` declares, routes the supervisor's fetches to it, and turns finished downloads into supervisor events.
 - **Readiness.** An inbound stream is served only from a ready peer, and dropped otherwise.
-- **No directory.** A fetch for a group that has no directory, such as one forgotten while the fetch was queued, fails, to be retried, so the supervisor frees its slot.
+- **No directory.** A fetch for a group that has no directory, such as one this node no longer holds, fails, to be retried, so the supervisor frees its slot.
 - **Imports first.** Before downloading, the node looks in `.unsorted`. If the bytes were imported and not yet sorted, they are moved into the group instead. Any failure there falls back to downloading.
 - **Two download caps.** The supervisor runs at most 8 transfers at once (`MAX_TRANSFERS` in `ac-supervisor`), and the service refuses a download past 8 (`MAX_DOWNLOADS` in `ac-files`) as a backstop. A fetch refused there fails, to be retried.
 - **Hanging up.** A running download counts as work outstanding with its peer. An upload does not.
@@ -69,7 +69,7 @@ Sorting moves the bytes into the group, copying them if the group is on another 
 
 `ac join` decodes the invite token and enrols with the server under the chosen username, giving up after 30 s. It checks the attestation it gets back against this node and the server's peer id from the token. Then it keeps one of the server's service addresses as `server` in the config, preferring the same host over QUIC, then the same host, then QUIC, then the first offered. From then on, the node trusts only that server.
 
-Creating or accepting a group needs the username from the attestation, and adding or removing members needs to be the admin. An admin cannot leave a group. Forgetting one drops it and its file index from this node, tells nobody, and leaves its files on disk.
+Creating or accepting a group needs the username from the attestation, and adding or removing members needs to be the admin. An admin leaves a group as any member does, with an `Out` standing, and the group is `left`. After that it cannot accept the group again, nor add members to it. A group cannot be forgotten by hand.
 
 Adding a file copies it in before recording it, and refuses a second copy of bytes the group already holds. `ac file verify` marks files whose bytes are missing as not held, which puts them back on the download list: it repairs, not just reports. At startup, partial downloads untouched for an hour are swept, unless a transfer could still resume them.
 

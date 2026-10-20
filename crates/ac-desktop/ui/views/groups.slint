@@ -183,10 +183,9 @@ export component GroupsView inherits Rectangle {
     callback remove-member(string, string);
     callback accept(string);
     callback leave(string);
-    callback forget(string);
     callback open-folder(string);
 
-    // 0 none, 1 leave, 2 forget, 3 remove-member
+    // 0 none, 1 leave, 2 remove-member
     property <int> asking: 0;
     property <string> asking-peer;
     property <string> asking-peer-name;
@@ -314,20 +313,10 @@ export component GroupsView inherits Rectangle {
 
                             Rectangle { horizontal-stretch: 1; }
 
-                            if root.detail-membership == 1 && !root.detail-admin : DangerButton {
+                            if root.detail-membership == 1 : DangerButton {
                                 label: "Leave";
                                 enabled: !root.busy;
                                 clicked => { root.asking = 1; }
-                            }
-                            if root.detail-membership == 1 && root.detail-admin : DangerButton {
-                                label: "Leave";
-                                enabled: !root.busy;
-                                clicked => { root.asking = 2; }
-                            }
-                            if root.detail-membership == 2 : DangerButton {
-                                label: "Leave";
-                                enabled: !root.busy;
-                                clicked => { root.asking = 2; }
                             }
                         }
                     }
@@ -381,7 +370,7 @@ export component GroupsView inherits Rectangle {
                                 clicked => {
                                     root.asking-peer = member.peer;
                                     root.asking-peer-name = member.username;
-                                    root.asking = 3;
+                                    root.asking = 2;
                                 }
                             }
                         }
@@ -407,25 +396,19 @@ export component GroupsView inherits Rectangle {
     if root.asking == 1 : Confirm {
         title: "Leave " + root.detail-name + "?";
         // What `ac group leave` says once it has done it.
-        body: "This node stops sharing that group immediately, whatever anyone else believes. "
-            + "The others are told when they next connect, and the admin then makes it "
-            + "official. Being added again will not undo this, you would accept afresh.";
+        body: root.detail-admin
+            ? "This node stops sharing that group immediately. The others are told when they "
+                + "next connect. You are its admin, so nobody can be added to it afterwards, "
+                + "and you cannot come back."
+            : "This node stops sharing that group immediately, whatever anyone else believes. "
+                + "The others are told when they next connect, and the admin then makes it "
+                + "official. Being added again will not undo this, you would accept afresh.";
         verb: "Leave";
         confirmed => { root.asking = 0; root.leave(root.selected); }
         dismissed => { root.asking = 0; }
     }
 
     if root.asking == 2 : Confirm {
-        title: "Leave " + root.detail-name + "?";
-        body: "This tells nobody. The group is dropped from this node, and anyone still "
-            + "listing it will go on doing so. Files already on disk are left there, no "
-            + "longer indexed.";
-        verb: "Leave";
-        confirmed => { root.asking = 0; root.forget(root.selected); }
-        dismissed => { root.asking = 0; }
-    }
-
-    if root.asking == 3 : Confirm {
         title: "Remove " + root.asking-peer-name + "?";
         verb: "Remove";
         confirmed => { root.asking = 0; root.remove-member(root.selected, root.asking-peer); }

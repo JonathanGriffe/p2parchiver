@@ -5,8 +5,8 @@
 //! of them: the position each row was stamped with in `files`, how far each peer has read in
 //! `file_sync`, and the digest and the unsent counts in `file_state`.
 //!
-//! `file_state` is this module's alone: the parent names it in the schema and when a group is
-//! forgotten, and otherwise never reads or writes a column of it. The handful of `pub(super)`
+//! `file_state` is this module's alone: the parent names it in the schema, and otherwise never
+//! reads or writes a column of it. The handful of `pub(super)`
 //! helpers at the bottom are what it goes through instead — a position in the log is the log's
 //! to hand out, so a writer asks for one rather than reaching for the table. That keeps the
 //! calls running from the parent into here, and one module answerable for the counters.
@@ -328,24 +328,6 @@ mod tests {
     use crate::content::Content;
     use crate::path::RelPath;
     use crate::store::fixtures::{AT, group_id, peer, row, served, store};
-
-    #[test]
-    fn a_forgotten_group_does_not_leave_its_digest_behind() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        let before = files.digest(g).unwrap();
-
-        files.forget_group(g).unwrap();
-        files.record(g, &row(me, "b.jpg", "bb"), false).unwrap();
-
-        assert_eq!(files.seq(g).unwrap(), 1, "the counter did restart");
-        assert_ne!(
-            files.digest(g).unwrap(),
-            before,
-            "a different catalogue at the same counter position"
-        );
-    }
 
     #[test]
     fn the_cached_digest_is_invalidated_by_the_writes_it_covers() {

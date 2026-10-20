@@ -190,9 +190,6 @@ enum GroupCommand {
     Leave {
         group: String,
     },
-    Forget {
-        group: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -256,7 +253,6 @@ fn main() -> Result<()> {
         }
         Command::Group(GroupCommand::Accept { group }) => cmd::group::accept(&paths, &group),
         Command::Group(GroupCommand::Leave { group }) => cmd::group::leave(&paths, &group),
-        Command::Group(GroupCommand::Forget { group }) => cmd::group::forget(&paths, &group),
         Command::File(FileCommand::Add {
             group,
             source,

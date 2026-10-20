@@ -30,7 +30,7 @@ Entries and standings are kept as the exact bytes that were signed and never re-
 
 ### Standings
 
-Membership comes from the chain alone. On top of it, each member signs a standing for each group: `Unanswered`, `In` or `Out`, along with its username. A member saying `Out` prompts the admin to write a `Remove`. Until then the chain still lists the member, and the member's own local state keeps it from taking part.
+Membership comes from the chain alone. On top of it, each member signs a standing for each group: `Unanswered`, `In` or `Out`, along with its username. A member saying `Out` prompts the admin to write a `Remove`. Until then the chain still lists the member, and the member's own local state keeps it from taking part. The admin's own `Out` is never ratified, since the chain cannot remove its admin: the chain keeps listing it, and nobody can be added after it.
 
 Between two standings from the same peer, the higher seq wins, and on a tie the smaller body wins, so every node settles on the same one without coordinating. A node's own seq always climbs past the highest it holds, so restoring from a backup does not reuse one.
 
@@ -62,7 +62,7 @@ The sync machine does no IO: it takes events and returns the fetches to send, an
 - A group is fetched from one peer at a time, with at most 8 fetches in flight and up to 256 more queued. Fetches time out after 30 s, and a response that does not match the outstanding fetch is dropped.
 - A new group is stored, as `Pending`, only once its whole chain has been verified, so an offer alone never creates a row.
 
-After ingesting, a pending node named by the group writes an `Unanswered` standing if it has not spoken yet, so others stop re-offering the chain. If the node is the admin, it writes a `Remove` for each member whose newly winning standing is `Out`.
+After ingesting, a pending node named by the group writes an `Unanswered` standing if it has not spoken yet, so others stop re-offering the chain. If the node is the admin, it writes a `Remove` for each member whose newly winning standing is `Out`, except its own.
 
 An invitation that was never accepted and no longer names the node is forgotten after 30 days.
 
@@ -86,4 +86,4 @@ The tables are prefixed with `group_` because `state.sqlite` is shared with othe
 - `group_standings`: each current member's winning standing, keyed by `(group_id, peer)`, with its `seq`, `position` and the signed `body` and `signature`. The username is read from the body rather than stored in a column, so the only copy is the signed one.
 - `group_members`: a cache of the membership folded from the chain, keyed by `(group_id, peer)`, with `username` and `is_admin`, and indexed on `peer`. It is rebuilt in the same transaction that changes the chain.
 
-Forgetting a group deletes its rows from all four tables and tells nobody.
+The 30-day sweep of invitations that no longer name the node deletes their rows from all four tables and tells nobody.
