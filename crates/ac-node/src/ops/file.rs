@@ -4,7 +4,7 @@ use ac_files::store::Recorded;
 use ac_files::{Content, FileRow, Files, RelPath};
 use ac_groups::id::GroupId;
 use ac_groups::store::{GroupRow, State};
-use ac_net::config::{Config, Paths};
+use ac_net::config::Paths;
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::{now, open, open_files, resolve};
@@ -214,9 +214,7 @@ pub struct Storage {
 pub fn storage(paths: &Paths) -> Result<Storage> {
     let (identity, _) = open(paths)?;
     let (files, _) = open_files(paths, &identity)?;
-    let config = Config::load(&paths.config_file())
-        .with_context(|| format!("reading the config at {}", paths.config_file().display()))?;
-
+    let config = super::config(paths)?;
     let root = config.storage_root(paths);
     // A storage root that does not exist yet still sits on a volume worth measuring.
     let probe = if root.exists() {
