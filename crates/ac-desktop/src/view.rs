@@ -67,6 +67,9 @@ pub const PEERS: i32 = 2;
 pub const FILES: i32 = 3;
 pub const SORT: i32 = 4;
 pub const SOURCES: i32 = 5;
+/// Nothing narrows a read by this one, so only tests name it.
+#[cfg(test)]
+pub const SETTINGS: i32 = 6;
 
 pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
     let looking_at = selection.get();
@@ -175,6 +178,9 @@ pub fn apply(window: &MainWindow, snapshot: Snapshot) {
         sort,
         sources,
     } = snapshot;
+
+    // A code to scan may be up for the enrol dialog or Settings as well as Sources.
+    sources::show_code(window);
 
     if let Some(status) = status {
         window.set_running(status.running);
@@ -779,19 +785,49 @@ mod reading {
         // Every tab in the nav, the two Rust never reads for (Settings, About) included.
         const TABS: i32 = 8;
 
-        for tab in STATUS..TABS {
-            window.set_tab(tab);
-
+        let fits = |at: &str| {
             for kind in ["Button", "ComboBox", "LineEdit", "CheckBox"] {
                 for control in ElementHandle::find_by_element_type_name(&window, kind) {
                     let right = control.absolute_position().x + control.size().width;
                     assert!(
                         right <= narrowest,
-                        "tab {tab}: {kind} {:?} reaches {right}, past the {narrowest} edge",
+                        "{at}: {kind} {:?} reaches {right}, past the {narrowest} edge",
                         control.accessible_label().unwrap_or_default()
                     );
                 }
             }
+        };
+
+        for tab in STATUS..TABS {
+            window.set_tab(tab);
+            fits(&format!("tab {tab}"));
+        }
+
+        // Settings with a backup on offer, and then waiting on the phone.
+        window.set_tab(SETTINGS);
+        window.set_enrolled(true);
+        fits("Settings, enrolled");
+        window.set_backing_up(true);
+        window.set_pairing_code(slint::Image::from_rgba8(slint::SharedPixelBuffer::<
+            slint::Rgba8Pixel,
+        >::new(29, 29)));
+        fits("Settings, backing up");
+        window.set_backing_up(false);
+
+        // Every step of the enrol dialog, a restored identity's included.
+        window.set_tab(STATUS);
+        window.set_show_enrol(true);
+        window.set_enrol_restored(true);
+        use crate::ui::EnrolPhase;
+        for phase in [
+            EnrolPhase::Identity,
+            EnrolPhase::Restoring,
+            EnrolPhase::Form,
+            EnrolPhase::Working,
+            EnrolPhase::Done,
+        ] {
+            window.set_enrol_phase(phase);
+            fits(&format!("enrol step {phase:?}"));
         }
     }
 }
