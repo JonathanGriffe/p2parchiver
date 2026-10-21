@@ -1,5 +1,5 @@
 import { Button, LineEdit, ScrollView } from "std-widgets.slint";
-import { Theme, Card } from "../theme.slint";
+import { Theme, Card, QrCode } from "../theme.slint";
 import { FieldItem, Field } from "sources.slint";
 
 export component AddSourceDialog inherits Rectangle {
@@ -64,13 +64,9 @@ export component AddSourceDialog inherits Rectangle {
                 HorizontalLayout {
                     alignment: center;
 
-                    Image {
+                    QrCode {
                         source: root.code;
-                        // Nearest, or the squares blur into each other and a camera has to
-                        // work harder than it should.
-                        image-rendering: pixelated;
                         width: min(280px, root.width - 4 * Theme.lg);
-                        height: self.width;
                     }
                 }
                 Text {

@@ -261,6 +261,13 @@ export component Card inherits Rectangle {
     border-color: Theme.line;
 }
 
+// A code for a phone to scan, square at whatever width it is given. Nearest-neighbour, or the
+// squares blur into each other and a camera has to work harder than it should.
+export component QrCode inherits Image {
+    image-rendering: pixelated;
+    height: self.width;
+}
+
 // A small round state marker. Colour is the message, so the text beside it always repeats it.
 export component Dot inherits Rectangle {
     in property <brush> tint: Theme.faint;

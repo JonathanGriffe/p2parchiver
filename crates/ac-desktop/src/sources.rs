@@ -209,38 +209,7 @@ fn also_ignored(ignored: u64) -> String {
     }
 }
 
-fn pairing_code() -> Option<slint::Image> {
-    let qr = ops::prompt::showing()?;
-    const QUIET: usize = 4;
-
-    let side = qr.size + QUIET * 2;
-    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(side as u32, side as u32);
-    let pixels = buffer.make_mut_slice();
-
-    for row in 0..side {
-        for column in 0..side {
-            let dark = row >= QUIET
-                && column >= QUIET
-                && row < side - QUIET
-                && column < side - QUIET
-                && qr.at(row - QUIET, column - QUIET);
-            let shade = if dark { 0 } else { 255 };
-            pixels[row * side + column] = slint::Rgba8Pixel {
-                r: shade,
-                g: shade,
-                b: shade,
-                a: 255,
-            };
-        }
-    }
-    Some(slint::Image::from_rgba8(buffer))
-}
-
 pub fn apply(window: &MainWindow, page: Page) {
-    match pairing_code() {
-        Some(code) => window.set_pairing_code(code),
-        None => window.set_pairing_code(slint::Image::default()),
-    }
     window.set_pairing_says(
         ops::import::implementation(&window.get_adding_source())
             .map(|entry| entry.waiting())
@@ -340,6 +309,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         move |source| {
             let (paths, nudge) = (paths.clone(), nudge.clone());
             let dir = source.to_string();
+            work::nudge_when_code_shows(&nudge);
             work::run(&weak, &nudge, move || {
                 let row = ops::import::authorize(&paths, &dir)?;
                 Ok(format!("signed in again as {}", row.name))
@@ -424,6 +394,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     Err(_) => "",
                 },
             );
+            work::nudge_when_code_shows(&nudge);
 
             work::action(
                 &weak,
@@ -921,7 +892,7 @@ mod tests {
                 a: 255,
             };
         }
-        window.set_pairing_code(slint::Image::from_rgba8(pixels));
+        window.set_code(slint::Image::from_rgba8(pixels));
 
         let code = ElementHandle::find_by_element_type_name(&window, "Image")
             .next()
