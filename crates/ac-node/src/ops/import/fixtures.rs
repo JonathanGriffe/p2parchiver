@@ -108,6 +108,9 @@ impl Fake {
     }
 }
 
+/// Long enough for a claim's lease to run out.
+pub(crate) const DELAY: i64 = ac_import::ledger::FETCH_RETRY_DELAY + 1;
+
 /// The attempts a reference has spent, or `None` if the ledger has no row for it.
 pub(crate) fn attempts(ledger: &Ledger, dir: &str, reference: &str) -> Option<i64> {
     let known = ledger.known_refs(dir, &[reference]).unwrap();

@@ -682,8 +682,6 @@ mod tests {
         }
     }
 
-    const DELAY: i64 = ac_import::ledger::FETCH_RETRY_DELAY + 1;
-
     #[test]
     fn a_file_changed_at_the_source_comes_in_after_the_next_scan() {
         let home = home();

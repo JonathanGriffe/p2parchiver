@@ -108,7 +108,6 @@ pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Resul
         let known = ledger.known_refs(&row.dir, &refs)?;
         let at = now();
 
-        let mut stale = Vec::new();
         for item in &page.items {
             out.found += 1;
 
@@ -120,16 +119,14 @@ pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Resul
                 continue;
             }
 
-            match known.iter().find(|seen| seen.source_ref == item.reference) {
-                Some(seen) if seen.settled => {}
+            match known
+                .iter()
+                .find(|seen| seen.stored.reference == item.reference)
+            {
                 Some(seen) => {
-                    // A claim already in flight is still checked against the old promise,
-                    // and may fail once. The next claim reads the new one.
-                    if seen.differs(item) && ledger.refresh(&row.dir, item, at)? {
-                        out.refreshed += 1;
-                    }
-                    if seen.fails >= ac_import::ledger::MAX_FETCH_ATTEMPTS {
-                        stale.push(item.reference.as_str());
+                    if ledger.refresh(&row.dir, seen, item, at)? {
+                        out.again += u64::from(seen.exhausted());
+                        out.refreshed += u64::from(seen.refreshed(item) != seen.stored);
                     }
                 }
                 None => {
@@ -138,7 +135,6 @@ pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Resul
                 }
             }
         }
-        out.again += ledger.offer_again(&row.dir, &stale, at)? as u64;
         out.skipped.extend(page.skipped);
 
         match page.next {
@@ -276,7 +272,7 @@ mod tests {
         let mut at = now();
         for _ in 0..ac_import::ledger::MAX_FETCH_ATTEMPTS {
             ledger.claim(at, 8).unwrap();
-            at += ac_import::ledger::FETCH_RETRY_DELAY + 1;
+            at += DELAY;
         }
         assert!(ledger.claim(at, 8).unwrap().is_empty());
 
@@ -291,8 +287,6 @@ mod tests {
         assert_eq!(ledger.owed(&row.dir).unwrap(), 1);
         assert_eq!(ledger.claim(at, 8).unwrap().len(), 1);
     }
-
-    const DELAY: i64 = ac_import::ledger::FETCH_RETRY_DELAY + 1;
 
     #[test]
     fn a_rescan_refreshes_what_an_owed_reference_promises() {
