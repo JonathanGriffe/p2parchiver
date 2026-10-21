@@ -51,7 +51,8 @@ The Sort page steps through the imported files waiting to be sorted, one at a ti
 
 - A name this node chose for someone is shown as it is. A name they chose for themselves is shown with a `~ ` prefix, since nothing verifies it. Without a name, nothing is shown rather than the start of a peer id, which is the same for every node.
 - A group this node has left disappears at once, without waiting for the admin to remove it.
-- For a group this node administers, Leave forgets the group instead, since an admin cannot leave.
+- Leave asks first, in the words `ac group leave` prints. For a group this node administers, it warns that nobody can be added afterwards.
+- Add member is offered to the admin only, and not once the admin has left.
 
 ### Window and enrolment
 

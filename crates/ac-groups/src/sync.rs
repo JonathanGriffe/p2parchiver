@@ -342,7 +342,8 @@ impl GroupSync {
             return;
         }
 
-        for peer in &applied.departed {
+        // The chain cannot remove its admin, so our own `Out` stays a standing.
+        for peer in applied.departed.iter().filter(|p| **p != self.me) {
             let op = Op::Remove {
                 peer: peer.to_base58(),
             };

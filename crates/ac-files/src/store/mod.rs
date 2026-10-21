@@ -604,21 +604,6 @@ impl Files {
         tx.commit()?;
         Ok(changed > 0)
     }
-
-    /// Drop everything this node records about a group's files, for `ac group forget`.
-    pub fn forget_group(&mut self, group: GroupId) -> Result<(), FilesError> {
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for table in ["files", "file_roots", "file_sync", "file_state"] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE group_id = ?1"),
-                params![group.to_string()],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
 }
 
 /// Write a row and give it the next position in this group's change log.
@@ -946,19 +931,6 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_a_group_drops_its_rows_and_its_directory() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        files.dir_for(g, "holiday").unwrap();
-
-        files.forget_group(g).unwrap();
-
-        assert!(files.list(g, None, true).unwrap().is_empty());
-        assert_eq!(files.dir_of(g).unwrap(), None);
-    }
-
-    #[test]
     fn held_bytes_by_group_splits_the_same_total() {
         let (mut files, me) = store();
         let (g, other) = (group_id(1), group_id(2));
@@ -1195,22 +1167,6 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_a_group_leaves_no_work_behind() {
-        let (mut files, me) = store();
-        let g = group_id(1);
-        files.record(g, &row(me, "a.jpg", "aa"), false).unwrap();
-        files.set_cursor(g, &me, 42).unwrap();
-
-        files.forget_group(g).unwrap();
-
-        assert_eq!(
-            files.cursor(g, &me).unwrap(),
-            0,
-            "and a cursor into a log we no longer hold would skip rows on re-joining"
-        );
-    }
-
-    #[test]
     fn content_already_held_is_found_by_hash() {
         let (mut files, me) = store();
         let g = group_id(1);
@@ -1276,18 +1232,6 @@ mod tests {
 
         let unfinished = files.unfinished(g).unwrap();
         assert_eq!(unfinished, vec![missing.path]);
-    }
-
-    #[test]
-    fn a_forgotten_group_has_no_directory_left_to_sweep() {
-        let (mut files, _me) = store();
-        let g = group_id(1);
-        let dir = files.dir_for(g, "holiday").unwrap();
-
-        assert_eq!(files.group_dirs().unwrap(), vec![(g, dir)]);
-
-        files.forget_group(g).unwrap();
-        assert!(files.group_dirs().unwrap().is_empty());
     }
 
     /// A store, its peer, and a content root the merge can move bytes in.

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use ac_groups::chain::{Entry, Op};
 use ac_groups::id::GroupId;
-use ac_groups::standing::Position;
+use ac_groups::standing::{Position, Standing};
 use ac_groups::store::{Groups, State};
 use ac_groups::sync::{GroupAction, GroupEvent, GroupSync, MAX_INFLIGHT};
 use ac_groups::wire::{GroupHead, GroupRequest, GroupResponse};
@@ -585,6 +585,49 @@ fn the_admin_ratifies_a_departure_exactly_once() {
         admin.sync.store().get(id).unwrap().unwrap().head_seq,
         head_before + 1,
         "exactly one entry was appended"
+    );
+}
+
+/// As a restored admin does: its own `Out` comes back from a member, and stays a standing.
+/// The chain's `SelfRemoval` check is what keeps the admin in; ratify's filter only keeps
+/// this expected case out of the warnings, which this test does not observe.
+#[test]
+fn ratifying_ignores_the_admins_own_departure() {
+    let (mut admin, mut member, id) = admin_and_member();
+    join(&mut admin, &mut member, id);
+
+    let head = member.sync.store().get(id).unwrap().unwrap().head_seq;
+    let out = Standing::author(&admin.key, id, 10, Position::Out, "alice", AT).unwrap();
+    member
+        .sync
+        .store_mut()
+        .put(id, head, &[], &[out], AT)
+        .unwrap();
+
+    let before = admin.sync.store().get(id).unwrap().unwrap().head_seq;
+    connect(&mut admin, &mut member);
+
+    assert!(
+        admin
+            .sync
+            .store()
+            .departed(id)
+            .unwrap()
+            .contains(&admin.peer()),
+        "the admin learned its own Out"
+    );
+    assert_eq!(
+        admin.sync.store().get(id).unwrap().unwrap().head_seq,
+        before,
+        "and its log holds no Remove of the admin, which the chain refuses"
+    );
+    assert!(
+        admin
+            .sync
+            .store()
+            .members(id)
+            .unwrap()
+            .contains(&admin.peer())
     );
 }
 

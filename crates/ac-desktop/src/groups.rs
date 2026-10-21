@@ -35,6 +35,10 @@ pub struct Detail {
     pub content: String,
     pub dir: String,
     pub admin: bool,
+    /// The admin, not yet left: whether Add member is offered.
+    pub can_add: bool,
+    /// What the Leave confirm says, which is what `ac group leave` prints.
+    pub leave_warning: String,
     pub members: Vec<MemberItem>,
     /// Who the Add dialog offers, in the Peers page's two lists less this group's members.
     pub candidates: peers::Page,
@@ -120,8 +124,8 @@ pub fn read(paths: &Paths, known: &[ops::Known], directory: &peers::Page, select
         }
     };
 
-    // A selected group that has just been forgotten is not an error worth showing: the list
-    // beside it has already stopped mentioning it.
+    // A selected group that has just gone is not an error worth showing: the list beside it
+    // has already stopped mentioning it.
     let detail = (!selected.is_empty())
         .then(|| ops::group::show(paths, selected, false).ok())
         .flatten()
@@ -158,30 +162,12 @@ fn present(
     let members = detail
         .members
         .iter()
-        .map(|member| {
-            // The same notes `ac group show` puts after a member, in the same order.
-            let mut notes = Vec::new();
-            if member.is_admin {
-                notes.push("admin");
-            }
-            if member.is_me {
-                notes.push("this node");
-            }
-            if member.departed {
-                notes.push("has left, awaiting removal");
-            } else if !member.answered && !member.is_me {
-                // Named in the chain, silent so far. Either they have not been reached yet or
-                // they have the invitation and have not decided.
-                notes.push("invited, no answer yet");
-            }
-
-            MemberItem {
-                username: name_for(member, known).into(),
-                peer: member.peer.to_string().into(),
-                note: notes.join(", ").into(),
-                departed: member.departed,
-                is_me: member.is_me,
-            }
+        .map(|member| MemberItem {
+            username: name_for(member, known).into(),
+            peer: member.peer.to_string().into(),
+            note: member.notes().join(", ").into(),
+            departed: member.departed,
+            is_me: member.is_me,
         })
         .collect();
 
@@ -193,6 +179,8 @@ fn present(
         content,
         dir,
         admin: detail.is_admin,
+        can_add: detail.can_add,
+        leave_warning: ops::group::leave_warning(detail.is_admin).to_owned(),
         candidates: candidates(directory, &detail.members),
         members,
     }
@@ -229,6 +217,8 @@ pub fn apply(window: &MainWindow, page: Page) {
     window.set_group_content(detail.content.into());
     window.set_group_dir(detail.dir.into());
     window.set_group_admin(detail.admin);
+    window.set_group_can_add(detail.can_add);
+    window.set_group_leave_warning(detail.leave_warning.into());
     window.set_group_members(ModelRc::from(Rc::new(VecModel::from(detail.members))));
     window.set_group_add_contacts(ModelRc::from(Rc::new(VecModel::from(
         detail.candidates.contacts,
@@ -275,33 +265,13 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         let inner = run(&weak, paths, nudge, |paths, id: &str, _| {
             Ok(match ops::group::leave(paths, id)? {
                 ops::group::Departed::Already(name) => format!("already left {name}"),
-                ops::group::Departed::Left(name) => {
+                ops::group::Departed::Left { name, .. } => {
                     format!("left {name}. The others are told when they next connect.")
                 }
             })
         });
         move |id| {
             // The list is about to stop offering it, so nothing should still be pointing at it.
-            selection.set_group("");
-            inner(id);
-        }
-    });
-
-    window.on_forget_group({
-        let selection = selection.clone();
-        let inner = run(&weak, paths, nudge, |paths, id: &str, _| {
-            let forgotten = ops::group::forget(paths, id)?;
-            let mut said = format!("left {} on this node only, nobody was told", forgotten.name);
-            if forgotten.held > 0 {
-                said += &format!(
-                    ", {} file(s) left on disk and no longer indexed",
-                    forgotten.held
-                );
-            }
-            Ok(said)
-        });
-        move |id| {
-            // The group is about to stop existing, so nothing should still be pointing at it.
             selection.set_group("");
             inner(id);
         }
@@ -574,10 +544,15 @@ pub mod tests {
         window.set_group_add_contacts(model(vec![candidate("ana", "12D3-ana")]));
         window.set_group_add_discovered(model(vec![candidate("~ bo", "12D3-bo")]));
 
-        window.set_group_admin(false);
-        assert_eq!(showing("Add member"), 0, "not this node's group to add to");
-
         window.set_group_admin(true);
+        window.set_group_can_add(false);
+        assert_eq!(
+            showing("Add member"),
+            0,
+            "not this node's group to add to, or left"
+        );
+
+        window.set_group_can_add(true);
         assert_eq!(showing("Add member"), 1);
         assert_eq!(showing("Add to holiday"), 0, "not until it is asked for");
 
@@ -685,23 +660,79 @@ pub mod tests {
     }
 
     #[test]
-    fn a_groups_own_admin_is_not_offered_a_leave_that_would_be_refused() {
+    fn a_groups_own_admin_is_offered_a_leave_that_leaves() {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
         let id = created.id.to_string();
 
         let detail = page(&paths, &id).detail.unwrap();
-        assert_eq!(detail.membership, MEMBER);
-        assert!(detail.admin, "this is the case the branch turns on");
+        assert_eq!(detail.membership, MEMBER, "so Leave is offered");
+        assert!(detail.admin);
+        assert!(detail.can_add);
+        assert_eq!(detail.leave_warning, ops::group::leave_warning(true));
 
-        // What the Leave button would have called, had it been offered.
-        let Err(refused) = ops::group::leave(&paths, &id) else {
-            panic!("leaving must be refused for a group's only admin");
-        };
-        assert!(
-            format!("{refused:#}").contains("forget"),
-            "and it points at the action that does apply: {refused:#}"
-        );
+        // What the Leave button calls.
+        assert!(matches!(
+            ops::group::leave(&paths, &id).unwrap(),
+            ops::group::Departed::Left { admin: true, .. }
+        ));
+        let left = ops::group::show(&paths, &id, false).unwrap();
+        assert_eq!(left.row.state, State::Left);
+    }
+
+    /// Leave sits with the member's buttons, for the admin too, and a left group has none.
+    #[test]
+    fn leave_is_offered_to_a_member_admin_or_not_and_never_to_a_left_group() {
+        use i_slint_backend_testing::ElementHandle;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+
+        // Wide enough that Leave, at the row's far end, is not clipped out of the query.
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(1600., 800.));
+        window.set_tab(1);
+        window.set_selected_group("holiday-id".into());
+        window.set_group_membership(MEMBER);
+
+        for admin in [false, true] {
+            window.set_group_admin(admin);
+            assert_eq!(showing("Leave"), 1, "admin: {admin}");
+        }
+
+        window.set_group_membership(GONE);
+        assert_eq!(showing("Leave"), 0);
+    }
+
+    /// The confirm says what Rust hands it, word for word.
+    #[test]
+    fn the_leave_confirm_shows_the_warning_the_cli_prints() {
+        use i_slint_backend_testing::ElementHandle;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(1600., 800.));
+        window.set_tab(1);
+        window.set_selected_group("holiday-id".into());
+        window.set_group_name("holiday".into());
+        // An invitation's Leave is a std Button, which the testing backend can press.
+        window.set_group_membership(INVITED);
+        let warning = ops::group::leave_warning(false);
+        window.set_group_leave_warning(warning.into());
+
+        ElementHandle::find_by_accessible_label(&window, "Leave")
+            .next()
+            .unwrap()
+            .invoke_accessible_default_action();
+
+        assert_eq!(showing("Leave holiday?"), 1);
+        assert_eq!(showing(warning), 1);
     }
 
     #[test]
@@ -828,10 +859,10 @@ pub mod tests {
     }
 
     #[test]
-    fn a_forgotten_group_stops_being_listed() {
+    fn a_group_its_admin_has_left_stops_being_listed() {
         let (_tmp, paths) = home("jonathan");
         let created = ops::group::create(&paths, "holiday").unwrap();
-        ops::group::forget(&paths, &created.id.to_string()).unwrap();
+        ops::group::leave(&paths, &created.id.to_string()).unwrap();
 
         let page = page(&paths, &created.id.to_string());
 

@@ -653,7 +653,7 @@ impl Groups {
         Ok(())
     }
 
-    /// Forget a group locally. Writes nothing to any chain and tells nobody.
+    /// Forget a group locally, for the sweep of stale invitations. Tells nobody.
     pub fn forget(&mut self, group: GroupId) -> Result<(), StoreError> {
         let tx = self
             .db
@@ -1388,7 +1388,7 @@ mod tests {
         // The window it exists for is exactly "they said so, the admin has not acted yet". While
         // the chain still lists them the statement has work to do; once the `Remove` lands the
         // entry is the record, and a stale `Out` at some high seq would beat the seq-1 standing
-        // of the same peer re-added after an `ac group forget`.
+        // of the same peer re-added later.
         let (mut store, admin, id) = admin_store();
         let bob = key();
         add(&mut store, &admin, id, peer_of(&bob), "bob");

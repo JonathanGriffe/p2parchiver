@@ -99,7 +99,8 @@ These are deliberate for now:
   that also carries the standings. At roughly 340 bytes an entry, that is about 3,000
   membership changes before a new member can no longer fetch it. The test
   `a_chain_transfers_at_a_size_that_leaves_room_for_real_history` pins the per-entry cost.
-- **One permanent admin per group**, with no transfer, removal or key rotation.
+- **One permanent admin per group**, with no transfer, removal or key rotation. A group whose
+  admin has left can take no new members.
 - **Revocation reaches other nodes only through expiry**, up to 24 h later.
 - **Platform gaps.** The tray, start at login and "show in folder" work only on Linux and Windows, and ffmpeg
   is vendored only for x86_64 Linux and Windows.

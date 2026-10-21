@@ -82,16 +82,7 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<()> {
         .max()
         .unwrap_or(0);
     for member in &detail.members {
-        let mut notes = Vec::new();
-        if member.is_admin {
-            notes.push("admin");
-        }
-        if member.is_me {
-            notes.push("this node");
-        }
-        if member.departed {
-            notes.push("has left, awaiting removal");
-        }
+        let notes = member.notes();
         let note = if notes.is_empty() {
             String::new()
         } else {
@@ -144,42 +135,10 @@ pub fn accept(paths: &Paths, needle: &str) -> Result<()> {
 
 pub fn leave(paths: &Paths, needle: &str) -> Result<()> {
     match ops::group::leave(paths, needle)? {
-        Departed::Already(name) => {
-            println!("already left {name}");
-            return Ok(());
+        Departed::Already(name) => println!("already left {name}"),
+        Departed::Left { name, admin } => {
+            println!("left {name}\n\n{}", ops::group::leave_warning(admin));
         }
-        Departed::Left(name) => println!("left {name}"),
-    }
-
-    println!();
-    println!("This node stops sharing that group immediately, whatever anyone else believes.");
-    println!("The others are told when they next connect, and the admin then makes it");
-    println!("official. Being added again will not undo this, you would accept afresh.");
-    Ok(())
-}
-
-pub fn forget(paths: &Paths, needle: &str) -> Result<()> {
-    let forgotten = ops::group::forget(paths, needle)?;
-
-    println!("forgot {} locally", forgotten.name);
-    if forgotten.held > 0 {
-        println!();
-        println!(
-            "{} file(s) were left on disk, no longer indexed:",
-            forgotten.held
-        );
-        if let Some(dir) = forgotten.dir {
-            println!("  {}", dir.display());
-        }
-    }
-    if forgotten.was_admin {
-        println!();
-        println!("You were this group's admin, so nobody can change its membership again.");
-        println!("Other members keep their copy and can still reach each other with it.");
-    } else {
-        println!();
-        println!("Nothing was told to anyone. The others still list you, and will keep");
-        println!("offering it, use `ac group leave` instead if you meant to tell them.");
     }
     Ok(())
 }

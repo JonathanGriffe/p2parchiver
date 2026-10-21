@@ -91,5 +91,3 @@ The tables are prefixed with `file` because `state.sqlite` is shared with other 
 - `files`: the catalogues. One row per file, keyed by `(group_id, path)`, with `size`, `hash`, `modified`, `added_at`, `added_by`, `removed_at`, `have` (whether the bytes are on this disk) and `seen_seq` (its position in the log). Indexed on `hash` and on `(group_id, seen_seq)`.
 - `file_sync`: how far this node has read each peer's log. `cursor`, keyed by `(group_id, peer)`.
 - `file_state`: one row per group, only touched by `src/store/log.rs`. `seq` (the last log position handed out), `served_seq` (the highest position ever served), `digest` and `digest_seq` (the cached digest and the position it was computed at), `changes` and `last_change` (this node's untold changes), and `wanted` (new rows whose bytes are missing).
-
-Forgetting a group deletes its rows from all four tables.

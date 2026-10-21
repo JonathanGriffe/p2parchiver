@@ -99,6 +99,8 @@ export component MainWindow inherits Window {
     in property <string> group-content;
     in property <string> group-dir;
     in property <bool> group-admin;
+    in property <bool> group-can-add;
+    in property <string> group-leave-warning;
     in property <[MemberItem]> group-members;
     // Who the group's Add dialog offers, which is the Peers page's lists less its members.
     in property <[PeerItem]> group-add-contacts;
@@ -187,7 +189,6 @@ export component MainWindow inherits Window {
     callback remove-member(string, string);
     callback accept-group(string);
     callback leave-group(string);
-    callback forget-group(string);
     callback open-group-folder(string);
     callback add-peer(string, string);
     callback remove-peer(string);
@@ -329,6 +330,8 @@ export component MainWindow inherits Window {
                 detail-content: root.group-content;
                 detail-dir: root.group-dir;
                 detail-admin: root.group-admin;
+                detail-can-add: root.group-can-add;
+                detail-leave-warning: root.group-leave-warning;
                 members: root.group-members;
                 add-contacts: root.group-add-contacts;
                 add-discovered: root.group-add-discovered;
@@ -341,7 +344,6 @@ export component MainWindow inherits Window {
                 remove-member(id, peer) => { root.remove-member(id, peer); }
                 accept(id) => { root.accept-group(id); }
                 leave(id) => { root.selected-group = ""; root.leave-group(id); }
-                forget(id) => { root.selected-group = ""; root.forget-group(id); }
                 open-folder(dir) => { root.open-group-folder(dir); }
             }
 
