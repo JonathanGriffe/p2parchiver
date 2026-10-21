@@ -200,7 +200,9 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
                 &weak,
                 move || {
                     stop(&node)?;
-                    let enrolled = ops::join::from_token(&paths, &token, &username);
+                    let enrolled = ops::identity(&paths).and_then(|identity| {
+                        ops::join::from_token(&paths, &identity, &token, &username)
+                    });
                     // Started again whichever way it went: a node left stopped by a
                     // refusal would look like the app itself had given up.
                     start(&node, &paths)?;
