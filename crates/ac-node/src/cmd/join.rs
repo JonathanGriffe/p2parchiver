@@ -5,7 +5,8 @@ use ac_net::config::Paths;
 use crate::ops;
 
 pub fn run(paths: &Paths, token: &str, username: &str) -> Result<()> {
-    let enrolled = ops::join::from_token(paths, token, username)?;
+    let identity = ops::identity(paths)?;
+    let enrolled = ops::join::from_token(paths, &identity, token, username)?;
 
     println!("enrolled as {}", enrolled.username);
     println!("peer     {}", enrolled.peer);

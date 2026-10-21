@@ -6,6 +6,7 @@ use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
 use anyhow::{Context, Result, anyhow};
 
+pub mod backup;
 pub mod file;
 pub mod format;
 pub mod group;

@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ac_net::config::{Config, Paths};
 use ac_node::ops;
+use ac_node::ops::backup::Recovered;
 use ac_node::ops::format::human_size;
+use ac_node::ops::join::Enrolled;
 use anyhow::{Context, Result, anyhow};
 use slint::{ComponentHandle, ModelRc, VecModel};
 
@@ -17,9 +20,20 @@ pub type Shared = Arc<Mutex<Node>>;
 
 /// What the enrolment dialog is showing. Mirrored in `views/enrol.slint`, which is why
 /// these are the ints the property takes rather than an enum.
-pub const ENROL_FORM: i32 = 0;
-pub const ENROL_WORKING: i32 = 1;
-pub const ENROL_DONE: i32 = 2;
+pub const ENROL_IDENTITY: i32 = 0;
+pub const ENROL_RESTORING: i32 = 1;
+pub const ENROL_FORM: i32 = 2;
+pub const ENROL_WORKING: i32 = 3;
+pub const ENROL_DONE: i32 = 4;
+
+/// An identity restored from the phone, held until enrolling with it, and lost with the app.
+type Restored = Arc<Mutex<Option<ops::backup::Recovered>>>;
+
+/// How the enrol dialog enrols.
+enum Enrol {
+    Token { token: String, username: String },
+    Continue,
+}
 
 pub fn load(window: &MainWindow, paths: &Paths) {
     let config = Config::load(&paths.config_file()).unwrap_or_default();
@@ -182,75 +196,240 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
         }
     });
 
+    let restored: Restored = Arc::default();
+    // Whether the code on screen was given up on by hand, which needs no message.
+    let stopped = Arc::new(AtomicBool::new(false));
+
+    window.on_stop_phone_code({
+        let stopped = stopped.clone();
+        move || {
+            stopped.store(true, Ordering::SeqCst);
+            ops::import::stop_signing_in();
+        }
+    });
+
+    window.on_enrol_new({
+        let weak = weak.clone();
+        let restored = restored.clone();
+        move || {
+            if let Ok(mut held) = restored.lock() {
+                *held = None;
+            }
+            if let Some(window) = weak.upgrade() {
+                window.set_enrol_restored(false);
+                window.set_enrol_error("".into());
+                window.set_enrol_phase(ENROL_FORM);
+            }
+        }
+    });
+
+    window.on_enrol_restore({
+        let weak = weak.clone();
+        let paths = paths.clone();
+        let nudge = nudge.clone();
+        let restored = restored.clone();
+        let stopped = stopped.clone();
+        move || {
+            let (paths, nudge, restored, stopped) = (
+                paths.clone(),
+                nudge.clone(),
+                restored.clone(),
+                stopped.clone(),
+            );
+            work::begin(&weak);
+            stopped.store(false, Ordering::SeqCst);
+            if let Some(window) = weak.upgrade() {
+                window.set_enrol_error("".into());
+                window.set_enrol_phase(ENROL_RESTORING);
+            }
+            nudge_when_shown(&nudge);
+
+            work::action(
+                &weak,
+                move || ops::backup::restore(&paths),
+                move |window, outcome| {
+                    match outcome {
+                        Ok(recovered) => {
+                            window.set_enrol_username(recovered.username.as_str().into());
+                            window.set_enrol_restored(true);
+                            if let Ok(mut held) = restored.lock() {
+                                *held = Some(recovered);
+                            }
+                            window.set_enrol_phase(ENROL_FORM);
+                        }
+                        Err(e) => {
+                            if !stopped.load(Ordering::SeqCst) {
+                                window.set_enrol_error(format!("{e:#}").into());
+                            }
+                            window.set_enrol_phase(ENROL_IDENTITY);
+                        }
+                    }
+                    work::quiet(window, &nudge);
+                },
+            );
+        }
+    });
+
+    window.on_backup({
+        let weak = weak.clone();
+        let paths = paths.clone();
+        let nudge = nudge.clone();
+        let stopped = stopped.clone();
+        move || {
+            let (paths, nudge, stopped) = (paths.clone(), nudge.clone(), stopped.clone());
+            work::begin(&weak);
+            stopped.store(false, Ordering::SeqCst);
+            if let Some(window) = weak.upgrade() {
+                window.set_backing_up(true);
+            }
+            nudge_when_shown(&nudge);
+
+            work::action(
+                &weak,
+                move || ops::backup::backup(&paths),
+                move |window, outcome| {
+                    window.set_backing_up(false);
+                    // Nothing else on screen changes, so the line says how it went.
+                    let said = match outcome {
+                        Ok(()) => Ok("backed up to the phone".to_owned()),
+                        Err(_) if stopped.load(Ordering::SeqCst) => Ok(String::new()),
+                        Err(e) => Err(e),
+                    };
+                    work::finish(window, said, &nudge);
+                },
+            );
+        }
+    });
+
+    window.on_enrol_continue({
+        let weak = weak.clone();
+        let paths = paths.clone();
+        let node = node.clone();
+        let nudge = nudge.clone();
+        let restored = restored.clone();
+        move || enrol(&weak, &paths, &node, &nudge, &restored, Enrol::Continue)
+    });
+
     window.on_join({
         let paths = paths.clone();
         let node = node.clone();
         let nudge = nudge.clone();
         move |token, username| {
-            let (paths, node, nudge) = (paths.clone(), node.clone(), nudge.clone());
-            let (token, username) = (token.to_string(), username.to_string());
-            work::begin(&weak);
-            if let Some(window) = weak.upgrade() {
-                window.set_enrol_phase(ENROL_WORKING);
-                window.set_enrol_error("".into());
-            }
-
-            let reload = paths.clone();
-            work::action(
-                &weak,
-                move || {
-                    stop(&node)?;
-                    let enrolled = ops::join::from_token(&paths, &token, &username);
-                    // Started again whichever way it went: a node left stopped by a
-                    // refusal would look like the app itself had given up.
-                    start(&node, &paths)?;
-                    enrolled
-                },
-                move |window, outcome| {
-                    load(window, &reload);
-                    // The window reads these once at startup, and enrolling is the one
-                    // thing that changes them: without this the name and the server stay
-                    // blank until the app is opened again.
-                    if let Err(e) = view::describe_node(window, &reload) {
-                        tracing::warn!(error = %e, "could not re-read this node's details");
-                    }
-
-                    match &outcome {
-                        Ok(enrolled) => {
-                            // The dialog has the name in front of someone who just typed
-                            // it; the rest is on the Status page behind it.
-                            window.set_enrol_summary(
-                                format!("Enrolled as {}.", enrolled.username).into(),
-                            );
-                            window.set_enrol_phase(ENROL_DONE);
-                        }
-                        Err(e) => {
-                            // `{:#}` so the server's reason comes through, not just the
-                            // outermost context.
-                            window.set_enrol_error(format!("{e:#}").into());
-                            window.set_enrol_phase(ENROL_FORM);
-                        }
-                    }
-
-                    if window.get_show_enrol() {
-                        // The dialog is saying it; the shared line would only repeat it,
-                        // out of sight behind the dialog.
-                        work::quiet(window, &nudge);
-                    } else {
-                        // Nobody is looking at a dialog, so the one line has to carry it.
-                        let said = outcome.map(|enrolled| {
-                            format!(
-                                "Enrolled as {} with {}, attested for {}h. That server is \
-                                 pinned now.",
-                                enrolled.username, enrolled.server, enrolled.attested_for
-                            )
-                        });
-                        work::finish(window, said, &nudge);
-                    }
-                },
-            );
+            let how = Enrol::Token {
+                token: token.to_string(),
+                username: username.to_string(),
+            };
+            enrol(&weak, &paths, &node, &nudge, &restored, how);
         }
     });
+}
+
+/// Have the poller read as soon as a code to scan is up, rather than at its next tick.
+fn nudge_when_shown(nudge: &Nudge) {
+    let nudge = nudge.clone();
+    std::thread::spawn(move || {
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if ops::import::showing().is_some() {
+                nudge.now();
+                return;
+            }
+        }
+    });
+}
+
+/// Enrol from the dialog, with the restored identity if there is one, else this node's own.
+fn enrol_with(paths: &Paths, restored: Option<Recovered>, how: Enrol) -> Result<Enrolled> {
+    match (how, restored) {
+        (Enrol::Continue, Some(r)) => ops::join::from_server(paths, &r.identity, &r.server),
+        (Enrol::Continue, None) => Err(anyhow!("no identity has been restored from the phone")),
+        (Enrol::Token { token, username }, Some(r)) => {
+            ops::join::from_token(paths, &r.identity, &token, &username)
+        }
+        (Enrol::Token { token, username }, None) => {
+            ops::join::from_token(paths, &ops::identity(paths)?, &token, &username)
+        }
+    }
+}
+
+/// Stop the node, enrol, and start the node again whatever the outcome.
+fn enrol(
+    weak: &slint::Weak<MainWindow>,
+    paths: &Paths,
+    node: &Shared,
+    nudge: &Nudge,
+    restored: &Restored,
+    how: Enrol,
+) {
+    let (paths, node, nudge) = (paths.clone(), node.clone(), nudge.clone());
+    let (held, kept) = (restored.clone(), restored.clone());
+    work::begin(weak);
+    if let Some(window) = weak.upgrade() {
+        window.set_enrol_phase(ENROL_WORKING);
+        window.set_enrol_error("".into());
+    }
+
+    let reload = paths.clone();
+    work::action(
+        weak,
+        move || {
+            let restored = held
+                .lock()
+                .map_err(|_| anyhow!("the restored identity is in an unknown state"))?
+                .clone();
+            stop(&node)?;
+            let enrolled = enrol_with(&paths, restored, how);
+            // Started again whichever way it went: a node left stopped by a
+            // refusal would look like the app itself had given up.
+            start(&node, &paths)?;
+            enrolled
+        },
+        move |window, outcome| {
+            if outcome.is_ok() {
+                if let Ok(mut held) = kept.lock() {
+                    *held = None;
+                }
+                window.set_enrol_restored(false);
+            }
+            load(window, &reload);
+            // The window reads these once at startup, and enrolling is the one thing that
+            // changes them, the peer id too after a restore: without this the name and the
+            // server stay blank until the app is opened again.
+            if let Err(e) = view::describe_node(window, &reload) {
+                tracing::warn!(error = %e, "could not re-read this node's details");
+            }
+
+            match &outcome {
+                Ok(enrolled) => {
+                    // The dialog has the name in front of someone who just typed it; the
+                    // rest is on the Status page behind it.
+                    window.set_enrol_summary(format!("Enrolled as {}.", enrolled.username).into());
+                    window.set_enrol_phase(ENROL_DONE);
+                }
+                Err(e) => {
+                    // `{:#}` so the server's reason comes through, not just the outermost
+                    // context.
+                    window.set_enrol_error(format!("{e:#}").into());
+                    window.set_enrol_phase(ENROL_FORM);
+                }
+            }
+
+            if window.get_show_enrol() {
+                // The dialog is saying it; the shared line would only repeat it, out of
+                // sight behind the dialog.
+                work::quiet(window, &nudge);
+            } else {
+                // Nobody is looking at a dialog, so the one line has to carry it.
+                let said = outcome.map(|enrolled| {
+                    format!(
+                        "Enrolled as {} with {}, attested for {}h. That server is pinned now.",
+                        enrolled.username, enrolled.server, enrolled.attested_for
+                    )
+                });
+                work::finish(window, said, &nudge);
+            }
+        },
+    );
 }
 
 struct Fields {
@@ -384,8 +563,20 @@ mod tests {
         let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
         let enrolling = "Enrolling. The node stops and starts again, which takes a moment.";
 
+        window.set_enrol_phase(ENROL_IDENTITY);
+        assert_eq!(showing("New identity"), 1, "first, which identity");
+        assert_eq!(showing("Restore from phone"), 1);
+        assert_eq!(showing("Not now"), 1);
+        assert_eq!(showing("Enrol"), 0, "the server comes after");
+
+        window.set_enrol_phase(ENROL_RESTORING);
+        assert_eq!(showing("Cancel"), 1, "waiting on the phone can be given up");
+        assert_eq!(showing("New identity"), 0);
+        assert_eq!(showing("Not now"), 0);
+
         window.set_enrol_phase(ENROL_FORM);
         assert_eq!(showing("Enrol"), 1, "the form offers to enrol");
+        assert_eq!(showing("Continue"), 0, "with nothing restored to continue");
         assert_eq!(showing("Not now"), 1);
         assert_eq!(showing(enrolling), 0);
         assert_eq!(showing("Close"), 0);
@@ -418,6 +609,55 @@ mod tests {
             .unwrap()
             .invoke_accessible_default_action();
         assert!(!window.get_show_enrol(), "Close puts the dialog away");
+    }
+
+    /// A restored identity can enrol again with its own server, under the name it came with.
+    #[test]
+    fn a_restored_identity_can_continue_under_its_own_name() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window.set_show_enrol(true);
+        window.set_enrol_phase(ENROL_FORM);
+
+        let continued = Rc::new(std::cell::Cell::new(false));
+        window.on_enrol_continue({
+            let continued = continued.clone();
+            move || continued.set(true)
+        });
+
+        window.set_enrol_restored(true);
+        window.set_enrol_username("alice".into());
+        let field = ElementHandle::find_by_element_id(&window, "EnrolDialog::who")
+            .next()
+            .unwrap();
+        assert_eq!(field.accessible_value().unwrap(), "alice", "prefilled");
+
+        let button = ElementHandle::find_by_accessible_label(&window, "Continue")
+            .next()
+            .expect("offered once restored");
+        button.invoke_accessible_default_action();
+        assert!(continued.get());
+    }
+
+    #[test]
+    fn a_backup_is_offered_only_once_enrolled() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(1200, 3000));
+        window.set_tab(SETTINGS_TAB);
+        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+
+        window.set_enrolled(false);
+        assert_eq!(showing("Back up to phone"), 0);
+
+        window.set_enrolled(true);
+        assert_eq!(showing("Back up to phone"), 1);
+
+        window.set_backing_up(true);
+        assert_eq!(showing("Back up to phone"), 0, "one at a time");
+        assert_eq!(showing("Cancel"), 1, "and it can be given up");
     }
 
     /// Enrolling is the one thing that changes the name and the server a node shows, and it

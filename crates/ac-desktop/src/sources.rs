@@ -236,11 +236,15 @@ fn pairing_code() -> Option<slint::Image> {
     Some(slint::Image::from_rgba8(buffer))
 }
 
-pub fn apply(window: &MainWindow, page: Page) {
+/// The code a sign-in, a backup or a restore is waiting on, whichever page is up.
+pub fn show_code(window: &MainWindow) {
     match pairing_code() {
         Some(code) => window.set_pairing_code(code),
         None => window.set_pairing_code(slint::Image::default()),
     }
+}
+
+pub fn apply(window: &MainWindow, page: Page) {
     window.set_pairing_says(
         ops::import::implementation(&window.get_adding_source())
             .map(|entry| entry.waiting())

@@ -36,6 +36,10 @@ enum Command {
         username: String,
     },
 
+    /// Back this node's identity up to the companion app, or restore it from there.
+    #[command(subcommand)]
+    Identity(IdentityCommand),
+
     Run {
         #[arg(long, value_name = "MULTIADDR")]
         dial: Vec<Multiaddr>,
@@ -57,6 +61,19 @@ enum Command {
 
     #[command(subcommand)]
     Import(ImportCommand),
+}
+
+#[derive(Subcommand)]
+enum IdentityCommand {
+    /// Show a code for the phone to take a backup of this node's identity. Once enrolled.
+    Backup,
+    /// Take an identity back from the phone on a home that has not enrolled, and enrol with
+    /// it: again with its server, or with an invite.
+    Restore {
+        /// Enrol with this invite token instead, under the backup's username.
+        #[arg(long, value_name = "TOKEN")]
+        invite: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -238,6 +255,10 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Id => cmd::id::run(&paths),
         Command::Join { token, username } => cmd::join::run(&paths, &token, &username),
+        Command::Identity(IdentityCommand::Backup) => cmd::identity::backup(&paths),
+        Command::Identity(IdentityCommand::Restore { invite }) => {
+            cmd::identity::restore(&paths, invite.as_deref())
+        }
         Command::Run { dial } => cmd::run::run(&paths, &dial),
         Command::Probe { peer } => cmd::probe::run(&paths, peer),
         Command::Peer(PeerCommand::Add { peer, label }) => cmd::peer::add(&paths, &peer, &label),

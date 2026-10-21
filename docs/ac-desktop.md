@@ -58,7 +58,13 @@ The Sort page steps through the imported files waiting to be sorted, one at a ti
 
 Closing the window hides it to the tray while there is one. Without a tray, including on Linux when the tray host goes away, closing quits. `--background` starts in the tray without a window, for starting at login.
 
-A node that has not enrolled shows the enrol dialog at startup. Enrolling stops the node, joins, and starts the node again whatever the outcome, so a refusal never leaves it stopped.
+A node that has not enrolled shows the enrol dialog at startup, in two steps:
+1. **Identity.** "New identity" goes on with the node's current key. "Restore from phone" shows the restore code and waits for the companion app, and Cancel or closing the dialog gives up on it. Once the phone has answered, the restored identity, server and username are held in memory, and closing the app before enrolling loses them.
+2. **Server.** The invite token and the username, with "Enrol". After a restore the username is prefilled, and "Continue" enrols again with the restored server instead.
+
+"Enrol" and "Continue" stop the node, enrol through `from_token` or `from_server`, with the restored identity if there is one, and start the node again whatever the outcome, so a refusal never leaves it stopped. The node's details are read again afterwards, since a restore changes its peer id.
+
+Settings offers "Back up to phone" once enrolled. It shows the backup code beside a Cancel button and waits, and the outcome goes on the message line, since nothing else on screen changes. The code to scan is read on every poll whichever page is up, so the enrol dialog and Settings show it as the Sources page does.
 
 ### Start at login
 
@@ -70,7 +76,7 @@ On Linux and Windows the app can start in the tray when its user logs in, throug
 
 ### Layout
 
-- The window is at least 880 px wide, and a test checks that every button, drop-down, text field and checkbox on every page fits at that width. Button labels never contain paths, since a button cannot shorten its text.
+- The window is at least 880 px wide, and a test checks that every button, drop-down, text field and checkbox on every page, and in every step of the enrol dialog, fits at that width. Button labels never contain paths, since a button cannot shorten its text.
 - Rust formats every string, and the `.slint` files only lay text out.
 - Colours and sizes live in `ui/theme.slint`, and colour is never the only signal: a word always goes with it.
 - The window uses Slint's software renderer, so the workspace optimises dependencies even in debug builds. Otherwise drawing the Sort page's preview would take noticeably long on every step.
