@@ -7,24 +7,35 @@ import { Theme, Card } from "../theme.slint";
 // every peer connection it makes is closed. Saying so at the door is kinder than letting
 // someone create a group and wonder why it never reaches anyone.
 //
-// It stays up for the whole of enrolling, which stops and restarts the node and can take a
-// few seconds. Closing on the click would leave that happening behind an empty window, and
-// a refusal from the server would have nowhere to land.
+// Two steps: which identity to enrol with, a new one or one restored from the phone, then the
+// server. It stays up for the whole of enrolling, which stops and restarts the node and can
+// take a few seconds. Closing on the click would leave that happening behind an empty window,
+// and a refusal from the server would have nowhere to land.
 export component EnrolDialog inherits Rectangle {
-    // 0 the form, 1 working, 2 done. `settings::ENROL_FORM` and friends.
+    // 0 the identity step, 1 waiting for the phone, 2 the server form, 3 working, 4 done.
+    // `settings::ENROL_IDENTITY` and friends.
     in property <int> phase;
-    // Why the last attempt failed, shown above the form it goes back to.
+    // Why the last attempt failed, shown above the step it goes back to.
     in property <string> error;
     in property <string> summary;
     in property <bool> busy;
+    // The restore code, once it is up.
+    in property <image> code;
+    // Whether an identity came back from the phone, which can continue with its own server.
+    in property <bool> restored;
 
+    callback new-identity();
+    callback restore();
+    callback stop-restoring();
     callback enrol(string, string);
+    callback continue-restored();
     callback dismissed();
 
     // Held here rather than in the fields, which are torn down and rebuilt with the phase:
-    // a refusal over the username should not cost someone the token they pasted.
+    // a refusal over the username should not cost someone the token they pasted. The name is
+    // two-way so a restore can fill it in.
     property <string> token-text;
-    property <string> who-text;
+    in-out property <string> who-text;
 
     background: #000000.with-alpha(0.45);
 
@@ -44,29 +55,46 @@ export component EnrolDialog inherits Rectangle {
             spacing: Theme.md;
 
             Text {
-                text: root.phase == 2 ? "Successfully enrolled" : "Enrol this node";
+                text: root.phase == 4 ? "Successfully enrolled" : "Enrol this node";
                 color: Theme.text;
                 font-size: Theme.heading-size;
                 font-weight: 700;
             }
 
-            if root.phase == 0 : VerticalLayout {
-                spacing: Theme.md;
+            if root.error != "" && (root.phase == 0 || root.phase == 2) : Rectangle {
+                border-radius: Theme.radius;
+                background: Theme.danger.with-alpha(0.12);
 
-                if root.error != "" : Rectangle {
-                    border-radius: Theme.radius;
-                    background: Theme.danger.with-alpha(0.12);
-
-                    VerticalLayout {
-                        padding: Theme.sm;
-                        Text {
-                            text: root.error;
-                            color: Theme.danger;
-                            font-size: Theme.small-size;
-                            wrap: word-wrap;
-                        }
+                VerticalLayout {
+                    padding: Theme.sm;
+                    Text {
+                        text: root.error;
+                        color: Theme.danger;
+                        font-size: Theme.small-size;
+                        wrap: word-wrap;
                     }
                 }
+            }
+
+            if root.phase == 1 : HorizontalLayout {
+                alignment: center;
+
+                if root.code.width > 0 : Image {
+                    source: root.code;
+                    // Nearest, or the squares blur into each other.
+                    image-rendering: pixelated;
+                    width: 240px;
+                    height: self.width;
+                }
+                if root.code.width == 0 : Spinner {
+                    indeterminate: true;
+                    width: 24px;
+                    height: 24px;
+                }
+            }
+
+            if root.phase == 2 : VerticalLayout {
+                spacing: Theme.md;
 
                 token := LineEdit {
                     placeholder-text: "invite token";
@@ -83,7 +111,7 @@ export component EnrolDialog inherits Rectangle {
                 }
             }
 
-            if root.phase == 1 : HorizontalLayout {
+            if root.phase == 3 : HorizontalLayout {
                 spacing: Theme.md;
 
                 Spinner {
@@ -101,7 +129,7 @@ export component EnrolDialog inherits Rectangle {
                 }
             }
 
-            if root.phase == 2 : Text {
+            if root.phase == 4 : Text {
                 text: root.summary;
                 color: Theme.dim;
                 font-size: Theme.small-size;
@@ -112,18 +140,39 @@ export component EnrolDialog inherits Rectangle {
                 spacing: Theme.sm;
                 alignment: end;
 
-                if root.phase == 0 : Button {
+                if root.phase == 0 || root.phase == 2 : Button {
                     text: "Not now";
                     enabled: !root.busy;
                     clicked => { root.dismissed(); }
                 }
                 if root.phase == 0 : Button {
-                    text: "Enrol";
+                    text: "Restore from phone";
+                    enabled: !root.busy;
+                    clicked => { root.restore(); }
+                }
+                if root.phase == 0 : Button {
+                    text: "New identity";
                     primary: true;
+                    enabled: !root.busy;
+                    clicked => { root.new-identity(); }
+                }
+                if root.phase == 1 : Button {
+                    text: "Cancel";
+                    clicked => { root.stop-restoring(); }
+                }
+                if root.phase == 2 && root.restored : Button {
+                    text: "Continue";
+                    primary: root.token-text == "";
+                    enabled: !root.busy;
+                    clicked => { root.continue-restored(); }
+                }
+                if root.phase == 2 : Button {
+                    text: "Enrol";
+                    primary: !root.restored || root.token-text != "";
                     enabled: root.token-text != "" && root.who-text != "" && !root.busy;
                     clicked => { root.enrol(root.token-text, root.who-text); }
                 }
-                if root.phase == 2 : Button {
+                if root.phase == 4 : Button {
                     text: "Close";
                     primary: true;
                     clicked => { root.dismissed(); }

@@ -23,6 +23,7 @@ struct Payload {
 }
 
 /// A backup taken back from a phone: enough to enrol as the same node again.
+#[derive(Clone)]
 pub struct Recovered {
     pub identity: Identity,
     /// The service address the node enrolled with, ending in `/p2p/<server peer id>`.

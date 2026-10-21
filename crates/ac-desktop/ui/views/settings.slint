@@ -48,6 +48,9 @@ export component SettingsView inherits ScrollView {
     in property <bool> busy;
     in property <bool> enrolled;
     in property <[SettingItem]> source-settings;
+    // A backup waiting for the phone, and its code once it is up.
+    in property <bool> backing-up;
+    in property <image> code;
 
     callback save(bool, string, string, string);
     callback set-autostart(bool);
@@ -58,6 +61,8 @@ export component SettingsView inherits ScrollView {
     callback open-logs();
     callback restart();
     callback join(string, string);
+    callback backup();
+    callback stop-backup();
 
     VerticalLayout {
         spacing: Theme.md;
@@ -157,6 +162,30 @@ export component SettingsView inherits ScrollView {
                         font-size: Theme.small-size;
                         font-family: Theme.mono;
                         wrap: char-wrap;
+                    }
+                }
+
+                if root.enrolled : HorizontalLayout {
+                    alignment: start;
+                    spacing: Theme.sm;
+                    if !root.backing-up : Button {
+                        text: "Back up to phone";
+                        enabled: !root.busy;
+                        clicked => { root.backup(); }
+                    }
+                    if root.backing-up : Button {
+                        text: "Cancel";
+                        clicked => { root.stop-backup(); }
+                    }
+                }
+
+                if root.enrolled && root.backing-up && root.code.width > 0 : HorizontalLayout {
+                    alignment: start;
+                    Image {
+                        source: root.code;
+                        image-rendering: pixelated;
+                        width: 240px;
+                        height: self.width;
                     }
                 }
 

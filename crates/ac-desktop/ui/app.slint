@@ -164,10 +164,16 @@ export component MainWindow inherits Window {
     // Raised once at startup for a node that has never enrolled, and lowered for good the
     // moment the dialog is closed, whether it enrolled or was waved away.
     in-out property <bool> show-enrol;
-    // What that dialog is showing: the form, the wait, or what it settled as.
+    // What that dialog is showing: the identity step, the restore code, the server form, the
+    // wait, or what it settled as.
     in-out property <int> enrol-phase;
     in-out property <string> enrol-error;
     in-out property <string> enrol-summary;
+    // Whether the dialog holds an identity restored from the phone, and the name it came with.
+    in-out property <bool> enrol-restored;
+    in-out property <string> enrol-username;
+    // Whether Settings is waiting for a phone to take a backup.
+    in-out property <bool> backing-up;
     // Starting with the session. Hidden where the platform has no way to.
     in-out property <bool> autostart-supported;
     in-out property <bool> autostart;
@@ -204,6 +210,12 @@ export component MainWindow inherits Window {
     callback open-logs();
     callback restart();
     callback join(string, string);
+    callback enrol-new();
+    callback enrol-restore();
+    callback enrol-continue();
+    callback backup();
+    // Gives up on the restore or backup code on screen.
+    callback stop-phone-code();
     callback copy-peer-id();
     callback sort-pick-group(int);
     callback sort-pick-folder(int);
@@ -438,8 +450,13 @@ export component MainWindow inherits Window {
                 autostart-supported: root.autostart-supported;
                 autostart <=> root.autostart;
                 autostart-warning: root.autostart-warning;
+                backing-up: root.backing-up;
+                code: root.pairing-code;
                 busy: root.busy;
                 vertical-stretch: 1;
+
+                backup() => { root.backup(); }
+                stop-backup() => { root.stop-phone-code(); }
 
                 save(m, r, s, b) => { root.save(m, r, s, b); }
                 set-autostart(on) => { root.set-autostart(on); }
@@ -509,7 +526,15 @@ export component MainWindow inherits Window {
         phase: root.enrol-phase;
         error: root.enrol-error;
         summary: root.enrol-summary;
+        code: root.pairing-code;
+        restored: root.enrol-restored;
+        who-text <=> root.enrol-username;
+        new-identity => { root.enrol-new(); }
+        restore => { root.enrol-restore(); }
+        stop-restoring => { root.stop-phone-code(); }
         enrol(t, u) => { root.join(t, u); }
-        dismissed => { root.show-enrol = false; }
+        continue-restored => { root.enrol-continue(); }
+        // Closing it gives up on a restore code still waiting for the phone.
+        dismissed => { root.stop-phone-code(); root.show-enrol = false; }
     }
 }
