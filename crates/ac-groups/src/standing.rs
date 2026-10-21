@@ -205,6 +205,13 @@ impl StandingSet {
         self.0.iter().map(|(p, h)| (p, h.seq, h.position))
     }
 
+    /// Each member's winning statement, with what it decoded to.
+    pub fn entries(&self) -> impl Iterator<Item = (&PeerId, &Standing, u64, Position, &str)> {
+        self.0
+            .iter()
+            .map(|(p, h)| (p, &h.standing, h.seq, h.position, h.username.as_str()))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
