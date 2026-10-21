@@ -289,15 +289,12 @@ impl GroupSync {
 
     /// Say what changed, where it changed.
     fn report(&self, group: GroupId, applied: &Applied) {
-        let name = self
-            .store
-            .get(group)
-            .ok()
-            .flatten()
-            .map(|r| r.name)
-            .unwrap_or_default();
+        let row = self.store.get(group).ok().flatten();
+        let pending = matches!(&row, Some(r) if r.state == State::Pending);
+        let name = row.map(|r| r.name).unwrap_or_default();
 
-        if applied.we_joined {
+        // A group adopted as active or left was answered before, on another home.
+        if applied.we_joined && pending {
             tracing::info!(%group, %name, "invited to a group; accept it with `ac group accept`");
         }
         if applied.we_lost {

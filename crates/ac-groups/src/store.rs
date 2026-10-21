@@ -673,7 +673,8 @@ impl Groups {
         Ok(())
     }
 
-    /// Store a group we have never seen, from someone else's offer.
+    /// Store a group we have never seen, from someone else's offer. Its state follows our own
+    /// winning standing among `standings`, so a restored node gets back the groups it was in.
     pub fn adopt(
         &mut self,
         entries: &[Entry],
@@ -685,6 +686,7 @@ impl Groups {
         if self.get(id)?.is_some() {
             return self.put(id, 0, entries, standings, now);
         }
+        let state = adopted_state(&chain, standings, &self.me);
 
         let tx = self
             .db
@@ -692,11 +694,12 @@ impl Groups {
         tx.execute(
             "INSERT INTO groups (group_id, name, admin, state, head_seq, head_hash,
                                  standings_digest, first_seen, last_synced)
-             VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?5, ?6, ?6)",
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?7)",
             params![
                 id.to_string(),
                 chain.name(),
                 chain.admin().to_base58(),
+                state.as_str(),
                 EntryHash::of_body(&[]).to_string(),
                 hex::encode([0u8; 32]),
                 now,
@@ -723,6 +726,33 @@ impl Groups {
         rebuild_caches(&tx, group, &chain, &set)?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+/// The consent our own winning standing records, for a chain that still names us.
+fn adopted_state(chain: &Chain, standings: &[Standing], me: &PeerId) -> State {
+    if !chain.fold().contains(me) {
+        return State::Pending;
+    }
+    let mut ours = StandingSet::default();
+    for standing in standings {
+        let Ok(body) = standing.verify(chain.id()) else {
+            continue;
+        };
+        if body.peer.parse::<PeerId>().ok().as_ref() == Some(me) {
+            ours.insert(
+                *me,
+                standing.clone(),
+                body.seq,
+                body.position,
+                body.username,
+            );
+        }
+    }
+    match ours.latest(me) {
+        Some((_, Position::In)) => State::Active,
+        Some((_, Position::Out)) => State::Left,
+        Some((_, Position::Unanswered)) | None => State::Pending,
     }
 }
 
@@ -1312,6 +1342,68 @@ mod tests {
             .unwrap();
         assert_eq!(mine.get(id).unwrap().unwrap().state, State::Active);
         assert_eq!(mine.shared_with(&peer_of(&admin)).unwrap().len(), 1);
+    }
+
+    /// Adopt, as `me`, a group naming `me` that comes with `mine` as our own standings.
+    fn adopt_with_own(mine: &[Position]) -> (Groups, GroupId) {
+        let admin = key();
+        let me = key();
+        let mut theirs = Groups::in_memory(peer_of(&admin)).unwrap();
+        let id = theirs.create(&admin, "family", "alice", AT).unwrap();
+        add(&mut theirs, &admin, id, peer_of(&me), "bob");
+        let entries: Vec<Entry> = theirs.chain(id).unwrap().entries().cloned().collect();
+        let standings: Vec<Standing> = mine
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Standing::author(&me, id, i as u64 + 1, *p, "bob", AT).unwrap())
+            .collect();
+
+        let mut fresh = Groups::in_memory(peer_of(&me)).unwrap();
+        fresh.adopt(&entries, &standings, AT).unwrap();
+        (fresh, id)
+    }
+
+    #[test]
+    fn adopting_follows_our_own_winning_standing() {
+        let state = |mine: &[Position]| {
+            let (store, id) = adopt_with_own(mine);
+            store.get(id).unwrap().unwrap().state
+        };
+        assert_eq!(state(&[Position::In]), State::Active);
+        assert_eq!(state(&[Position::Out]), State::Left);
+        assert_eq!(state(&[Position::Unanswered]), State::Pending);
+        assert_eq!(state(&[]), State::Pending);
+        assert_eq!(
+            state(&[Position::Unanswered, Position::In, Position::Out]),
+            State::Left,
+            "the latest word wins, not the first"
+        );
+    }
+
+    #[test]
+    fn a_group_adopted_as_active_is_shared_at_once() {
+        let (store, id) = adopt_with_own(&[Position::In]);
+        let admin = store.get(id).unwrap().unwrap().admin;
+        assert_eq!(store.shared_with(&admin).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn someone_elses_standing_does_not_set_our_consent() {
+        let admin = key();
+        let me = key();
+        let mut theirs = Groups::in_memory(peer_of(&admin)).unwrap();
+        let id = theirs.create(&admin, "family", "alice", AT).unwrap();
+        add(&mut theirs, &admin, id, peer_of(&me), "bob");
+        let entries: Vec<Entry> = theirs.chain(id).unwrap().entries().cloned().collect();
+        let standings = theirs.standings(id).unwrap();
+
+        let mut fresh = Groups::in_memory(peer_of(&me)).unwrap();
+        fresh.adopt(&entries, &standings, AT).unwrap();
+        assert_eq!(
+            fresh.get(id).unwrap().unwrap().state,
+            State::Pending,
+            "the admin's `In` is the admin's, not ours"
+        );
     }
 
     #[test]

@@ -357,6 +357,93 @@ fn receiving_an_invitation_is_answered_in_writing_and_only_once() {
 }
 
 #[test]
+fn a_restored_node_gets_its_groups_back_as_it_left_them() {
+    let (mut admin, mut member, kept) = admin_and_member();
+    let left = admin
+        .sync
+        .store_mut()
+        .create(&admin.key, "work", "alice", AT)
+        .unwrap();
+    add(&mut admin, left, member.peer(), "bob");
+    join(&mut admin, &mut member, kept);
+    member
+        .sync
+        .store_mut()
+        .author_standing(&member.key, left, Position::In, "someone", AT)
+        .unwrap();
+    member
+        .sync
+        .store_mut()
+        .author_standing(&member.key, left, Position::Out, "someone", AT)
+        .unwrap();
+    connect(&mut admin, &mut member);
+    assert!(
+        !admin
+            .sync
+            .store()
+            .members(left)
+            .unwrap()
+            .contains(&member.peer()),
+        "the admin ratified the departure"
+    );
+
+    // The same key on an empty home.
+    let mut restored = Node {
+        sync: sync_for(&member.key),
+        admitted_peers: AdmittedPeers::default(),
+        key: member.key.clone(),
+    };
+    connect(&mut admin, &mut restored);
+
+    let row = restored.sync.store().get(kept).unwrap().unwrap();
+    assert_eq!(row.state, State::Active, "its own `In` came back with it");
+    let mine = restored
+        .sync
+        .store()
+        .standings(kept)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.subject().unwrap() == restored.peer())
+        .unwrap();
+    assert_eq!(
+        mine.verify(kept).unwrap().position,
+        Position::In,
+        "and no `Unanswered` was written over it"
+    );
+    assert!(
+        restored.sync.store().get(left).unwrap().is_none(),
+        "a group it was removed from is not offered back"
+    );
+}
+
+#[test]
+fn a_restored_node_that_left_before_the_removal_gets_the_group_back_as_left() {
+    let (mut admin, mut member, id) = admin_and_member();
+    let mut other = Node::new();
+    add(&mut admin, id, other.peer(), "carol");
+    connect(&mut admin, &mut other);
+    join(&mut admin, &mut member, id);
+    // The `Out` reaches a fellow member, but not yet the admin who would ratify it.
+    member
+        .sync
+        .store_mut()
+        .author_standing(&member.key, id, Position::Out, "someone", AT)
+        .unwrap();
+    connect(&mut member, &mut other);
+
+    let mut restored = Node {
+        sync: sync_for(&member.key),
+        admitted_peers: AdmittedPeers::default(),
+        key: member.key.clone(),
+    };
+    connect(&mut other, &mut restored);
+    assert_eq!(
+        restored.sync.store().get(id).unwrap().unwrap().state,
+        State::Left
+    );
+}
+
+#[test]
 fn an_answer_never_provokes_another_question() {
     // Answering a set of heads with a question of our own would volley forever. `settle` panics
     // if the exchange does not terminate, so this is also checked by every other test here.
