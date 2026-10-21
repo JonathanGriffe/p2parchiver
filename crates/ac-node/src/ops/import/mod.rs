@@ -29,8 +29,7 @@ pub use fetch::{Brought, Fetched, Outcome, Pace, Pump, drain, pump};
 pub use scan::{Scanned, pollable, scan, scan_with};
 pub use sources::{
     Configured, Picked, Setting, add_source, authorize, available, from_folder, implementation,
-    open_source, remove_source, set_setting, settings, settings_with, showing, sources,
-    sources_with, stop_signing_in, tidy,
+    open_source, remove_source, set_setting, settings, settings_with, sources, sources_with, tidy,
 };
 
 /// Where imported files wait to be sorted. The leading dot is what keeps it out of the way of

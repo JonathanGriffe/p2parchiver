@@ -210,7 +210,7 @@ fn also_ignored(ignored: u64) -> String {
 }
 
 fn pairing_code() -> Option<slint::Image> {
-    let qr = ops::import::showing()?;
+    let qr = ops::prompt::showing()?;
     const QUIET: usize = 4;
 
     let side = qr.size + QUIET * 2;
@@ -398,7 +398,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
     // Closing the dialog gives up on whatever it was waiting for. The work thread wakes,
     // reports that it was stopped, and clears `source-adding` on its way out — so nothing is
     // left disabled by a window somebody shut.
-    window.on_stop_adding(ops::import::stop_signing_in);
+    window.on_stop_adding(ops::prompt::stop);
 
     window.on_add_source({
         let weak = weak.clone();
