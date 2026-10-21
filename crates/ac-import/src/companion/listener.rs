@@ -1,8 +1,8 @@
-//! The one thing this node serves: a place for a phone to say where it is.
+//! The one thing this node serves: a place for a phone to say where it is, and to answer a
+//! code on screen, to pair, back up or restore.
 //!
-//! Two calls, both tiny, both from a device that has already been paired. It never receives a
-//! photograph — the desktop fetches those — so nothing here streams and everything has a hard
-//! ceiling on its size.
+//! Every call is tiny. It never receives a photograph — the desktop fetches those — so nothing
+//! here streams and everything has a hard ceiling on its size.
 //!
 //! ## Why it speaks TLS
 //!
@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use serde_json::Value;
 
+use super::Code;
 use crate::source::{Result, SourceError};
 
 /// Nothing here is large. A phone sends a few hundred bytes and anything claiming more is
@@ -51,8 +53,6 @@ const IDLE: Duration = Duration::from_secs(10);
 /// phone taken out of the house stops being scanned well inside the 16-hour cadence.
 pub const FRESH: Duration = Duration::from_secs(5 * 60);
 
-
-
 /// Where a phone last said it could be found. Written by the listener, read by `reachable`.
 static SEEN: OnceLock<Mutex<HashMap<String, Seen>>> = OnceLock::new();
 
@@ -68,15 +68,17 @@ static LISTENING: AtomicBool = AtomicBool::new(false);
 /// be describing the first one for ever.
 static SERVING: Mutex<Option<Serving>> = Mutex::new(None);
 
-/// Whether the pairing that just ended was stopped rather than lapsed. Read once, by the
-/// wait it belongs to, while that wait still holds the only claim on the slot.
-static STOPPED: AtomicBool = AtomicBool::new(false);
-
-/// The one pairing that may be completed right now, if any.
+/// The one code a phone may answer right now, if any: a pairing, a backup or a restore.
 ///
 /// One at a time on purpose: two QRs on one screen is not a thing that happens, and a single
 /// slot means a phone's answer can only ever belong to the request a person is looking at.
-static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+static OPEN: Mutex<Option<Open>> = Mutex::new(None);
+
+/// Answers a phone checking in with which phone it is, or `None` if it is not one of ours.
+pub(crate) type Hello = fn(&str, IpAddr) -> Option<String>;
+
+/// What a source handed over to answer check-ins. Until one has, every hello is refused.
+static HELLO: Mutex<Option<Hello>> = Mutex::new(None);
 
 #[derive(Debug, Clone)]
 pub struct Serving {
@@ -89,38 +91,14 @@ pub struct Serving {
     pub fingerprint: String,
 }
 
-/// How a wait ended.
-#[derive(Debug)]
-pub enum Waited {
-    /// A phone scanned the code and answered.
-    Paired(Box<Paired>),
-    /// Somebody closed the dialog, or pressed Cancel.
-    Stopped,
-    /// Nobody scanned it in time.
-    Expired,
-}
-
-struct Pending {
-    token: String,
-    /// Filled in by the phone that answers, and taken by whoever is waiting.
-    answered: std::sync::mpsc::Sender<Paired>,
-}
-
-/// What a phone says about itself when it pairs.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct Paired {
-    /// Stable for this device, and what a source is bound to ever after.
-    pub id: String,
-    /// What to call it on screen.
-    #[serde(default)]
-    pub name: String,
-    /// Which port it serves its camera roll on.
-    pub port: u16,
-    /// Its certificate, PEM, which this node pins for every later connection.
-    pub cert: String,
-    /// Not from the body: where the pairing request came from.
-    #[serde(skip)]
-    pub address: String,
+/// A code on screen, waiting for a `POST` to its path carrying `token`.
+pub struct Open {
+    pub code: Code,
+    pub token: String,
+    /// The body of a `200`, or `None` for a `204`. Secret for a backup, so never logged.
+    pub reply: Option<String>,
+    /// Reads the answer and hands the result to whoever is waiting. False if it was unusable.
+    pub answer: Box<dyn FnOnce(Value, IpAddr) -> bool + Send>,
 }
 
 /// Where this node is answering, once it is.
@@ -136,101 +114,134 @@ pub fn serving() -> Option<Serving> {
 #[cfg(test)]
 pub(crate) static ONE_LISTENER: Mutex<()> = Mutex::new(());
 
-/// Wait for a phone to pair with this token, or give up.
+/// Open a code for a phone to answer.
 ///
 /// The token is the one already on screen: a phone that has not seen it cannot answer, which
 /// is the whole of what makes an open listener safe to leave running.
 ///
-/// One at a time, and the second caller is refused rather than allowed to replace the first.
-/// Two codes on two screens would be one of them silently unanswerable, and whoever was
-/// looking at it would have no way to know which.
-pub fn expect(token: &str, until: Duration) -> Result<Waited> {
-    let (answered, arrives) = std::sync::mpsc::channel();
-    {
-        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-        if pending.is_some() {
-            return Err(SourceError::Failed(
-                "another phone is being paired right now; finish that one first".to_owned(),
-            ));
-        }
-        STOPPED.store(false, Ordering::SeqCst);
-        *pending = Some(Pending {
-            token: token.to_owned(),
-            answered,
-        });
+/// One at a time, and the second is refused rather than allowed to replace the first. Two
+/// codes on two screens would be one of them silently unanswerable, and whoever was looking
+/// at it would have no way to know which.
+pub fn open(code: Open) -> Result<()> {
+    let mut slot_lock = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    if slot_lock.is_some() {
+        return Err(SourceError::Failed(
+            "another code is waiting for a phone right now; finish that one first".to_owned(),
+        ));
     }
-
-    let waited = match arrives.recv_timeout(until) {
-        Ok(paired) => Waited::Paired(Box::new(paired)),
-        // Disconnected rather than timed out means the sender went with the pending slot,
-        // which is [`cancel`] and nothing else.
-        Err(_) if STOPPED.load(Ordering::SeqCst) => Waited::Stopped,
-        Err(_) => Waited::Expired,
-    };
-
-    // Whatever happened, this token is spent: a second phone cannot answer a QR that has
-    // already been used, and one that lapsed must not be answerable later.
-    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    Ok(waited)
+    *slot_lock = Some(code);
+    Ok(())
 }
 
-/// Stop waiting, now.
+/// Take the open code down, so nothing can answer it.
 ///
-/// Dropping the pending slot drops the sender with it, so whoever is waiting wakes at once
-/// rather than sitting out the rest of its three minutes. Without this, closing the dialog
-/// would leave the button that opened it disabled until the wait gave up on its own.
-pub fn cancel() {
-    STOPPED.store(true, Ordering::SeqCst);
-    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+/// Dropping it drops its `answer`, so whoever is still waiting wakes at once rather than
+/// sitting out the rest of its three minutes.
+pub fn close() {
+    *OPEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Have `on_hello` answer phones checking in.
+pub(crate) fn hear(on_hello: Hello) {
+    *HELLO.lock().unwrap_or_else(|e| e.into_inner()) = Some(on_hello);
+}
+
+/// Which phone a hello is from, as the handler a source handed over says.
+fn hello_from(body: &str, from: IpAddr) -> Option<String> {
+    let on_hello = (*HELLO.lock().unwrap_or_else(|e| e.into_inner()))?;
+    on_hello(body, from)
+}
+
+/// Say a listener is up without raising one, for a test of what happens once it is.
+#[cfg(test)]
+pub(crate) fn pretend_listening(up: bool) {
+    LISTENING.store(up, Ordering::SeqCst);
 }
 
 /// Raise a listener without the once-per-process guard, which a test binary trips after its
 /// first listener. Held to one at a time by [`ONE_LISTENER`] instead.
 #[cfg(test)]
 pub(crate) fn start_for_test(state: &Path) -> Result<u16> {
-    bring_up(state, |_, _| None)
+    *HELLO.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    bring_up(state)
 }
 
-/// The token a pairing is currently waiting for, if one is. For a test standing in for the
-/// camera that would otherwise have read it off the screen.
+/// Be the phone: post `body` to `route` over the pinned handshake, and read the answer.
+#[cfg(test)]
+pub(crate) fn post_for_test(state: &Path, port: u16, route: &str, body: &str) -> String {
+    use rustls::pki_types::ServerName;
+    use rustls::{ClientConfig, ClientConnection, RootCertStore};
+
+    let (cert, _) = certificate(state).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+    let server = ServerName::try_from(name(state).unwrap()).unwrap();
+    let connection = ClientConnection::new(Arc::new(config), server).unwrap();
+    let socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut tls = StreamOwned::new(connection, socket);
+    write!(
+        tls,
+        "POST {route} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    tls.flush().unwrap();
+    let mut answer = String::new();
+    tls.read_to_string(&mut answer).unwrap();
+    answer
+}
+
+/// The token the open code carries, if one is open. For a test standing in for the camera
+/// that would otherwise have read it off the screen.
 #[cfg(test)]
 pub fn pending_token() -> Option<String> {
-    PENDING
-        .lock()
+    OPEN.lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map(|pending| pending.token.clone())
+        .map(|open_code| open_code.token.clone())
 }
 
-/// A phone answering a QR. `true` when it was the one being waited for.
-fn pair(body: &str, from: IpAddr) -> bool {
-    let Ok(said) = serde_json::from_str::<serde_json::Value>(body) else {
-        return false;
-    };
-    let token = said.get("token").and_then(|t| t.as_str()).unwrap_or_default();
+/// What a phone whose answer was read gets back.
+#[derive(Debug, PartialEq, Eq)]
+enum Reply {
+    /// A `204`.
+    NoContent,
+    /// A `200`, carrying the code's reply.
+    Json(String),
+}
 
-    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(waiting) = pending.as_ref() else {
-        return false;
+/// A phone answering `code`. The reply to send when its answer was read, or `None` for a `403`.
+///
+/// Spent once the token matches, whether or not the answer could be used: only the phone that
+/// scanned the code has the token, and sending again would send the same thing.
+fn exchange(code: Code, body: &str, from: IpAddr) -> Option<Reply> {
+    let body: Value = serde_json::from_str(body).ok()?;
+    let open_code = {
+        let token = body
+            .get("token")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut slot_lock = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        let waiting = slot_lock.as_ref()?;
+        // Compared whole. A token nobody is waiting for, or the wrong one, is not an error
+        // worth explaining to whoever sent it — they are not the person holding the phone.
+        if code != waiting.code || token.is_empty() || token != waiting.token {
+            return None;
+        }
+        slot_lock.take()?
     };
-    // Compared whole. A token nobody is waiting for, or the wrong one, is not an error worth
-    // explaining to whoever sent it — they are not the person holding the phone.
-    if token.is_empty() || token != waiting.token {
-        return false;
-    }
-
-    let Ok(mut paired) = serde_json::from_str::<Paired>(body) else {
-        return false;
+    let reply = match open_code.reply {
+        Some(json) => Reply::Json(json),
+        None => Reply::NoContent,
     };
-    paired.address = format!("{from}:{}", paired.port);
-
-    let sent = waiting.answered.send(paired).is_ok();
-    if sent {
-        // Spent here as well as in `expect`, so a retry cannot land twice even if the waiter
-        // has not woken yet.
-        *pending = None;
-    }
-    sent
+    (open_code.answer)(body, from).then_some(reply)
 }
 
 #[derive(Debug, Clone)]
@@ -275,8 +286,8 @@ pub fn note(device: &str, address: &str) {
 pub enum Asked {
     /// `POST /v1/hello`, with the body.
     Hello(String),
-    /// `POST /v1/pair`, with the body. Answered in step 4; refused until then.
-    Pair(String),
+    /// A `POST` answering a code, to its path, with the body.
+    Code(Code, String),
     /// Understood, and not one of ours.
     Elsewhere,
     /// Not understood at all.
@@ -285,17 +296,17 @@ pub enum Asked {
 
 /// Start the listener, and answer with the port it got.
 ///
-/// Idempotent by way of [`LISTENING`]: a second call while one is up is a no-op rather than a
-/// second socket, because the registry promises at most one start per process and a mistake
-/// there should not become two listeners racing for the same map.
-pub fn start(state: &Path, on_hello: fn(&str, IpAddr) -> Option<String>) -> Result<u16> {
+/// Refused by way of [`LISTENING`] while one is up, rather than a second socket: `serve`
+/// starts it at most once per process, and a mistake there should not become two listeners
+/// racing for the same map.
+pub fn start(state: &Path) -> Result<u16> {
     if LISTENING.swap(true, Ordering::SeqCst) {
         return Err(SourceError::Failed(
             "the phone listener is already running".to_owned(),
         ));
     }
 
-    let outcome = bring_up(state, on_hello);
+    let outcome = bring_up(state);
     if outcome.is_err() {
         // Undone, or a failure at startup would leave `reachable` believing a listener is
         // watching and answering "not here" for every phone for the life of the process.
@@ -304,7 +315,7 @@ pub fn start(state: &Path, on_hello: fn(&str, IpAddr) -> Option<String>) -> Resu
     outcome
 }
 
-fn bring_up(state: &Path, on_hello: fn(&str, IpAddr) -> Option<String>) -> Result<u16> {
+fn bring_up(state: &Path) -> Result<u16> {
     let (cert, key) = certificate(state)?;
     let fingerprint = fingerprint(&cert);
     let tls = Arc::new(server_config(cert, key)?);
@@ -323,7 +334,7 @@ fn bring_up(state: &Path, on_hello: fn(&str, IpAddr) -> Option<String>) -> Resul
                 match stream {
                     // One at a time and inline: a hello is a few hundred bytes, and a phone
                     // that has to wait behind another phone's hello waits microseconds.
-                    Ok(stream) => answer(stream, &tls, on_hello),
+                    Ok(stream) => answer(stream, &tls),
                     Err(error) => tracing::debug!(%error, "a phone connection did not open"),
                 }
             }
@@ -338,7 +349,7 @@ fn bring_up(state: &Path, on_hello: fn(&str, IpAddr) -> Option<String>) -> Resul
 }
 
 /// One connection, from the handshake to the closed socket.
-fn answer(stream: TcpStream, tls: &Arc<ServerConfig>, on_hello: fn(&str, IpAddr) -> Option<String>) {
+fn answer(stream: TcpStream, tls: &Arc<ServerConfig>) {
     let from = match stream.peer_addr() {
         Ok(addr) => addr.ip(),
         Err(error) => {
@@ -359,24 +370,25 @@ fn answer(stream: TcpStream, tls: &Arc<ServerConfig>, on_hello: fn(&str, IpAddr)
     let mut tls = StreamOwned::new(connection, stream);
 
     match read(&mut tls) {
-        Asked::Hello(body) => match on_hello(&body, from) {
+        Asked::Hello(body) => match hello_from(&body, from) {
             Some(device) => {
                 tracing::debug!(device, %from, "a phone says it is here");
-                say(&mut tls, 204, "");
+                say(&mut tls, 204, TEXT, "");
             }
             // Not a phone this node has paired, or a token that has since been replaced.
-            None => say(&mut tls, 403, "no"),
+            None => say(&mut tls, 403, TEXT, "no"),
         },
-        Asked::Pair(body) => match pair(&body, from) {
-            true => say(&mut tls, 204, ""),
-            // Deliberately the same answer for "no pairing is open", "wrong token" and
+        Asked::Code(code, body) => match exchange(code, &body, from) {
+            Some(Reply::NoContent) => say(&mut tls, 204, TEXT, ""),
+            Some(Reply::Json(reply)) => say(&mut tls, 200, JSON, &reply),
+            // Deliberately the same answer for "no code is open", "wrong token" and
             // "unreadable": whoever is asking without the code learns nothing from which.
-            false => say(&mut tls, 403, "no"),
+            None => say(&mut tls, 403, TEXT, "no"),
         },
-        Asked::Elsewhere => say(&mut tls, 404, "no"),
+        Asked::Elsewhere => say(&mut tls, 404, TEXT, "no"),
         Asked::Malformed(why) => {
             tracing::debug!(why, %from, "a connection to the phone listener made no sense");
-            say(&mut tls, 400, why);
+            say(&mut tls, 400, TEXT, why);
         }
     }
 
@@ -444,10 +456,13 @@ pub fn read(from: &mut impl Read) -> Asked {
     };
 
     // The path only; a query string on these would mean nothing.
-    match target.split('?').next().unwrap_or(target) {
-        "/v1/hello" => Asked::Hello(body),
-        "/v1/pair" => Asked::Pair(body),
-        _ => Asked::Elsewhere,
+    let path = target.split('?').next().unwrap_or(target);
+    if path == "/v1/hello" {
+        return Asked::Hello(body);
+    }
+    match Code::at(path) {
+        Some(code) => Asked::Code(code, body),
+        None => Asked::Elsewhere,
     }
 }
 
@@ -473,9 +488,13 @@ fn finish(mut raw: Vec<u8>) -> String {
     String::from_utf8_lossy(&raw).into_owned()
 }
 
+const TEXT: &str = "text/plain";
+const JSON: &str = "application/json";
+
 /// The shortest reply that is still a reply.
-fn say(to: &mut impl Write, status: u16, body: &str) {
+fn say(to: &mut impl Write, status: u16, kind: &str, body: &str) {
     let reason = match status {
+        200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
         403 => "Forbidden",
@@ -484,7 +503,8 @@ fn say(to: &mut impl Write, status: u16, body: &str) {
     };
     let _ = write!(
         to,
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = to.flush();
@@ -762,17 +782,17 @@ mod tests {
             note("round-trip", &format!("{from}:9999"));
             (!body.is_empty()).then(|| body.to_owned())
         }
-        let port = bring_up(dir.path(), heard).unwrap();
+        hear(heard);
+        let port = bring_up(dir.path()).unwrap();
 
         let mut roots = RootCertStore::empty();
         roots.add(cert).unwrap();
-        let config = ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
 
         let server = ServerName::try_from(issued_for).unwrap();
         let connection = ClientConnection::new(Arc::new(config), server).unwrap();
@@ -807,7 +827,8 @@ mod tests {
         fn nobody(_: &str, _: IpAddr) -> Option<String> {
             None
         }
-        let port = bring_up(dir.path(), nobody).unwrap();
+        hear(nobody);
+        let port = bring_up(dir.path()).unwrap();
 
         // Plain TCP: the handshake will fail, which is itself the point — there is no way in
         // without the certificate, let alone without a token.
@@ -818,7 +839,9 @@ mod tests {
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        socket.write_all(b"POST /v1/hello HTTP/1.1\r\n\r\n").unwrap();
+        socket
+            .write_all(b"POST /v1/hello HTTP/1.1\r\n\r\n")
+            .unwrap();
         let mut answer = String::new();
         let _ = socket.read_to_string(&mut answer);
         assert!(
@@ -827,67 +850,148 @@ mod tests {
         );
     }
 
+    /// Open `code` with `token`, and return what its `answer` is handed, if anything ever is.
+    fn waiting(
+        code: Code,
+        token: &str,
+        reply: Option<&str>,
+    ) -> std::sync::mpsc::Receiver<(Value, IpAddr)> {
+        let (send, got) = std::sync::mpsc::channel();
+        open(Open {
+            code,
+            token: token.to_owned(),
+            reply: reply.map(str::to_owned),
+            answer: Box::new(move |body, from| send.send((body, from)).is_ok()),
+        })
+        .unwrap();
+        got
+    }
+
     /// The token on the screen is the whole of what makes an open listener safe: only the
-    /// phone that has seen it can pair, only once, and only while somebody is waiting.
+    /// phone that has seen it can answer, only once, and only while somebody is waiting.
     #[test]
-    fn only_the_phone_that_scanned_the_code_can_pair_and_only_once() {
+    fn only_the_phone_that_scanned_the_code_can_answer_and_only_once() {
+        let _one = ONE_LISTENER.lock().unwrap_or_else(|e| e.into_inner());
         let from: IpAddr = "192.168.1.77".parse().unwrap();
-        let body = |token: &str| {
-            format!(
-                r#"{{"token":"{token}","id":"dev-1","name":"Pixel","port":8443,
-                    "cert":"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----"}}"#
-            )
-        };
+        let body = |token: &str| format!(r#"{{"token":"{token}","id":"dev-1","port":8443}}"#);
 
         // Nobody waiting: an answer to a question that was never asked.
-        assert!(!pair(&body("anything"), from), "no pairing is open");
+        assert!(exchange(Code::Pair, &body("anything"), from).is_none());
 
-        let waiting =
-            std::thread::spawn(move || expect("the-token", Duration::from_secs(10)).unwrap());
-        // The waiter has to have registered before anything can answer it.
-        let mut ready = false;
-        for _ in 0..200 {
-            if PENDING.lock().unwrap().is_some() {
-                ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(ready, "the wait never opened");
-
-        assert!(!pair(&body("wrong-token"), from), "a guess is not a scan");
-        assert!(!pair("not json", from), "nor is nonsense");
-        assert!(pair(&body("the-token"), from), "the one that scanned it");
-
-        let Waited::Paired(paired) = waiting.join().unwrap() else {
-            panic!("the wait was answered");
-        };
-        assert_eq!(paired.id, "dev-1");
-        assert_eq!(paired.name, "Pixel");
-        assert_eq!(
-            paired.address, "192.168.1.77:8443",
-            "the host is the socket's and the port is the phone's"
+        let got = waiting(Code::Pair, "the-token", None);
+        assert!(
+            exchange(Code::Pair, &body("wrong-token"), from).is_none(),
+            "a guess is not a scan"
         );
-        assert!(paired.cert.contains("BEGIN CERTIFICATE"));
+        assert!(
+            exchange(Code::Pair, "not json", from).is_none(),
+            "nor is nonsense"
+        );
+        assert!(
+            exchange(Code::Backup, &body("the-token"), from).is_none(),
+            "nor the right token at another code's path"
+        );
+        assert_eq!(
+            exchange(Code::Pair, &body("the-token"), from),
+            Some(Reply::NoContent)
+        );
+
+        let (read, at) = got.try_recv().expect("the answer was handed over");
+        assert_eq!(
+            read,
+            serde_json::from_str::<Value>(&body("the-token")).unwrap()
+        );
+        assert_eq!(at, from, "with where it came from");
 
         // Spent. A second phone cannot answer a code that has already been used, and neither
         // can the first one twice.
-        assert!(!pair(&body("the-token"), from), "the token was used up");
+        assert!(
+            exchange(Code::Pair, &body("the-token"), from).is_none(),
+            "the token was used up"
+        );
 
-        // A code nobody scans stops being answerable when the wait gives up, rather than
-        // sitting open for whoever finds it later. One test rather than two because there is
-        // one slot in this process, and two tests would race for it.
+        // A code taken down stops being answerable, rather than sitting open for whoever
+        // finds it later.
+        let _got = waiting(Code::Pair, "brief", None);
+        close();
         assert!(
-            matches!(
-                expect("brief", Duration::from_millis(50)).unwrap(),
-                Waited::Expired
-            ),
-            "nothing scanned it"
+            exchange(Code::Pair, &body("brief"), from).is_none(),
+            "a closed code is not a code"
         );
+    }
+
+    #[test]
+    fn an_answer_that_cannot_be_used_is_refused_and_spends_the_code() {
+        let _one = ONE_LISTENER.lock().unwrap_or_else(|e| e.into_inner());
+        let from: IpAddr = "192.168.1.77".parse().unwrap();
+        open(Open {
+            code: Code::Restore,
+            token: "tok".to_owned(),
+            reply: None,
+            answer: Box::new(|_, _| false),
+        })
+        .unwrap();
+
+        assert!(exchange(Code::Restore, r#"{"token":"tok","bad":1}"#, from).is_none());
+        assert!(pending_token().is_none(), "the code is spent");
+    }
+
+    #[test]
+    fn only_one_code_is_open_at_a_time() {
+        let _one = ONE_LISTENER.lock().unwrap_or_else(|e| e.into_inner());
+        let from: IpAddr = "192.168.1.77".parse().unwrap();
+        let _first = waiting(Code::Pair, "first", None);
+
+        let second = open(Open {
+            code: Code::Backup,
+            token: "second".to_owned(),
+            reply: Some("{}".to_owned()),
+            answer: Box::new(|_, _| true),
+        });
+        assert!(second.is_err(), "the first is not replaced");
         assert!(
-            !pair(&body("brief"), from),
-            "a lapsed code is not a code"
+            exchange(Code::Backup, r#"{"token":"second"}"#, from).is_none(),
+            "and the second was never answerable"
         );
+        assert_eq!(pending_token().as_deref(), Some("first"));
+        close();
+    }
+
+    #[test]
+    fn a_backup_answers_its_token_once_with_the_reply() {
+        let _one = ONE_LISTENER.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let port = start_for_test(dir.path()).unwrap();
+        let path = Code::Backup.path();
+
+        let reply = r#"{"v":1,"peer":"p"}"#;
+        let got = waiting(Code::Backup, "tok-b", Some(reply));
+
+        let wrong = post_for_test(dir.path(), port, path, r#"{"token":"guess"}"#);
+        assert!(wrong.starts_with("HTTP/1.1 403"), "{wrong}");
+        assert!(!wrong.contains(reply), "a guess gets nothing: {wrong}");
+
+        let right = post_for_test(dir.path(), port, path, r#"{"token":"tok-b"}"#);
+        assert!(right.starts_with("HTTP/1.1 200"), "{right}");
+        assert!(right.ends_with(&format!("\r\n\r\n{reply}")), "{right}");
+        got.try_recv().expect("the answer was handed over");
+
+        let again = post_for_test(dir.path(), port, path, r#"{"token":"tok-b"}"#);
+        assert!(again.starts_with("HTTP/1.1 403"), "spent: {again}");
+    }
+
+    #[test]
+    fn a_restore_hands_its_whole_body_over() {
+        let _one = ONE_LISTENER.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let port = start_for_test(dir.path()).unwrap();
+
+        let got = waiting(Code::Restore, "tok-r", None);
+        let body = r#"{"token":"tok-r", "backup": {"v":1,  "key":"a2V5"}}"#;
+        let answer = post_for_test(dir.path(), port, Code::Restore.path(), body);
+        assert!(answer.starts_with("HTTP/1.1 204"), "{answer}");
+        let (read, _) = got.try_recv().expect("the answer was handed over");
+        assert_eq!(read, serde_json::from_str::<Value>(body).unwrap());
     }
 
     /// The port outlives a restart because the QR told a phone where to come back to, and

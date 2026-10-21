@@ -59,6 +59,7 @@ Only one daemon may run on a home. `ac run` and the desktop app take a lock on `
 ### Imports
 
 The import link runs the import workflow described in `ac-import` from the daemon's tick:
+- **Services.** At start, each source's service, then the companion app's listener, which pairing, check-ins, backup and restore all answer on. `ac import source add` starts them too, since with no daemon running its process is the one a phone reaches.
 - **Scans.** One at a time, stalest source first, on a blocking thread. A failed scan backs off from 60 s, doubling up to 16 h, and an absent source is tried again after 5 minutes. Both are kept in memory, so a restart scans again.
 - **Fetches.** Up to 8 workers, each claiming 8 references at a time so that a short queue is shared out. Only one goes looking when the queue was last found empty. Workers stop between files, never during one, when the disk is full or the node shuts down.
 - **Tidying.** Each tick removes one-shot sources once all their files are sorted or dropped.

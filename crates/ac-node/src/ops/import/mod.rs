@@ -77,35 +77,20 @@ pub(super) fn ledger_at(db: &Path) -> Result<Ledger> {
     Ledger::open(db).with_context(|| format!("opening the import ledger at {}", db.display()))
 }
 
-/// Start whatever each source needs running for as long as this node is.
+/// Start whatever each source needs for as long as this node runs, then the listener the
+/// companion app answers on, for pairing, check-ins, backup and restore.
 ///
 /// A source that has to be *found* cannot answer "are you there?" by opening a socket every
-/// time it is asked, so it declares something to run once and answers from what that learns.
-/// Here rather than at the first scan because a phone that came home while nothing was
+/// time it is asked, so it declares something to set up once and answers from what that
+/// learns. Here rather than at the first scan because a phone that came home while nothing was
 /// listening would be invisible until something else woke the question.
 ///
 /// **A service that will not start is not a failed node.** It is logged and stepped over: the
 /// source it belongs to will simply never be reachable, and every other source still works.
 /// A listener that cannot bind must not be the reason a folder import stops happening.
 pub fn start_services(paths: &Paths) {
-    // Who this node is, for a source that has to be findable again after its address moves.
-    // Not fatal if it cannot be read: a service that needs it will say so, and the ones that
-    // do not are unaffected.
     let db = paths.db_file();
-    let id = match node_id(paths) {
-        Ok(id) => id,
-        Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "could not read this node's id");
-            String::new()
-        }
-    };
-
-    let node = ac_import::registry::NodeInfo {
-        db: &db,
-        state: &paths.root,
-        id: &id,
-    };
-
+    let node = ac_import::registry::NodeInfo { db: &db };
     for entry in available().iter().filter(|entry| entry.serves()) {
         match entry.start(node) {
             Ok(()) => tracing::debug!(source = entry.name, "started its service"),
@@ -115,6 +100,22 @@ pub fn start_services(paths: &Paths) {
                 "could not start this source's service; it will not be reachable"
             ),
         }
+    }
+
+    // After the services, so a phone's first check-in finds what answers it. The id is only
+    // named in the codes, so a node that cannot read it still listens.
+    let id = match node_id(paths) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "could not read this node's id");
+            String::new()
+        }
+    };
+    if let Err(error) = ac_import::companion::serve(&paths.root, &id) {
+        tracing::warn!(
+            error = %error,
+            "could not listen for the companion app; phones cannot reach this node"
+        );
     }
 }
 

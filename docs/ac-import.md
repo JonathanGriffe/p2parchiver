@@ -11,10 +11,12 @@ Paths below are relative to `crates/ac-import/`.
 - **Settings**: the fields a source declares and the answers stored for them in `src/config.rs`.
 - **Ledger**: the configured sources, the files still owed, and the history of imported files in `src/ledger.rs`.
 - **Verdict**: what to do with a file once its hash is known in `src/verdict.rs`.
-- **Sign-in and HTTP**: OAuth sign-in and token refresh in `src/oauth.rs`, and timeouts for HTTP calls in `src/http.rs`.
+- **Sign-in and HTTP**: OAuth sign-in and token refresh in `src/oauth.rs`, and timeouts and percent-encoding for HTTP calls in `src/http.rs`.
+- **Prompt**: the QR a sign-in or a companion code is showing, and how to stop the wait, in `src/prompt.rs`.
 - **Folder source**: a one-time import of a local file or folder in `src/sources/folder.rs`.
 - **Drive source**: Google Drive, read-only, in `src/sources/drive.rs`.
-- **Phone source**: a companion app on the same Wi-Fi in `src/sources/phone.rs`, and the listener phones pair and check in with in `src/sources/phone/listener.rs`.
+- **Phone source**: a companion app on the same Wi-Fi in `src/sources/phone.rs`.
+- **Companion app**: the codes the app scans to pair, back a node up or restore it, and the listener it answers them and checks in on, in `src/companion/`.
 
 ## Design
 
@@ -77,8 +79,10 @@ Read-only. Signing in goes through the browser, with OAuth redirecting to a loca
 ### Phone
 
 A companion app on the same Wi-Fi runs a server, and the node reads from it like any other source.
-- **Pairing.** The node shows a QR code holding its address, its listener's port and certificate fingerprint, its peer id and a single-use token, and waits up to 3 minutes. The phone answers on the listener with its id, name, port and certificate, which the node stores.
-- **Presence.** The phone checks in with the listener about once a minute, and counts as present for 5 minutes after its last check-in. Its address is taken from where the check-in came from.
+- **Pairing.** The node shows a QR code, `ac://pair?v=1&a=…&p=…&i=…&t=…&f=…&n=…`, holding its address, its listener's port, its peer id, a single-use token, and its certificate's fingerprint and name, and waits up to 3 minutes. The phone answers `POST /v1/pair` on the listener with the token and its id, name, port and certificate, which the node stores.
+- **Codes.** `companion::ask` shows a code and waits for the phone that answers it. Pairing uses it, and `ac-node` uses it for backup and restore. The caller passes a `read` function: once a body's token matches the open code, the listener parses the body once and hands it to `read` with the address it came from, and the caller gets back what `read` made of it or the reason it refused. A backup shows `ac://backup`, with the same fields as pairing, and answers `POST /v1/backup` with `200` and the payload it was handed. A restore shows `ac://restore`, without `i`, and answers `POST /v1/restore` with `204`. A wrong or spent token gets `403`, the same as a refused pairing. A matching token can only come from the phone that scanned the code, so it spends the code either way: a body `read` refuses gets `403`, and the wait ends at once with the reason. Only one code is open at a time. Each waits 3 minutes, and Cancel or closing the dialog stops it, which the caller sees as stopped rather than as an error.
+- **Starting.** `ac-node` calls `companion::serve` on every node start, after the sources' services, so backup and restore depend on no source. The peer id in codes is the one the last `serve` was given, so after a restore restarts the node the codes name the restored key. The listener itself starts once per process and outlives a node restart.
+- **Presence.** The phone checks in with the listener about once a minute, and counts as present for 5 minutes after its last check-in. Its address is taken from where the check-in came from. The phone source's service hands the listener what answers a check-in, and until it has, every check-in is refused.
 - **Reading.** The node calls the phone over HTTPS, trusting only the certificate it paired with, at a stable name mapped to the phone's last known address, so a new IP from the router does not break the pin. A `404` or `410` means the file is gone, and a `401` or `403` means the phone needs pairing again.
 - **The listener** is a small HTTPS server the node runs with a self-signed certificate. Its port stays the same across restarts, since phones were told it at pairing, and it does not start if it cannot get that port back. Its HTTP is written by hand, to avoid a second TLS stack, and accepts little: one request per connection, at most 64 headers and an 8 KiB body, no chunked encoding.
 
