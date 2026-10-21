@@ -1,4 +1,4 @@
-//! How long a call may hang before it is given up on.
+//! How long a call may hang before it is given up on, and how to put a value in its URL.
 //!
 //! ureq sets no timeouts of its own — every field of its `Timeouts` is `None` bar the wait
 //! for a 100-continue — so a host that accepts the connection and then says nothing holds the
@@ -46,6 +46,21 @@ pub fn agent() -> ureq::Agent {
     ureq::Agent::new_with_config(bounded(Config::builder()).build())
 }
 
+/// Percent-encoding, keeping only what every reading of the standard leaves alone. An id is
+/// the phone's to choose, so it has to survive being put in a path.
+pub(crate) fn encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +80,11 @@ mod tests {
             timeouts.recv_body, None,
             "a body has no total: a video is as long as it is"
         );
+    }
+
+    #[test]
+    fn an_id_the_phone_chose_survives_being_put_in_a_url() {
+        assert_eq!(encode("media-store/42 891"), "media-store%2F42%20891");
+        assert_eq!(encode("plain-Id_1.0~"), "plain-Id_1.0~");
     }
 }

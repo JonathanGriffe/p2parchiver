@@ -79,7 +79,7 @@ impl Watching {
 
 /// A QR as text. Two characters per cell, because a terminal cell is about half as wide as it
 /// is tall and a squashed code will not scan.
-fn as_blocks(qr: &ac_import::registry::Qr) -> String {
+fn as_blocks(qr: &ac_import::prompt::Qr) -> String {
     const QUIET: usize = 2;
 
     let mut out = String::new();

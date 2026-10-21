@@ -1,9 +1,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod companion;
 pub mod config;
 pub mod http;
 pub mod ledger;
 pub mod oauth;
+pub mod prompt;
 pub mod registry;
 pub mod source;
 pub mod verdict;

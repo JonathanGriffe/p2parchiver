@@ -434,14 +434,14 @@ fn slug(name: &str) -> Option<String> {
 
 /// What this build can import from, and what each one has to be told.
 /// What a sign-in is asking somebody to look at, if one is waiting.
-pub fn showing() -> Option<ac_import::registry::Qr> {
-    ac_import::registry::showing()
+pub fn showing() -> Option<ac_import::prompt::Qr> {
+    ac_import::prompt::showing()
 }
 
 /// Give up on a sign-in that is waiting on somebody, because they closed the window it was
 /// asking through. Safe to call when nothing is waiting.
 pub fn stop_signing_in() {
-    ac_import::registry::stop();
+    ac_import::prompt::stop();
 }
 
 #[cfg(test)]
