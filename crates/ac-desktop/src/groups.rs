@@ -35,6 +35,10 @@ pub struct Detail {
     pub content: String,
     pub dir: String,
     pub admin: bool,
+    /// The admin, not yet left: whether Add member is offered.
+    pub can_add: bool,
+    /// What the Leave confirm says, which is what `ac group leave` prints.
+    pub leave_warning: String,
     pub members: Vec<MemberItem>,
     /// Who the Add dialog offers, in the Peers page's two lists less this group's members.
     pub candidates: peers::Page,
@@ -158,30 +162,12 @@ fn present(
     let members = detail
         .members
         .iter()
-        .map(|member| {
-            // The same notes `ac group show` puts after a member, in the same order.
-            let mut notes = Vec::new();
-            if member.is_admin {
-                notes.push("admin");
-            }
-            if member.is_me {
-                notes.push("this node");
-            }
-            if member.departed {
-                notes.push("has left, awaiting removal");
-            } else if !member.answered && !member.is_me {
-                // Named in the chain, silent so far. Either they have not been reached yet or
-                // they have the invitation and have not decided.
-                notes.push("invited, no answer yet");
-            }
-
-            MemberItem {
-                username: name_for(member, known).into(),
-                peer: member.peer.to_string().into(),
-                note: notes.join(", ").into(),
-                departed: member.departed,
-                is_me: member.is_me,
-            }
+        .map(|member| MemberItem {
+            username: name_for(member, known).into(),
+            peer: member.peer.to_string().into(),
+            note: member.notes().join(", ").into(),
+            departed: member.departed,
+            is_me: member.is_me,
         })
         .collect();
 
@@ -193,6 +179,8 @@ fn present(
         content,
         dir,
         admin: detail.is_admin,
+        can_add: detail.can_add,
+        leave_warning: ops::group::leave_warning(detail.is_admin).to_owned(),
         candidates: candidates(directory, &detail.members),
         members,
     }
@@ -229,6 +217,8 @@ pub fn apply(window: &MainWindow, page: Page) {
     window.set_group_content(detail.content.into());
     window.set_group_dir(detail.dir.into());
     window.set_group_admin(detail.admin);
+    window.set_group_can_add(detail.can_add);
+    window.set_group_leave_warning(detail.leave_warning.into());
     window.set_group_members(ModelRc::from(Rc::new(VecModel::from(detail.members))));
     window.set_group_add_contacts(ModelRc::from(Rc::new(VecModel::from(
         detail.candidates.contacts,
@@ -554,10 +544,15 @@ pub mod tests {
         window.set_group_add_contacts(model(vec![candidate("ana", "12D3-ana")]));
         window.set_group_add_discovered(model(vec![candidate("~ bo", "12D3-bo")]));
 
-        window.set_group_admin(false);
-        assert_eq!(showing("Add member"), 0, "not this node's group to add to");
-
         window.set_group_admin(true);
+        window.set_group_can_add(false);
+        assert_eq!(
+            showing("Add member"),
+            0,
+            "not this node's group to add to, or left"
+        );
+
+        window.set_group_can_add(true);
         assert_eq!(showing("Add member"), 1);
         assert_eq!(showing("Add to holiday"), 0, "not until it is asked for");
 
@@ -673,6 +668,8 @@ pub mod tests {
         let detail = page(&paths, &id).detail.unwrap();
         assert_eq!(detail.membership, MEMBER, "so Leave is offered");
         assert!(detail.admin);
+        assert!(detail.can_add);
+        assert_eq!(detail.leave_warning, ops::group::leave_warning(true));
 
         // What the Leave button calls.
         assert!(matches!(
@@ -707,6 +704,35 @@ pub mod tests {
 
         window.set_group_membership(GONE);
         assert_eq!(showing("Leave"), 0);
+    }
+
+    /// The confirm says what Rust hands it, word for word.
+    #[test]
+    fn the_leave_confirm_shows_the_warning_the_cli_prints() {
+        use i_slint_backend_testing::ElementHandle;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().unwrap();
+        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(1600., 800.));
+        window.set_tab(1);
+        window.set_selected_group("holiday-id".into());
+        window.set_group_name("holiday".into());
+        // An invitation's Leave is a std Button, which the testing backend can press.
+        window.set_group_membership(INVITED);
+        let warning = ops::group::leave_warning(false);
+        window.set_group_leave_warning(warning.into());
+
+        ElementHandle::find_by_accessible_label(&window, "Leave")
+            .next()
+            .unwrap()
+            .invoke_accessible_default_action();
+
+        assert_eq!(showing("Leave holiday?"), 1);
+        assert_eq!(showing(warning), 1);
     }
 
     #[test]

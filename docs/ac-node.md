@@ -69,7 +69,9 @@ Sorting moves the bytes into the group, copying them if the group is on another 
 
 `ac join` decodes the invite token and enrols with the server under the chosen username, giving up after 30 s. It checks the attestation it gets back against this node and the server's peer id from the token. Then it keeps one of the server's service addresses as `server` in the config, preferring the same host over QUIC, then the same host, then QUIC, then the first offered. From then on, the node trusts only that server.
 
-Creating or accepting a group needs the username from the attestation, and adding or removing members needs to be the admin. An admin leaves a group as any member does, with an `Out` standing, and the group is `left`. After that it cannot accept the group again, nor add members to it. A group cannot be forgotten by hand.
+Creating or accepting a group needs the username from the attestation, and adding or removing members needs to be the admin. An admin leaves a group as any member does, with an `Out` standing, and the group is `left`. After that it cannot accept the group again, nor add members to it. Both checks read its own signed standing, not the group's state, so they still hold when the `Out` comes back from a peer and the group is `pending` again. A group cannot be forgotten by hand.
+
+The CLI and the desktop take their shared wording from `ops`: the notes after each member, and the warning about what leaving means. An admin that has left is noted as "has left", since the removal other members wait for never comes for an admin.
 
 Adding a file copies it in before recording it, and refuses a second copy of bytes the group already holds. `ac file verify` marks files whose bytes are missing as not held, which puts them back on the download list: it repairs, not just reports. At startup, partial downloads untouched for an hour are swept, unless a transfer could still resume them.
 

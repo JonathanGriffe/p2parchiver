@@ -1,7 +1,7 @@
 use ac_groups::chain::Op;
 use ac_groups::id::GroupId;
 use ac_groups::standing::Position;
-use ac_groups::store::{GroupRow, State};
+use ac_groups::store::{GroupRow, Groups, State};
 use ac_net::PeerId;
 use ac_net::attest;
 use ac_net::config::Paths;
@@ -27,11 +27,35 @@ pub struct MemberView {
     pub username: Option<String>,
     pub is_admin: bool,
     pub is_me: bool,
-    /// Has said they are out, but the admin has not written the removal yet.
+    /// Has said they are out. The admin then writes their removal, except for its own: the
+    /// chain cannot remove its admin, so an admin's `Out` stays a standing.
     pub departed: bool,
     /// Whether they have answered the invitation at all. False while this node holds the
     /// entry that names them but has heard nothing back from them.
     pub answered: bool,
+}
+
+impl MemberView {
+    /// What `ac group show` and the desktop say after a member's name, in this order.
+    pub fn notes(&self) -> Vec<&'static str> {
+        let mut notes = Vec::new();
+        if self.is_admin {
+            notes.push("admin");
+        }
+        if self.is_me {
+            notes.push("this node");
+        }
+        if self.departed {
+            notes.push(if self.is_admin {
+                "has left"
+            } else {
+                "has left, awaiting removal"
+            });
+        } else if !self.answered && !self.is_me {
+            notes.push("invited, no answer yet");
+        }
+        notes
+    }
 }
 
 /// One log entry, or the reason it could not be read. A corrupt entry is shown rather than
@@ -44,6 +68,8 @@ pub enum LogLine {
 pub struct GroupDetail {
     pub row: GroupRow,
     pub is_admin: bool,
+    /// This node is the admin and has not left, so `add` would be allowed.
+    pub can_add: bool,
     pub members: Vec<MemberView>,
     pub log: Option<Vec<LogLine>>,
 }
@@ -138,6 +164,7 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<GroupDetail> {
 
     Ok(GroupDetail {
         is_admin: row.admin == me,
+        can_add: row.admin == me && !left_as_admin(&groups, id, &row, &me)?,
         row,
         members,
         log,
@@ -176,7 +203,7 @@ pub fn add(paths: &Paths, needle: &str, peer: &PeerId) -> Result<Added> {
     let (identity, mut groups) = open(paths)?;
     let (id, row) = resolve(&groups, needle)?;
     require_admin(&row, &identity, "add members")?;
-    if row.state == State::Left {
+    if left_as_admin(&groups, id, &row, &identity.peer_id())? {
         bail!("you left {}, so nobody can be added to it", row.name);
     }
 
@@ -229,13 +256,7 @@ pub fn accept(paths: &Paths, needle: &str) -> Result<Accepted> {
     if row.state == State::Active {
         return Ok(Accepted::Already(row.name));
     }
-    let left_as_admin = row.admin == identity.peer_id()
-        && groups
-            .positions(id)
-            .context("reading positions")?
-            .get(&identity.peer_id())
-            == Some(&Position::Out);
-    if left_as_admin {
+    if left_as_admin(&groups, id, &row, &identity.peer_id())? {
         bail!(
             "you left {} as its admin, and an admin cannot come back",
             row.name
@@ -277,6 +298,25 @@ pub fn leave(paths: &Paths, needle: &str) -> Result<Departed> {
         name: row.name,
         admin: row.admin == identity.peer_id(),
     })
+}
+
+/// What leaving means, said by the desktop before it happens and by the CLI after.
+pub fn leave_warning(admin: bool) -> &'static str {
+    if admin {
+        "This node stops sharing that group immediately. The others are told when they next \
+         connect. You are its admin, so nobody can be added to it afterwards, and you cannot \
+         come back."
+    } else {
+        "This node stops sharing that group immediately, whatever anyone else believes. The \
+         others are told when they next connect, and the admin then makes it official. Being \
+         added again will not undo this, you would accept afresh."
+    }
+}
+
+/// This node is the group's admin, and its own signed standing says it left.
+fn left_as_admin(groups: &Groups, id: GroupId, row: &GroupRow, me: &PeerId) -> Result<bool> {
+    Ok(row.admin == *me
+        && groups.positions(id).context("reading positions")?.get(me) == Some(&Position::Out))
 }
 
 fn require_admin(row: &GroupRow, identity: &Identity, what: &str) -> Result<()> {
@@ -321,7 +361,7 @@ mod tests {
     }
 
     /// A group this node created and has left.
-    fn left_as_admin(paths: &Paths) -> String {
+    fn created_and_left(paths: &Paths) -> String {
         let id = create(paths, "holiday").unwrap().id.to_string();
         leave(paths, &id).unwrap();
         id
@@ -355,7 +395,7 @@ mod tests {
     #[test]
     fn an_admin_that_has_left_cannot_accept_again() {
         let (_tmp, paths) = home();
-        let id = left_as_admin(&paths);
+        let id = created_and_left(&paths);
 
         assert!(accept(&paths, &id).is_err());
 
@@ -366,13 +406,78 @@ mod tests {
     #[test]
     fn an_admin_that_has_left_cannot_add_members() {
         let (_tmp, paths) = home();
-        let id = left_as_admin(&paths);
+        let id = created_and_left(&paths);
         let them = somebody_else();
 
         assert!(add(&paths, &id, &them).is_err());
+        assert!(!show(&paths, &id, false).unwrap().can_add);
 
         let (_, groups) = open(&paths).unwrap();
         let (gid, _) = resolve(&groups, &id).unwrap();
         assert!(!groups.members(gid).unwrap().contains(&them));
+    }
+
+    /// As when the admin's own `Out` comes back from a peer: the row is `pending` again, but
+    /// the standing still says it left.
+    #[test]
+    fn an_admin_whose_row_says_pending_but_who_has_left_cannot_add_members() {
+        let (_tmp, paths) = home();
+        let id = created_and_left(&paths);
+        let them = somebody_else();
+        {
+            let (_, mut groups) = open(&paths).unwrap();
+            let (gid, _) = resolve(&groups, &id).unwrap();
+            groups.set_state(gid, State::Pending).unwrap();
+        }
+
+        assert!(add(&paths, &id, &them).is_err());
+        assert!(!show(&paths, &id, false).unwrap().can_add);
+
+        let (_, groups) = open(&paths).unwrap();
+        let (gid, _) = resolve(&groups, &id).unwrap();
+        assert!(!groups.members(gid).unwrap().contains(&them));
+    }
+
+    #[test]
+    fn an_admin_that_has_not_left_can_add() {
+        let (_tmp, paths) = home();
+        let id = create(&paths, "holiday").unwrap().id.to_string();
+        assert!(show(&paths, &id, false).unwrap().can_add);
+    }
+
+    fn member(is_admin: bool, is_me: bool, departed: bool, answered: bool) -> MemberView {
+        MemberView {
+            peer: somebody_else(),
+            username: None,
+            is_admin,
+            is_me,
+            departed,
+            answered,
+        }
+    }
+
+    #[test]
+    fn an_admin_that_has_left_is_not_said_to_await_a_removal_that_never_comes() {
+        assert_eq!(
+            member(true, false, true, true).notes(),
+            ["admin", "has left"]
+        );
+        assert_eq!(
+            member(false, false, true, true).notes(),
+            ["has left, awaiting removal"]
+        );
+    }
+
+    #[test]
+    fn a_silent_member_is_marked_as_unanswered_unless_it_is_this_node() {
+        assert_eq!(
+            member(false, false, false, false).notes(),
+            ["invited, no answer yet"]
+        );
+        assert_eq!(
+            member(true, true, false, false).notes(),
+            ["admin", "this node"]
+        );
+        assert!(member(false, false, false, true).notes().is_empty());
     }
 }

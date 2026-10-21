@@ -589,6 +589,8 @@ fn the_admin_ratifies_a_departure_exactly_once() {
 }
 
 /// As a restored admin does: its own `Out` comes back from a member, and stays a standing.
+/// The chain's `SelfRemoval` check is what keeps the admin in; ratify's filter only keeps
+/// this expected case out of the warnings, which this test does not observe.
 #[test]
 fn ratifying_ignores_the_admins_own_departure() {
     let (mut admin, mut member, id) = admin_and_member();
@@ -617,7 +619,7 @@ fn ratifying_ignores_the_admins_own_departure() {
     assert_eq!(
         admin.sync.store().get(id).unwrap().unwrap().head_seq,
         before,
-        "and wrote no Remove for itself"
+        "and its log holds no Remove of the admin, which the chain refuses"
     );
     assert!(
         admin

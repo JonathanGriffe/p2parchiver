@@ -99,6 +99,8 @@ export component MainWindow inherits Window {
     in property <string> group-content;
     in property <string> group-dir;
     in property <bool> group-admin;
+    in property <bool> group-can-add;
+    in property <string> group-leave-warning;
     in property <[MemberItem]> group-members;
     // Who the group's Add dialog offers, which is the Peers page's lists less its members.
     in property <[PeerItem]> group-add-contacts;
@@ -328,6 +330,8 @@ export component MainWindow inherits Window {
                 detail-content: root.group-content;
                 detail-dir: root.group-dir;
                 detail-admin: root.group-admin;
+                detail-can-add: root.group-can-add;
+                detail-leave-warning: root.group-leave-warning;
                 members: root.group-members;
                 add-contacts: root.group-add-contacts;
                 add-discovered: root.group-add-discovered;

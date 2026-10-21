@@ -171,6 +171,9 @@ export component GroupsView inherits Rectangle {
     in property <string> detail-content;
     in property <string> detail-dir;
     in property <bool> detail-admin;
+    // The admin, and not one that has left.
+    in property <bool> detail-can-add;
+    in property <string> detail-leave-warning;
     in property <[MemberItem]> members;
     // Who the Add dialog offers: the Peers page's two lists, less this group's members.
     in property <[PeerItem]> add-contacts;
@@ -298,8 +301,8 @@ export component GroupsView inherits Rectangle {
                                 clicked => { root.asking = 1; }
                             }
 
-                            // Adding a member is the admin's job, so only an admin is offered it.
-                            if root.detail-admin : Button {
+                            // Adding a member is the admin's job, until the admin leaves.
+                            if root.detail-can-add : Button {
                                 text: "Add member";
                                 enabled: !root.busy;
                                 clicked => { root.adding = true; }
@@ -395,14 +398,7 @@ export component GroupsView inherits Rectangle {
 
     if root.asking == 1 : Confirm {
         title: "Leave " + root.detail-name + "?";
-        // What `ac group leave` says once it has done it.
-        body: root.detail-admin
-            ? "This node stops sharing that group immediately. The others are told when they "
-                + "next connect. You are its admin, so nobody can be added to it afterwards, "
-                + "and you cannot come back."
-            : "This node stops sharing that group immediately, whatever anyone else believes. "
-                + "The others are told when they next connect, and the admin then makes it "
-                + "official. Being added again will not undo this, you would accept afresh.";
+        body: root.detail-leave-warning;
         verb: "Leave";
         confirmed => { root.asking = 0; root.leave(root.selected); }
         dismissed => { root.asking = 0; }

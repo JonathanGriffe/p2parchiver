@@ -82,16 +82,7 @@ pub fn show(paths: &Paths, needle: &str, log: bool) -> Result<()> {
         .max()
         .unwrap_or(0);
     for member in &detail.members {
-        let mut notes = Vec::new();
-        if member.is_admin {
-            notes.push("admin");
-        }
-        if member.is_me {
-            notes.push("this node");
-        }
-        if member.departed {
-            notes.push("has left, awaiting removal");
-        }
+        let notes = member.notes();
         let note = if notes.is_empty() {
             String::new()
         } else {
@@ -146,21 +137,7 @@ pub fn leave(paths: &Paths, needle: &str) -> Result<()> {
     match ops::group::leave(paths, needle)? {
         Departed::Already(name) => println!("already left {name}"),
         Departed::Left { name, admin } => {
-            println!("left {name}");
-            println!();
-            if admin {
-                println!("This node stops sharing that group immediately. The others are told");
-                println!("when they next connect. You are its admin, so nobody can be added to");
-                println!("it afterwards, and you cannot come back.");
-            } else {
-                println!(
-                    "This node stops sharing that group immediately, whatever anyone else believes."
-                );
-                println!("The others are told when they next connect, and the admin then makes it");
-                println!(
-                    "official. Being added again will not undo this, you would accept afresh."
-                );
-            }
+            println!("left {name}\n\n{}", ops::group::leave_warning(admin));
         }
     }
     Ok(())
