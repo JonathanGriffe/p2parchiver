@@ -111,6 +111,18 @@ impl Identity {
         })
     }
 
+    /// An identity from a keypair's protobuf encoding, the bytes of `identity.key`.
+    pub fn from_protobuf(bytes: &[u8]) -> Result<Self, libp2p::identity::DecodingError> {
+        Ok(Self {
+            keypair: Keypair::from_protobuf_encoding(bytes)?,
+        })
+    }
+
+    /// The keypair's protobuf encoding, as `identity.key` holds it. A secret.
+    pub fn to_protobuf(&self) -> Result<Vec<u8>, libp2p::identity::DecodingError> {
+        self.keypair.to_protobuf_encoding()
+    }
+
     pub fn keypair(&self) -> &Keypair {
         &self.keypair
     }
@@ -257,6 +269,19 @@ mod tests {
         let (identity, origin) = Identity::load_or_generate(&path).unwrap();
         assert_eq!(origin, Origin::Generated);
         assert_eq!(Identity::load(&path).unwrap().peer_id(), identity.peer_id());
+    }
+
+    #[test]
+    fn the_key_file_bytes_make_the_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILENAME);
+        let (saved, _) = Identity::load_or_generate(&path).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(saved.to_protobuf().unwrap(), bytes);
+        let rebuilt = Identity::from_protobuf(&bytes).unwrap();
+        assert_eq!(rebuilt.peer_id(), saved.peer_id());
+        assert!(Identity::from_protobuf(b"not a key").is_err());
     }
 
     #[test]
