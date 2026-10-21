@@ -14,7 +14,7 @@ Paths below are relative to `crates/ac-import/`.
 - **Sign-in and HTTP**: OAuth sign-in and token refresh in `src/oauth.rs`, and timeouts for HTTP calls in `src/http.rs`.
 - **Folder source**: a one-time import of a local file or folder in `src/sources/folder.rs`.
 - **Drive source**: Google Drive, read-only, in `src/sources/drive.rs`.
-- **Phone source**: a companion app on the same Wi-Fi in `src/sources/phone.rs`, and the listener phones pair and check in with in `src/sources/phone/listener.rs`.
+- **Phone source**: a companion app on the same Wi-Fi in `src/sources/phone.rs`, and the listener phones pair, check in, and back a node up or restore it with in `src/sources/phone/listener.rs`.
 
 ## Design
 
@@ -77,7 +77,9 @@ Read-only. Signing in goes through the browser, with OAuth redirecting to a loca
 ### Phone
 
 A companion app on the same Wi-Fi runs a server, and the node reads from it like any other source.
-- **Pairing.** The node shows a QR code holding its address, its listener's port and certificate fingerprint, its peer id and a single-use token, and waits up to 3 minutes. The phone answers on the listener with its id, name, port and certificate, which the node stores.
+- **Pairing.** The node shows a QR code, `ac://pair?v=1&a=…&p=…&i=…&t=…&f=…&n=…`, holding its address, its listener's port, its peer id, a single-use token, and its certificate's fingerprint and name, and waits up to 3 minutes. The phone answers `POST /v1/pair` on the listener with the token and its id, name, port and certificate, which the node stores.
+- **Other exchanges.** The listener's one pending slot holds a route, a token and an optional reply, so it also carries the companion app's other exchanges, which `registry::companion` offers to `ac-node`. A backup shows `ac://backup`, with the same fields as pairing, and answers `POST /v1/backup` with `200` and the bytes it was handed. A restore shows `ac://restore`, without `i`, and hands the `backup` object of `POST /v1/restore` to the caller, after the caller's check accepts it, answering `204`. The listener reads only the token out of a body. A wrong or spent token, or a body the caller refuses, gets `403`, the same as a refused pairing, and only one code can be answered at a time. Each waits 3 minutes, and closing the dialog cancels it.
+- **The peer id in codes** is the one the last `serve` was given, and `serve` runs on every node start, so after a restore restarts the node the codes name the restored key. The listener itself starts once per process and outlives a node restart.
 - **Presence.** The phone checks in with the listener about once a minute, and counts as present for 5 minutes after its last check-in. Its address is taken from where the check-in came from.
 - **Reading.** The node calls the phone over HTTPS, trusting only the certificate it paired with, at a stable name mapped to the phone's last known address, so a new IP from the router does not break the pin. A `404` or `410` means the file is gone, and a `401` or `403` means the phone needs pairing again.
 - **The listener** is a small HTTPS server the node runs with a self-signed certificate. Its port stays the same across restarts, since phones were told it at pairing, and it does not start if it cannot get that port back. Its HTTP is written by hand, to avoid a second TLS stack, and accepts little: one request per connection, at most 64 headers and an 8 KiB body, no chunked encoding.

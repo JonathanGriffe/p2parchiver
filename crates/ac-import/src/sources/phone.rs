@@ -17,7 +17,7 @@ mod listener;
 use std::io::Write;
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -82,17 +82,22 @@ const PROBE: Duration = Duration::from_secs(1);
 const PAIRING: Duration = Duration::from_secs(3 * 60);
 
 /// Who this node is, for the QR: what a phone browses for when the address in it goes stale.
-static NODE: OnceLock<String> = OnceLock::new();
+/// Set on every [`serve`], since the listener outlives a node restarted with a restored key.
+static NODE: Mutex<String> = Mutex::new(String::new());
 
 /// The ledger, so a hello can be checked against the phones this node has actually paired.
 /// A static because the callback the listener takes is a plain function: it is set once, by
 /// the one call to [`serve`], before anything can read it.
 static DB: OnceLock<PathBuf> = OnceLock::new();
 
-/// Start listening for phones announcing themselves.
+/// Start listening for phones announcing themselves, or only follow the node's id if the
+/// listener is already up.
 fn serve(node: NodeInfo<'_>) -> Result<()> {
     let _ = DB.set(node.db.to_path_buf());
-    let _ = NODE.set(node.id.to_owned());
+    *NODE.lock().unwrap_or_else(|e| e.into_inner()) = node.id.to_owned();
+    if listener::listening() {
+        return Ok(());
+    }
     let port = listener::start(node.state, arrived)?;
     tracing::info!(port, "listening for phones");
     Ok(())
@@ -149,42 +154,21 @@ fn arrived(body: &str, from: IpAddr) -> Option<String> {
 /// token it will be asked for ever after. None of that crosses the network to get there — it
 /// crosses a room, which is the one channel nothing on the wifi can listen to.
 fn authorize(_settings: &Fields) -> Result<Fields> {
-    // Pairing happens in whichever process holds the listener, because that is where a
-    // phone's answer arrives. The app is that process. A command is not, whenever the node is
-    // already running and holding the port — and pairing against a second listener that died
-    // with the command would leave a phone talking to nothing.
-    let Some(serving) = listener::serving() else {
-        return Err(SourceError::Failed(
-            "there is nowhere for a phone to answer. Pair from the app, which is where the \
-             node listens; from a terminal this works only while the node is stopped."
-                .to_owned(),
-        ));
-    };
-
     let token = nonce()?;
-    let payload = code(&serving, &token)?;
-    let qr = render(&payload)?;
-
-    crate::registry::show(Some(qr));
-    crate::registry::stoppable(Some(listener::cancel));
-    tracing::info!("waiting for a phone to scan the pairing code");
-
-    let waited = listener::expect(&token, PAIRING);
-    crate::registry::stoppable(None);
-    crate::registry::show(None);
-
-    let paired = match waited? {
-        listener::Waited::Paired(paired) => *paired,
-        listener::Waited::Stopped => {
-            return Err(SourceError::Failed("pairing was stopped".to_owned()));
-        }
-        listener::Waited::Expired => {
-            return Err(SourceError::Failed(
-                "nothing scanned the code in time; adding the phone again shows a fresh one"
-                    .to_owned(),
-            ));
-        }
-    };
+    let answered = show_and_wait(
+        Kind::Pair,
+        listener::Exchange {
+            route: listener::PAIR,
+            token: token.clone(),
+            reply: None,
+            accepts: Box::new(|body| serde_json::from_str::<Paired>(body).is_ok()),
+        },
+        "pairing was stopped",
+        "nothing scanned the code in time; adding the phone again shows a fresh one",
+    )?;
+    let mut paired: Paired = serde_json::from_str(&answered.body)
+        .map_err(|e| SourceError::Failed(format!("the phone's answer is unreadable: {e}")))?;
+    paired.address = format!("{}:{}", answered.from, paired.port);
 
     // All four, because `signed_in` reads every one of them: a source missing any would look
     // unpaired and be sent round this loop again on the next add.
@@ -201,18 +185,137 @@ fn authorize(_settings: &Fields) -> Result<Fields> {
     Ok(out)
 }
 
+/// What the phone pairs with when it answers a pairing code.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Paired {
+    /// Stable for this device, and what a source is bound to ever after.
+    id: String,
+    /// What to call it on screen.
+    #[serde(default)]
+    name: String,
+    /// Which port it serves its camera roll on.
+    port: u16,
+    /// Its certificate, PEM, which this node pins for every later connection.
+    cert: String,
+    /// Not from the body: where the pairing request came from.
+    #[serde(skip)]
+    address: String,
+}
+
+/// Which code is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Pair,
+    Backup,
+    Restore,
+}
+
+impl Kind {
+    fn host(self) -> &'static str {
+        match self {
+            Kind::Pair => "pair",
+            Kind::Backup => "backup",
+            Kind::Restore => "restore",
+        }
+    }
+}
+
+/// Show a code for `exchange`, wait for the phone that answers it, and take the code down.
+fn show_and_wait(
+    kind: Kind,
+    exchange: listener::Exchange,
+    stopped: &str,
+    expired: &str,
+) -> Result<listener::Answered> {
+    // The exchange happens in whichever process holds the listener, because that is where a
+    // phone's answer arrives. The app is that process. A command is not, whenever the node is
+    // already running and holding the port — and a second listener that died with the
+    // command would leave a phone talking to nothing.
+    let Some(serving) = listener::serving() else {
+        return Err(SourceError::Failed(
+            "there is nowhere for a phone to answer. Use the app, which is where the node \
+             listens; from a terminal this works only while the node is stopped."
+                .to_owned(),
+        ));
+    };
+
+    let qr = render(&code(kind, &serving, &exchange.token)?)?;
+    crate::registry::show(Some(qr));
+    crate::registry::stoppable(Some(listener::cancel));
+    tracing::info!(code = kind.host(), "waiting for a phone to scan the code");
+
+    let waited = listener::expect(exchange, PAIRING);
+    crate::registry::stoppable(None);
+    crate::registry::show(None);
+
+    match waited? {
+        listener::Waited::Answered(answered) => Ok(answered),
+        listener::Waited::Stopped => Err(SourceError::Failed(stopped.to_owned())),
+        listener::Waited::Expired => Err(SourceError::Failed(expired.to_owned())),
+    }
+}
+
+/// Show an `ac://backup` code, and hand `backup` to the phone that answers it.
+pub fn back_up(backup: String) -> Result<()> {
+    show_and_wait(
+        Kind::Backup,
+        listener::Exchange {
+            route: listener::BACKUP,
+            token: nonce()?,
+            reply: Some(backup),
+            accepts: Box::new(|_| true),
+        },
+        "the backup was stopped",
+        "nothing scanned the code in time",
+    )?;
+    tracing::info!("backed up to a phone");
+    Ok(())
+}
+
+/// Show an `ac://restore` code, and return the backup the phone that answers it sends, once
+/// `accepts` takes it. A backup `accepts` refuses gets a `403` and leaves the code open.
+pub fn restore(accepts: fn(&str) -> bool) -> Result<String> {
+    let answered = show_and_wait(
+        Kind::Restore,
+        listener::Exchange {
+            route: listener::RESTORE,
+            token: nonce()?,
+            reply: None,
+            accepts: Box::new(move |body| backup_in(body).is_some_and(|b| accepts(&b))),
+        },
+        "the restore was stopped",
+        "nothing scanned the code in time",
+    )?;
+    backup_in(&answered.body)
+        .ok_or_else(|| SourceError::Failed("the phone sent no backup".to_owned()))
+}
+
+/// The `backup` a restore's body carries, as JSON text.
+fn backup_in(body: &str) -> Option<String> {
+    let said: serde_json::Value = serde_json::from_str(body).ok()?;
+    let backup = said.get("backup").filter(|b| b.is_object())?;
+    serde_json::to_string(backup).ok()
+}
+
 /// What the phone reads off the screen.
 ///
 /// `a` and `p` get it connected now and need no discovery at all. `i` is what it needs later:
 /// the peer id this node already publishes over mDNS, so an address that has moved can be
-/// found again without pairing afresh.
-fn code(serving: &listener::Serving, token: &str) -> Result<String> {
-    let node = NODE.get().map(String::as_str).unwrap_or_default();
+/// found again without pairing afresh. A restore code has none, since the node has no
+/// identity worth naming yet.
+fn code(kind: Kind, serving: &listener::Serving, token: &str) -> Result<String> {
+    let node = match kind {
+        Kind::Restore => String::new(),
+        Kind::Pair | Kind::Backup => {
+            let id = NODE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            format!("&i={}", encode(&id))
+        }
+    };
     Ok(format!(
-        "ac://pair?v=1&a={}&p={}&i={}&t={}&f={}&n={}",
+        "ac://{}?v=1&a={}&p={}{node}&t={}&f={}&n={}",
+        kind.host(),
         encode(&address()?),
         serving.port,
-        encode(node),
         encode(token),
         encode(&serving.fingerprint),
         encode(&serving.name),
@@ -238,7 +341,7 @@ fn address() -> Result<String> {
 
 fn render(payload: &str) -> Result<crate::registry::Qr> {
     let made = qrcode::QrCode::new(payload.as_bytes())
-        .map_err(|e| SourceError::Failed(format!("could not make a pairing code: {e}")))?;
+        .map_err(|e| SourceError::Failed(format!("could not make a code: {e}")))?;
     let colours = made.to_colors();
     let size = made.width();
 
@@ -1116,6 +1219,93 @@ mod tests {
             let field = Phone::CONFIG.iter().find(|f| f.key == key).unwrap();
             assert_eq!(field.kind, crate::config::FieldKind::Secret, "{key}");
         }
+    }
+
+    fn a_code_up() {
+        for _ in 0..300 {
+            if crate::registry::showing().is_some() && listener::pending_token().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no code went up");
+    }
+
+    #[test]
+    fn codes_name_the_node_by_the_id_it_last_served_with() {
+        let _one = listener::ONE_LISTENER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let serving = listener::Serving {
+            port: 4433,
+            name: "n.node.archiverclient".to_owned(),
+            fingerprint: "ab12".to_owned(),
+        };
+
+        *NODE.lock().unwrap() = "12D3KooWOld".to_owned();
+        let pair = code(Kind::Pair, &serving, "tok").unwrap();
+        assert!(pair.starts_with("ac://pair?v=1&a="), "{pair}");
+        assert!(pair.contains("&p=4433&i=12D3KooWOld&t=tok&f=ab12&n="), "{pair}");
+
+        *NODE.lock().unwrap() = "12D3KooWNew".to_owned();
+        let backup = code(Kind::Backup, &serving, "tok").unwrap();
+        assert!(backup.starts_with("ac://backup?v=1&a="), "{backup}");
+        assert!(backup.contains("&i=12D3KooWNew&"), "follows the key: {backup}");
+
+        let restore = code(Kind::Restore, &serving, "tok").unwrap();
+        assert!(restore.starts_with("ac://restore?v=1&a="), "{restore}");
+        assert!(!restore.contains("&i="), "no identity to name yet: {restore}");
+        assert!(restore.contains("&p=4433&t=tok&f=ab12&n="), "{restore}");
+    }
+
+    #[test]
+    fn a_backup_goes_to_the_phone_that_scanned_its_code() {
+        let _one = listener::ONE_LISTENER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let port = listener::start_for_test(dir.path()).unwrap();
+
+        let backup = r#"{"v":1,"peer":"p","key":"secret"}"#;
+        let backing_up = std::thread::spawn(|| back_up(backup.to_owned()));
+        a_code_up();
+        let token = listener::pending_token().unwrap();
+
+        let body = serde_json::json!({ "token": token }).to_string();
+        let answer = listener::post_for_test(dir.path(), port, listener::BACKUP, &body);
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.ends_with(backup), "{answer}");
+        backing_up.join().unwrap().unwrap();
+        assert!(crate::registry::showing().is_none(), "the code came down");
+    }
+
+    #[test]
+    fn a_restore_takes_the_backup_the_phone_sends_once_it_is_accepted() {
+        let _one = listener::ONE_LISTENER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let port = listener::start_for_test(dir.path()).unwrap();
+
+        let restoring = std::thread::spawn(|| restore(|backup| backup.contains("\"v\":1")));
+        a_code_up();
+        let token = listener::pending_token().unwrap();
+
+        let refused = serde_json::json!({ "token": token, "backup": { "v": 9 } }).to_string();
+        let answer = listener::post_for_test(dir.path(), port, listener::RESTORE, &refused);
+        assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+        let none = serde_json::json!({ "token": token }).to_string();
+        let answer = listener::post_for_test(dir.path(), port, listener::RESTORE, &none);
+        assert!(answer.starts_with("HTTP/1.1 403"), "no backup: {answer}");
+
+        let body = serde_json::json!({ "token": token, "backup": { "v": 1, "peer": "p" } });
+        let answer =
+            listener::post_for_test(dir.path(), port, listener::RESTORE, &body.to_string());
+        assert!(answer.starts_with("HTTP/1.1 204"), "{answer}");
+
+        let got: serde_json::Value =
+            serde_json::from_str(&restoring.join().unwrap().unwrap()).unwrap();
+        assert_eq!(got, body["backup"]);
     }
 
     #[test]

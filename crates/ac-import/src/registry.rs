@@ -66,6 +66,12 @@ pub fn show(qr: Option<Qr>) {
 
 include!(concat!(env!("OUT_DIR"), "/registry.rs"));
 
+/// The companion app's exchanges beside pairing: handing a backup to it, and taking one back.
+/// The bytes are the caller's; nothing here reads them.
+pub mod companion {
+    pub use super::phone::{back_up, restore};
+}
+
 /// What a source has to say about itself to be one of these.
 pub trait RegisteredSource {
     const NAME: &'static str;
