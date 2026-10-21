@@ -6,6 +6,7 @@ use std::path::Path;
 
 use ac_files::{Content, Files};
 use ac_import::config::Fields;
+use ac_import::ledger::Ledger;
 use ac_import::source::{Checksum, Cursor, Digest, Item, Page, Source, SourceError, SourceType};
 use ac_net::config::Paths;
 
@@ -76,6 +77,17 @@ impl Fake {
         self
     }
 
+    /// Offer one reference under another folder and name, as a file moved at the source.
+    pub(crate) fn moves(mut self, reference: &str, folder: &str, name: &str) -> Self {
+        for item in &mut self.items {
+            if item.reference == reference {
+                item.folder = folder.to_owned();
+                item.name = name.to_owned();
+            }
+        }
+        self
+    }
+
     /// Promise something about one reference's bytes.
     /// Here when asked, and gone by the time its pages are read.
     pub(crate) fn walks_out(mut self) -> Self {
@@ -94,6 +106,15 @@ impl Fake {
         }
         self
     }
+}
+
+/// Long enough for a claim's lease to run out.
+pub(crate) const DELAY: i64 = ac_import::ledger::FETCH_RETRY_DELAY + 1;
+
+/// The attempts a reference has spent, or `None` if the ledger has no row for it.
+pub(crate) fn attempts(ledger: &Ledger, dir: &str, reference: &str) -> Option<i64> {
+    let known = ledger.known_refs(dir, &[reference]).unwrap();
+    known.first().map(|row| row.fails)
 }
 
 /// Each reference is offered under its own name, holding its own name as its bytes.

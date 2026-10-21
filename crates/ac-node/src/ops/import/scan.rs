@@ -20,6 +20,8 @@ pub struct Scanned {
     pub owed: u64,
     /// Exhausted references the source still offers, put back on the queue.
     pub again: u64,
+    /// Owed references whose promise, name or folder the source changed since.
+    pub refreshed: u64,
     /// Exhausted references it no longer offers: the file has gone from the source.
     pub retired: u64,
     /// Offered but not media: documents, spreadsheets, whatever else the source holds. Never
@@ -104,8 +106,8 @@ pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Resul
             .map(|item| item.reference.as_str())
             .collect();
         let known = ledger.known_refs(&row.dir, &refs)?;
+        let at = now();
 
-        let mut stale = Vec::new();
         for item in &page.items {
             out.found += 1;
 
@@ -117,16 +119,22 @@ pub fn scan_with(ledger: &Ledger, row: &SourceRow, source: &dyn Source) -> Resul
                 continue;
             }
 
-            match known.iter().find(|(seen, _)| *seen == item.reference) {
-                Some((_, fails)) if *fails < ac_import::ledger::MAX_FETCH_ATTEMPTS => {}
-                Some(_) => stale.push(item.reference.as_str()),
+            match known
+                .iter()
+                .find(|seen| seen.stored.reference == item.reference)
+            {
+                Some(seen) => {
+                    if ledger.refresh(&row.dir, seen, item, at)? {
+                        out.again += u64::from(seen.exhausted());
+                        out.refreshed += u64::from(seen.refreshed(item) != seen.stored);
+                    }
+                }
                 None => {
                     ledger.owe(&row.dir, item)?;
                     out.owed += 1;
                 }
             }
         }
-        out.again += ledger.offer_again(&row.dir, &stale)? as u64;
         out.skipped.extend(page.skipped);
 
         match page.next {
@@ -147,7 +155,7 @@ mod tests {
     use crate::ops::import::fixtures::*;
     use crate::ops::import::scan;
     use crate::ops::import::sources::add_source;
-    use ac_import::source::SourceType;
+    use ac_import::source::{Digest, Item, SourceType};
 
     #[test]
     fn a_scan_writes_down_what_it_owes_and_moves_no_bytes() {
@@ -264,7 +272,7 @@ mod tests {
         let mut at = now();
         for _ in 0..ac_import::ledger::MAX_FETCH_ATTEMPTS {
             ledger.claim(at, 8).unwrap();
-            at += ac_import::ledger::FETCH_RETRY_DELAY + 1;
+            at += DELAY;
         }
         assert!(ledger.claim(at, 8).unwrap().is_empty());
 
@@ -278,6 +286,130 @@ mod tests {
         );
         assert_eq!(ledger.owed(&row.dir).unwrap(), 1);
         assert_eq!(ledger.claim(at, 8).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_rescan_refreshes_what_an_owed_reference_promises() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+
+        let before = fake(SourceType::Remote, &["a.jpg", "b.jpg"]).claims_size("a.jpg", 4096);
+        scan_with(&ledger, &row, &before).unwrap();
+
+        let after = fake(SourceType::Remote, &["a.jpg", "b.jpg"])
+            .moves("b.jpg", "Trips", "beach.jpg")
+            .promises("a.jpg", Digest::Md5, "394659692a460258b45a99f1424ea357");
+        let scanned = scan_with(&ledger, &row, &after).unwrap();
+        assert_eq!(scanned.owed, 0);
+        assert_eq!(scanned.refreshed, 2);
+
+        let mut taken: Vec<Item> = ledger
+            .claim(now(), 8)
+            .unwrap()
+            .iter()
+            .map(|owed| owed.item())
+            .collect();
+        taken.sort_by(|a, b| a.reference.cmp(&b.reference));
+        assert_eq!(taken, after.items);
+    }
+
+    #[test]
+    fn a_value_a_rescan_leaves_out_keeps_the_one_written_down() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let row = add_source(&paths, "folder", "Phone", picked(home.path())).unwrap();
+
+        let first = fake(SourceType::Intermittent, &["a.jpg"]).promises("a.jpg", Digest::Md5, "x");
+        scan_with(&ledger, &row, &first).unwrap();
+
+        let mut silent = fake(SourceType::Intermittent, &["a.jpg"]);
+        silent.items[0].size = None;
+        assert_eq!(scan_with(&ledger, &row, &silent).unwrap().refreshed, 0);
+
+        let taken = ledger.claim(now(), 8).unwrap();
+        assert_eq!(taken[0].item(), first.items[0]);
+    }
+
+    #[test]
+    fn an_unchanged_promise_leaves_the_row_as_it_was() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+
+        let drive = fake(SourceType::Remote, &["a.jpg"]).claims_size("a.jpg", 4096);
+        scan_with(&ledger, &row, &drive).unwrap();
+        ledger.claim(now() - 2 * DELAY, 8).unwrap();
+        let before = ledger.known_refs(&row.dir, &["a.jpg"]).unwrap();
+
+        assert_eq!(scan_with(&ledger, &row, &drive).unwrap().refreshed, 0);
+        assert_eq!(ledger.known_refs(&row.dir, &["a.jpg"]).unwrap(), before);
+        assert_eq!(attempts(&ledger, &row.dir, "a.jpg"), Some(1));
+    }
+
+    #[test]
+    fn a_settled_reference_is_left_alone_whatever_the_source_now_says() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+
+        scan_with(&ledger, &row, &fake(SourceType::Remote, &["a.jpg"])).unwrap();
+        ledger.settled(&row.dir, "a.jpg", "aa").unwrap();
+        let before = ledger.known_refs(&row.dir, &["a.jpg"]).unwrap();
+
+        let edited = fake(SourceType::Remote, &["a.jpg"])
+            .claims_size("a.jpg", 4096)
+            .moves("a.jpg", "Trips", "beach.jpg");
+        let scanned = scan_with(&ledger, &row, &edited).unwrap();
+        assert_eq!((scanned.owed, scanned.refreshed, scanned.again), (0, 0, 0));
+        assert_eq!(ledger.known_refs(&row.dir, &["a.jpg"]).unwrap(), before);
+        assert!(ledger.claim(now() + 10 * DELAY, 8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_changed_promise_on_a_leased_reference_waits_for_the_lease() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+
+        let before = fake(SourceType::Remote, &["a.jpg"]).claims_size("a.jpg", 4096);
+        scan_with(&ledger, &row, &before).unwrap();
+        assert_eq!(ledger.claim(now(), 8).unwrap().len(), 1, "held by a worker");
+
+        let after = fake(SourceType::Remote, &["a.jpg"]);
+        assert_eq!(scan_with(&ledger, &row, &after).unwrap().refreshed, 1);
+        assert_eq!(attempts(&ledger, &row.dir, "a.jpg"), Some(0));
+        assert!(ledger.claim(now(), 8).unwrap().is_empty(), "still leased");
+
+        let taken = ledger.claim(now() + DELAY, 8).unwrap();
+        assert_eq!(taken[0].item(), after.items[0]);
+    }
+
+    #[test]
+    fn an_exhausted_reference_whose_last_attempt_is_held_is_not_handed_out_twice() {
+        let home = home();
+        let paths = paths(&home);
+        let mut ledger = ledger(&paths).unwrap();
+        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+
+        let drive = fake(SourceType::Remote, &["a.jpg"]);
+        scan_with(&ledger, &row, &drive).unwrap();
+        let start = now();
+        for at in [start - 2 * DELAY, start - DELAY, start] {
+            assert_eq!(ledger.claim(at, 8).unwrap().len(), 1);
+        }
+
+        assert_eq!(scan_with(&ledger, &row, &drive).unwrap().again, 1);
+        assert!(
+            ledger.claim(start, 8).unwrap().is_empty(),
+            "the third attempt is still held"
+        );
+        assert_eq!(ledger.claim(start + DELAY, 8).unwrap().len(), 1);
     }
 
     /// A source offers everything it has; only pictures and video are taken. Enforced once

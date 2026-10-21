@@ -30,20 +30,22 @@ scan ─► each file ─┬─► new ─────────────�
 
 1. **Scan.** A source lists what it offers a page at a time: for each file a reference that stays the same across scans, a name, the folder it sits in, and optionally a size and a checksum. Each file is then compared with what the ledger holds for that source:
    - **new**: a reference the ledger has no row for. It becomes owed.
-   - **fetch previously failed 3 times**: still owed, but its fetch failed 3 times, the most allowed between two scans, so claims have been skipping it. The source still offers it, and the failure may have passed, such as a phone leaving the Wi-Fi mid-transfer, so it gets 3 fresh attempts. A file that never downloads correctly therefore costs up to 3 attempts per scan, for as long as the source lists it.
-   - **already queued**: still owed, with attempts left. It is already waiting to be claimed, so nothing changes.
-   - **already fetched**: settled, so nothing changes. A file edited at the source under the same reference is therefore not fetched again.
+   - **fetch previously failed 3 times**: still owed, but its fetch failed 3 times, the most allowed between two scans, so claims have been skipping it. The source still offers it, and the failure may have passed, such as a phone leaving the Wi-Fi mid-transfer, so it gets 3 fresh attempts. A file that never downloads correctly therefore costs up to 3 attempts per scan, for as long as the source lists it. Its promise is refreshed as for an already queued one.
+   - **already queued**: still owed, with attempts left. It is already waiting to be claimed, so only its promise is refreshed: the name, folder, size and checksum the scan offers replace the stored ones, and a value the scan leaves out keeps the stored one. A changed size or checksum voids the earlier failures, so the attempts start again. An unchanged row is not written.
+   - **already fetched**: settled, so nothing changes, whatever the scan now offers for it. A file edited at the source under the same reference is therefore not fetched again.
    - **not a photo or video**: judged by extension, since the choice has to be made from a listing before anything downloads. `ac-node` applies this filter, so no source can forget it.
 
+   A known owed reference is refreshed and offered again in one write. A rescan never takes a claim back: a reference that is claimed stays leased, so no second claim takes it, and its fresh attempts start once the lease runs out. A fetch already in flight is checked against the promise it was claimed with, so it may fail once, and the next claim uses the new one.
+
    After a complete scan, references whose fetch failed 3 times and that the scan did not offer again are retired, since the source no longer has them.
-2. **Claim.** The node claims a batch of owed references, and the claim counts the attempt in the same write, so two claims never take the same reference. A claim left behind by a crash comes back an hour later.
-3. **Fetch and check.** The bytes are written under `.unsorted` as they arrive, hashed on the way, and checked against the size and checksum the source promised at scan time. Bytes that fail the check, or a fetch that fails, are thrown away, and the reference is tried again an hour later, 3 times at most. A reference the source says is gone is forgotten, until a scan offers it again.
+2. **Claim.** The node claims a batch of owed references, and the claim counts the attempt in the same write, so two claims never take the same reference. A claim is a lease of an hour: a claim left behind by a crash comes back an hour later, and one the node hands back unfetched comes back at once.
+3. **Fetch and check.** The bytes are written under `.unsorted` as they arrive, hashed on the way, and checked against the size and checksum the source promised at the latest scan before the claim. Bytes that fail the check, or a fetch that fails, are thrown away, and the reference is tried again an hour later, 3 times at most. A reference the source says is gone is forgotten, until a scan offers it again.
 4. **Verdict.** Once the bytes pass the check, their hash decides:
    - **imported before**: the hash is in `imported`, because this node imported the same content before, from any source, whether it is still waiting, was sorted into a group, or was dropped. This wins over the next case, so content that was dropped, or later removed from its group, does not come back.
    - **held by a group**: never imported, but a group on this node already has these bytes on disk, for example because a member shared them.
    - **new content**: anything else. It is kept in `.unsorted`, until someone files it into a group or drops it.
 
-   Either way the reference is settled with the hash.
+   Either way the reference is settled with the hash, for good: neither a later scan nor anything after the download changes its row, so a file edited at the source after it was imported is not fetched again.
 
 ### Imported files
 
