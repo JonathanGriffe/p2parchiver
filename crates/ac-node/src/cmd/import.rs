@@ -44,7 +44,7 @@ pub fn available(source: Option<&str>) -> Result<()> {
 /// Watch for a sign-in raising something to look at, and print it when it does.
 ///
 /// A thread because the sign-in owns the calling one until somebody acts on what it shows.
-fn watch_for_a_code(waiting: Option<&'static str>) -> Watching {
+pub(crate) fn watch_for_a_code(waiting: Option<&'static str>) -> Watching {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
@@ -65,13 +65,13 @@ fn watch_for_a_code(waiting: Option<&'static str>) -> Watching {
     Watching { stop, watcher }
 }
 
-struct Watching {
+pub(crate) struct Watching {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     watcher: std::thread::JoinHandle<()>,
 }
 
 impl Watching {
-    fn stop(self) {
+    pub(crate) fn stop(self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = self.watcher.join();
     }
