@@ -6,11 +6,11 @@ Paths below are relative to `crates/ac-node/`.
 
 ## Features
 
-- **CLI**: the `ac` binary and its commands (`id`, `join`, `run`, `probe`, `peer`, `group`, `file` and `import`) in `src/main.rs` and `src/cmd/`.
+- **CLI**: the `ac` binary and its commands (`id`, `join`, `identity`, `run`, `probe`, `peer`, `group`, `file` and `import`) in `src/main.rs` and `src/cmd/`.
 - **Daemon**: the event loop that drives the swarm and every layer in `src/daemon.rs`.
 - **Links**: connect each layer's state machine to the swarm: chains in `src/group_link.rs`, catalogues and file transfers in `src/file_link.rs`, the supervisor in `src/supervisor_link.rs`, and imports in `src/import_link.rs`.
 - **Dialing**: where to dial each member, its LAN address or the server's relay, in `src/dial_policy.rs`.
-- **Operations**: the actions the CLI and the desktop app share in `src/ops/`: joining a server, groups, files, contacts and status, imports, and the node lock.
+- **Operations**: the actions the CLI and the desktop app share in `src/ops/`: joining a server, backing the identity up and restoring it, groups, files, contacts and status, imports, and the node lock.
 - **Contacts**: peers named by hand in `src/contacts.rs`, merged with fellow group members into one list of names in `src/directory.rs`.
 - **Status**: the supervisor's snapshot, published for the CLI and the desktop app, in `src/status.rs`.
 - **Diagnostics**: `ac probe`, a 20 s connectivity check covering UPnP, AutoNAT, a relay reservation and optionally a hole punch to one peer, in `src/cmd/probe.rs`.
@@ -70,6 +70,13 @@ Sorting moves the bytes into the group, copying them if the group is on another 
 `ac join` decodes the invite token and enrols with the server under the chosen username, giving up after 30 s. It checks the attestation it gets back against this node and the server's peer id from the token. Then it keeps one of the server's service addresses as `server` in the config, preferring the same host over QUIC, then the same host, then QUIC, then the first offered. From then on, the node trusts only that server.
 
 Enrolling takes the identity to enrol as a parameter: the node's own key, or one recovered from a backup. `ops::join::from_token` enrols with an invite. `ops::join::from_server` enrols again with a server the identity enrolled with before: it dials that service address and asks for an attestation, the same request the daemon sends to renew one, checks it against the identity and the address's `/p2p/` peer id, and gives up after 30 s. Both write nothing until the attestation checks out, and then write `identity.key`, then `attestation.cbor`, then `server` in the config. `server` is what marks the home as enrolled, so a failure at any step leaves it looking unenrolled, as it was.
+
+`ops::backup` backs the identity up to the companion app and takes it back, over the phone listener's exchanges in `ac-import`. The payload is one JSON object, `{"v": 1, "peer", "key", "server", "username"}`: the peer id, the base64 of `identity.key`'s bytes, `server` from the config, and the username from the attestation. The phone keeps it as it receives it, and `v` changes whenever a section is added, so a later desktop still reads every version a phone may hold.
+- **Backup** is only for an enrolled home. It shows a backup code and hands the payload to the phone that scans it.
+- **Restore** is refused once the home has enrolled. It shows a restore code and takes a payload back, refusing one whose `peer` does not match its `key`, whose `v` is unknown, or whose server lacks `/p2p/`. It writes nothing: it returns the identity, the server and the username, and enrolling with them, through `from_server` or `from_token`, is what keeps the key.
+- **The CLI.** `ac identity backup`, and `ac identity restore [--invite <token>]`, which restores and enrols in one command, again with the backup's server or with the invite under the backup's username. Both take `node.lock`, since a running daemon holds the listener's port, and print the code as text, as phone pairing does.
+- **What a restore brings back**: the identity and its server, then the groups, their standings and their files from fellow members. Each group comes back as this node left it, since its consent follows its own signed standing, so the files of the groups it had accepted download without asking. It waits for a fellow member to have news, or for that member's heartbeat to reach it.
+- **What it does not**: contacts, sources, settings, the unsorted backlog and the import history. The key never appears in logs or error messages.
 
 Creating or accepting a group needs the username from the attestation, and adding or removing members needs to be the admin. An admin leaves a group as any member does, with an `Out` standing, and the group is `left`. After that it cannot accept the group again, nor add members to it. Both checks read its own signed standing, not the group's state, so they still hold when the `Out` comes back from a peer and the group is `pending` again. A group cannot be forgotten by hand.
 
