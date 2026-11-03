@@ -37,7 +37,7 @@ The window reaches the daemon only through the node's home: every read and every
 
 A button runs its action on a new thread, with the page's buttons disabled meanwhile, then shows the outcome and has the poller read again at once. One message line is shared by every page. A successful action usually says nothing, since the change on screen already says it, so the line is kept for failures and for what the screen does not show, and it clears after 5 s.
 
-Adding a source does not disable the rest of the app, since a sign-in can wait on a browser for minutes, and closing its dialog cancels the sign-in.
+Adding a source does not disable the rest of the app, since a sign-in can wait on a browser for minutes, and closing its dialog cancels the sign-in without a message, since nothing failed.
 
 ### Sort page
 

@@ -431,7 +431,6 @@ mod tests {
     use crate::ops::import::fixtures::*;
     use crate::ops::import::scan;
     use crate::ops::import::scan::scan_with;
-    use crate::ops::import::sources::add_source;
     use ac_groups::id::GroupId;
     use ac_import::config::Fields;
     use ac_import::source::{Item, SourceType};
@@ -484,7 +483,7 @@ mod tests {
         let album = home.path().join("album");
         tree(&album, &["a.jpg", "DCIM/b.jpg"]);
 
-        let row = add_source(&paths, "folder", "Pictures 2024", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures 2024", picked(&album)).unwrap();
         scan(&paths, &row.dir).unwrap();
 
         let fetched = drain(&paths, None).unwrap();
@@ -536,7 +535,7 @@ mod tests {
             std::fs::write(album.join(at), b"the same bytes").unwrap();
         }
 
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
         scan(&paths, &row.dir).unwrap();
 
         let fetched = drain(&paths, None).unwrap();
@@ -556,7 +555,7 @@ mod tests {
         let album = home.path().join("album");
         tree(&album, &["a.jpg"]);
 
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
         scan(&paths, &row.dir).unwrap();
 
         // The same bytes, already filed in a group, as a re-import of a folder would find.
@@ -604,7 +603,7 @@ mod tests {
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
         let (files, content) = store(&paths);
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         // "a.jpg" hashes to something; the source says it will be something else.
         let drive = fake(SourceType::Remote, &["a.jpg"]).promises(
@@ -633,7 +632,7 @@ mod tests {
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
         let (files, content) = store(&paths);
-        let row = add_source(&paths, "folder", "Phone", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Phone", picked(home.path())).unwrap();
 
         // A truncated transfer, which is what this catches: the source offered more bytes
         // than it went on to serve, and promised no digest to notice it by.
@@ -670,7 +669,7 @@ mod tests {
             let paths = paths(&home);
             let mut ledger = ledger(&paths).unwrap();
             let (files, content) = store(&paths);
-            let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+            let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
             let drive = fake(SourceType::Remote, &["a.jpg"]).promises("a.jpg", algo, value);
             scan_with(&ledger, &row, &drive).unwrap();
@@ -688,7 +687,7 @@ mod tests {
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
         let (files, content) = store(&paths);
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         // Listed before an edit: the promise no longer matches what the source serves.
         let stale = fake(SourceType::Remote, &["a.jpg"]).claims_size("a.jpg", 4096);
@@ -718,7 +717,7 @@ mod tests {
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
         let (files, content) = store(&paths);
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         let stale = fake(SourceType::Remote, &["a.jpg"]).claims_size("a.jpg", 4096);
         scan_with(&ledger, &row, &stale).unwrap();
@@ -773,7 +772,7 @@ mod tests {
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
         let (files, content) = store(&paths);
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         scan_with(&ledger, &row, &fake(SourceType::Remote, &["a.jpg"])).unwrap();
         let moved = fake(SourceType::Remote, &["a.jpg"]).moves("a.jpg", "Trips", "beach.jpg");
@@ -789,7 +788,7 @@ mod tests {
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
         let (files, content) = store(&paths);
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         let drive = fake(SourceType::Remote, &["here.jpg", "gone.jpg"]);
         scan_with(&ledger, &row, &drive).unwrap();
@@ -819,7 +818,7 @@ mod tests {
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
         let (files, content) = store(&paths);
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         // What an id-addressed source looks like: two ids, one name, different bytes.
         let mut drive = fake(SourceType::Remote, &["id-1", "id-2"]);
@@ -903,7 +902,7 @@ mod tests {
         let album = home.path().join("album");
         tree(&album, &["a.jpg", "b.jpg", "c.jpg"]);
 
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
         scan(&paths, &row.dir).unwrap();
 
         let fetched = drain(&paths, Some(2)).unwrap();

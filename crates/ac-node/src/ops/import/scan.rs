@@ -154,7 +154,6 @@ mod tests {
     use super::*;
     use crate::ops::import::fixtures::*;
     use crate::ops::import::scan;
-    use crate::ops::import::sources::add_source;
     use ac_import::source::{Digest, Item, SourceType};
 
     #[test]
@@ -164,7 +163,7 @@ mod tests {
         let album = home.path().join("album");
         tree(&album, &["a.jpg", "DCIM/b.jpg", "DCIM/c.jpg"]);
 
-        let row = add_source(&paths, "folder", "Pictures 2024", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures 2024", picked(&album)).unwrap();
         assert_eq!(row.dir, "pictures-2024");
 
         let scanned = scan(&paths, &row.dir).unwrap();
@@ -186,7 +185,7 @@ mod tests {
         let album = home.path().join("album");
         tree(&album, &["a.jpg", "b.jpg"]);
 
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
         scan(&paths, &row.dir).unwrap();
 
         let again = scan(&paths, &row.dir).unwrap();
@@ -201,7 +200,7 @@ mod tests {
         let paths = paths(&home);
         let ledger = ledger(&paths).unwrap();
 
-        let row = add_source(&paths, "folder", "Phone", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Phone", picked(home.path())).unwrap();
         let mut phone = fake(SourceType::Intermittent, &["a.jpg"]);
         phone.reachable = false;
 
@@ -225,7 +224,7 @@ mod tests {
         let paths = paths(&home);
         let ledger = ledger(&paths).unwrap();
 
-        let row = add_source(&paths, "folder", "Phone", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Phone", picked(home.path())).unwrap();
         let phone = fake(SourceType::Intermittent, &["a.jpg"]).walks_out();
         assert!(phone.reachable(), "it is here when the scan starts");
 
@@ -247,7 +246,7 @@ mod tests {
         let paths = paths(&home);
         let ledger = ledger(&paths).unwrap();
 
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
         assert!(scan_with(&ledger, &row, &Stubborn).is_err(), "it failed");
 
         let back = ledger.source(&row.dir).unwrap().unwrap();
@@ -263,7 +262,7 @@ mod tests {
         let home = home();
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         let both = fake(SourceType::Remote, &["kept.jpg", "gone.jpg"]);
         assert_eq!(scan_with(&ledger, &row, &both).unwrap().owed, 2);
@@ -293,7 +292,7 @@ mod tests {
         let home = home();
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         let before = fake(SourceType::Remote, &["a.jpg", "b.jpg"]).claims_size("a.jpg", 4096);
         scan_with(&ledger, &row, &before).unwrap();
@@ -320,7 +319,7 @@ mod tests {
         let home = home();
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
-        let row = add_source(&paths, "folder", "Phone", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Phone", picked(home.path())).unwrap();
 
         let first = fake(SourceType::Intermittent, &["a.jpg"]).promises("a.jpg", Digest::Md5, "x");
         scan_with(&ledger, &row, &first).unwrap();
@@ -338,7 +337,7 @@ mod tests {
         let home = home();
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         let drive = fake(SourceType::Remote, &["a.jpg"]).claims_size("a.jpg", 4096);
         scan_with(&ledger, &row, &drive).unwrap();
@@ -355,7 +354,7 @@ mod tests {
         let home = home();
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         scan_with(&ledger, &row, &fake(SourceType::Remote, &["a.jpg"])).unwrap();
         ledger.settled(&row.dir, "a.jpg", "aa").unwrap();
@@ -375,7 +374,7 @@ mod tests {
         let home = home();
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         let before = fake(SourceType::Remote, &["a.jpg"]).claims_size("a.jpg", 4096);
         scan_with(&ledger, &row, &before).unwrap();
@@ -395,7 +394,7 @@ mod tests {
         let home = home();
         let paths = paths(&home);
         let mut ledger = ledger(&paths).unwrap();
-        let row = add_source(&paths, "folder", "Drive", picked(home.path())).unwrap();
+        let row = add_folder(&paths, "Drive", picked(home.path())).unwrap();
 
         let drive = fake(SourceType::Remote, &["a.jpg"]);
         scan_with(&ledger, &row, &drive).unwrap();
@@ -432,7 +431,7 @@ mod tests {
             ],
         );
 
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
         let scanned = scan(&paths, &row.dir).unwrap();
 
         assert_eq!(scanned.found, 7, "the source offered all of it");

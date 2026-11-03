@@ -6,7 +6,7 @@ use std::path::Path;
 
 use ac_files::{Content, Files};
 use ac_import::config::Fields;
-use ac_import::ledger::Ledger;
+use ac_import::ledger::{Ledger, SourceRow};
 use ac_import::source::{Checksum, Cursor, Digest, Item, Page, Source, SourceError, SourceType};
 use ac_net::config::Paths;
 
@@ -155,6 +155,11 @@ pub(crate) fn picked(path: &Path) -> Fields {
     config
 }
 
+/// Add a folder source, which has no sign-in that could be stopped.
+pub(crate) fn add_folder(paths: &Paths, name: &str, config: Fields) -> anyhow::Result<SourceRow> {
+    add_source(paths, "folder", name, config).map(|row| row.expect("a folder never stops"))
+}
+
 pub(crate) fn tree(root: &Path, files: &[&str]) {
     for file in files {
         let path = root.join(file);
@@ -185,7 +190,7 @@ pub(crate) fn imported(home: &tempfile::TempDir, files: &[&str]) -> (Paths, Stri
     let album = home.path().join("album");
     tree(&album, files);
 
-    let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+    let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
     scan(&paths, &row.dir).unwrap();
     assert_eq!(drain(&paths, None).unwrap().kept as usize, files.len());
     (paths, row.dir)
@@ -197,7 +202,7 @@ pub(crate) fn home_with_owed(home: &tempfile::TempDir) -> (Paths, String) {
     let album = home.path().join("owed");
     tree(&album, &["a.jpg"]);
 
-    let row = add_source(&paths, "folder", "Owed", picked(&album)).unwrap();
+    let row = add_folder(&paths, "Owed", picked(&album)).unwrap();
     scan(&paths, &row.dir).unwrap();
     (paths, row.dir)
 }

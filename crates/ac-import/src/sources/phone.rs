@@ -135,9 +135,9 @@ fn arrived(body: &str, from: IpAddr) -> Option<String> {
 /// conversation: where this node is answering now, how to recognise its certificate, and the
 /// token it will be asked for ever after. None of that crosses the network to get there — it
 /// crosses a room, which is the one channel nothing on the wifi can listen to.
-fn authorize(_settings: &Fields) -> Result<Fields> {
+fn authorize(_settings: &Fields) -> Result<Option<Fields>> {
     let Some(paired) = companion::ask(Code::Pair, None, Paired::read)? else {
-        return Err(SourceError::Failed("pairing was stopped".to_owned()));
+        return Ok(None);
     };
 
     // All four, because `signed_in` reads every one of them: a source missing any would look
@@ -152,7 +152,7 @@ fn authorize(_settings: &Fields) -> Result<Fields> {
         .push("token", &paired.token)
         .push("cert", paired.cert.trim())
         .push("address", &paired.address);
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// What the phone pairs with when it answers a pairing code. No `Debug`, for the token.
@@ -918,7 +918,11 @@ mod tests {
         let answer = listener::post_for_test(state, port, "/v1/pair", &body);
         assert!(answer.starts_with("HTTP/1.1 204"), "{answer}");
 
-        let paired = pairing.join().unwrap().expect("pairing finished");
+        let paired = pairing
+            .join()
+            .unwrap()
+            .expect("pairing finished")
+            .expect("and was not stopped");
 
         // The id, not the name: a name is a display string and two phones can share one.
         assert_eq!(paired.get("device"), Some("device-abc-123"));
@@ -974,8 +978,10 @@ mod tests {
         );
         assert!(waited < companion::WAIT / 2, "and nothing like the full wait");
 
-        let err = outcome.unwrap_err().to_string();
-        assert!(err.contains("stopped"), "said plainly rather than as a failure: {err}");
+        assert!(
+            outcome.expect("stopped, which is not a failure").is_none(),
+            "and nothing was paired"
+        );
 
         // Nothing is left up, and nothing is left listening for an answer.
         assert!(crate::prompt::showing().is_none(), "the code came down");
