@@ -64,7 +64,7 @@ A source is driven according to its kind:
 
 A backoff after failures can delay a scan but never bring it forward.
 
-Adding a source means adding a file to `src/sources/` that implements `RegisteredSource`: `build.rs` registers every file there, and fails the build if there are none. Each source declares its settings, shared by every source of that kind, such as Drive's OAuth client, and its config, specific to each configured source. Some config is filled by signing in rather than typed, such as Drive's refresh token or a phone's certificate. Answers are stored as `key = value` lines, readable and editable by hand, and secrets are never shown or logged.
+Adding a source means adding a file to `src/sources/` that implements `RegisteredSource`: `build.rs` registers every file there, and fails the build if there are none. Each source declares its settings, shared by every source of that kind, such as Drive's OAuth client, and its config, specific to each configured source. Some config is filled by signing in rather than typed, such as Drive's refresh token or a phone's certificate. A sign-in somebody stops returns nothing rather than an error. Answers are stored as `key = value` lines, readable and editable by hand, and secrets are never shown or logged.
 
 All network calls are blocking and run on threads that cannot be cancelled, so every stage up to the first byte of an answer has a timeout: 10 s to resolve and connect, 30 s to send and to receive the headers. A download's body has no total timeout, since a video takes as long as it takes.
 

@@ -311,8 +311,10 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
             let dir = source.to_string();
             work::nudge_when_code_shows(&nudge);
             work::run(&weak, &nudge, move || {
-                let row = ops::import::authorize(&paths, &dir)?;
-                Ok(format!("signed in again as {}", row.name))
+                Ok(match ops::import::authorize(&paths, &dir)? {
+                    Some(row) => format!("signed in again as {}", row.name),
+                    None => String::new(),
+                })
             });
         }
     });
@@ -366,8 +368,8 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
     });
 
     // Closing the dialog gives up on whatever it was waiting for. The work thread wakes,
-    // reports that it was stopped, and clears `source-adding` on its way out — so nothing is
-    // left disabled by a window somebody shut.
+    // says nothing, since nothing failed, and clears `source-adding` on its way out — so
+    // nothing is left disabled by a window somebody shut.
     window.on_stop_adding(ops::prompt::stop);
 
     window.on_add_source({
@@ -402,7 +404,9 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     for (key, value) in shared.iter() {
                         ops::import::set_setting(&paths, &source, key, value)?;
                     }
-                    let row = ops::import::add_source(&paths, &source, &name, config)?;
+                    let Some(row) = ops::import::add_source(&paths, &source, &name, config)? else {
+                        return Ok(String::new());
+                    };
 
                     selection.rewind();
 

@@ -12,8 +12,9 @@ use ac_net::config::Paths;
 
 use crate::ops::import::fetch::drain;
 use crate::ops::import::scan::scan;
-use crate::ops::import::sources::add_source;
 use crate::ops::now;
+
+pub(in crate::ops::import) use crate::ops::import::sources::add_folder;
 
 pub(crate) struct Fake {
     pub(crate) kind: SourceType,
@@ -185,7 +186,7 @@ pub(crate) fn imported(home: &tempfile::TempDir, files: &[&str]) -> (Paths, Stri
     let album = home.path().join("album");
     tree(&album, files);
 
-    let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+    let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
     scan(&paths, &row.dir).unwrap();
     assert_eq!(drain(&paths, None).unwrap().kept as usize, files.len());
     (paths, row.dir)
@@ -197,7 +198,7 @@ pub(crate) fn home_with_owed(home: &tempfile::TempDir) -> (Paths, String) {
     let album = home.path().join("owed");
     tree(&album, &["a.jpg"]);
 
-    let row = add_source(&paths, "folder", "Owed", picked(&album)).unwrap();
+    let row = add_folder(&paths, "Owed", picked(&album)).unwrap();
     scan(&paths, &row.dir).unwrap();
     (paths, row.dir)
 }

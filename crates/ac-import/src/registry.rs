@@ -3,7 +3,8 @@ use crate::source::{Result, Source, SourceError, SourceType};
 
 type Opener = fn(&Fields, &Fields) -> Result<Box<dyn Source>>;
 
-pub type Authorize = fn(&Fields) -> Result<Fields>;
+/// Sign in, and return the settings that come back. `None` if somebody stopped it.
+pub type Authorize = fn(&Fields) -> Result<Option<Fields>>;
 
 /// The info a service needs to run
 #[derive(Debug, Clone, Copy)]
@@ -113,8 +114,8 @@ impl Registered {
     }
 
     /// Sign in, if this source has a way to. The settings that come back are to be stored
-    /// beside the ones given.
-    pub fn authorize(&self, settings: &Fields) -> Result<Fields> {
+    /// beside the ones given. `None` if somebody stopped it.
+    pub fn authorize(&self, settings: &Fields) -> Result<Option<Fields>> {
         match self.auth {
             Some(auth) => auth(settings),
             None => Err(SourceError::config(

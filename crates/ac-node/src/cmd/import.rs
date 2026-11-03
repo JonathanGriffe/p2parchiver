@@ -84,7 +84,9 @@ pub fn source_add(paths: &Paths, source: &str, name: &str, set: &[String]) -> Re
     );
     let added = ops::import::add_source(paths, source, name, pairs(set)?);
     watching.stop();
-    let row = added?;
+    let Some(row) = added? else {
+        bail!("signing in was stopped");
+    };
 
     println!("added {} ({})", row.name, row.source);
     println!(
@@ -402,7 +404,9 @@ pub fn settings_show(paths: &Paths, source: &str) -> Result<()> {
 }
 
 pub fn auth(paths: &Paths, source: &str) -> Result<()> {
-    let row = ops::import::authorize(paths, source)?;
+    let Some(row) = ops::import::authorize(paths, source)? else {
+        bail!("signing in was stopped");
+    };
     println!("signed in again as {}", row.name);
     Ok(())
 }
