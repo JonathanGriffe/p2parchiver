@@ -44,7 +44,7 @@ pub fn available(source: Option<&str>) -> Result<()> {
 /// Watch for a sign-in raising something to look at, and print it when it does.
 ///
 /// A thread because the sign-in owns the calling one until somebody acts on what it shows.
-fn watch_for_a_code(waiting: Option<&'static str>) -> Watching {
+pub(crate) fn watch_for_a_code(waiting: Option<&'static str>) -> Watching {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
@@ -65,13 +65,13 @@ fn watch_for_a_code(waiting: Option<&'static str>) -> Watching {
     Watching { stop, watcher }
 }
 
-struct Watching {
+pub(crate) struct Watching {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     watcher: std::thread::JoinHandle<()>,
 }
 
 impl Watching {
-    fn stop(self) {
+    pub(crate) fn stop(self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = self.watcher.join();
     }
@@ -79,7 +79,7 @@ impl Watching {
 
 /// A QR as text. Two characters per cell, because a terminal cell is about half as wide as it
 /// is tall and a squashed code will not scan.
-fn as_blocks(qr: &ac_import::registry::Qr) -> String {
+fn as_blocks(qr: &ac_import::prompt::Qr) -> String {
     const QUIET: usize = 2;
 
     let mut out = String::new();
@@ -146,7 +146,9 @@ pub fn source_add(paths: &Paths, source: &str, name: &str, set: &[String]) -> Re
     );
     let added = ops::import::add_source(paths, source, name, pairs(set)?);
     watching.stop();
-    let row = added?;
+    let Some(row) = added? else {
+        bail!("signing in was stopped");
+    };
 
     println!("added {} ({})", row.name, row.source);
     println!(
@@ -464,7 +466,9 @@ pub fn settings_show(paths: &Paths, source: &str) -> Result<()> {
 }
 
 pub fn auth(paths: &Paths, source: &str) -> Result<()> {
-    let row = ops::import::authorize(paths, source)?;
+    let Some(row) = ops::import::authorize(paths, source)? else {
+        bail!("signing in was stopped");
+    };
     println!("signed in again as {}", row.name);
     Ok(())
 }

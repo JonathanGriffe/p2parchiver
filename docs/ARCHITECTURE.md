@@ -51,8 +51,8 @@ Three kinds of authority, each backed by its own signature and checked by every 
 | A group's admin | The group's chain: creation, adds, removals | Who is in the group | On every group operation (membership and file sharing) |
 | Each member | Its own standing: not answered yet, in, or out | Whether it takes part, and the name it shows in the group | On every standing a node receives |
 
-Identity belongs to the node: its key is generated locally and never leaves the machine, and
-the server only vouches for it. The server's own key is the root of trust. The invite token
+Identity belongs to the node: its key is generated locally and leaves the machine only for a
+phone that scanned a backup code the node showed, and the server only vouches for it. The server's own key is the root of trust. The invite token
 carries it, the node pins it at enrolment, and from then on only attestations signed by it
 are accepted.
 
@@ -102,6 +102,10 @@ These are deliberate for now:
 - **One permanent admin per group**, with no transfer, removal or key rotation. A group whose
   admin has left can take no new members.
 - **Revocation reaches other nodes only through expiry**, up to 24 h later.
+- **Two machines with one identity.** Restoring a backup while the old machine still runs
+  gives two nodes the same peer id. The server keeps one connection per client, so they knock
+  each other off it, and an admin's two copies can write different entries at the same seq,
+  splitting the chain for good. None of this is detected: avoiding it is left to the user.
 - **Platform gaps.** The tray, start at login and "show in folder" work only on Linux and Windows, and ffmpeg
   is vendored only for x86_64 Linux and Windows.
 - **Import backoff lives in memory**, so a restart scans again.

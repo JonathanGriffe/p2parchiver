@@ -8,12 +8,6 @@
 //! Intermittent, because a phone is out of the house most of the day. Being absent is not a
 //! failure and is not recorded as one: see `reachable`.
 
-// Spelled out because the registry includes this file through its own `#[path]`, which makes
-// a bare `mod listener;` look in `sources/` — where `build.rs` would then register it as a
-// source in its own right. The directory is invisible to that glob; a file beside us is not.
-#[path = "phone/listener.rs"]
-mod listener;
-
 use std::io::Write;
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -21,7 +15,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::Value;
 
+use crate::companion::{self, Code, listener};
+use crate::http::encode;
 use crate::config::{Field, Fields};
 use crate::ledger::Ledger;
 use crate::registry::{Authorize, NodeInfo, Registered, RegisteredSource, Serve};
@@ -55,8 +52,7 @@ impl RegisteredSource for Phone {
 
     const AUTH: Option<Authorize> = Some(authorize);
 
-    /// The QR is the whole instruction, so this only has to say where to look.
-    const WAITING: &'static str = "scan this with the app on your phone";
+    const WAITING: &'static str = companion::SCAN;
 
     /// A phone has to be able to say where it is, and something has to be listening when it
     /// does. Started once, at launch, because a phone that came home while nothing was
@@ -77,25 +73,16 @@ const PAGE: usize = 200;
 /// having no answer at all.
 const PROBE: Duration = Duration::from_secs(1);
 
-/// How long a QR is worth scanning for. Long enough to find your phone and unlock it, short
-/// enough that one left on a screen is not an open door.
-const PAIRING: Duration = Duration::from_secs(3 * 60);
-
-/// Who this node is, for the QR: what a phone browses for when the address in it goes stale.
-static NODE: OnceLock<String> = OnceLock::new();
-
 /// The ledger, so a hello can be checked against the phones this node has actually paired.
-/// A static because the callback the listener takes is a plain function: it is set once, by
-/// the one call to [`serve`], before anything can read it.
+/// A static because the callback the listener takes is a plain function: it is set by the
+/// first [`serve`], before anything can read it, and the home does not change after.
 static DB: OnceLock<PathBuf> = OnceLock::new();
 
-/// Start listening for phones announcing themselves.
+/// Start listening for phones announcing themselves, or only follow the node's id if the
+/// listener is already up.
 fn serve(node: NodeInfo<'_>) -> Result<()> {
     let _ = DB.set(node.db.to_path_buf());
-    let _ = NODE.set(node.id.to_owned());
-    let port = listener::start(node.state, arrived)?;
-    tracing::info!(port, "listening for phones");
-    Ok(())
+    companion::serve(node.state, node.id, arrived)
 }
 
 /// A phone says it is here. Answers with which phone, or nothing if it is not one of ours.
@@ -148,42 +135,9 @@ fn arrived(body: &str, from: IpAddr) -> Option<String> {
 /// conversation: where this node is answering now, how to recognise its certificate, and the
 /// token it will be asked for ever after. None of that crosses the network to get there — it
 /// crosses a room, which is the one channel nothing on the wifi can listen to.
-fn authorize(_settings: &Fields) -> Result<Fields> {
-    // Pairing happens in whichever process holds the listener, because that is where a
-    // phone's answer arrives. The app is that process. A command is not, whenever the node is
-    // already running and holding the port — and pairing against a second listener that died
-    // with the command would leave a phone talking to nothing.
-    let Some(serving) = listener::serving() else {
-        return Err(SourceError::Failed(
-            "there is nowhere for a phone to answer. Pair from the app, which is where the \
-             node listens; from a terminal this works only while the node is stopped."
-                .to_owned(),
-        ));
-    };
-
-    let token = nonce()?;
-    let payload = code(&serving, &token)?;
-    let qr = render(&payload)?;
-
-    crate::registry::show(Some(qr));
-    crate::registry::stoppable(Some(listener::cancel));
-    tracing::info!("waiting for a phone to scan the pairing code");
-
-    let waited = listener::expect(&token, PAIRING);
-    crate::registry::stoppable(None);
-    crate::registry::show(None);
-
-    let paired = match waited? {
-        listener::Waited::Paired(paired) => *paired,
-        listener::Waited::Stopped => {
-            return Err(SourceError::Failed("pairing was stopped".to_owned()));
-        }
-        listener::Waited::Expired => {
-            return Err(SourceError::Failed(
-                "nothing scanned the code in time; adding the phone again shows a fresh one"
-                    .to_owned(),
-            ));
-        }
+fn authorize(_settings: &Fields) -> Result<Option<Fields>> {
+    let Some(paired) = companion::ask(Code::Pair, None, Paired::read)? else {
+        return Ok(None);
     };
 
     // All four, because `signed_in` reads every one of them: a source missing any would look
@@ -195,68 +149,40 @@ fn authorize(_settings: &Fields) -> Result<Fields> {
     // renaming one in the app would break the source bound to it. What the user calls this
     // source is the row's own name, which they typed.
     out.push("device", &paired.id)
-        .push("token", &token)
+        .push("token", &paired.token)
         .push("cert", paired.cert.trim())
         .push("address", &paired.address);
-    Ok(out)
+    Ok(Some(out))
 }
 
-/// What the phone reads off the screen.
-///
-/// `a` and `p` get it connected now and need no discovery at all. `i` is what it needs later:
-/// the peer id this node already publishes over mDNS, so an address that has moved can be
-/// found again without pairing afresh.
-fn code(serving: &listener::Serving, token: &str) -> Result<String> {
-    let node = NODE.get().map(String::as_str).unwrap_or_default();
-    Ok(format!(
-        "ac://pair?v=1&a={}&p={}&i={}&t={}&f={}&n={}",
-        encode(&address()?),
-        serving.port,
-        encode(node),
-        encode(token),
-        encode(&serving.fingerprint),
-        encode(&serving.name),
-    ))
+/// What the phone pairs with when it answers a pairing code. No `Debug`, for the token.
+#[derive(Deserialize)]
+struct Paired {
+    /// The code's own token, already checked by the listener. What the phone presents from
+    /// now on.
+    token: String,
+    /// Stable for this device, and what a source is bound to ever after.
+    id: String,
+    /// What to call it on screen.
+    #[serde(default)]
+    name: String,
+    /// Which port it serves its camera roll on.
+    port: u16,
+    /// Its certificate, PEM, which this node pins for every later connection.
+    cert: String,
+    /// Not from the body: where the pairing request came from.
+    #[serde(skip)]
+    address: String,
 }
 
-/// This machine's address on the network the phone is on.
-///
-/// Found by asking the routing table which interface would reach the outside, which is the
-/// only way to pick one on a machine with several. Nothing is sent: a UDP socket that has
-/// been connected has a local address and has put no packet on the wire.
-fn address() -> Result<String> {
-    let probe = std::net::UdpSocket::bind("0.0.0.0:0")
-        .map_err(|e| SourceError::io("a socket to find this machine's address with", e))?;
-    probe
-        .connect("192.0.2.1:9")
-        .map_err(|e| SourceError::io("asking which interface reaches the network", e))?;
-    let local = probe
-        .local_addr()
-        .map_err(|e| SourceError::io("this machine's address", e))?;
-    Ok(local.ip().to_string())
-}
-
-fn render(payload: &str) -> Result<crate::registry::Qr> {
-    let made = qrcode::QrCode::new(payload.as_bytes())
-        .map_err(|e| SourceError::Failed(format!("could not make a pairing code: {e}")))?;
-    let colours = made.to_colors();
-    let size = made.width();
-
-    Ok(crate::registry::Qr {
-        size,
-        dark: colours
-            .iter()
-            .map(|colour| *colour == qrcode::Color::Dark)
-            .collect(),
-    })
-}
-
-/// Unguessable, and safe to put in a URL as it is.
-fn nonce() -> Result<String> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes)
-        .map_err(|e| SourceError::Failed(format!("could not draw a random value: {e}")))?;
-    Ok(hex::encode(bytes))
+impl Paired {
+    /// A phone's answer to a pairing code, at the address it came from.
+    fn read(body: Value, from: IpAddr) -> std::result::Result<Self, String> {
+        let mut paired: Paired = serde_json::from_value(body)
+            .map_err(|e| format!("the phone's answer is unreadable: {e}"))?;
+        paired.address = format!("{from}:{}", paired.port);
+        Ok(paired)
+    }
 }
 
 /// What a phone sends when it announces itself.
@@ -600,21 +526,6 @@ fn knock(address: &str) -> bool {
     candidates.any(|addr| TcpStream::connect_timeout(&addr, PROBE).is_ok())
 }
 
-/// Percent-encoding, keeping only what every reading of the standard leaves alone. An id is
-/// the phone's to choose, so it has to survive being put in a path.
-fn encode(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for byte in raw.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -956,11 +867,6 @@ mod tests {
     /// round again on the next add.
     #[test]
     fn pairing_ends_with_everything_a_source_needs_to_be_paired() {
-        use rustls::pki_types::ServerName;
-        use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-        use std::io::Read as _;
-        use std::sync::Arc;
-
         let _one = listener::ONE_LISTENER
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -978,7 +884,7 @@ mod tests {
         // The code is up while it waits, which is what the app photographs.
         let mut shown = None;
         for _ in 0..200 {
-            if let Some(qr) = crate::registry::showing() {
+            if let Some(qr) = crate::prompt::showing() {
                 shown = Some(qr);
                 break;
             }
@@ -1000,21 +906,6 @@ mod tests {
             "the code names this certificate and no other"
         );
 
-        let mut roots = RootCertStore::empty();
-        roots.add(rustls::pki_types::CertificateDer::from(cert)).unwrap();
-        let config = ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-        let name = ServerName::try_from(serving.name.clone()).unwrap();
-        let connection = ClientConnection::new(Arc::new(config), name).unwrap();
-        let socket = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let mut tls = StreamOwned::new(connection, socket);
-
         let mine = rcgen::generate_simple_self_signed(vec!["a-phone".to_owned()]).unwrap();
         let body = serde_json::json!({
             "token": token,
@@ -1024,18 +915,14 @@ mod tests {
             "cert": mine.cert.pem(),
         })
         .to_string();
-        write!(
-            tls,
-            "POST /v1/pair HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        tls.flush().unwrap();
-        let mut answer = String::new();
-        tls.read_to_string(&mut answer).unwrap();
+        let answer = listener::post_for_test(state, port, "/v1/pair", &body);
         assert!(answer.starts_with("HTTP/1.1 204"), "{answer}");
 
-        let paired = pairing.join().unwrap().expect("pairing finished");
+        let paired = pairing
+            .join()
+            .unwrap()
+            .expect("pairing finished")
+            .expect("and was not stopped");
 
         // The id, not the name: a name is a display string and two phones can share one.
         assert_eq!(paired.get("device"), Some("device-abc-123"));
@@ -1052,7 +939,7 @@ mod tests {
         assert!(Phone::parse(&paired).is_ok(), "and it opens");
 
         // The code comes down when the wait ends.
-        assert!(crate::registry::showing().is_none());
+        assert!(crate::prompt::showing().is_none());
     }
 
     /// Closing the dialog has to release the thread at once. It waits three minutes for a
@@ -1072,7 +959,7 @@ mod tests {
         // Wait for it to actually be waiting, so the cancel is not a race.
         let mut up = false;
         for _ in 0..300 {
-            if crate::registry::showing().is_some() {
+            if crate::prompt::showing().is_some() {
                 up = true;
                 break;
             }
@@ -1081,7 +968,7 @@ mod tests {
         assert!(up, "a code went up");
 
         // What Cancel does.
-        crate::registry::stop();
+        crate::prompt::stop();
 
         let outcome = pairing.join().unwrap();
         let waited = began.elapsed();
@@ -1089,13 +976,15 @@ mod tests {
             waited < Duration::from_secs(10),
             "it took {waited:?}, so it sat out its own timeout rather than being stopped"
         );
-        assert!(waited < PAIRING / 2, "and nothing like the full wait");
+        assert!(waited < companion::WAIT / 2, "and nothing like the full wait");
 
-        let err = outcome.unwrap_err().to_string();
-        assert!(err.contains("stopped"), "said plainly rather than as a failure: {err}");
+        assert!(
+            outcome.expect("stopped, which is not a failure").is_none(),
+            "and nothing was paired"
+        );
 
         // Nothing is left up, and nothing is left listening for an answer.
-        assert!(crate::registry::showing().is_none(), "the code came down");
+        assert!(crate::prompt::showing().is_none(), "the code came down");
         assert!(listener::pending_token().is_none(), "and the code is spent");
     }
 
@@ -1118,9 +1007,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_id_the_phone_chose_survives_being_put_in_a_url() {
-        assert_eq!(encode("media-store/42 891"), "media-store%2F42%20891");
-        assert_eq!(encode("plain-Id_1.0~"), "plain-Id_1.0~");
-    }
 }

@@ -148,8 +148,13 @@ fn without_secrets(mut row: SourceRow, declared: Option<&[Field]>) -> SourceRow 
     row
 }
 
-/// Create a source
-pub fn add_source(paths: &Paths, source: &str, name: &str, config: Fields) -> Result<SourceRow> {
+/// Create a source. `None` if somebody stopped its sign-in.
+pub fn add_source(
+    paths: &Paths,
+    source: &str,
+    name: &str,
+    config: Fields,
+) -> Result<Option<SourceRow>> {
     let entry = implementation(source)?;
     let name = name.trim();
     if name.is_empty() {
@@ -174,9 +179,12 @@ pub fn add_source(paths: &Paths, source: &str, name: &str, config: Fields) -> Re
     // token of its own, not merely the first — adding a second Drive is how a second Google
     // account gets connected, and it would be no use handed the first one's.
     if entry.signs_in() && !entry.signed_in(&config) {
-        let granted = entry
+        let Some(granted) = entry
             .authorize(&settings)
-            .with_context(|| format!("signing in to {}", entry.name))?;
+            .with_context(|| format!("signing in to {}", entry.name))?
+        else {
+            return Ok(None);
+        };
         for (key, value) in granted.iter() {
             config.push(key, value);
         }
@@ -199,7 +207,7 @@ pub fn add_source(paths: &Paths, source: &str, name: &str, config: Fields) -> Re
     ledger
         .add_source(&row)
         .with_context(|| format!("adding {name}"))?;
-    Ok(row)
+    Ok(Some(row))
 }
 
 /// One configured source, by the name it was given or by the directory that name became.
@@ -277,8 +285,8 @@ pub fn settings_with(ledger: &Ledger, source: &str) -> Result<Vec<Setting>> {
 /// implementation because that is what a token now belongs to.
 ///
 /// The settings it is built from are the shared ones — the application's own credentials,
-/// which are typed — and what comes back is that source's alone.
-pub fn authorize(paths: &Paths, needle: &str) -> Result<SourceRow> {
+/// which are typed — and what comes back is that source's alone. `None` if somebody stopped it.
+pub fn authorize(paths: &Paths, needle: &str) -> Result<Option<SourceRow>> {
     let ledger = ledger(paths)?;
     let mut row = find_source(&ledger, needle)?;
 
@@ -291,9 +299,12 @@ pub fn authorize(paths: &Paths, needle: &str) -> Result<SourceRow> {
         );
     }
 
-    let granted = entry
+    let Some(granted) = entry
         .authorize(&ledger.settings(entry.name)?)
-        .with_context(|| format!("signing in as {}", row.name))?;
+        .with_context(|| format!("signing in as {}", row.name))?
+    else {
+        return Ok(None);
+    };
 
     // Replaced rather than added to: a second token under the same key would leave `get`
     // answering with the stale one, which is the failure this is meant to repair.
@@ -311,7 +322,7 @@ pub fn authorize(paths: &Paths, needle: &str) -> Result<SourceRow> {
     ledger
         .set_source_config(&row.dir, &row.config)
         .with_context(|| format!("storing the new sign-in for {}", row.name))?;
-    Ok(row)
+    Ok(Some(row))
 }
 
 pub fn set_setting(paths: &Paths, source: &str, key: &str, value: &str) -> Result<()> {
@@ -361,10 +372,11 @@ pub fn from_folder(paths: &Paths, name: Option<&str>, picked: &Path) -> Result<P
         Some(name) => name.to_owned(),
         None => folder_name(picked)?,
     };
-    Ok(Picked {
-        row: add_source(paths, FOLDER, &named, config)?,
-        added: true,
-    })
+    // A folder has no sign-in, so nothing can stop it.
+    let Some(row) = add_source(paths, FOLDER, &named, config)? else {
+        bail!("adding {named} was stopped");
+    };
+    Ok(Picked { row, added: true })
 }
 
 /// The folder source already importing from this path, if there is one.
@@ -434,14 +446,14 @@ fn slug(name: &str) -> Option<String> {
 
 /// What this build can import from, and what each one has to be told.
 /// What a sign-in is asking somebody to look at, if one is waiting.
-pub fn showing() -> Option<ac_import::registry::Qr> {
-    ac_import::registry::showing()
+pub fn showing() -> Option<ac_import::prompt::Qr> {
+    ac_import::prompt::showing()
 }
 
 /// Give up on a sign-in that is waiting on somebody, because they closed the window it was
 /// asking through. Safe to call when nothing is waiting.
 pub fn stop_signing_in() {
-    ac_import::registry::stop();
+    ac_import::prompt::stop();
 }
 
 #[cfg(test)]
@@ -594,7 +606,7 @@ mod tests {
         assert!(err.contains("no source called"), "{err}");
         assert!(err.contains("source list"), "{err}");
 
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
         let err = authorize(&paths, &row.dir).unwrap_err().to_string();
         assert!(err.contains("nothing to sign in to"), "{err}");
         assert!(err.contains("Pictures"), "named, not a directory: {err}");
@@ -606,11 +618,11 @@ mod tests {
         let paths = paths(&home);
         let ledger = ledger(&paths).unwrap();
 
-        let first = add_source(&paths, "folder", "Pictures", picked(home.path())).unwrap();
+        let first = add_folder(&paths, "Pictures", picked(home.path())).unwrap();
         assert_eq!(first.dir, "pictures");
 
         // The name itself is taken while the source exists.
-        let err = add_source(&paths, "folder", "Pictures", picked(home.path())).unwrap_err();
+        let err = add_folder(&paths, "Pictures", picked(home.path())).unwrap_err();
         assert!(err.to_string().contains("already a source"), "{err}");
 
         ledger
@@ -629,7 +641,7 @@ mod tests {
             .unwrap();
         remove_source(&paths, &first.dir).unwrap();
 
-        let second = add_source(&paths, "folder", "Pictures", picked(home.path())).unwrap();
+        let second = add_folder(&paths, "Pictures", picked(home.path())).unwrap();
         assert_eq!(second.dir, "pictures-2");
     }
 
@@ -653,12 +665,12 @@ mod tests {
             ("Nothing", Fields::new()),
             ("Relative", picked(Path::new("pictures/2024"))),
         ] {
-            assert!(add_source(&paths, "folder", name, config).is_err());
+            assert!(add_folder(&paths, name, config).is_err());
         }
 
         let mut undeclared = picked(home.path());
         undeclared.push("recursive", "true");
-        let err = add_source(&paths, "folder", "Typo", undeclared).unwrap_err();
+        let err = add_folder(&paths, "Typo", undeclared).unwrap_err();
         assert!(err.to_string().contains("recursive"), "{err}");
 
         assert!(sources(&paths).unwrap().is_empty(), "nothing was written");
@@ -697,7 +709,7 @@ mod tests {
         let album = home.path().join("album");
         tree(&album, &["a.jpg", "b.jpg"]);
 
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
         scan(&paths, &row.dir).unwrap();
         assert_eq!(ledger(&paths).unwrap().owed(&row.dir).unwrap(), 2);
 
@@ -718,7 +730,7 @@ mod tests {
         let album = home.path().join("album");
         tree(&album, &["a.jpg"]);
 
-        let row = add_source(&paths, "folder", "Family Photos", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Family Photos", picked(&album)).unwrap();
         assert_eq!(row.dir, "family-photos", "which is nothing anybody typed");
 
         assert!(scan(&paths, "Family Photos").is_ok());
@@ -741,7 +753,7 @@ mod tests {
         let album = home.path().join("album");
         tree(&album, &["a.jpg"]);
 
-        let row = add_source(&paths, "folder", "Family Photos", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Family Photos", picked(&album)).unwrap();
         assert!(scan(&paths, &row.dir).is_ok());
         assert!(remove_source(&paths, &row.dir).unwrap());
     }
@@ -756,8 +768,8 @@ mod tests {
         tree(&album, &["a.jpg"]);
 
         // "Pictures" takes the directory `pictures`, so "pictures" cannot have it.
-        let upper = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
-        let lower = add_source(&paths, "folder", "pictures", picked(&album)).unwrap();
+        let upper = add_folder(&paths, "Pictures", picked(&album)).unwrap();
+        let lower = add_folder(&paths, "pictures", picked(&album)).unwrap();
         assert_eq!(upper.dir, "pictures");
         assert_eq!(lower.dir, "pictures-2");
 
@@ -965,7 +977,7 @@ mod tests {
         let album = home.path().join("album");
         tree(&album, &["a.jpg", "b.jpg", "c.jpg"]);
 
-        let row = add_source(&paths, "folder", "Pictures", picked(&album)).unwrap();
+        let row = add_folder(&paths, "Pictures", picked(&album)).unwrap();
         scan(&paths, &row.dir).unwrap();
 
         let listed = sources(&paths).unwrap();

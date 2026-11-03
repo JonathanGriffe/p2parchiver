@@ -11,18 +11,12 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 use crate::node::Node;
 use crate::ui::MainWindow;
 use crate::work::{self, Nudge};
-use crate::{autostart, log, shell, view};
+use crate::{autostart, log, shell};
 
 pub type Shared = Arc<Mutex<Node>>;
 
-/// What the enrolment dialog is showing. Mirrored in `views/enrol.slint`, which is why
-/// these are the ints the property takes rather than an enum.
-pub const ENROL_FORM: i32 = 0;
-pub const ENROL_WORKING: i32 = 1;
-pub const ENROL_DONE: i32 = 2;
-
 pub fn load(window: &MainWindow, paths: &Paths) {
-    let config = Config::load(&paths.config_file()).unwrap_or_default();
+    let config = ops::config(paths).unwrap_or_default();
 
     window.set_mdns(config.mdns);
     window.set_config_storage_root(
@@ -43,7 +37,7 @@ pub fn load(window: &MainWindow, paths: &Paths) {
             .unwrap_or_default()
             .into(),
     );
-    window.set_enrolled(config.server.is_some());
+    window.set_enrolled(ops::enrolled(paths).ok().flatten().is_some());
 
     // The Sources section, which is read here rather than on the poll for the same reason as
     // everything above it: these are boxes somebody types into, and a poll would take the
@@ -182,71 +176,32 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
         }
     });
 
-    window.on_join({
+    window.on_stop_phone_code(ops::import::stop_signing_in);
+
+    window.on_backup({
+        let weak = weak.clone();
         let paths = paths.clone();
-        let node = node.clone();
         let nudge = nudge.clone();
-        move |token, username| {
-            let (paths, node, nudge) = (paths.clone(), node.clone(), nudge.clone());
-            let (token, username) = (token.to_string(), username.to_string());
+        move || {
+            let (paths, nudge) = (paths.clone(), nudge.clone());
             work::begin(&weak);
             if let Some(window) = weak.upgrade() {
-                window.set_enrol_phase(ENROL_WORKING);
-                window.set_enrol_error("".into());
+                window.set_backing_up(true);
             }
+            work::nudge_when_code_shows(&nudge);
 
-            let reload = paths.clone();
             work::action(
                 &weak,
-                move || {
-                    stop(&node)?;
-                    let enrolled = ops::join::from_token(&paths, &token, &username);
-                    // Started again whichever way it went: a node left stopped by a
-                    // refusal would look like the app itself had given up.
-                    start(&node, &paths)?;
-                    enrolled
-                },
+                move || ops::backup::backup(&paths),
                 move |window, outcome| {
-                    load(window, &reload);
-                    // The window reads these once at startup, and enrolling is the one
-                    // thing that changes them: without this the name and the server stay
-                    // blank until the app is opened again.
-                    if let Err(e) = view::describe_node(window, &reload) {
-                        tracing::warn!(error = %e, "could not re-read this node's details");
-                    }
-
-                    match &outcome {
-                        Ok(enrolled) => {
-                            // The dialog has the name in front of someone who just typed
-                            // it; the rest is on the Status page behind it.
-                            window.set_enrol_summary(
-                                format!("Enrolled as {}.", enrolled.username).into(),
-                            );
-                            window.set_enrol_phase(ENROL_DONE);
-                        }
-                        Err(e) => {
-                            // `{:#}` so the server's reason comes through, not just the
-                            // outermost context.
-                            window.set_enrol_error(format!("{e:#}").into());
-                            window.set_enrol_phase(ENROL_FORM);
-                        }
-                    }
-
-                    if window.get_show_enrol() {
-                        // The dialog is saying it; the shared line would only repeat it,
-                        // out of sight behind the dialog.
-                        work::quiet(window, &nudge);
-                    } else {
-                        // Nobody is looking at a dialog, so the one line has to carry it.
-                        let said = outcome.map(|enrolled| {
-                            format!(
-                                "Enrolled as {} with {}, attested for {}h. That server is \
-                                 pinned now.",
-                                enrolled.username, enrolled.server, enrolled.attested_for
-                            )
-                        });
-                        work::finish(window, said, &nudge);
-                    }
+                    window.set_backing_up(false);
+                    // Nothing else on screen changes, so the line says how it went.
+                    let said = match outcome {
+                        Ok(Some(())) => Ok("backed up to the phone".to_owned()),
+                        Ok(None) => Ok(String::new()),
+                        Err(e) => Err(e),
+                    };
+                    work::finish(window, said, &nudge);
                 },
             );
         }
@@ -351,14 +306,14 @@ fn restart(node: &Shared, paths: &Paths) -> Result<()> {
     start(node, paths)
 }
 
-fn stop(node: &Shared) -> Result<()> {
+pub(crate) fn stop(node: &Shared) -> Result<()> {
     node.lock()
         .map_err(|_| anyhow!("the node is in an unknown state after an earlier panic"))?
         .stop()
         .context("stopping the node")
 }
 
-fn start(node: &Shared, paths: &Paths) -> Result<()> {
+pub(crate) fn start(node: &Shared, paths: &Paths) -> Result<()> {
     let mut node = node
         .lock()
         .map_err(|_| anyhow!("the node is in an unknown state after an earlier panic"))?;
@@ -372,52 +327,27 @@ mod tests {
     use slint::Model as _;
 
     use super::*;
+    use crate::view::{self, SETTINGS};
 
-    /// The dialog stays up for the whole of enrolling, so what it shows is the only thing
-    /// saying whether anything is happening. Drawn into memory, so this needs no display.
     #[test]
-    fn the_enrol_dialog_shows_one_thing_at_a_time() {
+    fn a_backup_is_offered_only_once_enrolled() {
         i_slint_backend_testing::init_no_event_loop();
         let window = MainWindow::new().unwrap();
-        window.set_show_enrol(true);
-
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(1200, 3000));
+        window.set_tab(SETTINGS);
         let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
-        let enrolling = "Enrolling. The node stops and starts again, which takes a moment.";
 
-        window.set_enrol_phase(ENROL_FORM);
-        assert_eq!(showing("Enrol"), 1, "the form offers to enrol");
-        assert_eq!(showing("Not now"), 1);
-        assert_eq!(showing(enrolling), 0);
-        assert_eq!(showing("Close"), 0);
+        window.set_enrolled(false);
+        assert_eq!(showing("Back up to phone"), 0);
 
-        // A refusal comes back into the form, with the reason above it.
-        window.set_enrol_error("that invite token is damaged".into());
-        assert_eq!(showing("that invite token is damaged"), 1);
-        assert_eq!(showing("Enrol"), 1, "and it can be tried again");
+        window.set_enrolled(true);
+        assert_eq!(showing("Back up to phone"), 1);
 
-        window.set_enrol_phase(ENROL_WORKING);
-        assert_eq!(showing(enrolling), 1);
-        assert_eq!(showing("Enrol"), 0, "nothing to press while it runs");
-        assert_eq!(showing("Not now"), 0);
-        assert_eq!(
-            showing("that invite token is damaged"),
-            0,
-            "the last failure is not still on screen while the next attempt runs"
-        );
-
-        window.set_enrol_phase(ENROL_DONE);
-        window.set_enrol_summary("Enrolled as alice.".into());
-        assert_eq!(showing("Successfully enrolled"), 1, "the title says so too");
-        assert_eq!(showing("Enrol this node"), 0);
-        assert_eq!(showing("Enrolled as alice."), 1);
-        assert_eq!(showing("Close"), 1);
-        assert_eq!(showing("Enrol"), 0, "there is nothing left to enrol");
-
-        ElementHandle::find_by_accessible_label(&window, "Close")
-            .next()
-            .unwrap()
-            .invoke_accessible_default_action();
-        assert!(!window.get_show_enrol(), "Close puts the dialog away");
+        window.set_backing_up(true);
+        assert_eq!(showing("Back up to phone"), 0, "one at a time");
+        assert_eq!(showing("Cancel"), 1, "and it can be given up");
     }
 
     /// Enrolling is the one thing that changes the name and the server a node shows, and it
@@ -459,10 +389,6 @@ mod tests {
         assert_eq!(window.get_server_host(), "ac.example.net");
     }
 
-    /// The Settings page, as `app.slint` numbers the tabs. Only here: nothing in the poll
-    /// narrows by it, which is the whole reason this page is loaded instead.
-    const SETTINGS_TAB: i32 = 6;
-
     /// The Settings tab is where a source's shared settings are changed, and it is reachable
     /// without ever opening the Sources tab. Filled only by the Sources page's own poll, the
     /// section was gated on a list that was still empty and did not appear at all.
@@ -479,7 +405,7 @@ mod tests {
             .set_size(slint::PhysicalSize::new(1200, 3000));
 
         // Straight to Settings, which is what somebody changing a credential does.
-        window.set_tab(SETTINGS_TAB);
+        window.set_tab(SETTINGS);
         assert_eq!(
             window.get_source_settings().iter().count(),
             0,
@@ -516,7 +442,7 @@ mod tests {
         window
             .window()
             .set_size(slint::PhysicalSize::new(1200, 3000));
-        window.set_tab(SETTINGS_TAB);
+        window.set_tab(SETTINGS);
 
         let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
         let checkboxes = || start_at_login(&window).count();
@@ -561,7 +487,7 @@ mod tests {
         window
             .window()
             .set_size(slint::PhysicalSize::new(1200, 3000));
-        window.set_tab(SETTINGS_TAB);
+        window.set_tab(SETTINGS);
         show_autostart(&window, Ok(autostart::State::Off));
 
         let asked = Rc::new(std::cell::Cell::new(None));
@@ -585,36 +511,6 @@ mod tests {
         // And a later success still gets through to the box.
         show_autostart(&window, Ok(autostart::State::On));
         assert_eq!(checkbox().accessible_checked(), Some(true));
-    }
-
-    /// A refusal over the username should not cost someone the token they pasted, so the
-    /// fields have to survive the trip out to the phase that has no fields at all.
-    #[test]
-    fn what_was_typed_survives_a_failed_attempt() {
-        i_slint_backend_testing::init_no_event_loop();
-        let window = MainWindow::new().unwrap();
-        window.set_show_enrol(true);
-        window.set_enrol_phase(ENROL_FORM);
-
-        let field = |id: &str| {
-            ElementHandle::find_by_element_id(&window, id)
-                .next()
-                .unwrap()
-        };
-        field("EnrolDialog::token").set_accessible_value("ac1thetoken");
-        field("EnrolDialog::who").set_accessible_value("alice");
-
-        window.set_enrol_phase(ENROL_WORKING);
-        window.set_enrol_phase(ENROL_FORM);
-
-        assert_eq!(
-            field("EnrolDialog::token").accessible_value().unwrap(),
-            "ac1thetoken"
-        );
-        assert_eq!(
-            field("EnrolDialog::who").accessible_value().unwrap(),
-            "alice"
-        );
     }
 
     #[test]

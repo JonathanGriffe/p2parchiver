@@ -236,11 +236,15 @@ fn pairing_code() -> Option<slint::Image> {
     Some(slint::Image::from_rgba8(buffer))
 }
 
-pub fn apply(window: &MainWindow, page: Page) {
+/// The code a sign-in, a backup or a restore is waiting on, whichever page is up.
+pub fn show_code(window: &MainWindow) {
     match pairing_code() {
         Some(code) => window.set_pairing_code(code),
         None => window.set_pairing_code(slint::Image::default()),
     }
+}
+
+pub fn apply(window: &MainWindow, page: Page) {
     window.set_pairing_says(
         ops::import::implementation(&window.get_adding_source())
             .map(|entry| entry.waiting())
@@ -340,9 +344,12 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         move |source| {
             let (paths, nudge) = (paths.clone(), nudge.clone());
             let dir = source.to_string();
+            work::nudge_when_code_shows(&nudge);
             work::run(&weak, &nudge, move || {
-                let row = ops::import::authorize(&paths, &dir)?;
-                Ok(format!("signed in again as {}", row.name))
+                Ok(match ops::import::authorize(&paths, &dir)? {
+                    Some(row) => format!("signed in again as {}", row.name),
+                    None => String::new(),
+                })
             });
         }
     });
@@ -396,8 +403,8 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
     });
 
     // Closing the dialog gives up on whatever it was waiting for. The work thread wakes,
-    // reports that it was stopped, and clears `source-adding` on its way out — so nothing is
-    // left disabled by a window somebody shut.
+    // says nothing, since nothing failed, and clears `source-adding` on its way out — so
+    // nothing is left disabled by a window somebody shut.
     window.on_stop_adding(ops::import::stop_signing_in);
 
     window.on_add_source({
@@ -424,6 +431,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     Err(_) => "",
                 },
             );
+            work::nudge_when_code_shows(&nudge);
 
             work::action(
                 &weak,
@@ -431,7 +439,9 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     for (key, value) in shared.iter() {
                         ops::import::set_setting(&paths, &source, key, value)?;
                     }
-                    let row = ops::import::add_source(&paths, &source, &name, config)?;
+                    let Some(row) = ops::import::add_source(&paths, &source, &name, config)? else {
+                        return Ok(String::new());
+                    };
 
                     selection.rewind();
 

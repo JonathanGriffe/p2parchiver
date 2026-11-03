@@ -1,11 +1,13 @@
 use ac_files::{Content, Files};
 use ac_groups::id::GroupId;
 use ac_groups::store::{GroupRow, Groups, Resolved};
+use ac_net::Multiaddr;
 use ac_net::attest;
 use ac_net::config::{Config, Paths};
 use ac_net::identity::Identity;
 use anyhow::{Context, Result, anyhow};
 
+pub mod backup;
 pub mod file;
 pub mod format;
 pub mod group;
@@ -44,15 +46,21 @@ pub fn enrolment(paths: &Paths) -> Result<Option<attest::Statement>> {
         .context("reading the stored attestation")
 }
 
+/// This home's config.
+pub fn config(paths: &Paths) -> Result<Config> {
+    let path = paths.config_file();
+    Config::load(&path).with_context(|| format!("loading config from {}", path.display()))
+}
+
+/// The server this home enrolled with, which `server` in the config records. `None` until it
+/// has enrolled.
+pub fn enrolled(paths: &Paths) -> Result<Option<Multiaddr>> {
+    Ok(config(paths)?.server)
+}
+
 /// What a daemon needs before it can start: who this node is, and how it is configured.
 pub fn startup(paths: &Paths) -> Result<(Identity, Config)> {
-    let identity = identity(paths)?;
-
-    let config_path = paths.config_file();
-    let config = Config::load(&config_path)
-        .with_context(|| format!("loading config from {}", config_path.display()))?;
-
-    Ok((identity, config))
+    Ok((identity(paths)?, config(paths)?))
 }
 
 pub fn open(paths: &Paths) -> Result<(Identity, Groups)> {
@@ -71,10 +79,7 @@ pub fn open_files(paths: &Paths, identity: &Identity) -> Result<(Files, Content)
     let files = Files::open(&db, identity.peer_id())
         .with_context(|| format!("opening the file index at {}", db.display()))?;
 
-    let config = Config::load(&paths.config_file())
-        .with_context(|| format!("reading the config at {}", paths.config_file().display()))?;
-
-    Ok((files, Content::new(config.storage_root(paths))))
+    Ok((files, Content::new(config(paths)?.storage_root(paths))))
 }
 
 /// Turn what the user typed into one group, or explain why it was not one.
