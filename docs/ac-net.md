@@ -7,7 +7,7 @@ Paths below are relative to `crates/ac-net/`.
 ## Features
 
 - **Re-export**: It re-exports a few types (`PeerId`, `Multiaddr` and `Protocol`) in `src/lib.rs` from libp2p that will be used by other layers that do not depend on libp2p.
-- **Identity**: handles the identity of the node in `src/identity.rs`.
+- **Identity**: handles the identity of the node in `src/identity.rs`, loaded from `identity.key` or built from the same protobuf bytes, such as a key restored from a backup.
 - **Config**: Owns the config in `src/config.rs`.
 - **Enrollment**: It creates the protocol for enrollment in `src/proto.rs` and `src/invite.rs`.
 - **Attestation**: It implements attestation and admission, ie issuing an attestation and handling it in the node in `src/attest.rs`, the protocol to ask the server for one and the protocol for admission in in `src/proto.rs`, and the admission state machine in `src/admission.rs`. It connects the admission to the swarm through the `AdmissionLink` in `src/admission_link.rs`

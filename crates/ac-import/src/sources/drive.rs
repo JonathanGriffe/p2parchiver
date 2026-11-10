@@ -89,7 +89,7 @@ const EARLY: Duration = Duration::from_secs(60);
 const TOP: &str = "root";
 
 /// Send someone to Google, and keep what comes back.
-fn authorize(settings: &Fields) -> Result<Fields> {
+fn authorize(settings: &Fields) -> Result<Option<Fields>> {
     let flow = Flow {
         authorize: CONSENT,
         token: TOKEN,
@@ -100,7 +100,7 @@ fn authorize(settings: &Fields) -> Result<Fields> {
 
     // So closing the window that started this actually stops it, rather than leaving the
     // button dead until the consent window runs out.
-    crate::registry::stoppable(Some(oauth::cancel));
+    crate::prompt::stoppable(Some(oauth::cancel));
     let waited = flow.run(|url| {
         // Said three ways, because the one thing worse than this failing is it failing
         // silently: a window with no console shows nothing, and someone watching a spinner
@@ -113,12 +113,14 @@ fn authorize(settings: &Fields) -> Result<Fields> {
 
     // Held rather than asked, so this runs whichever way the sign-in went. Saying a sign-in
     // is waiting when none is makes `stop` do something where it promises to do nothing.
-    crate::registry::stoppable(None);
-    let granted = waited?;
+    crate::prompt::stoppable(None);
+    let Some(granted) = waited? else {
+        return Ok(None);
+    };
 
     let mut out = Fields::new();
     out.push("refresh_token", &granted.refresh_token);
-    Ok(out)
+    Ok(Some(out))
 }
 
 struct Drive {

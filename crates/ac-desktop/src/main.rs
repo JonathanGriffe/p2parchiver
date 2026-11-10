@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod autostart;
+mod enrol;
 mod files;
 mod groups;
 mod log;
@@ -118,6 +119,7 @@ fn main() -> Result<()> {
     sort::wire(&window, &paths, &selection, &nudge);
     sources::wire(&window, &paths, &selection, &nudge);
     settings::wire(&window, &paths, &node, &nudge);
+    enrol::wire(&window, &paths, &node, &nudge);
     settings::load(&window, &paths);
 
     // Asked once, on the way in. A node that has not enrolled can prove nothing about itself

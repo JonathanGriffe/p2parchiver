@@ -70,7 +70,8 @@ impl Flow {
     /// code that comes back for a token.
     ///
     /// `announce` is handed the URL, so a caller can open a browser at it, print it, or both.
-    pub fn run(&self, announce: impl FnOnce(&str)) -> Result<Granted> {
+    /// `None` if somebody stopped it.
+    pub fn run(&self, announce: impl FnOnce(&str)) -> Result<Option<Granted>> {
         // Bound before the browser is sent anywhere: the port is part of what it is told to
         // come back to, so it has to be a port already held.
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -92,8 +93,10 @@ impl Flow {
 
         announce(&self.consent_url(&redirect, &state, &challenge));
 
-        let code = self.wait_for_code(&listener, &state)?;
-        self.redeem(&code, &redirect, &verifier)
+        let Some(code) = self.wait_for_code(&listener, &state)? else {
+            return Ok(None);
+        };
+        self.redeem(&code, &redirect, &verifier).map(Some)
     }
 
     /// Where to send the browser.
@@ -114,8 +117,8 @@ impl Flow {
         format!("{}?{query}", self.authorize)
     }
 
-    /// Sit on the socket until the browser is sent back to it.
-    fn wait_for_code(&self, listener: &TcpListener, state: &str) -> Result<String> {
+    /// Sit on the socket until the browser is sent back to it. `None` if somebody stopped it.
+    fn wait_for_code(&self, listener: &TcpListener, state: &str) -> Result<Option<String>> {
         // Non-blocking, so the wait can be given up on. A blocking `accept` would hold this
         // thread for the whole consent window whatever anybody did to the window that started
         // it, and the button that opened the browser would stay dead until it gave up.
@@ -128,7 +131,7 @@ impl Flow {
         // — so one that carries no answer is served and forgotten rather than ending the wait.
         while Instant::now() < deadline {
             if STOPPED.load(Ordering::SeqCst) {
-                return Err(SourceError::Failed("signing in was stopped".to_owned()));
+                return Ok(None);
             }
 
             let stream = match listener.accept() {
@@ -146,7 +149,7 @@ impl Flow {
             // say something, and reading it in slices would be a parser for no reason.
             let _ = stream.set_nonblocking(false);
             match self.read_answer(stream, state) {
-                Ok(Some(code)) => return Ok(code),
+                Ok(Some(code)) => return Ok(Some(code)),
                 Ok(None) => continue,
                 Err(e) => return Err(e),
             }
@@ -559,7 +562,7 @@ mod tests {
             200,
         );
 
-        let granted = flow(url).run(browser_follows).unwrap();
+        let granted = flow(url).run(browser_follows).unwrap().unwrap();
         assert_eq!(granted.refresh_token, "rt-123");
 
         let form = asked.recv().unwrap();
@@ -598,10 +601,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         cancel();
 
-        let err = waiting.join().unwrap().unwrap_err().to_string();
+        let outcome = waiting.join().unwrap();
         let waited = began.elapsed();
 
-        assert!(err.contains("stopped"), "said plainly: {err}");
+        assert!(
+            outcome.expect("stopped, which is not a failure").is_none(),
+            "and nothing was granted"
+        );
         assert!(
             waited < Duration::from_secs(10),
             "it took {waited:?}, so it sat out the whole consent window"

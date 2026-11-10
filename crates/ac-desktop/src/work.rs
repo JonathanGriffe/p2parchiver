@@ -174,6 +174,21 @@ impl Nudge {
     }
 }
 
+/// Have the poller read as soon as a code to scan is up, rather than at its next tick. Gives
+/// up after 5 s, for a wait that never shows one.
+pub fn nudge_when_code_shows(nudge: &Nudge) {
+    let nudge = nudge.clone();
+    std::thread::spawn(move || {
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(50));
+            if ac_node::ops::prompt::showing().is_some() {
+                nudge.now();
+                return;
+            }
+        }
+    });
+}
+
 /// The handle the window holds, and the channel the poller waits on.
 pub fn nudge() -> (Nudge, Receiver<()>) {
     let (tx, rx) = channel();

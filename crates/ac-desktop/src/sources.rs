@@ -209,38 +209,7 @@ fn also_ignored(ignored: u64) -> String {
     }
 }
 
-fn pairing_code() -> Option<slint::Image> {
-    let qr = ops::import::showing()?;
-    const QUIET: usize = 4;
-
-    let side = qr.size + QUIET * 2;
-    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(side as u32, side as u32);
-    let pixels = buffer.make_mut_slice();
-
-    for row in 0..side {
-        for column in 0..side {
-            let dark = row >= QUIET
-                && column >= QUIET
-                && row < side - QUIET
-                && column < side - QUIET
-                && qr.at(row - QUIET, column - QUIET);
-            let shade = if dark { 0 } else { 255 };
-            pixels[row * side + column] = slint::Rgba8Pixel {
-                r: shade,
-                g: shade,
-                b: shade,
-                a: 255,
-            };
-        }
-    }
-    Some(slint::Image::from_rgba8(buffer))
-}
-
 pub fn apply(window: &MainWindow, page: Page) {
-    match pairing_code() {
-        Some(code) => window.set_pairing_code(code),
-        None => window.set_pairing_code(slint::Image::default()),
-    }
     window.set_pairing_says(
         ops::import::implementation(&window.get_adding_source())
             .map(|entry| entry.waiting())
@@ -340,9 +309,12 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
         move |source| {
             let (paths, nudge) = (paths.clone(), nudge.clone());
             let dir = source.to_string();
+            work::nudge_when_code_shows(&nudge);
             work::run(&weak, &nudge, move || {
-                let row = ops::import::authorize(&paths, &dir)?;
-                Ok(format!("signed in again as {}", row.name))
+                Ok(match ops::import::authorize(&paths, &dir)? {
+                    Some(row) => format!("signed in again as {}", row.name),
+                    None => String::new(),
+                })
             });
         }
     });
@@ -396,9 +368,9 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
     });
 
     // Closing the dialog gives up on whatever it was waiting for. The work thread wakes,
-    // reports that it was stopped, and clears `source-adding` on its way out — so nothing is
-    // left disabled by a window somebody shut.
-    window.on_stop_adding(ops::import::stop_signing_in);
+    // says nothing, since nothing failed, and clears `source-adding` on its way out — so
+    // nothing is left disabled by a window somebody shut.
+    window.on_stop_adding(ops::prompt::stop);
 
     window.on_add_source({
         let weak = weak.clone();
@@ -424,6 +396,7 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     Err(_) => "",
                 },
             );
+            work::nudge_when_code_shows(&nudge);
 
             work::action(
                 &weak,
@@ -431,7 +404,9 @@ pub fn wire(window: &MainWindow, paths: &Paths, selection: &Selection, nudge: &N
                     for (key, value) in shared.iter() {
                         ops::import::set_setting(&paths, &source, key, value)?;
                     }
-                    let row = ops::import::add_source(&paths, &source, &name, config)?;
+                    let Some(row) = ops::import::add_source(&paths, &source, &name, config)? else {
+                        return Ok(String::new());
+                    };
 
                     selection.rewind();
 
@@ -921,7 +896,7 @@ mod tests {
                 a: 255,
             };
         }
-        window.set_pairing_code(slint::Image::from_rgba8(pixels));
+        window.set_code(slint::Image::from_rgba8(pixels));
 
         let code = ElementHandle::find_by_element_type_name(&window, "Image")
             .next()

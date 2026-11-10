@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 
 use ac_net::throttle::{THROTTLE_BURST, Throttle};
 
+use crate::cmd::prompt::watch_for_a_code;
 use crate::ops::format::{ago, human_size};
 use crate::ops::{self};
 
@@ -39,69 +40,6 @@ pub fn available(source: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Watch for a sign-in raising something to look at, and print it when it does.
-///
-/// A thread because the sign-in owns the calling one until somebody acts on what it shows.
-fn watch_for_a_code(waiting: Option<&'static str>) -> Watching {
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watcher = std::thread::spawn({
-        let stop = std::sync::Arc::clone(&stop);
-        move || {
-            let mut shown = false;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if !shown && let Some(qr) = ops::import::showing() {
-                    println!("\n{}", as_blocks(&qr));
-                    if let Some(waiting) = waiting {
-                        println!("{waiting}\n");
-                    }
-                    shown = true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-    });
-    Watching { stop, watcher }
-}
-
-struct Watching {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    watcher: std::thread::JoinHandle<()>,
-}
-
-impl Watching {
-    fn stop(self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = self.watcher.join();
-    }
-}
-
-/// A QR as text. Two characters per cell, because a terminal cell is about half as wide as it
-/// is tall and a squashed code will not scan.
-fn as_blocks(qr: &ac_import::registry::Qr) -> String {
-    const QUIET: usize = 2;
-
-    let mut out = String::new();
-    for _ in 0..QUIET {
-        out.push_str(&"  ".repeat(qr.size + QUIET * 2));
-        out.push('\n');
-    }
-    for row in 0..qr.size {
-        out.push_str(&"  ".repeat(QUIET));
-        for column in 0..qr.size {
-            // Dark cells as spaces on a light field: a terminal's own background is not
-            // reliably white, so the light half is drawn rather than left to it.
-            out.push_str(if qr.at(row, column) { "  " } else { "██" });
-        }
-        out.push_str(&"  ".repeat(QUIET));
-        out.push('\n');
-    }
-    for _ in 0..QUIET {
-        out.push_str(&"  ".repeat(qr.size + QUIET * 2));
-        out.push('\n');
-    }
-    out
 }
 
 fn print_fields(what: &str, fields: &[Field]) {
@@ -146,7 +84,9 @@ pub fn source_add(paths: &Paths, source: &str, name: &str, set: &[String]) -> Re
     );
     let added = ops::import::add_source(paths, source, name, pairs(set)?);
     watching.stop();
-    let row = added?;
+    let Some(row) = added? else {
+        bail!("signing in was stopped");
+    };
 
     println!("added {} ({})", row.name, row.source);
     println!(
@@ -464,7 +404,9 @@ pub fn settings_show(paths: &Paths, source: &str) -> Result<()> {
 }
 
 pub fn auth(paths: &Paths, source: &str) -> Result<()> {
-    let row = ops::import::authorize(paths, source)?;
+    let Some(row) = ops::import::authorize(paths, source)? else {
+        bail!("signing in was stopped");
+    };
     println!("signed in again as {}", row.name);
     Ok(())
 }

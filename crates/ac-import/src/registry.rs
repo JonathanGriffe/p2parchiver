@@ -1,68 +1,18 @@
-use std::sync::Mutex;
-
 use crate::config::{Field, Fields};
 use crate::source::{Result, Source, SourceError, SourceType};
 
 type Opener = fn(&Fields, &Fields) -> Result<Box<dyn Source>>;
 
-pub type Authorize = fn(&Fields) -> Result<Fields>;
+/// Sign in, and return the settings that come back. `None` if somebody stopped it.
+pub type Authorize = fn(&Fields) -> Result<Option<Fields>>;
 
 /// The info a service needs to run
 #[derive(Debug, Clone, Copy)]
 pub struct NodeInfo<'a> {
     pub db: &'a std::path::Path,
-    pub state: &'a std::path::Path,
-    pub id: &'a str,
 }
 
 pub type Serve = fn(NodeInfo<'_>) -> Result<()>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Qr {
-    pub size: usize,
-    pub dark: Vec<bool>,
-}
-
-impl Qr {
-    pub fn at(&self, row: usize, column: usize) -> bool {
-        self.dark.get(row * self.size + column).copied() == Some(true)
-    }
-}
-
-/// What a sign-in currently wants a person to look at, if one is waiting.
-static SHOWING: Mutex<Option<Qr>> = Mutex::new(None);
-
-pub fn showing() -> Option<Qr> {
-    SHOWING.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-/// How to give up on the sign-in that is waiting, left here by the sign-in itself.
-static STOP: Mutex<Option<fn()>> = Mutex::new(None);
-
-/// Give up on whatever sign-in is waiting, if it left a way to.
-///
-/// A sign-in blocks a thread until somebody acts, and somebody may instead close the window
-/// it was asking through. Without this, the button that started it would stay disabled until
-/// the wait gave up on its own — minutes later, for no reason a person could see.
-///
-/// Nothing waiting, or a sign-in that cannot be interrupted, is a no-op: this is called from
-/// a window closing, which is not a place to be refusing things.
-pub fn stop() {
-    let hook = *STOP.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(stop) = hook {
-        stop();
-    }
-}
-
-/// Say how to be given up on, around a wait. `None` takes it back.
-pub fn stoppable(with: Option<fn()>) {
-    *STOP.lock().unwrap_or_else(|e| e.into_inner()) = with;
-}
-
-/// Put something up, or take it down. Called by an `Authorize` around its wait.
-pub fn show(qr: Option<Qr>) {
-    *SHOWING.lock().unwrap_or_else(|e| e.into_inner()) = qr;
-}
 
 include!(concat!(env!("OUT_DIR"), "/registry.rs"));
 
@@ -81,8 +31,8 @@ pub trait RegisteredSource {
     /// waits on anybody.
     const WAITING: &'static str = "";
 
-    /// Something to run for as long as the node does, for a source that has to be listened
-    /// for rather than asked. Most have nothing.
+    /// What to set up when the node starts, for a source that has to be listened for rather
+    /// than asked. Most have nothing.
     const SERVICE: Option<Serve> = None;
 
     fn open(config: &Fields, settings: &Fields) -> Result<Box<dyn Source>>;
@@ -164,8 +114,8 @@ impl Registered {
     }
 
     /// Sign in, if this source has a way to. The settings that come back are to be stored
-    /// beside the ones given.
-    pub fn authorize(&self, settings: &Fields) -> Result<Fields> {
+    /// beside the ones given. `None` if somebody stopped it.
+    pub fn authorize(&self, settings: &Fields) -> Result<Option<Fields>> {
         match self.auth {
             Some(auth) => auth(settings),
             None => Err(SourceError::config(
@@ -209,8 +159,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = NodeInfo {
             db: &dir.path().join("ac.db"),
-            state: dir.path(),
-            id: "12D3KooWTestPeerId",
         };
 
         for entry in known() {

@@ -44,6 +44,8 @@ Peers compare groups by their head: the last seq and hash, and a digest of the m
 
 Each node records its own consent to each group: `Pending` when invited, `Active` once accepted, `Left` once it left. Only the node changes it, never the admin, so a node re-added after leaving stays `Left` until it accepts again.
 
+A group adopted from a peer's offer takes its consent from this node's own winning standing among those offered: `In` gives `Active`, `Out` gives `Left`, and `Unanswered` or no standing gives `Pending`. Only the holder of the key can have signed that standing, so this is the node's own earlier answer coming back, as when a node restored from a backup re-learns its groups from fellow members.
+
 ### Who sees what
 
 A group is only named to a peer if both are members, so a non-member does not learn it exists.
@@ -60,7 +62,7 @@ The sync machine does no IO: it takes events and returns the fetches to send, an
 - From a peer's heads, it fetches groups it has never seen from the start, and known groups where the peer is ahead or the digests differ.
 - A group it holds that names the peer, but that the peer did not offer, gets one fetch too. That is how a removal is learned, since nobody offers a group to someone they no longer count as a member.
 - A group is fetched from one peer at a time, with at most 8 fetches in flight and up to 256 more queued. Fetches time out after 30 s, and a response that does not match the outstanding fetch is dropped.
-- A new group is stored, as `Pending`, only once its whole chain has been verified, so an offer alone never creates a row.
+- A new group is stored, with the consent described above, only once its whole chain has been verified, so an offer alone never creates a row.
 
 After ingesting, a pending node named by the group writes an `Unanswered` standing if it has not spoken yet, so others stop re-offering the chain. If the node is the admin, it writes a `Remove` for each member whose newly winning standing is `Out`, except its own.
 
