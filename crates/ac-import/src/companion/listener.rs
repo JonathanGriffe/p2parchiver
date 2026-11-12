@@ -553,7 +553,7 @@ fn fingerprint(cert: &CertificateDer<'static>) -> String {
 }
 
 /// This node's own certificate, made once and kept.
-fn server_config(
+pub(crate) fn server_config(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> Result<ServerConfig> {
