@@ -21,7 +21,7 @@ use crate::companion::{self, Code, listener};
 use crate::http::encode;
 use crate::config::{Field, Fields};
 use crate::ledger::Ledger;
-use crate::registry::{Authorize, NodeInfo, Registered, RegisteredSource, Serve};
+use crate::registry::{Authorize, HandOver, NodeInfo, Registered, RegisteredSource, Serve};
 use crate::source::{
     Checksum, Cursor, Digest, Item, Page, Result, Source, SourceError, SourceType,
 };
@@ -57,6 +57,8 @@ impl RegisteredSource for Phone {
     /// A phone says where it is by checking in with the companion listener, so this hands the
     /// listener what answers it.
     const SERVICE: Option<Serve> = Some(hear_hellos);
+
+    const BACKUP: Option<HandOver> = Some(back_up);
 
     fn open(config: &Fields, _settings: &Fields) -> Result<Box<dyn Source>> {
         Ok(Box::new(Phone::parse(config)?))
@@ -126,6 +128,11 @@ fn arrived(body: &str, from: IpAddr) -> Option<String> {
     }
 
     Some(device)
+}
+
+/// Hand a backup to the phone paired as `config`.
+fn back_up(config: &Fields, payload: &str) -> Result<()> {
+    Phone::parse(config)?.hand_over(payload)
 }
 
 /// Show a code, and wait for the phone that scans it.
@@ -263,14 +270,35 @@ impl Phone {
             false => format!("{}{path}?{}", self.base, query.join("&")),
         };
 
-        self.agent
-            .get(url)
+        self.authed(self.agent.get(url))
+    }
+
+    /// Statuses read rather than thrown, with the pairing token as a bearer.
+    fn authed<B>(&self, request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        request
             .config()
-            // Read rather than thrown: a 404 from a fetch means the photograph has gone,
-            // which is an outcome the pump knows what to do with and not an error.
+            // A 404 from a fetch means the photograph has gone, which is an outcome the pump
+            // knows what to do with and not an error.
             .http_status_as_error(false)
             .build()
             .header("Authorization", format!("Bearer {}", self.token))
+    }
+
+    /// Hand `payload` to this phone with `POST /v1/backup`. The payload is opaque here, and
+    /// never logged. Only a `204` means the phone keeps it.
+    fn hand_over(&self, payload: &str) -> Result<()> {
+        let answer = self
+            .authed(self.agent.post(format!("{}/v1/backup", self.base)))
+            .content_type("application/json")
+            .send(payload);
+        match answer.map_err(|e| self.unreachable(e))?.status().as_u16() {
+            204 => Ok(()),
+            404 => Err(SourceError::Failed(format!(
+                "{}'s app cannot take a backup; update it",
+                self.who()
+            ))),
+            other => Err(self.refused(other)),
+        }
     }
 
     /// A call that answers with JSON.
@@ -528,52 +556,152 @@ fn knock(address: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    use std::sync::Arc;
+    use std::sync::mpsc::Receiver;
 
-    /// A stand-in for the companion app: serves the two calls a phone serves, over plain
-    /// HTTP, and hands back what it was asked so a test can check the request as well as the
+    /// A stand-in for the companion app: serves the calls a phone serves, over plain HTTP,
+    /// and hands back what it was asked so a test can check the request as well as the
     /// answer. The same shape `oauth.rs` uses for Google's token endpoint.
     struct FakePhone {
         base: String,
-        asked: std::sync::mpsc::Receiver<String>,
+        asked: Receiver<Asked>,
     }
 
-    fn fake(answers: Vec<(u16, &'static str, &'static [u8])>) -> FakePhone {
+    /// A status, a content type and a body.
+    type Answer = (u16, &'static str, &'static [u8]);
+
+    /// One request as the phone received it.
+    struct Asked {
+        line: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl Asked {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+    }
+
+    /// Read one request off `stream` and give it `answer`. `None` if no whole request came.
+    fn take(stream: &mut (impl Read + Write), (status, kind, body): Answer) -> Option<Asked> {
+        let mut reader = BufReader::new(&mut *stream);
+
+        // The request line, then headers to the blank one, then the body.
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let mut headers = Vec::new();
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).ok()?;
+            let header = header.trim_end();
+            if header.is_empty() {
+                break;
+            }
+            let (key, value) = header.split_once(':')?;
+            headers.push((key.trim().to_owned(), value.trim().to_owned()));
+        }
+        let length = headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+            .map_or(0, |(_, value)| value.parse().unwrap_or(0));
+        let mut sent = vec![0u8; length];
+        reader.read_exact(&mut sent).ok()?;
+        drop(reader);
+
+        let reason = if status == 200 { "OK" } else { "No" };
+        write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .ok()?;
+        stream.write_all(body).ok()?;
+        stream.flush().ok()?;
+        Some(Asked {
+            line: line.trim_end().to_owned(),
+            headers,
+            body: String::from_utf8(sent).ok()?,
+        })
+    }
+
+    fn fake(answers: Vec<Answer>) -> FakePhone {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let (send, asked) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            for (status, kind, body) in answers {
+            for answer in answers {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-
-                // The request line, then headers to the blank one.
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let _ = send.send(line.trim_end().to_owned());
-                loop {
-                    let mut header = String::new();
-                    reader.read_line(&mut header).unwrap();
-                    if header == "\r\n" || header.is_empty() {
-                        break;
-                    }
+                if let Some(request) = take(&mut stream, answer) {
+                    let _ = send.send(request);
                 }
-
-                let reason = if status == 200 { "OK" } else { "No" };
-                write!(
-                    stream,
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .unwrap();
-                stream.write_all(body).unwrap();
             }
         });
 
         FakePhone { base, asked }
+    }
+
+    /// The same stand-in over TLS, with its own certificate for `device`, answering one
+    /// request. Comes with what pairing would have stored for it.
+    fn fake_over_tls(device: &str, answer: Answer) -> (Fields, Receiver<Asked>) {
+        use rustls::pki_types::PrivateKeyDer;
+        use rustls::{ServerConfig, ServerConnection, StreamOwned};
+
+        let made = rcgen::generate_simple_self_signed(vec![synthetic(device)]).unwrap();
+        let key = PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap();
+        let tls = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![made.cert.der().clone()], key)
+                .unwrap(),
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (send, asked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut stream = StreamOwned::new(ServerConnection::new(tls).unwrap(), socket);
+            // A handshake the client walks away from ends here, with nothing asked.
+            if let Some(request) = take(&mut stream, answer) {
+                let _ = send.send(request);
+            }
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
+        });
+
+        let mut config = Fields::new();
+        config
+            .push("device", device)
+            .push("token", "tok-123")
+            .push("cert", &made.cert.pem())
+            .push("address", &format!("127.0.0.1:{port}"));
+        (config, asked)
+    }
+
+    /// A port nothing listens on.
+    fn nowhere() -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("127.0.0.1:{port}")
+    }
+
+    /// `config` with `key` set to `value`.
+    fn with(config: &Fields, key: &str, value: &str) -> Fields {
+        let mut out = Fields::new();
+        for (held, was) in config.iter() {
+            out.push(held, if held == key { value } else { was });
+        }
+        out
     }
 
     fn phone(at: &FakePhone) -> Phone {
@@ -719,7 +847,7 @@ mod tests {
         );
         assert_eq!(page.next.as_deref(), Some("page-2"));
 
-        let asked = at.asked.recv().unwrap();
+        let asked = at.asked.recv().unwrap().line;
         assert!(asked.starts_with("GET /v1/items?"), "{asked}");
         assert!(asked.contains("limit=200"), "{asked}");
         assert!(!asked.contains("after="), "nothing to resume from: {asked}");
@@ -733,7 +861,7 @@ mod tests {
         assert!(page.items.is_empty());
         assert!(page.next.is_none(), "the walk ends rather than looping");
 
-        let asked = at.asked.recv().unwrap();
+        let asked = at.asked.recv().unwrap().line;
         assert!(asked.contains("after=page-2"), "{asked}");
     }
 
@@ -767,7 +895,7 @@ mod tests {
         phone(&at).fetch(&item, &mut arrived).unwrap();
         assert_eq!(arrived, b"these are the bytes");
 
-        let asked = at.asked.recv().unwrap();
+        let asked = at.asked.recv().unwrap().line;
         assert!(asked.starts_with("GET /v1/items/m-1/bytes"), "{asked}");
     }
 
@@ -802,6 +930,114 @@ mod tests {
             assert!(err.contains("pair it again"), "{status}: {err}");
             assert!(err.contains("this phone"), "{err}");
         }
+    }
+
+    const PAYLOAD: &str =
+        r#"{"v":1,"peer":"12D3KooWPeer","key":"c2VjcmV0","server":"/p2p/x","username":"alice"}"#;
+
+    /// A backup handed through the registry's hook, as `ac-node` hands it.
+    fn back_up_through_the_registry(config: &Fields) -> Result<()> {
+        crate::registry::find(Phone::NAME)
+            .unwrap()
+            .hand_over(config, PAYLOAD)
+    }
+
+    /// The error a backup failed with, checked never to carry the key.
+    fn refusal(handed: Result<()>) -> String {
+        let said = handed.unwrap_err().to_string();
+        assert!(!said.contains("c2VjcmV0"), "{said}");
+        said
+    }
+
+    #[test]
+    fn a_backup_goes_with_the_pairing_token_and_the_payload_unchanged() {
+        let at = fake(vec![(204, "text/plain", b"")]);
+        phone(&at).hand_over(PAYLOAD).unwrap();
+
+        let asked = at.asked.recv().unwrap();
+        assert_eq!(asked.line, "POST /v1/backup HTTP/1.1");
+        assert_eq!(asked.header("authorization"), Some("Bearer tok-123"));
+        assert_eq!(asked.header("content-type"), Some("application/json"));
+        assert_eq!(asked.body, PAYLOAD);
+    }
+
+    #[test]
+    fn each_answer_says_what_became_of_the_backup() {
+        let at = fake(vec![(204, "text/plain", b"")]);
+        assert!(phone(&at).hand_over(PAYLOAD).is_ok());
+
+        for (status, says) in [
+            (401, "pair it again"),
+            (403, "pair it again"),
+            (404, "update it"),
+            (200, "answered 200"),
+            (500, "answered 500"),
+        ] {
+            let at = fake(vec![(status, "text/plain", b"")]);
+            let said = refusal(phone(&at).hand_over(PAYLOAD));
+            assert!(said.contains(says), "{status}: {said}");
+        }
+    }
+
+    #[test]
+    fn a_phone_that_does_not_answer_is_away() {
+        let address = nowhere();
+        let away = Phone {
+            agent: crate::http::agent(),
+            base: format!("http://{address}"),
+            address,
+            token: "tok-123".to_owned(),
+            device: "Pixel".to_owned(),
+        };
+        let said = refusal(away.hand_over(PAYLOAD));
+        assert!(said.contains("could not reach"), "{said}");
+    }
+
+    /// The whole way, through the hook, the pinned agent, the synthetic name and the stored
+    /// address.
+    #[test]
+    fn a_paired_phone_takes_the_backup_over_its_pinned_certificate() {
+        let (config, asked) = fake_over_tls("Jonathan's Pixel", (204, "text/plain", b""));
+        back_up_through_the_registry(&config).unwrap();
+
+        let asked = asked.recv().unwrap();
+        assert_eq!(asked.line, "POST /v1/backup HTTP/1.1");
+        assert_eq!(asked.header("authorization"), Some("Bearer tok-123"));
+        assert_eq!(asked.body, PAYLOAD);
+    }
+
+    /// The key goes only to the certificate this node paired with.
+    #[test]
+    fn a_phone_with_another_certificate_is_sent_nothing() {
+        let (config, asked) = fake_over_tls("Pixel", (204, "text/plain", b""));
+        let (impostor, _) = fake_over_tls("Pixel", (204, "text/plain", b""));
+        let config = with(&config, "cert", impostor.get("cert").unwrap());
+
+        let said = refusal(back_up_through_the_registry(&config));
+        assert!(said.contains("could not reach"), "{said}");
+        assert!(
+            asked.recv_timeout(Duration::from_secs(1)).is_err(),
+            "nothing reached it"
+        );
+    }
+
+    #[test]
+    fn with_two_phones_one_away_the_other_still_takes_it() {
+        let (here, asked) = fake_over_tls("Pixel", (204, "text/plain", b""));
+        let away = with(&here, "address", &nowhere());
+
+        let said = refusal(back_up_through_the_registry(&away));
+        assert!(said.contains("could not reach"), "{said}");
+        back_up_through_the_registry(&here).unwrap();
+        assert_eq!(asked.recv().unwrap().body, PAYLOAD);
+    }
+
+    #[test]
+    fn a_phone_that_is_not_paired_is_sent_nothing_and_says_why() {
+        let mut config = Fields::new();
+        config.push("device", "Pixel").push("token", "tok-123");
+        let said = refusal(back_up_through_the_registry(&config));
+        assert!(said.contains("has not been paired"), "{said}");
     }
 
     /// The whole of what a hello does, short of the socket: it says which phone, remembers
