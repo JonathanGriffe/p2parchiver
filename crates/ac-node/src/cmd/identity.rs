@@ -8,20 +8,9 @@ use crate::cmd::prompt::watch_for_a_code;
 use crate::ops;
 use crate::ops::lock::NodeLock;
 
-/// Back this node's identity up to the companion app.
+/// Back this node's identity up to every paired phone.
 pub fn backup(paths: &Paths) -> Result<()> {
-    // A running daemon holds the listener's port, so the phone would answer it, not us.
-    let _lock = NodeLock::take(paths)?;
-    ops::import::start_services(paths);
-
-    let watching = watch_for_a_code(Some(SCAN));
-    let done = ops::backup::backup(paths);
-    watching.stop();
-    if done?.is_none() {
-        bail!("the backup was stopped");
-    }
-
-    println!("backed up to the phone");
+    println!("{}", ops::backup::backup(paths)?);
     Ok(())
 }
 

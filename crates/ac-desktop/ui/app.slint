@@ -145,7 +145,7 @@ export component MainWindow inherits Window {
     in-out property <[FieldItem]> source-settings-fields;
     // Which implementation the Add dialog is about, and empty when it is closed.
     in-out property <string> adding-source;
-    // The code a sign-in, a backup or a restore is waiting on, while it waits. Written by the
+    // The code a sign-in or a restore is waiting on, while it waits. Written by the
     // poll, so it appears whether the wait was started here or from a command.
     in property <image> code;
     in property <string> pairing-says;
@@ -170,7 +170,9 @@ export component MainWindow inherits Window {
     // Whether the dialog holds an identity restored from the phone, and the name it came with.
     in-out property <bool> enrol-restored;
     in-out property <string> enrol-username;
-    // Whether Settings is waiting for a phone to take a backup.
+    // Whether a phone is paired to take a backup, from the poll, and whether Settings is
+    // sending one.
+    in property <bool> phone-paired;
     in-out property <bool> backing-up;
     // Starting with the session. Hidden where the platform has no way to.
     in-out property <bool> autostart-supported;
@@ -212,7 +214,7 @@ export component MainWindow inherits Window {
     callback enrol-restore();
     callback enrol-continue();
     callback backup();
-    // Gives up on the restore or backup code on screen.
+    // Gives up on the restore code on screen.
     callback stop-phone-code();
     callback copy-peer-id();
     callback sort-pick-group(int);
@@ -448,13 +450,12 @@ export component MainWindow inherits Window {
                 autostart-supported: root.autostart-supported;
                 autostart <=> root.autostart;
                 autostart-warning: root.autostart-warning;
+                phone-paired: root.phone-paired;
                 backing-up: root.backing-up;
-                code: root.code;
                 busy: root.busy;
                 vertical-stretch: 1;
 
                 backup() => { root.backup(); }
-                stop-backup() => { root.stop-phone-code(); }
 
                 save(m, r, s, b) => { root.save(m, r, s, b); }
                 set-autostart(on) => { root.set-autostart(on); }

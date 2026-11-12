@@ -14,6 +14,9 @@ pub struct NodeInfo<'a> {
 
 pub type Serve = fn(NodeInfo<'_>) -> Result<()>;
 
+/// Hand a backup, an opaque payload, to one configured source. `Ok` only once it keeps it.
+pub type HandOver = fn(&Fields, &str) -> Result<()>;
+
 include!(concat!(env!("OUT_DIR"), "/registry.rs"));
 
 /// What a source has to say about itself to be one of these.
@@ -35,6 +38,10 @@ pub trait RegisteredSource {
     /// than asked. Most have nothing.
     const SERVICE: Option<Serve> = None;
 
+    /// How to hand this node's identity to a configured source that keeps a backup of it.
+    /// Most cannot.
+    const BACKUP: Option<HandOver> = None;
+
     fn open(config: &Fields, settings: &Fields) -> Result<Box<dyn Source>>;
 }
 
@@ -48,6 +55,7 @@ pub struct Registered {
     auth: Option<Authorize>,
     waiting: &'static str,
     service: Option<Serve>,
+    backup: Option<HandOver>,
 }
 
 impl Registered {
@@ -66,6 +74,7 @@ impl Registered {
             auth: S::AUTH,
             waiting: S::WAITING,
             service: S::SERVICE,
+            backup: S::BACKUP,
         }
     }
 
@@ -92,6 +101,19 @@ impl Registered {
         match self.service {
             Some(serve) => serve(node),
             None => Ok(()),
+        }
+    }
+
+    /// Whether this source can keep a backup of the node's identity.
+    pub fn takes_backup(&self) -> bool {
+        self.backup.is_some()
+    }
+
+    /// Hand `payload` to one configured source, if it can keep a backup.
+    pub fn hand_over(&self, config: &Fields, payload: &str) -> Result<()> {
+        match self.backup {
+            Some(hand_over) => hand_over(config, payload),
+            None => Err(SourceError::config(self.name, "it keeps no backup")),
         }
     }
 
@@ -178,6 +200,13 @@ mod tests {
             !folder.serves(),
             "a folder needs nothing running to be found"
         );
+    }
+
+    #[test]
+    fn a_source_without_a_backup_hook_is_never_handed_one() {
+        let folder = find("folder").unwrap();
+        assert!(!folder.takes_backup());
+        assert!(folder.hand_over(&Fields::new(), "{}").is_err());
     }
 
     #[test]

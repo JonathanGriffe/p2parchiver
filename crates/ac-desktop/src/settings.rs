@@ -50,6 +50,18 @@ pub fn load(window: &MainWindow, paths: &Paths) {
     show_autostart(window, autostart::state());
 }
 
+/// What the poll reads while Settings is up: whether a phone is paired to take a backup.
+pub fn read(paths: &Paths) -> bool {
+    ops::backup::can_back_up(paths).unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "could not read the paired phones");
+        false
+    })
+}
+
+pub fn apply(window: &MainWindow, phone_paired: bool) {
+    window.set_phone_paired(phone_paired);
+}
+
 /// The tick, and the warning that goes with a recorded path that is no longer this binary.
 /// Where the platform has no way to start with the session, the option is not shown at all.
 fn show_autostart(window: &MainWindow, state: Result<autostart::State>) {
@@ -176,8 +188,6 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
         }
     });
 
-    window.on_stop_phone_code(ops::prompt::stop);
-
     window.on_backup({
         let weak = weak.clone();
         let paths = paths.clone();
@@ -188,20 +198,14 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
             if let Some(window) = weak.upgrade() {
                 window.set_backing_up(true);
             }
-            work::nudge_when_code_shows(&nudge);
 
             work::action(
                 &weak,
-                move || ops::backup::backup(&paths),
+                move || ops::backup::backup(&paths).map(|backup| backup.to_string()),
                 move |window, outcome| {
                     window.set_backing_up(false);
                     // Nothing else on screen changes, so the line says how it went.
-                    let said = match outcome {
-                        Ok(Some(())) => Ok("backed up to the phone".to_owned()),
-                        Ok(None) => Ok(String::new()),
-                        Err(e) => Err(e),
-                    };
-                    work::finish(window, said, &nudge);
+                    work::finish(window, outcome, &nudge);
                 },
             );
         }
@@ -330,24 +334,41 @@ mod tests {
     use crate::view::{self, SETTINGS};
 
     #[test]
-    fn a_backup_is_offered_only_once_enrolled() {
+    fn a_backup_is_offered_only_once_enrolled_with_a_phone_paired() {
         i_slint_backend_testing::init_no_event_loop();
         let window = MainWindow::new().unwrap();
         window
             .window()
             .set_size(slint::PhysicalSize::new(1200, 3000));
         window.set_tab(SETTINGS);
-        let showing = |label: &str| ElementHandle::find_by_accessible_label(&window, label).count();
+        let enabled = |label: &str| {
+            ElementHandle::find_by_accessible_label(&window, label)
+                .map(|button| button.accessible_enabled() == Some(true))
+                .collect::<Vec<_>>()
+        };
 
         window.set_enrolled(false);
-        assert_eq!(showing("Back up to phone"), 0);
+        window.set_phone_paired(true);
+        assert_eq!(enabled("Back up to phone"), Vec::<bool>::new());
 
         window.set_enrolled(true);
-        assert_eq!(showing("Back up to phone"), 1);
+        window.set_phone_paired(false);
+        assert_eq!(
+            enabled("Back up to phone"),
+            [false],
+            "no phone to send it to"
+        );
+
+        window.set_phone_paired(true);
+        assert_eq!(enabled("Back up to phone"), [true]);
 
         window.set_backing_up(true);
-        assert_eq!(showing("Back up to phone"), 0, "one at a time");
-        assert_eq!(showing("Cancel"), 1, "and it can be given up");
+        assert_eq!(enabled("Backing up…"), [false], "one at a time");
+        assert_eq!(
+            enabled("Cancel"),
+            Vec::<bool>::new(),
+            "and nothing to cancel"
+        );
     }
 
     /// Enrolling is the one thing that changes the name and the server a node shows, and it
