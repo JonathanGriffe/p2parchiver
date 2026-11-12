@@ -1,5 +1,5 @@
 //! The companion app's way in to this node: the listener it answers on, and the codes it scans
-//! to pair, to back a node up and to restore one.
+//! to pair and to restore a node.
 
 pub(crate) mod listener;
 
@@ -32,8 +32,6 @@ static NODE: Mutex<String> = Mutex::new(String::new());
 pub enum Code {
     /// Pair the phone as a source.
     Pair,
-    /// Hand this node's identity to the phone.
-    Backup,
     /// Take an identity back from the phone.
     Restore,
 }
@@ -43,7 +41,6 @@ impl Code {
     fn host(self) -> &'static str {
         match self {
             Code::Pair => "pair",
-            Code::Backup => "backup",
             Code::Restore => "restore",
         }
     }
@@ -52,14 +49,13 @@ impl Code {
     fn path(self) -> &'static str {
         match self {
             Code::Pair => "/v1/pair",
-            Code::Backup => "/v1/backup",
             Code::Restore => "/v1/restore",
         }
     }
 
     /// The code a `POST` to `path` answers, if any.
     fn at(path: &str) -> Option<Code> {
-        [Code::Pair, Code::Backup, Code::Restore]
+        [Code::Pair, Code::Restore]
             .into_iter()
             .find(|code| code.path() == path)
     }
@@ -84,11 +80,10 @@ pub fn serve(state: &Path, node: &str) -> Result<()> {
 /// Show `code`, and wait for the phone that answers it.
 ///
 /// `read` turns that answer, and the address it came from, into what the caller wants, or
-/// says why it cannot. It runs once, on the listener's thread. `reply` is the body of the
-/// `200` the phone gets back, or `None` for a `204`. `Ok(None)` means somebody stopped it.
+/// says why it cannot. It runs once, on the listener's thread, and the phone gets a `204`.
+/// `Ok(None)` means somebody stopped it.
 pub fn ask<T: Send + 'static>(
     code: Code,
-    reply: Option<String>,
     read: impl FnOnce(Value, IpAddr) -> std::result::Result<T, String> + Send + 'static,
 ) -> Result<Option<T>> {
     // An answer reaches whichever process holds the listener, which a command run beside a
@@ -107,7 +102,6 @@ pub fn ask<T: Send + 'static>(
     listener::open(listener::Open {
         code,
         token,
-        reply,
         answer: Box::new(move |body, from| {
             let read = read(body, from);
             let usable = read.is_ok();
@@ -237,12 +231,8 @@ mod tests {
         );
 
         *NODE.lock().unwrap() = "12D3KooWNew".to_owned();
-        let backup = text(Code::Backup, &serving, "tok").unwrap();
-        assert!(backup.starts_with("ac://backup?v=1&a="), "{backup}");
-        assert!(
-            backup.contains("&i=12D3KooWNew&"),
-            "follows the key: {backup}"
-        );
+        let pair = text(Code::Pair, &serving, "tok").unwrap();
+        assert!(pair.contains("&i=12D3KooWNew&"), "follows the key: {pair}");
 
         let restore = text(Code::Restore, &serving, "tok").unwrap();
         assert!(restore.starts_with("ac://restore?v=1&a="), "{restore}");
@@ -272,27 +262,6 @@ mod tests {
     }
 
     #[test]
-    fn a_backup_goes_to_the_phone_that_scanned_its_code() {
-        let _one = listener::ONE_LISTENER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let port = listener::start_for_test(dir.path()).unwrap();
-
-        let backup = r#"{"v":1,"peer":"p","key":"secret"}"#;
-        let backing_up =
-            std::thread::spawn(|| ask(Code::Backup, Some(backup.to_owned()), |_, _| Ok(())));
-        let token = a_code_up();
-
-        let body = serde_json::json!({ "token": token }).to_string();
-        let answer = listener::post_for_test(dir.path(), port, Code::Backup.path(), &body);
-        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
-        assert!(answer.ends_with(backup), "{answer}");
-        assert_eq!(backing_up.join().unwrap().unwrap(), Some(()));
-        assert!(prompt::showing().is_none(), "the code came down");
-    }
-
-    #[test]
     fn a_restore_returns_what_its_reader_made_of_the_answer() {
         let _one = listener::ONE_LISTENER
             .lock()
@@ -301,7 +270,7 @@ mod tests {
         let port = listener::start_for_test(dir.path()).unwrap();
 
         let restoring =
-            std::thread::spawn(|| ask(Code::Restore, None, |body, _| Ok(body["backup"].clone())));
+            std::thread::spawn(|| ask(Code::Restore, |body, _| Ok(body["backup"].clone())));
         let token = a_code_up();
 
         let body = serde_json::json!({ "token": token, "backup": { "v": 1, "peer": "p" } });
@@ -325,7 +294,7 @@ mod tests {
         let port = listener::start_for_test(dir.path()).unwrap();
 
         let restoring = std::thread::spawn(|| {
-            ask(Code::Restore, None, |_, _| {
+            ask(Code::Restore, |_, _| {
                 Err::<(), _>("update the app".to_owned())
             })
         });
@@ -349,7 +318,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         listener::start_for_test(dir.path()).unwrap();
 
-        let asking = std::thread::spawn(|| ask(Code::Backup, Some("{}".to_owned()), |_, _| Ok(())));
+        let asking = std::thread::spawn(|| ask(Code::Restore, |_, _| Ok(())));
         a_code_up();
         prompt::stop();
 

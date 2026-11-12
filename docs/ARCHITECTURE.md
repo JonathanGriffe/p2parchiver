@@ -51,8 +51,8 @@ Three kinds of authority, each backed by its own signature and checked by every 
 | A group's admin | The group's chain: creation, adds, removals | Who is in the group | On every group operation (membership and file sharing) |
 | Each member | Its own standing: not answered yet, in, or out | Whether it takes part, and the name it shows in the group | On every standing a node receives |
 
-Identity belongs to the node: its key is generated locally and leaves the machine only for a
-phone that scanned a backup code the node showed, and the server only vouches for it. The server's own key is the root of trust. The invite token
+Identity belongs to the node: its key is generated locally and leaves the machine only when
+someone at it sends a backup to a phone paired with it, and the server only vouches for it. The server's own key is the root of trust. The invite token
 carries it, the node pins it at enrolment, and from then on only attestations signed by it
 are accepted.
 
