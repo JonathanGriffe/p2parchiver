@@ -77,7 +77,7 @@ pub(super) fn ledger_at(db: &Path) -> Result<Ledger> {
 }
 
 /// Start whatever each source needs for as long as this node runs, then the listener the
-/// companion app answers on, for pairing, check-ins, backup and restore.
+/// companion app answers on, for pairing, check-ins and restore.
 ///
 /// A source that has to be *found* cannot answer "are you there?" by opening a socket every
 /// time it is asked, so it declares something to set up once and answers from what that

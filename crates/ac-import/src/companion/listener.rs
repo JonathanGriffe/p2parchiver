@@ -1,5 +1,5 @@
 //! The one thing this node serves: a place for a phone to say where it is, and to answer a
-//! code on screen, to pair, back up or restore.
+//! code on screen, to pair or restore. It never hands out a key.
 //!
 //! Every call is tiny. It never receives a photograph — the desktop fetches those — so nothing
 //! here streams and everything has a hard ceiling on its size.
@@ -68,7 +68,7 @@ static LISTENING: AtomicBool = AtomicBool::new(false);
 /// be describing the first one for ever.
 static SERVING: Mutex<Option<Serving>> = Mutex::new(None);
 
-/// The one code a phone may answer right now, if any: a pairing, a backup or a restore.
+/// The one code a phone may answer right now, if any: a pairing or a restore.
 ///
 /// One at a time on purpose: two QRs on one screen is not a thing that happens, and a single
 /// slot means a phone's answer can only ever belong to the request a person is looking at.
@@ -95,8 +95,6 @@ pub struct Serving {
 pub struct Open {
     pub code: Code,
     pub token: String,
-    /// The body of a `200`, or `None` for a `204`. Secret for a backup, so never logged.
-    pub reply: Option<String>,
     /// Reads the answer and hands the result to whoever is waiting. False if it was unusable.
     pub answer: Box<dyn FnOnce(Value, IpAddr) -> bool + Send>,
 }
@@ -208,40 +206,28 @@ pub fn pending_token() -> Option<String> {
         .map(|open_code| open_code.token.clone())
 }
 
-/// What a phone whose answer was read gets back.
-#[derive(Debug, PartialEq, Eq)]
-enum Reply {
-    /// A `204`.
-    NoContent,
-    /// A `200`, carrying the code's reply.
-    Json(String),
-}
-
-/// A phone answering `code`. The reply to send when its answer was read, or `None` for a `403`.
+/// A phone answering `code`. True when its answer was read, for a `204`, and false for a `403`.
 ///
 /// Spent once the token matches, whether or not the answer could be used: only the phone that
 /// scanned the code has the token, and sending again would send the same thing.
-fn exchange(code: Code, body: &str, from: IpAddr) -> Option<Reply> {
-    let body: Value = serde_json::from_str(body).ok()?;
-    let open_code = {
-        let token = body
-            .get("token")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let mut slot_lock = OPEN.lock().unwrap_or_else(|e| e.into_inner());
-        let waiting = slot_lock.as_ref()?;
-        // Compared whole. A token nobody is waiting for, or the wrong one, is not an error
-        // worth explaining to whoever sent it — they are not the person holding the phone.
-        if code != waiting.code || token.is_empty() || token != waiting.token {
-            return None;
-        }
-        slot_lock.take()?
+fn exchange(code: Code, body: &str, from: IpAddr) -> bool {
+    let Ok(body) = serde_json::from_str::<Value>(body) else {
+        return false;
     };
-    let reply = match open_code.reply {
-        Some(json) => Reply::Json(json),
-        None => Reply::NoContent,
+    let token = body
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // Compared whole. A token nobody is waiting for, or the wrong one, is not an error
+    // worth explaining to whoever sent it — they are not the person holding the phone.
+    let taken = OPEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take_if(|waiting| code == waiting.code && !token.is_empty() && token == waiting.token);
+    let Some(open_code) = taken else {
+        return false;
     };
-    (open_code.answer)(body, from).then_some(reply)
+    (open_code.answer)(body, from)
 }
 
 #[derive(Debug, Clone)]
@@ -379,11 +365,10 @@ fn answer(stream: TcpStream, tls: &Arc<ServerConfig>) {
             None => say(&mut tls, 403, TEXT, "no"),
         },
         Asked::Code(code, body) => match exchange(code, &body, from) {
-            Some(Reply::NoContent) => say(&mut tls, 204, TEXT, ""),
-            Some(Reply::Json(reply)) => say(&mut tls, 200, JSON, &reply),
+            true => say(&mut tls, 204, TEXT, ""),
             // Deliberately the same answer for "no code is open", "wrong token" and
             // "unreadable": whoever is asking without the code learns nothing from which.
-            None => say(&mut tls, 403, TEXT, "no"),
+            false => say(&mut tls, 403, TEXT, "no"),
         },
         Asked::Elsewhere => say(&mut tls, 404, TEXT, "no"),
         Asked::Malformed(why) => {
@@ -489,12 +474,10 @@ fn finish(mut raw: Vec<u8>) -> String {
 }
 
 const TEXT: &str = "text/plain";
-const JSON: &str = "application/json";
 
 /// The shortest reply that is still a reply.
 fn say(to: &mut impl Write, status: u16, kind: &str, body: &str) {
     let reason = match status {
-        200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
         403 => "Forbidden",
@@ -689,6 +672,7 @@ mod tests {
             "GET /v1/hello HTTP/1.1\r\n\r\n",
             "POST /wp-login.php HTTP/1.1\r\n\r\n",
             "POST / HTTP/1.1\r\n\r\n",
+            "POST /v1/backup HTTP/1.1\r\n\r\n",
         ] {
             assert_eq!(asked(raw), Asked::Elsewhere, "{raw:?}");
         }
@@ -851,16 +835,11 @@ mod tests {
     }
 
     /// Open `code` with `token`, and return what its `answer` is handed, if anything ever is.
-    fn waiting(
-        code: Code,
-        token: &str,
-        reply: Option<&str>,
-    ) -> std::sync::mpsc::Receiver<(Value, IpAddr)> {
+    fn waiting(code: Code, token: &str) -> std::sync::mpsc::Receiver<(Value, IpAddr)> {
         let (send, got) = std::sync::mpsc::channel();
         open(Open {
             code,
             token: token.to_owned(),
-            reply: reply.map(str::to_owned),
             answer: Box::new(move |body, from| send.send((body, from)).is_ok()),
         })
         .unwrap();
@@ -876,25 +855,19 @@ mod tests {
         let body = |token: &str| format!(r#"{{"token":"{token}","id":"dev-1","port":8443}}"#);
 
         // Nobody waiting: an answer to a question that was never asked.
-        assert!(exchange(Code::Pair, &body("anything"), from).is_none());
+        assert!(!exchange(Code::Pair, &body("anything"), from));
 
-        let got = waiting(Code::Pair, "the-token", None);
+        let got = waiting(Code::Pair, "the-token");
         assert!(
-            exchange(Code::Pair, &body("wrong-token"), from).is_none(),
+            !exchange(Code::Pair, &body("wrong-token"), from),
             "a guess is not a scan"
         );
+        assert!(!exchange(Code::Pair, "not json", from), "nor is nonsense");
         assert!(
-            exchange(Code::Pair, "not json", from).is_none(),
-            "nor is nonsense"
-        );
-        assert!(
-            exchange(Code::Backup, &body("the-token"), from).is_none(),
+            !exchange(Code::Restore, &body("the-token"), from),
             "nor the right token at another code's path"
         );
-        assert_eq!(
-            exchange(Code::Pair, &body("the-token"), from),
-            Some(Reply::NoContent)
-        );
+        assert!(exchange(Code::Pair, &body("the-token"), from));
 
         let (read, at) = got.try_recv().expect("the answer was handed over");
         assert_eq!(
@@ -906,16 +879,16 @@ mod tests {
         // Spent. A second phone cannot answer a code that has already been used, and neither
         // can the first one twice.
         assert!(
-            exchange(Code::Pair, &body("the-token"), from).is_none(),
+            !exchange(Code::Pair, &body("the-token"), from),
             "the token was used up"
         );
 
         // A code taken down stops being answerable, rather than sitting open for whoever
         // finds it later.
-        let _got = waiting(Code::Pair, "brief", None);
+        let _got = waiting(Code::Pair, "brief");
         close();
         assert!(
-            exchange(Code::Pair, &body("brief"), from).is_none(),
+            !exchange(Code::Pair, &body("brief"), from),
             "a closed code is not a code"
         );
     }
@@ -927,12 +900,11 @@ mod tests {
         open(Open {
             code: Code::Restore,
             token: "tok".to_owned(),
-            reply: None,
             answer: Box::new(|_, _| false),
         })
         .unwrap();
 
-        assert!(exchange(Code::Restore, r#"{"token":"tok","bad":1}"#, from).is_none());
+        assert!(!exchange(Code::Restore, r#"{"token":"tok","bad":1}"#, from));
         assert!(pending_token().is_none(), "the code is spent");
     }
 
@@ -940,44 +912,38 @@ mod tests {
     fn only_one_code_is_open_at_a_time() {
         let _one = ONE_LISTENER.lock().unwrap_or_else(|e| e.into_inner());
         let from: IpAddr = "192.168.1.77".parse().unwrap();
-        let _first = waiting(Code::Pair, "first", None);
+        let _first = waiting(Code::Pair, "first");
 
         let second = open(Open {
-            code: Code::Backup,
+            code: Code::Restore,
             token: "second".to_owned(),
-            reply: Some("{}".to_owned()),
             answer: Box::new(|_, _| true),
         });
         assert!(second.is_err(), "the first is not replaced");
         assert!(
-            exchange(Code::Backup, r#"{"token":"second"}"#, from).is_none(),
+            !exchange(Code::Restore, r#"{"token":"second"}"#, from),
             "and the second was never answerable"
         );
         assert_eq!(pending_token().as_deref(), Some("first"));
         close();
     }
 
+    /// A backup goes to a paired phone; the listener has no route that hands a key out.
     #[test]
-    fn a_backup_answers_its_token_once_with_the_reply() {
+    fn a_backup_is_not_answered_here() {
         let _one = ONE_LISTENER.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let port = start_for_test(dir.path()).unwrap();
-        let path = Code::Backup.path();
 
-        let reply = r#"{"v":1,"peer":"p"}"#;
-        let got = waiting(Code::Backup, "tok-b", Some(reply));
-
-        let wrong = post_for_test(dir.path(), port, path, r#"{"token":"guess"}"#);
-        assert!(wrong.starts_with("HTTP/1.1 403"), "{wrong}");
-        assert!(!wrong.contains(reply), "a guess gets nothing: {wrong}");
-
-        let right = post_for_test(dir.path(), port, path, r#"{"token":"tok-b"}"#);
-        assert!(right.starts_with("HTTP/1.1 200"), "{right}");
-        assert!(right.ends_with(&format!("\r\n\r\n{reply}")), "{right}");
-        got.try_recv().expect("the answer was handed over");
-
-        let again = post_for_test(dir.path(), port, path, r#"{"token":"tok-b"}"#);
-        assert!(again.starts_with("HTTP/1.1 403"), "spent: {again}");
+        let _got = waiting(Code::Restore, "tok-r");
+        let answer = post_for_test(dir.path(), port, "/v1/backup", r#"{"token":"tok-r"}"#);
+        assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+        assert_eq!(
+            pending_token().as_deref(),
+            Some("tok-r"),
+            "and the open code is untouched"
+        );
+        close();
     }
 
     #[test]
@@ -986,7 +952,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let port = start_for_test(dir.path()).unwrap();
 
-        let got = waiting(Code::Restore, "tok-r", None);
+        let got = waiting(Code::Restore, "tok-r");
         let body = r#"{"token":"tok-r", "backup": {"v":1,  "key":"a2V5"}}"#;
         let answer = post_for_test(dir.path(), port, Code::Restore.path(), body);
         assert!(answer.starts_with("HTTP/1.1 204"), "{answer}");

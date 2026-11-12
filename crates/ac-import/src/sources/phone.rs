@@ -142,7 +142,7 @@ fn back_up(config: &Fields, payload: &str) -> Result<()> {
 /// token it will be asked for ever after. None of that crosses the network to get there — it
 /// crosses a room, which is the one channel nothing on the wifi can listen to.
 fn authorize(_settings: &Fields) -> Result<Option<Fields>> {
-    let Some(paired) = companion::ask(Code::Pair, None, Paired::read)? else {
+    let Some(paired) = companion::ask(Code::Pair, Paired::read)? else {
         return Ok(None);
     };
 

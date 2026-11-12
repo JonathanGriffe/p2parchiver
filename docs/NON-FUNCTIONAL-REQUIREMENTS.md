@@ -6,7 +6,7 @@ The properties the peer-to-peer system must keep in order to work. A change that
 
 - T1. Every connection is encrypted and authenticated.
 - T2. Only enrolled peers are answered.
-- T3. Identity belongs to the node. Its key leaves the machine only for a phone that scanned a backup code the node showed.
+- T3. Identity belongs to the node. Its key leaves the machine only when someone at it sends a backup to a phone paired with it.
 - T4. Only the admin changes membership, and only a member speaks for itself.
 
 ## Privacy

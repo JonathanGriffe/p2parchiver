@@ -65,7 +65,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum IdentityCommand {
-    /// Show a code for the phone to take a backup of this node's identity. Once enrolled.
+    /// Send a backup of this node's identity to every paired phone. Once enrolled.
     Backup,
     /// Take an identity back from the phone on a home that has not enrolled, and enrol with
     /// it: again with its server, or with an invite.

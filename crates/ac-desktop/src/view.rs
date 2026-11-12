@@ -11,6 +11,7 @@ use crate::files;
 use crate::groups;
 use crate::peers;
 use crate::selection::Selection;
+use crate::settings;
 use crate::sort;
 use crate::sources;
 use crate::ui::{MainWindow, StorageSlice, TrafficRow};
@@ -58,6 +59,7 @@ pub struct Snapshot {
     pub files: Option<files::Page>,
     pub sort: Option<sort::Page>,
     pub sources: Option<sources::Page>,
+    pub settings: Option<bool>,
 }
 
 /// Which page is up. The nav sets it, and it is what a read is narrowed by.
@@ -67,8 +69,6 @@ pub const PEERS: i32 = 2;
 pub const FILES: i32 = 3;
 pub const SORT: i32 = 4;
 pub const SOURCES: i32 = 5;
-/// Nothing narrows a read by this one, so only tests name it.
-#[cfg(test)]
 pub const SETTINGS: i32 = 6;
 
 pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
@@ -79,12 +79,14 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
     let files = (tab == FILES).then(|| files::read(paths, &looking_at));
     let sort = (tab == SORT).then(|| sort::read(paths, &looking_at.sorting));
     let sources = (tab == SOURCES).then(|| sources::read(paths));
+    let settings = (tab == SETTINGS).then(|| settings::read(paths));
 
     if !matches!(tab, STATUS | GROUPS | PEERS) {
         return Snapshot {
             files,
             sort,
             sources,
+            settings,
             ..Snapshot::default()
         };
     }
@@ -134,6 +136,7 @@ pub fn read(paths: &Paths, selection: &Selection) -> Snapshot {
         files,
         sort,
         sources,
+        settings: None,
     }
 }
 
@@ -177,9 +180,10 @@ pub fn apply(window: &MainWindow, snapshot: Snapshot) {
         files,
         sort,
         sources,
+        settings,
     } = snapshot;
 
-    // A code to scan may be up for the enrol dialog or Settings as well as Sources.
+    // A code to scan may be up for the enrol dialog as well as Sources.
     window.set_code(code_image().unwrap_or_default());
 
     if let Some(status) = status {
@@ -210,9 +214,12 @@ pub fn apply(window: &MainWindow, snapshot: Snapshot) {
     if let Some(files) = files {
         files::apply(window, files);
     }
+    if let Some(settings) = settings {
+        settings::apply(window, settings);
+    }
 }
 
-/// The code a sign-in, a backup or a restore is waiting on, with a quiet zone around it.
+/// The code a sign-in or a restore is waiting on, with a quiet zone around it.
 fn code_image() -> Option<slint::Image> {
     let qr = ops::prompt::showing()?;
     const QUIET: usize = 4;
@@ -831,14 +838,12 @@ mod reading {
             fits(&format!("tab {tab}"));
         }
 
-        // Settings with a backup on offer, and then waiting on the phone.
+        // Settings with a backup on offer, and then sending it.
         window.set_tab(SETTINGS);
         window.set_enrolled(true);
-        fits("Settings, enrolled");
+        window.set_phone_paired(true);
+        fits("Settings, enrolled with a phone paired");
         window.set_backing_up(true);
-        window.set_code(slint::Image::from_rgba8(slint::SharedPixelBuffer::<
-            slint::Rgba8Pixel,
-        >::new(29, 29)));
         fits("Settings, backing up");
         window.set_backing_up(false);
 

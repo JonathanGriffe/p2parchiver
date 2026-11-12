@@ -64,7 +64,7 @@ A node that has not enrolled shows the enrol dialog at startup, in two steps:
 
 "Enrol" and "Continue" stop the node, enrol through `from_token` or `from_server`, with the restored identity if there is one, and start the node again whatever the outcome, so a refusal never leaves it stopped. The node's details are read again afterwards, since a restore changes its peer id.
 
-Settings offers "Back up to phone" once enrolled. It shows the backup code beside a Cancel button and waits, and the outcome goes on the message line, since nothing else on screen changes. The code to scan is read on every poll whichever page is up, so the enrol dialog and Settings show it as the Sources page does, and each of the three has the poll read as soon as its code is up rather than at the next tick.
+Settings offers "Back up to phone" once enrolled, enabled while a phone is paired, which the poll asks `ops::backup::can_back_up` while Settings is up. Pressing it sends the backup to every paired phone, with the button busy meanwhile, and each phone's outcome goes on the message line, since nothing else on screen changes, as a success or a failure as `ops::backup` decides. The code to scan is read on every poll whichever page is up, so the enrol dialog shows it as the Sources page does, and both have the poll read as soon as their code is up rather than at the next tick.
 
 ### Start at login
 
