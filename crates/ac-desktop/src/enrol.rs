@@ -35,6 +35,8 @@ pub fn wire(window: &MainWindow, paths: &Paths, node: &Shared, nudge: &Nudge) {
     let weak = window.as_weak();
     let restored: Restored = Arc::default();
 
+    window.on_stop_phone_code(ops::prompt::stop);
+
     window.on_enrol_new({
         let weak = weak.clone();
         let restored = restored.clone();
